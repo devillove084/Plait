@@ -1,0 +1,8 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(absl CONFIG)
+
+include("${CMAKE_CURRENT_LIST_DIR}/PlaitTargets.cmake")
+
+check_required_components(Plait)
