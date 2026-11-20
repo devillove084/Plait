@@ -65,8 +65,10 @@ conditional on a correct SCC partition.
   for 3 replicas, 2 instances, 2 commands, ballots bounded by 2.
 - [x] Model explicit dependency merge; `CommittedDepsStable` is checked by TLC.
 - [ ] Model message loss, duplication, and reordering.
-- [ ] Check liveness for the recovery protocol; unified compute/fusion liveness
-  is checked on the tiny instance.
+- [x] Check liveness for the single-instance ordering model
+  (`PlaitOrderingTiny`).
+- [ ] Check liveness for the full multi-instance recovery model; the current
+  state space is too large for a quick TLC pass.
 
 ### F3 — Modified protocol
 
