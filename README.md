@@ -298,11 +298,13 @@ Deliberate limits of this prototype:
 
 - **No authentication or encryption.** The transport trusts the network. A
   production deployment must authenticate `NodeId` and authorize membership.
-- **RDMA hardware was not available in this container or the provided remote
-  container.** The backend is real and compiles/links, but the two-QP path is
-  validated only on hosts with an RNIC or a configured Soft-RoCE link. The
-  `pro5000` container has 8 GPUs but no `/dev/infiniband`, no verbs device, and no
-  `CAP_NET_ADMIN`/`CAP_SYS_MODULE`, so it also reports a clear skip.
+- **The ordinary containers do not expose RDMA.** The backend is real and
+  compiles/links. On `pro5000`, a privileged helper container with host
+  `/sys`, `/dev`, `/lib/modules`, and the `rdma_rxe` module ran a real Soft-RoCE
+  two-QP `RDMA_WRITE` + `RDMA_READ` self-test successfully; the normal `pro5000`
+  container still reports a clear skip because it has no `/dev/infiniband` and no
+  `CAP_NET_ADMIN`/`CAP_SYS_MODULE`. See
+  [docs/validation/pro5000.md](docs/validation/pro5000.md).
 - **Vendor compute dispatch is not implemented yet.** Device discovery,
   capability matching, compute conflicts, scheduling, and placement are real;
   NVIDIA/AMD/Huawei/PPU kernel adapters are the next layer.
@@ -336,10 +338,10 @@ Deliberate limits of this prototype:
 - [x] EP MoE, DP optimizer, and PP stage-handoff execution
 - [x] Context- and tensor-parallel DSA reference execution
 - [x] Registered-memory descriptors, pooling, and loopback data plane
-- [x] Real `ibverbs` backend and two-QP self-test (hardware execution blocked here)
+- [x] Real `ibverbs` backend and two-QP Soft-RoCE self-test on `pro5000`
 - [x] Heterogeneous device profiles, compute access mode, and capability scheduler
 - [ ] Vendor kernel adapters (CUDA, ROCm, CANN, PPU) and GPU memory descriptors
-- [ ] GPUDirect RDMA and real multi-host hardware validation
+- [ ] GPUDirect RDMA and multi-host RDMA traffic validation
 - [ ] Descriptor-only bulk contribution commands and completion queues
 - [ ] Per-domain consensus groups and hierarchical membership
 - [ ] Durable snapshots, identity persistence, and authenticated transport

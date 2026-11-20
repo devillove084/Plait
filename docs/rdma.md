@@ -84,31 +84,41 @@ Some distributions package the module separately (`rdma-core` /
 `kmod-rdma`); the module must match the running kernel. Soft-iWARP (`siw`) is an
 alternative software provider if the host supports it.
 
-## This development container
+## Validation status
 
-The container cannot execute the hardware path:
+A real Soft-RoCE two-QP test passed on `pro5000` through a privileged helper
+container:
+
+```text
+plait rdma: rxe0 loopback write/read passed (128 bytes)
+```
+
+The normal `pro5000` container still has no `/dev/infiniband`, so `plait-node
+rdma-selftest` reports the expected skip there. See
+[validation/pro5000.md](validation/pro5000.md) for the exact setup.
+
+## Container behavior
+
+The **local development container** cannot execute the hardware path:
 
 - `/sys/class/infiniband` and `/dev/infiniband` are empty;
 - the running 4.19 kernel has no `rdma_rxe.ko`;
-- `CAP_NET_ADMIN` and `CAP_SYS_MODULE` are not in the effective/bounding set,
-  so `rdma link add ... type rxe` and `modprobe rdma_rxe` cannot work.
+- `CAP_NET_ADMIN` and `CAP_SYS_MODULE` are not in the effective/bounding set.
 
-The backend still compiles and links against the installed `libibverbs`
-(`rdma-core` 55 headers/libraries locally; `rdma-core` 48 on the remote
-`pro5000` container). On `pro5000`, `/sys/class/infiniband` and
-`/dev/infiniband` are also empty; only a virtio NIC is exposed (no Mellanox/
-Broadcom RDMA PCI function), the kernel has no `rdma_rxe` module, and the
-container lacks `CAP_NET_ADMIN` and `CAP_SYS_MODULE`. The self-test therefore
-exits successfully with a clear skip there too.
+The **pro5000 host kernel does support `rdma_rxe`** (dmesg shows it), but the
+ordinary `pro5000` container still does not expose `/dev/infiniband` and lacks
+the capabilities to create the link. A privileged helper container with host
+`/sys`, `/dev`, `/lib/modules`, and the repository mounted can create `rxe0` and
+run the test; the ordinary container then still reports:
 
 ```text
 plait rdma: skipped (no verbs device; configure Soft-RoCE or an RNIC)
 ```
 
-To validate the hardware path, run the repository on a host with an RNIC or a
-configured Soft-RoCE link. `Registration::descriptor` produces the same
-`RegionDescriptor` consumed by the loopback plane, and
-`post_write_descriptor`/`post_read_descriptor` accept it.
+To run a node over RDMA, start it with the device and capabilities exposed
+(`--privileged`, or `--device /dev/infiniband` plus the pre-created rxe link).
+`Registration::descriptor` produces the same `RegionDescriptor` consumed by the
+loopback plane, and `post_write_descriptor`/`post_read_descriptor` accept it.
 
 ## Performance notes
 
