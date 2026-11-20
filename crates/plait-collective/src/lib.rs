@@ -214,7 +214,7 @@ impl PeerGroup {
                 .load_function("plait_ring_allreduce")
                 .map_err(|error| CollectiveError::new(format!("load ring kernel: {error}")))?;
             let alltoall = module
-                .load_function("plait_alltoall")
+                .load_function("plait_alltoall_push")
                 .map_err(|error| CollectiveError::new(format!("load alltoall kernel: {error}")))?;
             let broadcast = module
                 .load_function("plait_broadcast_fanout")
@@ -560,10 +560,10 @@ impl PeerGroup {
             output.push(PeerRegion::alloc(rank, count * std::mem::size_of::<f32>())?);
             tables.push(PeerRegion::alloc(rank, n * 8)?);
         }
-        let data_ptrs: Vec<u64> = data.iter().map(|region| region.as_ptr() as u64).collect();
+        let output_ptrs: Vec<u64> = output.iter().map(|region| region.as_ptr() as u64).collect();
         for rank in 0..n {
             let mut bytes = Vec::with_capacity(n * 8);
-            for pointer in &data_ptrs {
+            for pointer in &output_ptrs {
                 bytes.extend_from_slice(&pointer.to_ne_bytes());
             }
             tables[rank].write_bytes(&bytes)?;
@@ -582,19 +582,26 @@ impl PeerGroup {
         for rank in 0..n {
             let stream = self.ranks[rank].stream.clone();
             let function = &self.ranks[rank].alltoall;
-            let output_ptr = workspace.output[rank].as_ptr() as u64;
+            let input_ptr = workspace._data[rank].as_ptr() as u64;
             let table_ptr = workspace.tables[rank].as_ptr() as u64;
             let rank_i = rank as i32;
             let n_i = n as i32;
             let chunk_i = workspace.chunk as i32;
             let mut launch = stream.launch_builder(function);
-            launch.arg(&output_ptr);
+            launch.arg(&input_ptr);
             launch.arg(&table_ptr);
             launch.arg(&rank_i);
             launch.arg(&n_i);
             launch.arg(&chunk_i);
-            unsafe { launch.launch(LaunchConfig::for_num_elems(workspace.chunk as u32)) }
-                .map_err(driver("alltoall launch"))?;
+            let blocks = workspace.chunk.div_ceil(1024) as u32;
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (blocks, 1, 1),
+                    block_dim: (1024, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(driver("alltoall launch"))?;
         }
         Ok(())
     }

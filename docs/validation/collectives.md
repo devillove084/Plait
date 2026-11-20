@@ -180,11 +180,11 @@ same `algbw_GB/s` / `busbw_GB/s` fields. On `pro5000` (8 ranks, 1 MiB):
 | reduce (device) | 3.220 | 20.359 |
 | allgather (device) | 14.153 | 38.689 |
 | reducescatter (device) | 13.070 | 26.475 |
-| alltoall (device) | 14.299 | 25.697 |
+| alltoall (device) | 14.299 | 24.941 |
 
 All correctness checks pass. At 1 MiB all six device paths beat NCCL. At larger
 sizes the result is not uniform: at 16 MiB allreduce/reduce/allgather/
-reducescatter are faster, while broadcast/alltoall still trail NCCL. `just nccl-ops` is
+reducescatter/alltoall are faster, while broadcast still trails NCCL. `just nccl-ops` is
 the M7 artifact generator; JSON traces are written by the Plait side when
 `--trace` is supplied. The full size sweep and a CI performance threshold remain
 open.

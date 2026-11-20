@@ -177,3 +177,20 @@ extern "C" __global__ void plait_broadcast_fanout(
         }
     }
 }
+
+extern "C" __global__ void plait_alltoall_push(
+    const float* input,
+    unsigned long long* output_peers,
+    int rank,
+    int ranks,
+    int chunk)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int destination = 0; destination < ranks; ++destination) {
+        float* dst = reinterpret_cast<float*>(output_peers[destination]);
+        for (int i = tid; i < chunk; i += stride) {
+            dst[rank * chunk + i] = input[destination * chunk + i];
+        }
+    }
+}
