@@ -128,9 +128,11 @@ just hetero-plan # 4+8 heterogeneous LP demo
 cargo run -q -p plait-node -- hetero-plan --local-gflops 1394 --remote-gflops 4317
 just matrix      # 12-replica matrix collective
 just ipc         # two-process CUDA IPC allreduce
+just tcp-allreduce # two-host TCP GPU-buffer fallback
 just gpu         # CUDA AXPY and CUTLASS SGEMM
 just gpu-bench   # per-GPU CUTLASS SGEMM throughput
 just rdma        # real ibverbs or an explicit skip
+just nccl-tcp    # experimental NCCL-over-TCP baseline
 just ci          # fmt, lint, tests, demos
 ```
 
@@ -145,8 +147,24 @@ The `pro5000` host passes cross-GPU IPC.
 
 The ibverbs backend compiles and links. The ordinary containers expose no
 `/dev/infiniband`, no active verbs device, and no `CAP_NET_ADMIN`, so
-`just gpu-rdma` and `just rdma` report explicit skips. Two-host GPU-buffer
-collectives therefore remain unverified.
+`just gpu-rdma` and `just rdma` report explicit skips.
+
+### TCP fallback
+
+`scripts/tcp-allreduce-two-host.sh` runs a 12-rank, host-staged allreduce across
+four local GPUs and eight GPUs on the remote host. It exercises GPU H2D/D2H,
+TCP, and a star reducer; it is not a GPUDirect path. On the current 4+8 host
+pair it completed with `errors=0` at 1 MiB and 16 MiB:
+
+```text
+1 MiB   0.009 GB/s
+16 MiB  0.032 GB/s
+```
+
+The star path is a correctness fallback, not a performance result. NCCL over the
+same TCP path is blocked by a local/remote NCCL version and CUDA runtime
+mismatch; `scripts/nccl-tcp-two-host.sh` is retained for a host with matching
+NCCL builds.
 
 TLA+ tools are not vendored. Run:
 

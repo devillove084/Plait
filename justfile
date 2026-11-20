@@ -54,6 +54,12 @@ collectives: setup
 ipc: setup
     ./scripts/ipc-peer.sh
 
+tcp-allreduce: setup
+    ./scripts/tcp-allreduce-two-host.sh
+
+nccl-tcp: setup
+    ./scripts/nccl-tcp-two-host.sh
+
 matrix: setup
     ./scripts/matrix-local.sh
 
