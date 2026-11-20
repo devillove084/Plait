@@ -170,7 +170,7 @@ fn main() -> AnyResult<()> {
         }
         drop(listener);
         let listener = listen(base + 8)?;
-        for _ in 0..8 {
+        for _ in 0..4 {
             crosses.push(accept(&listener)?);
         }
     } else if rank == 4 {
@@ -179,7 +179,7 @@ fn main() -> AnyResult<()> {
             workers.push(accept(&listener)?);
         }
         drop(listener);
-        for _ in 0..8 {
+        for _ in 0..4 {
             crosses.push(connect(local_ip, base + 8)?);
         }
     } else if is_local {
@@ -228,13 +228,13 @@ fn main() -> AnyResult<()> {
                 }
             }
 
-            let part = count / 8;
-            let mut cross_values = vec![vec![0.0f32; count]; 8];
+            let part = count / 4;
+            let mut cross_values = vec![vec![0.0f32; count]; 4];
             let (sender, receiver) = std::sync::mpsc::channel();
             thread::scope(|scope| {
-                for channel in 0..8 {
+                for channel in 0..4 {
                     let begin = channel * part;
-                    let end = if channel == 7 { count } else { begin + part };
+                    let end = if channel == 3 { count } else { begin + part };
                     let payload = sum[begin..end].to_vec();
                     let stream = crosses[channel].try_clone().expect("cross clone");
                     let sender = sender.clone();
@@ -245,7 +245,7 @@ fn main() -> AnyResult<()> {
                     });
                 }
                 drop(sender);
-                for _ in 0..8 {
+                for _ in 0..4 {
                     let message = receiver.recv().expect("cross channel closed");
                     let (channel, begin, values) = message.expect("cross exchange failed");
                     cross_values[channel][begin..begin + values.len()].copy_from_slice(&values);
