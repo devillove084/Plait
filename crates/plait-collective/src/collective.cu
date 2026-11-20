@@ -127,3 +127,53 @@ extern "C" __global__ void plait_alltoall(
         }
     }
 }
+
+extern "C" __global__ void plait_broadcast_chain(
+    float* data,
+    unsigned int* flags,
+    unsigned long long next_data,
+    unsigned long long next_flags,
+    int rank,
+    int ranks,
+    int root,
+    int count)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    float* next = reinterpret_cast<float*>(next_data);
+    unsigned int* next_flags_ptr = reinterpret_cast<unsigned int*>(next_flags);
+    for (int step = 0; step < ranks - 1; ++step) {
+        int source = (root + step) % ranks;
+        int destination = (source + 1) % ranks;
+        if (rank == source) {
+            for (int i = tid; i < count; i += stride) next[i] = data[i];
+            __threadfence_system();
+            if (tid == 0) next_flags_ptr[step] = (unsigned int)(step + 1);
+        }
+        if (rank == destination) {
+            if (tid == 0) {
+                while (*(volatile unsigned int*)(flags + step) != (unsigned int)(step + 1)) {
+                }
+            }
+            __syncthreads();
+            __threadfence_system();
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ void plait_broadcast_fanout(
+    const float* source,
+    unsigned long long* peers,
+    int ranks,
+    int count)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int peer = 0; peer < ranks; ++peer) {
+        float* destination = reinterpret_cast<float*>(peers[peer]);
+        for (int i = tid; i < count; i += stride) {
+            destination[i] = source[i];
+        }
+    }
+}

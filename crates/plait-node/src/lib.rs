@@ -1099,6 +1099,39 @@ pub fn run_collectives_demo(
             elapsed * 1e3
         );
     } else if device_ring {
+        if op == "allgather" {
+            let width = inputs[0].len() / ranks;
+            let chunks: Vec<Vec<f32>> = inputs
+                .iter()
+                .map(|values| values[..width].to_vec())
+                .collect();
+            let checked = group.all_gather_device(&chunks)?;
+            validate_device_output(op, &inputs, &expected, &checked)?;
+            let (duration, _) = group.all_gather_device_resident(&chunks, iters)?;
+            let elapsed = duration.as_secs_f64() / iters as f64;
+            let bw = allreduce_bytes_f64(bytes) / elapsed / 1e9;
+            let busbw = bw * 2.0 * (ranks - 1) as f64 / ranks as f64;
+            println!(
+                "plait collectives: device-ring allgather ranks={ranks} bytes={} time_ms={:.6} algbw_GB/s={bw:.3} busbw_GB/s={busbw:.3}",
+                (bytes / std::mem::size_of::<f32>()).max(1) * std::mem::size_of::<f32>(),
+                elapsed * 1e3
+            );
+            return Ok(());
+        }
+        if op == "reducescatter" {
+            let checked = group.reduce_scatter_device(&inputs)?;
+            validate_device_output(op, &inputs, &expected, &checked)?;
+            let (duration, _) = group.reduce_scatter_device_resident(&inputs, iters)?;
+            let elapsed = duration.as_secs_f64() / iters as f64;
+            let bw = allreduce_bytes_f64(bytes) / elapsed / 1e9;
+            let busbw = bw * 2.0 * (ranks - 1) as f64 / ranks as f64;
+            println!(
+                "plait collectives: device-ring reducescatter ranks={ranks} bytes={} time_ms={:.6} algbw_GB/s={bw:.3} busbw_GB/s={busbw:.3}",
+                (bytes / std::mem::size_of::<f32>()).max(1) * std::mem::size_of::<f32>(),
+                elapsed * 1e3
+            );
+            return Ok(());
+        }
         let contributions = device_collective_inputs(op, &inputs)?;
         let checked = group.all_reduce_device_ring(&contributions)?;
         let checked = device_collective_output(op, &inputs, checked);
@@ -1215,14 +1248,27 @@ fn validate_device_output(
     let count = inputs[0].len();
     let width = count / n;
     match op {
-        "allreduce" | "reducescatter" => {
+        "allreduce" => {
             for values in output {
                 if values
                     .iter()
                     .zip(expected)
                     .any(|(actual, expected)| (*actual - *expected).abs() > 1e-2)
                 {
-                    return Err(format!("{op} device correctness failed").into());
+                    return Err("allreduce device correctness failed".into());
+                }
+            }
+        }
+        "reducescatter" => {
+            for (rank, values) in output.iter().enumerate() {
+                let chunk = (rank + 1) % n;
+                let wanted = &expected[chunk * width..(chunk + 1) * width];
+                if values[chunk * width..(chunk + 1) * width]
+                    .iter()
+                    .zip(wanted)
+                    .any(|(actual, expected)| (*actual - *expected).abs() > 1e-2)
+                {
+                    return Err("reducescatter device correctness failed".into());
                 }
             }
         }
