@@ -231,6 +231,7 @@ Design documents:
 - [docs/architecture.md](docs/architecture.md) — protocol and data flow
 - [docs/parallelism.md](docs/parallelism.md) — parallelism-axis mapping
 - [docs/rdma.md](docs/rdma.md) — verbs backend and setup
+- [docs/goals/tcp-parity.md](docs/goals/tcp-parity.md) — TCP/NCCL acceptance goal
 - [specs/](specs/) — TLA+ models and TLC configurations
 
 ## Limitations
