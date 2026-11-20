@@ -305,35 +305,41 @@ mod tests {
         assert_eq!(remote, 80);
     }
     #[test]
-    fn heterogeneous_four_local_eight_remote_weights_compute_and_link() {
+    fn four_3090s_get_less_than_eight_pro5000s() {
         let mut profiles = Vec::new();
         for index in 0..4 {
             profiles.push(RankProfile {
-                node: NodeId::derive(&format!("local-{index}")),
-                gpus: 4,
-                compute_units: 4.0,
-                link: LinkKind::NvLink,
-                bandwidth_gbps: Some(400.0),
-                latency_us: Some(1.0),
+                node: NodeId::derive(&format!("3090-{index}")),
+                gpus: 1,
+                compute_units: 1.0,
+                link: LinkKind::Pcie,
+                bandwidth_gbps: Some(25.0),
+                latency_us: Some(5.0),
             });
         }
         for index in 0..8 {
             profiles.push(RankProfile {
-                node: NodeId::derive(&format!("remote-{index}")),
-                gpus: 8,
-                compute_units: 1.0,
+                node: NodeId::derive(&format!("pro5000-{index}")),
+                gpus: 1,
+                compute_units: 4.0,
                 link: LinkKind::Ub,
-                bandwidth_gbps: Some(50.0),
+                bandwidth_gbps: Some(200.0),
                 latency_us: Some(2.0),
             });
         }
-        let layout = HeterogeneousLayout::plan(&profiles, 1 << 20).expect("plan");
-        let ranges = layout.row_ranges(120);
+        let plan = HeterogeneousLayout::plan_detailed(&profiles, 1 << 20).expect("plan");
+        let ranges = plan.layout.row_ranges(120);
         let local: usize = ranges[..4].iter().map(|r| r.range.len()).sum();
         let remote: usize = ranges[4..].iter().map(|r| r.range.len()).sum();
         assert_eq!(local + remote, 120);
-        assert!(local > remote, "faster local ranks should own more rows");
-        assert!(ranges[0].range.len() > ranges[4].range.len());
+        assert!(
+            remote > local,
+            "eight Pro5000s must own more rows than four 3090s"
+        );
+        assert!(ranges[4].range.len() > ranges[0].range.len());
+        let local_share: f64 = plan.shares[..4].iter().map(|(_, share)| share).sum();
+        let remote_share: f64 = plan.shares[4..].iter().map(|(_, share)| share).sum();
+        assert!(remote_share > 4.0 * local_share);
     }
     #[test]
     fn lp_matches_closed_form_for_two_ranks_without_latency() {

@@ -1624,19 +1624,19 @@ pub async fn run_matrix_node(
                     if index < 4 {
                         RankProfile {
                             node: *node,
-                            gpus: 4,
-                            compute_units: 4.0,
-                            link: LinkKind::NvLink,
-                            bandwidth_gbps: Some(400.0),
-                            latency_us: Some(1.0),
+                            gpus: 1,
+                            compute_units: 1.0,
+                            link: LinkKind::Pcie,
+                            bandwidth_gbps: Some(25.0),
+                            latency_us: Some(5.0),
                         }
                     } else {
                         RankProfile {
                             node: *node,
-                            gpus: 8,
-                            compute_units: 1.0,
+                            gpus: 1,
+                            compute_units: 4.0,
                             link: LinkKind::Ub,
-                            bandwidth_gbps: Some(50.0),
+                            bandwidth_gbps: Some(200.0),
                             latency_us: Some(2.0),
                         }
                     }

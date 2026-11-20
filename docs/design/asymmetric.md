@@ -24,13 +24,15 @@ rank weights, then `row_ranges` covers `0..M` exactly once.
 For the 4+8 demo:
 
 ```text
-4 local ranks:  NVLink, compute 4.0, 400 Gbps
-8 remote ranks: UB,     compute 1.0,  50 Gbps
+4 local ranks:  RTX 3090, PCIe, compute 1.0, 25 Gbps
+8 remote ranks: RTX PRO 5000, UB, compute 4.0, 200 Gbps
 ```
 
-the LP gives `local_share=0.667`, `remote_share=0.333`, so the local group owns
-two thirds of the rows. Changing the link class, latency, or message size
-changes the weights without changing EPaxos membership.
+the LP gives `local_share=0.111`, `remote_share=0.889`, so the eight Pro 5000
+ranks own the large majority of rows. With only 8 matrix rows the local group
+can quantize to zero rows; at 64 rows it receives about 7. The planner also
+exposes the fractional shares so a scheduler need not rely on row counts for
+small matrices.
 
 ## EPaxos integration
 
@@ -60,7 +62,16 @@ entries; `run_matrix_node` takes `--asymmetric` only on the driver.
 
 - Weights currently feed the row dimension only; TP/EP dimensions are still
   uniform.
+- Integer row quantization can round a low-share group to zero when
+  `rows < ranks`; use fractional shares or a larger row count.
 - Matrix rows are the weighted dimension; TP/EP dimensions are not yet
   independently weighted.
 - The demo runs 12 processes on one host for repeatability; the network
   topology of a 4+8 cross-host run is not encoded in the matrix checksum.
+
+## Relaxed rejoin
+
+`plait-parallel::RejoinCost` chooses the cheapest of strict EPaxos recovery,
+snapshot replay, and deterministic recomputation. Recompute is selected when
+it is cheaper than communication plus replay; it does not bypass consensus for
+already committed commands.
