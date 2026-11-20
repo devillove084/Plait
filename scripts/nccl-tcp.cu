@@ -132,6 +132,11 @@ int main(int argc, char** argv) {
   auto end = std::chrono::steady_clock::now();
   double seconds = std::chrono::duration<double>(end - start).count() / iters;
 
+  // The timed loop changes the in-place buffer; reset before validation.
+  CHECK(cudaMemcpy(device, host.data(), bytes, cudaMemcpyHostToDevice));
+  NCCL_CHECK(ncclAllReduce(device, device, count, ncclFloat, ncclSum, comm,
+                           nullptr));
+  CHECK(cudaDeviceSynchronize());
   CHECK(cudaMemcpy(host.data(), device, bytes, cudaMemcpyDeviceToHost));
   double expected = static_cast<double>(world * (world + 1)) / 2.0;
   int errors = 0;

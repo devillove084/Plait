@@ -161,10 +161,18 @@ pair it completed with `errors=0` at 1 MiB and 16 MiB:
 16 MiB  0.032 GB/s
 ```
 
-The star path is a correctness fallback, not a performance result. NCCL over the
-same TCP path is blocked by a local/remote NCCL version and CUDA runtime
-mismatch; `scripts/nccl-tcp-two-host.sh` is retained for a host with matching
-NCCL builds.
+The star path is a correctness fallback, not a performance result. NCCL 2.28.9
+over the same TCP path reports `errors=0` at:
+
+```text
+1 MiB   0.050 GB/s
+16 MiB  0.273 GB/s
+```
+
+NCCL is faster because it uses a ring and avoids a serialized star root. The
+Plait TCP path still needs a ring implementation. `scripts/nccl-tcp-two-host.sh`
+expects the local CUDA 12.9 NCCL wheel at `PLAIT_LOCAL_NCCL` and the remote
+conda NCCL build at the same version.
 
 TLA+ tools are not vendored. Run:
 
