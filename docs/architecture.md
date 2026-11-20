@@ -126,16 +126,27 @@ recovery leader.
 - edges are EPaxos dependencies, classified from the conflicting access keys as
   `Data` (tensor/operator), `Device` (compute reservation), `Config`
   (membership), or `Control` (an explicit dependency with no shared key);
-- SCCs are computed with `petgraph`'s Tarjan implementation and cached until a
-  commit changes the graph. Executing a complete component removes it without
-  invalidating unrelated components;
-- `ready_batches` returns every component whose external dependencies are
-  executed, sorted by `(minimum seq, minimum instance id)`.
+- the SCC condensation is maintained online. A commit creates a singleton;
+  an edge either joins the condensation DAG or closes a cycle. In the latter
+  case the intersection of forward reachability from the dependency and reverse
+  reachability from the dependent is merged into one component;
+- removing an executed component updates its predecessors immediately; a
+  predecessor becomes ready when its last outgoing dependency disappears;
+- unresolved dependencies (an instance not committed yet) keep their component
+  blocked; when the dependency commits, the edge is inserted and the block is
+  cleared;
+- `ready_batches` reads the maintained ready frontier and sorts batches by
+  `(minimum seq, minimum instance id)`. It does not run a full SCC pass.
 
 Dependency cycles are the normal consequence of concurrent conflicting
 proposals; SCC order prevents a topological-sort deadlock. Independent
 components commute, so replicas that learn them in different orders still reach
 the same tensor state.
+
+This is a complete online SCC/condensation algorithm over the pending frontier,
+not a cached Tarjan rebuild. A cycle merge pays for a reachability search over
+the current condensation; it does not scan the executed log. `petgraph` remains
+in the test suite as an independent Tarjan oracle.
 
 `Runtime` opts into SCC-level parallel execution: each ready component is
 applied to a forked `Runtime`, then forks are merged in deterministic batch

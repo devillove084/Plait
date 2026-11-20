@@ -48,6 +48,12 @@ hetero: setup
 matrix: setup
     ./scripts/matrix-local.sh
 
+nccl: setup
+    ./scripts/nccl-compare.sh
+
+nccl-sweep: setup
+    ./scripts/nccl-compare.sh --sweep
+
 gpu: setup
     cargo run -q --locked -p plait-node -- gpu-demo
 

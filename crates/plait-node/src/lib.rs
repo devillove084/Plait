@@ -1025,6 +1025,7 @@ pub async fn run_matrix_node(
     local_count: usize,
     driver: bool,
     hold_seconds: u64,
+    shape: (usize, usize, usize),
 ) -> Result<(), Box<dyn std::error::Error>> {
     use plait_parallel::{AxisSizes, Topology};
 
@@ -1082,7 +1083,7 @@ pub async fn run_matrix_node(
             client.add_peer(*id, addr.clone());
         }
         let topology = Topology::new(AxisSizes::new(2, 1, 3, 2, 1, 1), ids.clone())?;
-        let (m, n, k) = (8usize, 8usize, 6usize);
+        let (m, n, k) = shape;
         let (a, b) = matrix_inputs(m, n, k);
         let expected = matrix_reference(&a, &b, m, n, k);
         let op = OpId::new(NodeId::derive("matrix-plan"), 1);
@@ -1096,20 +1097,28 @@ pub async fn run_matrix_node(
         client.submit(ids[0], Command::DeclareOp(spec)).await?;
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if client
-                .query(ids[0], op)
-                .await
-                .ok()
-                .is_some_and(|reply| reply.declared)
-            {
+            let mut declared_everywhere = true;
+            for (id, _) in &entries {
+                let declared = client
+                    .query(*id, op)
+                    .await
+                    .ok()
+                    .is_some_and(|reply| reply.declared);
+                if !declared {
+                    declared_everywhere = false;
+                    break;
+                }
+            }
+            if declared_everywhere {
                 break;
             }
             if Instant::now() >= deadline {
                 return Err("matrix declaration timed out".into());
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
+        let collective_start = Instant::now();
         let mut contributions = 0usize;
         for (id, _) in &entries {
             let coord = topology.coord(*id).ok_or("node missing from topology")?;
@@ -1151,7 +1160,7 @@ pub async fn run_matrix_node(
             if Instant::now() >= deadline {
                 return Err("matrix collective timed out".into());
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
         };
         if values.len() != expected.len() {
             return Err("matrix result length mismatch".into());
@@ -1163,7 +1172,8 @@ pub async fn run_matrix_node(
         }
         let checksum: f64 = values.iter().sum();
         println!(
-            "plait matrix: 12 replicas DP2×TP3×EP2, {m}x{n}x{k}, {contributions} contributions, checksum {checksum}"
+            "plait matrix: 12 replicas DP2×TP3×EP2, {m}x{n}x{k}, {contributions} contributions, checksum {checksum}, collective_ms {:.3}",
+            collective_start.elapsed().as_secs_f64() * 1e3
         );
         tokio::time::sleep(Duration::from_secs(2)).await;
     } else {

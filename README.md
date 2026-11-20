@@ -309,8 +309,9 @@ its [requirements](docs/design/plait-requirements.md) and
 [rendered architecture](docs/design/plait-architecture.html). Protocol details
 are in [docs/architecture.md](docs/architecture.md), axis mapping in
 [docs/parallelism.md](docs/parallelism.md), and the verbs backend in
-[docs/rdma.md](docs/rdma.md). The remote validation record is
-[docs/validation/pro5000.md](docs/validation/pro5000.md).
+[docs/rdma.md](docs/rdma.md). Remote validation is recorded in
+[docs/validation/pro5000.md](docs/validation/pro5000.md); the NCCL equivalence
+check is in [docs/validation/nccl.md](docs/validation/nccl.md).
 
 ## Guarantees and limits
 
@@ -319,8 +320,9 @@ What is implemented and tested:
 - fast-path agreement and slow-path acceptance for conflicting proposals;
 - concurrent conflicting proposals from every node converging to the same state;
 - recovery by any replica after the original proposer stops;
-- dependency cycles executed through cached strongly connected components,
-  with data/device/config/control edge classes and parallel ready-SCC batches;
+- dependency cycles executed through an online SCC condensation with a ready
+  frontier, data/device/config/control edge classes, and parallel ready-SCC
+  batches;
 - membership add/remove with snapshots, staged learners, and unanimous
   promotion/removal;
 - three-node real-TCP submission, fusion, and query;
@@ -335,6 +337,8 @@ What is implemented and tested:
   and 32 compute placements replicated on `pro5000`;
 - a compiling/linking real `libibverbs` backend with a two-QP self-test that
   runs when a device is present;
+- a 12-contribution matrix checksum matching NVIDIA NCCL all-reduce at 8x8x6
+  and 64x64x64, using `nccl-tests`-style warmup, timing, and bus bandwidth;
 - pooled/aligned memory, registered descriptors, and one-sided loopback
   transfers bounds-checked.
 
