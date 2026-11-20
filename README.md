@@ -350,7 +350,9 @@ What is implemented and tested:
 - cross-process CUDA IPC peer memory and a two-process allreduce with no host
   staging after setup (`just ipc`), plus VMM export/import;
 - pooled/aligned memory, registered descriptors, and one-sided loopback
-  transfers bounds-checked.
+  transfers bounds-checked;
+- an explicit GPUDirect/VMM registration probe (`just gpu-rdma`) that skips when
+  no verbs device is present.
 
 Deliberate limits of this prototype:
 

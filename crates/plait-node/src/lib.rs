@@ -1113,6 +1113,34 @@ fn cudarc_device_count() -> usize {
         .unwrap_or(0)
 }
 
+/// Probe GPUDirect registration: a VMM device allocation registered with the
+/// first verbs device. A skip means the host lacks an RDMA device, not that the
+/// path is fast.
+pub fn run_gpu_rdma_probe() -> Result<(), Box<dyn std::error::Error>> {
+    use plait_collective::ipc::VmmRegion;
+    use plait_rdma::RdmaDevice;
+
+    let Some(device) = RdmaDevice::open_first()? else {
+        println!("plait gpu-rdma: skipped (no active ibverbs device)");
+        return Ok(());
+    };
+    let mut region = VmmRegion::alloc(0, 1 << 20)?;
+    let len = region.bytes();
+    let probe = unsafe { device.probe_gpu_region(region.as_mut_ptr(), len) };
+    match probe {
+        Ok(()) => println!(
+            "plait gpu-rdma: registered {} bytes of VMM memory on {}",
+            len,
+            device.name()
+        ),
+        Err(error) => println!(
+            "plait gpu-rdma: provider {} rejected GPU registration: {error}",
+            device.name()
+        ),
+    }
+    Ok(())
+}
+
 /// Run one host's share of a two-host 12-replica matrix collective.
 ///
 /// Manifest lines are `hex-node-id@listen-address`. The first six entries are

@@ -63,6 +63,9 @@ nccl-sweep: setup
 gpu: setup
     cargo run -q --locked -p plait-node -- gpu-demo
 
+gpu-rdma: setup
+    cargo run -q --locked -p plait-node -- gpu-rdma
+
 rdma: setup
     cargo run -q --locked -p plait-node -- rdma-selftest
 

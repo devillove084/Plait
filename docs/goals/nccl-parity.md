@@ -80,14 +80,16 @@ detects `NV#`.
 
 ### M5 — GPUDirect RDMA
 
-- [ ] Register GPU memory with `ibv_reg_mr` (or dmabuf where required).
-- [ ] Probe peer-memory support and fail explicitly when absent.
+- [x] Register GPU memory with `ibv_reg_mr` probe (VMM pointer to verbs MR).
+- [x] Probe peer-memory support and report an explicit skip/error when absent.
 - [ ] Two-host RDMA allreduce/all-gather with GPU buffers, no host bounce.
 - [ ] Topology/manifest exchange replaces implicit rank assumptions.
 - [ ] Cross-host correctness and bandwidth test.
 
 Acceptance: two hosts with RNIC/rxe exchange GPU-backed regions and produce the
 same checksum as NCCL; absent hardware is a clear skip, not a fake pass.
+`just gpu-rdma` currently skips on both local and `pro5000` because neither
+ordinary container exposes an active ibverbs device.
 
 ### M6 — LL / LL128 protocols
 

@@ -156,6 +156,28 @@ impl RdmaDevice {
 
     /// Register an aligned staging buffer. The returned registration borrows the
     /// buffer; keep both alive for the lifetime of the transfer.
+    /// Probe whether the verbs provider can register a device pointer as an
+    /// MR. This is the GPUDirect gate: a successful probe means the kernel has
+    /// a peer-memory/dmabuf path for this GPU, not that a full RDMA collective
+    /// has been validated.
+    /// # Safety
+    /// `ptr` must point to a live device allocation of at least `len` bytes.
+    pub unsafe fn probe_gpu_region(&self, ptr: *mut u8, len: usize) -> io::Result<()> {
+        if ptr.is_null() || len == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "GPU region pointer/length is invalid",
+            ));
+        }
+        // SAFETY: the caller owns a live device allocation for `len` bytes.
+        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+        let access =
+            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ;
+        let mr = self.pd.reg_mr(slice, access).map_err(io_error)?;
+        drop(mr);
+        Ok(())
+    }
+
     pub fn register<'a>(&self, buffer: &'a mut AlignedBuffer) -> io::Result<Registration<'a>> {
         if buffer.is_empty() {
             return Err(io::Error::new(

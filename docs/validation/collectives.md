@@ -134,6 +134,20 @@ The TLA/I PC harness does not yet pass the fd over a Unix socket; the VMM test
 covers export/import in one process. Cross-process fd transport is the remaining
 M2 item. Both local and `pro5000` VMM tests pass.
 
+## GPUDirect registration probe
+
+`just gpu-rdma` allocates a VMM region and asks the first verbs device to
+register it as an MR:
+
+```text
+plait gpu-rdma: skipped (no active ibverbs device)
+```
+
+Both the local host and the ordinary `pro5000` container currently skip. This
+is an explicit hardware absence, not a successful GPUDirect test. The next M5
+step requires an RNIC/rxe host and a peer-memory/dmabuf provider, then a
+two-host GPU-buffer collective.
+
 ## Measured performance
 
 Eight RTX PRO 5000, 1 MiB, 8 ranks, 5 warmups / 10 timed iterations:
