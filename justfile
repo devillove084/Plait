@@ -8,9 +8,14 @@ setup:
     set -euo pipefail
     if [ ! -f "{{cutlass_dir}}/include/cutlass/gemm/device/gemm.h" ]; then
       rm -rf "{{cutlass_dir}}"
-      git clone --depth 1 --branch "${PLAIT_CUTLASS_REF:-v4.8.1}" \
+      ref="${PLAIT_CUTLASS_REF:-v4.8.1}"
+      if ! git clone --depth 1 --branch "$ref" \
         "${PLAIT_CUTLASS_REPO:-https://github.com/NVIDIA/cutlass.git}" \
-        "{{cutlass_dir}}"
+        "{{cutlass_dir}}"; then
+        rm -rf "{{cutlass_dir}}"
+        git clone --depth 1 --branch "$ref" \
+          "git@github.com:NVIDIA/cutlass.git" "{{cutlass_dir}}"
+      fi
     fi
 
 fmt:
