@@ -176,8 +176,9 @@ fallback, not a winner.
 A two-level host-leader allreduce (`scripts/tcp-twolevel.cu`) reduces within
 the four local and eight remote ranks, exchanges one host aggregate, and
 broadcasts locally. With a ready barrier before timing it reports `errors=0`
-at 0.056-0.059 GB/s for 1 MiB, above NCCL's 0.050 GB/s. At 16 MiB it reaches
-0.113-0.124 GB/s and loses to NCCL's 0.273 GB/s.
+at 0.091-0.103 GB/s for 1 MiB, roughly 2x NCCL's 0.050 GB/s. At 16 MiB the
+host leaders reach 0.301-0.330 GB/s and the workers 0.258 GB/s; NCCL's
+0.273 GB/s is still slightly ahead for the slowest workers.
 
 The star path is a correctness fallback, not a performance result. NCCL 2.28.9
 over the same TCP path reports `errors=0` at:

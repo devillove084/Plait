@@ -5,7 +5,11 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <fcntl.h>
+#include <poll.h>
+#include <cerrno>
 #include <chrono>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -67,6 +71,45 @@ static int listen_on(int port) {
   return fd;
 }
 
+// Full-duplex exchange between the two host leaders. Both sides send and
+// receive the same chunk at once instead of serializing a 16 MiB block.
+static void exchange_bidirectional(int fd, const float* send_buf, float* recv_buf,
+                                   size_t count) {
+  size_t total = count * sizeof(float);
+  int flags = ::fcntl(fd, F_GETFL, 0);
+  ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+  const char* send_data = reinterpret_cast<const char*>(send_buf);
+  char* recv_data = reinterpret_cast<char*>(recv_buf);
+  size_t sent = 0;
+  size_t received = 0;
+  while (sent < total || received < total) {
+    pollfd event{};
+    event.fd = fd;
+    event.events = 0;
+    if (sent < total) event.events |= POLLOUT;
+    if (received < total) event.events |= POLLIN;
+    if (::poll(&event, 1, -1) < 0) {
+      if (errno == EINTR) continue;
+      std::perror("poll"); std::exit(1);
+    }
+    if ((event.revents & POLLOUT) && sent < total) {
+      ssize_t n = ::send(fd, send_data + sent, total - sent, MSG_NOSIGNAL);
+      if (n > 0) sent += static_cast<size_t>(n);
+      else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+        std::perror("cross send"); std::exit(1);
+      }
+    }
+    if ((event.revents & POLLIN) && received < total) {
+      ssize_t n = ::recv(fd, recv_data + received, total - received, 0);
+      if (n > 0) received += static_cast<size_t>(n);
+      else if (n == 0) { std::fprintf(stderr, "cross peer closed\\n"); std::exit(1); }
+      else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+        std::perror("cross recv"); std::exit(1);
+      }
+    }
+  }
+}
+
 int main(int argc, char** argv) {
   if (argc != 9) {
     std::fprintf(stderr, "usage: %s rank world gpu bytes iters local_ip remote_ip base_port\n", argv[0]);
@@ -85,10 +128,11 @@ int main(int argc, char** argv) {
   float* device = nullptr;
   CHECK(cudaMalloc(&device, bytes));
   std::vector<float> input(count), received(count), sum(count);
+  std::vector<std::vector<float>> peer_data;
   for (size_t i = 0; i < count; ++i) input[i] = static_cast<float>(rank + 1);
 
   std::vector<int> workers;
-  int cross = -1;
+  std::vector<int> crosses;
   if (rank == 0) {
     int local_server = listen_on(base);
     for (int i = 0; i < 3; ++i) {
@@ -98,8 +142,11 @@ int main(int argc, char** argv) {
     }
     ::close(local_server);
     int cross_server = listen_on(base + 8);
-    cross = ::accept(cross_server, nullptr, nullptr);
-    int one = 1; ::setsockopt(cross, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    for (int i = 0; i < 4; ++i) {
+      int fd = ::accept(cross_server, nullptr, nullptr);
+      int one = 1; ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+      crosses.push_back(fd);
+    }
     ::close(cross_server);
   } else if (rank == 4) {
     int remote_server = listen_on(base + 4);
@@ -109,7 +156,7 @@ int main(int argc, char** argv) {
       workers.push_back(fd);
     }
     ::close(remote_server);
-    cross = connect_to(local_ip, base + 8);
+    for (int i = 0; i < 4; ++i) crosses.push_back(connect_to(local_ip, base + 8));
   } else if (rank < 4) {
     workers.push_back(connect_to(local_ip, base));
   } else {
@@ -124,26 +171,43 @@ int main(int argc, char** argv) {
     recv_all(workers[0], &ready, sizeof(ready));
   }
 
+  if (rank == 0 || rank == 4) {
+    peer_data.assign(workers.size(), std::vector<float>(count));
+  }
+
   auto start = std::chrono::steady_clock::now();
   for (int iteration = 0; iteration < iters; ++iteration) {
     CHECK(cudaMemcpy(received.data(), device, bytes, cudaMemcpyDeviceToHost));
     if (rank == 0 || rank == 4) {
       std::fill(sum.begin(), sum.end(), 0.0f);
       for (size_t i = 0; i < count; ++i) sum[i] += input[i];
-      for (int fd : workers) {
-        recv_all(fd, received.data(), bytes);
-        for (size_t i = 0; i < count; ++i) sum[i] += received[i];
+      std::vector<std::thread> receivers;
+      for (size_t p = 0; p < workers.size(); ++p) {
+        receivers.emplace_back([&, p] {
+          recv_all(workers[p], peer_data[p].data(), bytes);
+        });
       }
-      if (rank == 4) {
-        send_all(cross, sum.data(), bytes);
-        recv_all(cross, received.data(), bytes);
-        std::copy(received.begin(), received.end(), sum.begin());
-      } else {
-        recv_all(cross, received.data(), bytes);
-        for (size_t i = 0; i < count; ++i) sum[i] += received[i];
-        send_all(cross, sum.data(), bytes);
+      for (auto& thread : receivers) thread.join();
+      for (size_t p = 0; p < workers.size(); ++p) {
+        for (size_t i = 0; i < count; ++i) sum[i] += peer_data[p][i];
       }
-      for (int fd : workers) send_all(fd, sum.data(), bytes);
+      size_t part = count / 4;
+      std::vector<std::thread> exchanges;
+      for (int i = 0; i < 4; ++i) {
+        size_t begin = i * part;
+        size_t length = (i == 3) ? count - begin : part;
+        exchanges.emplace_back([&, i, begin, length] {
+          exchange_bidirectional(crosses[i], sum.data() + begin,
+                                 received.data() + begin, length);
+        });
+      }
+      for (auto& thread : exchanges) thread.join();
+      for (size_t i = 0; i < count; ++i) sum[i] += received[i];
+      std::vector<std::thread> senders;
+      for (size_t p = 0; p < workers.size(); ++p) {
+        senders.emplace_back([&, p] { send_all(workers[p], sum.data(), bytes); });
+      }
+      for (auto& thread : senders) thread.join();
       std::copy(sum.begin(), sum.end(), received.begin());
     } else {
       send_all(workers[0], input.data(), bytes);
@@ -161,7 +225,7 @@ int main(int argc, char** argv) {
   std::printf("rank=%d two-level bytes=%zu ms=%.3f algbw=%.3f errors=%d\n",
               rank, bytes, seconds * 1e3, algbw, errors);
   for (int fd : workers) ::close(fd);
-  if (cross >= 0) ::close(cross);
+  for (int fd : crosses) ::close(fd);
   CHECK(cudaFree(device));
   return errors == 0 ? 0 : 2;
 }
