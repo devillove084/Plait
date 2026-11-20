@@ -315,8 +315,10 @@ are in [docs/architecture.md](docs/architecture.md), axis mapping in
 check is in [docs/validation/nccl.md](docs/validation/nccl.md); peer-memory
 collectives and remaining gaps are in
 [docs/validation/collectives.md](docs/validation/collectives.md), and the gated
-parity plan is in [docs/goals/nccl-parity.md](docs/goals/nccl-parity.md); the
-formal EPaxos workstream is in [docs/goals/epaxos-formal.md](docs/goals/epaxos-formal.md).
+parity plan is in [docs/goals/nccl-parity.md](docs/goals/nccl-parity.md), the
+profile breakdown in [docs/validation/profile.md](docs/validation/profile.md),
+and the formal EPaxos workstream in
+[docs/goals/epaxos-formal.md](docs/goals/epaxos-formal.md).
 
 ## Guarantees and limits
 

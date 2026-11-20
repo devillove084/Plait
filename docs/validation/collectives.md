@@ -242,4 +242,5 @@ cargo run -q --locked -p plait-node -- collectives --gpus 8 --bytes 1048576 --it
 cargo run -q --locked -p plait-node -- collectives --gpus 8 --bytes 1048576 --iters 20 --algorithm recursive
 ```
 
-NCCL comparison data and methodology are in [nccl.md](nccl.md).
+NCCL comparison data and methodology are in [nccl.md](nccl.md). The Nsight
+profile showing host API/copy overhead is in [profile.md](profile.md).
