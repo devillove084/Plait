@@ -111,6 +111,14 @@ same checksum as NCCL; absent hardware is a clear skip, not a fake pass.
 The baseline is retained as a regression floor. A performance change is not
 accepted without a new measured table and the matching timeline artifact.
 
+## Related formal workstream
+
+An EPaxos variant is tracked separately in
+[epaxos-formal.md](epaxos-formal.md). Modifying EPaxos can improve control-plane
+metadata and ordering, but it cannot substitute for GPU peer memory, channels,
+or GPUDirect. TLA+/Lean acceptance gates are there; the first scheduler model is
+`specs/PlaitExecutionGraph.tla`.
+
 ## Non-goals until M2–M5 exist
 
 - Claiming NCCL parity from API coverage alone.
