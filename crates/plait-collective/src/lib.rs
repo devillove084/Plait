@@ -90,6 +90,14 @@ impl std::error::Error for CollectiveError {}
 
 type Result<T, E = CollectiveError> = std::result::Result<T, E>;
 
+pub struct AllToAllWorkspace {
+    _data: Vec<crate::ipc::PeerRegion>,
+    output: Vec<crate::ipc::PeerRegion>,
+    tables: Vec<crate::ipc::PeerRegion>,
+    count: usize,
+    chunk: usize,
+}
+
 pub struct DeviceRingWorkspace {
     data: Vec<crate::ipc::PeerRegion>,
     receive: Vec<crate::ipc::PeerRegion>,
@@ -119,6 +127,7 @@ struct GpuRank {
     streams: Box<[Arc<CudaStream>]>,
     function: CudaFunction,
     ring: CudaFunction,
+    alltoall: CudaFunction,
     _module: Arc<CudaModule>,
 }
 
@@ -196,12 +205,16 @@ impl PeerGroup {
             let ring = module
                 .load_function("plait_ring_allreduce")
                 .map_err(|error| CollectiveError::new(format!("load ring kernel: {error}")))?;
+            let alltoall = module
+                .load_function("plait_alltoall")
+                .map_err(|error| CollectiveError::new(format!("load alltoall kernel: {error}")))?;
             ranks.push(GpuRank {
                 ctx,
                 stream,
                 streams: streams.into_boxed_slice(),
                 function,
                 ring,
+                alltoall,
                 _module: module,
             });
         }
@@ -418,6 +431,95 @@ impl PeerGroup {
         self.launch_device_ring(&mut workspace)?;
         self.sync()?;
         self.read_device_ring(&workspace)
+    }
+
+    pub fn all_to_all_device(&self, inputs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
+        let workspace = self.prepare_all_to_all(inputs)?;
+        self.launch_all_to_all(&workspace)?;
+        self.sync()?;
+        self.read_all_to_all(&workspace)
+    }
+
+    pub fn all_to_all_device_resident(
+        &self,
+        inputs: &[Vec<f32>],
+        iterations: usize,
+    ) -> Result<(std::time::Duration, Vec<Vec<f32>>)> {
+        let workspace = self.prepare_all_to_all(inputs)?;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            self.launch_all_to_all(&workspace)?;
+        }
+        self.sync()?;
+        let elapsed = start.elapsed();
+        let output = self.read_all_to_all(&workspace)?;
+        Ok((elapsed, output))
+    }
+
+    fn prepare_all_to_all(&self, inputs: &[Vec<f32>]) -> Result<AllToAllWorkspace> {
+        use crate::ipc::PeerRegion;
+        self.validate(inputs)?;
+        let n = self.world_size();
+        let count = inputs[0].len();
+        if count % n != 0 {
+            return Err(CollectiveError::new("alltoall length must divide by ranks"));
+        }
+        let chunk = count / n;
+        let mut data = Vec::with_capacity(n);
+        let mut output = Vec::with_capacity(n);
+        let mut tables = Vec::with_capacity(n);
+        for (rank, input) in inputs.iter().enumerate() {
+            let region = PeerRegion::alloc(rank, count * std::mem::size_of::<f32>())?;
+            region.write_host(input)?;
+            data.push(region);
+            output.push(PeerRegion::alloc(rank, count * std::mem::size_of::<f32>())?);
+            tables.push(PeerRegion::alloc(rank, n * 8)?);
+        }
+        let data_ptrs: Vec<u64> = data.iter().map(|region| region.as_ptr() as u64).collect();
+        for rank in 0..n {
+            let mut bytes = Vec::with_capacity(n * 8);
+            for pointer in &data_ptrs {
+                bytes.extend_from_slice(&pointer.to_ne_bytes());
+            }
+            tables[rank].write_bytes(&bytes)?;
+        }
+        Ok(AllToAllWorkspace {
+            _data: data,
+            output,
+            tables,
+            count,
+            chunk,
+        })
+    }
+
+    fn launch_all_to_all(&self, workspace: &AllToAllWorkspace) -> Result<()> {
+        let n = self.world_size();
+        for rank in 0..n {
+            let stream = self.ranks[rank].stream.clone();
+            let function = &self.ranks[rank].alltoall;
+            let output_ptr = workspace.output[rank].as_ptr() as u64;
+            let table_ptr = workspace.tables[rank].as_ptr() as u64;
+            let rank_i = rank as i32;
+            let n_i = n as i32;
+            let chunk_i = workspace.chunk as i32;
+            let mut launch = stream.launch_builder(function);
+            launch.arg(&output_ptr);
+            launch.arg(&table_ptr);
+            launch.arg(&rank_i);
+            launch.arg(&n_i);
+            launch.arg(&chunk_i);
+            unsafe { launch.launch(LaunchConfig::for_num_elems(workspace.chunk as u32)) }
+                .map_err(driver("alltoall launch"))?;
+        }
+        Ok(())
+    }
+
+    fn read_all_to_all(&self, workspace: &AllToAllWorkspace) -> Result<Vec<Vec<f32>>> {
+        let mut result = Vec::with_capacity(workspace.output.len());
+        for region in &workspace.output {
+            result.push(region.read_host(workspace.count)?);
+        }
+        Ok(result)
     }
 
     pub fn all_reduce_device_ring_resident(

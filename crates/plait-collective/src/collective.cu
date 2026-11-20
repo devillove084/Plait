@@ -103,3 +103,20 @@ extern "C" __global__ void plait_ring_allreduce(
         __threadfence_system();
     }
 }
+
+extern "C" __global__ void plait_alltoall(
+    float* output,
+    unsigned long long* peers,
+    int rank,
+    int ranks,
+    int chunk)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int source = 0; source < ranks; ++source) {
+        const float* src = reinterpret_cast<const float*>(peers[source]);
+        for (int i = tid; i < chunk; i += stride) {
+            output[source * chunk + i] = src[rank * chunk + i];
+        }
+    }
+}

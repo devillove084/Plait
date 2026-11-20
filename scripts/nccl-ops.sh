@@ -13,13 +13,6 @@ bytes=${PLAIT_BYTES:-1048576}
 for op in allreduce broadcast reduce allgather reducescatter alltoall; do
   target/nccl-allreduce --gpus "$gpus" --op "$op" --min-bytes "$bytes" \
     --max-bytes "$bytes" --warmup 5 --iters 20 | tail -1
-  extra=""
-  if [ "$op" = "allreduce" ]; then extra="--device-ring --channels 4"; fi
-  if [ "$op" = "allreduce" ]; then
-    cargo run -q --locked -p plait-node -- collectives --gpus "$gpus" \
-      --bytes "$bytes" --iters 5 --op "$op" $extra | grep 'device-ring allreduce' | tail -1
-  else
-    cargo run -q --locked -p plait-node -- collectives --gpus "$gpus" \
-      --bytes "$bytes" --iters 5 --op "$op" | grep 'busbw_GB/s=' | tail -1
-  fi
+  cargo run -q --locked -p plait-node -- collectives --gpus "$gpus" \
+    --bytes "$bytes" --iters 5 --op "$op" --device-ring --channels 4 | grep "device-ring $op" | tail -1
 done

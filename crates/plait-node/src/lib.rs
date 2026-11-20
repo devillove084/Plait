@@ -1085,27 +1085,34 @@ pub fn run_collectives_demo(
         run_collective_op(&group, op, &inputs, &expected, algorithm)?;
     }
     let seconds = start.elapsed().as_secs_f64() / iters as f64;
-    if device_ring && op == "allreduce" {
-        let checked = group.all_reduce_device_ring(&inputs)?;
-        for values in &checked {
-            if values
-                .iter()
-                .zip(&expected)
-                .any(|(actual, expected)| (*actual - *expected).abs() > 1e-3)
-            {
-                return Err("device-ring allreduce correctness check failed".into());
-            }
-        }
-        let (duration, output) = group.all_reduce_device_ring_resident(&inputs, iters)?;
+    if device_ring && op == "alltoall" {
+        let checked = group.all_to_all_device(&inputs)?;
+        validate_device_output("alltoall", &inputs, &expected, &checked)?;
+        let (duration, output) = group.all_to_all_device_resident(&inputs, iters)?;
+        let _ = output;
         let elapsed = duration.as_secs_f64() / iters as f64;
         let bw = allreduce_bytes_f64(bytes) / elapsed / 1e9;
         let busbw = bw * 2.0 * (ranks - 1) as f64 / ranks as f64;
         println!(
-            "plait collectives: device-ring allreduce ranks={ranks} bytes={} time_ms={:.6} algbw_GB/s={bw:.3} busbw_GB/s={busbw:.3}",
+            "plait collectives: device-ring alltoall ranks={ranks} bytes={} time_ms={:.6} algbw_GB/s={bw:.3} busbw_GB/s={busbw:.3}",
             (bytes / std::mem::size_of::<f32>()).max(1) * std::mem::size_of::<f32>(),
             elapsed * 1e3
         );
-        let _ = output;
+    } else if device_ring {
+        let contributions = device_collective_inputs(op, &inputs)?;
+        let checked = group.all_reduce_device_ring(&contributions)?;
+        let checked = device_collective_output(op, &inputs, checked);
+        validate_device_output(op, &inputs, &expected, &checked)?;
+        let (duration, output) = group.all_reduce_device_ring_resident(&contributions, iters)?;
+        let _ = device_collective_output(op, &inputs, output);
+        let elapsed = duration.as_secs_f64() / iters as f64;
+        let bw = allreduce_bytes_f64(bytes) / elapsed / 1e9;
+        let busbw = bw * 2.0 * (ranks - 1) as f64 / ranks as f64;
+        println!(
+            "plait collectives: device-ring {op} ranks={ranks} bytes={} time_ms={:.6} algbw_GB/s={bw:.3} busbw_GB/s={busbw:.3}",
+            (bytes / std::mem::size_of::<f32>()).max(1) * std::mem::size_of::<f32>(),
+            elapsed * 1e3
+        );
     }
     if resident && op == "allreduce" {
         let (elapsed, output) = group.all_reduce_resident(&inputs, iters)?;
@@ -1142,6 +1149,136 @@ pub fn run_collectives_demo(
 
 fn allreduce_bytes_f64(bytes: usize) -> f64 {
     (bytes / std::mem::size_of::<f32>()).max(1) as f64 * std::mem::size_of::<f32>() as f64
+}
+
+fn device_collective_inputs(
+    op: &str,
+    inputs: &[Vec<f32>],
+) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
+    let n = inputs.len();
+    let count = inputs[0].len();
+    let width = count / n;
+    match op {
+        "allreduce" | "reduce" | "reducescatter" => Ok(inputs.to_vec()),
+        "broadcast" => {
+            let mut result = vec![vec![0.0f32; count]; n];
+            result[0].copy_from_slice(&inputs[0]);
+            Ok(result)
+        }
+        "allgather" => {
+            let mut result = vec![vec![0.0f32; count]; n];
+            for (rank, values) in inputs.iter().enumerate() {
+                result[rank][rank * width..(rank + 1) * width].copy_from_slice(&values[..width]);
+            }
+            Ok(result)
+        }
+        "alltoall" => {
+            let mut result = vec![vec![0.0f32; count]; n];
+            for (source, values) in inputs.iter().enumerate() {
+                for destination in 0..n {
+                    let dst = destination * width + source * width;
+                    result[source][dst..dst + width]
+                        .copy_from_slice(&values[destination * width..(destination + 1) * width]);
+                }
+            }
+            Ok(result)
+        }
+        other => Err(format!("unknown device collective op {other}").into()),
+    }
+}
+
+fn device_collective_output(
+    op: &str,
+    inputs: &[Vec<f32>],
+    reduced: Vec<Vec<f32>>,
+) -> Vec<Vec<f32>> {
+    let n = inputs.len();
+    let count = inputs[0].len();
+    let width = count / n;
+    match op {
+        "alltoall" => reduced
+            .into_iter()
+            .enumerate()
+            .map(|(rank, values)| values[rank * width..(rank + 1) * width].to_vec())
+            .collect(),
+        _ => reduced,
+    }
+}
+
+fn validate_device_output(
+    op: &str,
+    inputs: &[Vec<f32>],
+    expected: &[f32],
+    output: &[Vec<f32>],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let n = inputs.len();
+    let count = inputs[0].len();
+    let width = count / n;
+    match op {
+        "allreduce" | "reducescatter" => {
+            for values in output {
+                if values
+                    .iter()
+                    .zip(expected)
+                    .any(|(actual, expected)| (*actual - *expected).abs() > 1e-2)
+                {
+                    return Err(format!("{op} device correctness failed").into());
+                }
+            }
+        }
+        "broadcast" => {
+            for values in output {
+                if values
+                    .iter()
+                    .zip(&inputs[0])
+                    .any(|(actual, expected)| (*actual - *expected).abs() > 1e-2)
+                {
+                    return Err("broadcast device correctness failed".into());
+                }
+            }
+        }
+        "reduce" => {
+            if output[0]
+                .iter()
+                .zip(expected)
+                .any(|(actual, expected)| (*actual - *expected).abs() > 1e-2)
+            {
+                return Err("reduce device correctness failed".into());
+            }
+        }
+        "allgather" => {
+            let wanted: Vec<f32> = inputs
+                .iter()
+                .flat_map(|v| v[..width].iter().copied())
+                .collect();
+            for values in output {
+                if values
+                    .iter()
+                    .zip(&wanted)
+                    .any(|(actual, expected)| (*actual - *expected).abs() > 1e-2)
+                {
+                    return Err("allgather device correctness failed".into());
+                }
+            }
+        }
+        "alltoall" => {
+            for destination in 0..n {
+                for source in 0..n {
+                    let want = &inputs[source][destination * width..(destination + 1) * width];
+                    let actual = &output[destination][source * width..(source + 1) * width];
+                    if actual
+                        .iter()
+                        .zip(want)
+                        .any(|(actual, expected)| (*actual - *expected).abs() > 1e-2)
+                    {
+                        return Err("alltoall device correctness failed".into());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn run_collective_op(

@@ -27,17 +27,9 @@ for op in $ops; do
   for size in $sizes; do
     nccl=$(target/nccl-allreduce --gpus "$gpus" --op "$op" --min-bytes "$size" \
       --max-bytes "$size" --warmup 1 --iters "$iters" | tail -1)
-    extra=""
-    if [ "$op" = "allreduce" ]; then extra="--device-ring --channels 4"; fi
-    if [ "$op" = "allreduce" ]; then
-      plait=$(cargo run -q --locked -p plait-node -- collectives --gpus "$gpus" \
-        --bytes "$size" --iters "$iters" --op "$op" $extra \
-        --trace "target/plait-${op}-${size}.json" | grep 'device-ring allreduce' | tail -1)
-    else
-      plait=$(cargo run -q --locked -p plait-node -- collectives --gpus "$gpus" \
-        --bytes "$size" --iters "$iters" --op "$op" \
-        --trace "target/plait-${op}-${size}.json" | grep 'busbw_GB/s=' | tail -1)
-    fi
+    plait=$(cargo run -q --locked -p plait-node -- collectives --gpus "$gpus" \
+      --bytes "$size" --iters "$iters" --op "$op" --device-ring --channels 4 \
+      --trace "target/plait-${op}-${size}.json" | grep "device-ring $op" | tail -1)
     if ! printf '%s' "$nccl" | grep -q 'errors=0'; then
       echo "NCCL correctness failure: $op $size: $nccl" >&2
       exit 1

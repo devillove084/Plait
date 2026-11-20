@@ -135,6 +135,21 @@ impl PeerRegion {
         self.ptr as *const u8
     }
 
+    pub fn write_bytes(&self, values: &[u8]) -> Result<()> {
+        if values.len() > self.bytes {
+            return Err(CollectiveError::new("host write exceeds region"));
+        }
+        self.context
+            .bind_to_thread()
+            .map_err(|error| CollectiveError::new(format!("bind context: {error}")))?;
+        check(
+            unsafe {
+                sys::cuMemcpyHtoD_v2(self.ptr, values.as_ptr().cast::<c_void>(), values.len())
+            },
+            "cuMemcpyHtoD",
+        )
+    }
+
     pub fn write_host(&self, values: &[f32]) -> Result<()> {
         let bytes = std::mem::size_of_val(values);
         if bytes > self.bytes {
@@ -490,6 +505,21 @@ impl VmmRegion {
 
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
         self.ptr as *mut u8
+    }
+
+    pub fn write_bytes(&self, values: &[u8]) -> Result<()> {
+        if values.len() > self.bytes {
+            return Err(CollectiveError::new("host write exceeds region"));
+        }
+        self.context
+            .bind_to_thread()
+            .map_err(|error| CollectiveError::new(format!("bind context: {error}")))?;
+        check(
+            unsafe {
+                sys::cuMemcpyHtoD_v2(self.ptr, values.as_ptr().cast::<c_void>(), values.len())
+            },
+            "cuMemcpyHtoD",
+        )
     }
 
     pub fn write_host(&self, values: &[f32]) -> Result<()> {
