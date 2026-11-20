@@ -686,6 +686,57 @@ mod tests {
     }
 
     #[test]
+    fn execution_actions_conform_to_tla_scheduler() {
+        // Each ready batch is one TLA Execute(c) action. Check the same
+        // Safety and ExecutedOnce invariants that PlaitExecutionGraph.tla
+        // states, and record the action sequence as a conformance trace.
+        let ids: Vec<InstanceId> = (0..12).map(|index| id("conformance", index)).collect();
+        let mut graph = ExecutionGraph::new();
+        for (index, node) in ids.iter().enumerate() {
+            let deps: Vec<InstanceId> = ids[..index]
+                .iter()
+                .copied()
+                .filter(|_| index % 3 == 0)
+                .collect();
+            commit(&mut graph, *node, index as u64, &deps);
+        }
+
+        let mut trace = Vec::new();
+        loop {
+            let batches = graph.ready_batches();
+            if batches.is_empty() {
+                break;
+            }
+            for batch in batches {
+                let members: BTreeSet<InstanceId> = batch.iter().copied().collect();
+                assert!(
+                    members.is_disjoint(&graph.executed),
+                    "ExecutedOnce violated by {batch:?}"
+                );
+                for node in &batch {
+                    for dep in graph.deps(*node).expect("pending node has deps") {
+                        assert!(
+                            members.contains(dep) || graph.executed.contains(dep),
+                            "Safety violated: {node:?} depends on unexecuted {dep:?}"
+                        );
+                    }
+                }
+                for node in &batch {
+                    graph.mark_executed(*node);
+                }
+                trace.push(batch);
+            }
+        }
+
+        assert_eq!(graph.component_count(), 0);
+        assert_eq!(
+            trace.iter().flatten().copied().collect::<BTreeSet<_>>(),
+            ids.iter().copied().collect()
+        );
+        assert!(!trace.is_empty());
+    }
+
+    #[test]
     fn late_dependency_creates_an_edge_and_blocks() {
         let a = id("late-a", 1);
         let b = id("late-b", 1);
