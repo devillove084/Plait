@@ -1,7 +1,7 @@
 ---- MODULE PlaitExecutionGraph ----
 \* A finite model of Plait's SCC-condensation execution scheduler.
 \*
-\* This is a scheduler specification, not a full EPaxos protocol spec. The
+\* This is a scheduler specification, not a full ordering protocol spec. The
 \* consensus protocol must separately establish that committed values and their
 \* dependency edges are stable. This model checks the execution layer:
 \*   - a component runs only after all external dependencies have executed;

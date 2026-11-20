@@ -6,11 +6,11 @@
 \*   Ops         <-> OpSpec / fused operator
 \*   Contributors<-> OpSpec.contributors
 \*   Kind        <-> FuseKind (Sum, Max, Gather)
-\*   Deps        <-> EPaxos committed dependency edges
+\*   Deps        <-> ordering committed dependency edges
 \*   Assign      <-> HeterogeneousLayout row assignment / capacity
 \*   Contribute  <-> local compute result
 \*   Fuse        <-> Runtime::try_fuse
-\*   Commit      <-> EPaxos commit
+\*   Commit      <-> ordering commit
 \*   Execute     <-> ExecutionGraph::mark_executed
 EXTENDS Naturals, FiniteSets, TLC
 

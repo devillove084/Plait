@@ -1,5 +1,5 @@
----- MODULE PlaitEPaxos ----
-\* Finite EPaxos safety model for the Plait control plane.
+---- MODULE PlaitOrdering ----
+\* Finite ordering protocol safety model for the Plait control plane.
 \*
 \* This model abstracts messages and dependency metadata to the properties that
 \* matter for agreement: proposal, preaccept, accept, fast/slow commit, and

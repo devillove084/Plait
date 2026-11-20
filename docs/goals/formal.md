@@ -1,11 +1,11 @@
-# Goal: formal gate for an EPaxos variant
+# Goal: formal gate for the Plait ordering design
 
 Status: **proposed, not proven**. This workstream is separate from NCCL data-plane
 parity and must not be used to claim a performance win.
 
 ## Position
 
-Modifying EPaxos is allowed. A TLA+ or Lean model is necessary but not
+Modifying the ordering protocol is allowed. A TLA+ or Lean model is necessary but not
 sufficient:
 
 - TLA+ can establish safety/liveness of a protocol model over finite or symbolic
@@ -19,14 +19,14 @@ sufficient:
 The first useful artifact is a small, checkable execution model, not a claim
 that the current code is verified.
 
-## Candidate EPaxos changes
+## Candidate ordering protocol changes
 
 Evaluate each as a separate proposal, with a safety argument and benchmark:
 
 1. **Rank-aware dependency compression** — replace large dependency sets with
    version intervals or interval tree clocks. Invariant: dependency closure is
    preserved under merge and recovery.
-2. **Batched EPaxos** — amortize preaccept/accept messages across multiple
+2. **Batched ordering** — amortize preaccept/accept messages across multiple
    commands. Invariant: per-command dependency closure and deterministic order
    remain intact.
 3. **Execution watermark** — a committed prefix/watermark allows earlier
@@ -35,7 +35,7 @@ Evaluate each as a separate proposal, with a safety argument and benchmark:
 4. **Deterministic cycle ordering** — replace a dynamic SCC merge with a stable
    cycle signature and a fixed internal order. Invariant: all replicas choose
    the same order and execute the same state.
-5. **Conflict-domain partitioning** — per-tensor/per-device EPaxos groups with a
+5. **Conflict-domain partitioning** — per-tensor/per-device ordering groups with a
    cross-domain boundary protocol. Invariant: cross-domain dependencies are
    never dropped.
 
@@ -56,15 +56,17 @@ conditional on a correct SCC partition.
   as a constant.
 - [ ] Prove no deadlock and eventual completion for every bounded graph.
 
-### F2 — EPaxos safety (finite model)
+### F2 — ordering safety (finite model)
 
 - [x] Finite TLC model of ballots, preaccept/accept/commit, fast/slow commit,
-  and recovery (`specs/PlaitEPaxos.tla`).
+  and recovery (`specs/PlaitOrdering.tla`); TLC checked Agreement and
+  CommittedStable over 271,441 distinct states.
 - [x] Check agreement and committed stability for 3 replicas, 2 instances,
   2 commands, ballots bounded by 2.
 - [ ] Model dependency merge explicitly; current records carry empty deps.
 - [ ] Model message loss, duplication, and reordering.
-- [ ] Check liveness for recovery and execution.
+- [ ] Check liveness for the recovery protocol; unified compute/fusion liveness
+  is checked on the tiny instance.
 
 ### F3 — Modified protocol
 
@@ -76,21 +78,23 @@ conditional on a correct SCC partition.
 
 ## System-level model
 
-`specs/PlaitUnified.tla` models the layer above EPaxos: rank assignment under
-heterogeneous capacity, local compute, collective fusion groups, dependency-
-ordered group commit, and execution. TLC checks capacity bounds, disjoint
-fusion, commit/execute ordering, and eventual execution for a 3-rank/2-group
-instance. This is still an abstraction: it does not claim the Rust scheduler or
-GPU kernels are refined by TLC.
+`specs/PlaitUnified.tla` models the layer above the ordering protocol: rank
+assignment under heterogeneous capacity, local compute, collective fusion
+groups, dependency-ordered group commit, and execution. TLC checks capacity
+bounds, contributor completeness, fusion soundness, commit/execute ordering,
+and dependency closure on a 3-rank/4-op instance. `PlaitUnifiedTiny` adds the
+liveness property over 351 distinct states. This is still an abstraction: it
+does not claim the Rust scheduler or GPU kernels are refined by TLC.
 
 ## Relationship to NCCL work
 
-The EPaxos variant affects **control-plane** ordering and metadata. It does not
+The Plait ordering protocol affects **control-plane** ordering and metadata. It does not
 replace GPU peer memory, channels, GPUDirect, or NCCL's collective kernels. A
 control-plane improvement cannot by itself make collectives faster than NCCL.
 
 ## Tooling
 
-TLA+ tools are not vendored. Download `tla2tools.jar` and run TLC with
-`specs/PlaitExecutionGraph.cfg`; Lean tooling is not installed in this container.
-The model is committed as source, not represented as already checked.
+TLA+ tools are installed at `/opt/tlaplus/tla2tools.jar` with launchers in
+`/usr/local/bin`. Run all finite models with `./scripts/check-tla.sh`; Lean is
+still absent. The models are finite abstractions, not a refinement proof of the
+Rust implementation.

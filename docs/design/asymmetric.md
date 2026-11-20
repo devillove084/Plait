@@ -34,7 +34,7 @@ can quantize to zero rows; at 64 rows it receives about 7. The planner also
 exposes the fractional shares so a scheduler need not rely on row counts for
 small matrices.
 
-## EPaxos integration
+## ordering integration
 
 `ExecutionGraph::ready_batches_for(local)` keeps the online SCC frontier but
 orders independent ready components by:
@@ -71,7 +71,7 @@ entries; `run_matrix_node` takes `--asymmetric` only on the driver.
 
 ## Relaxed rejoin
 
-`plait-parallel::RejoinCost` chooses the cheapest of strict EPaxos recovery,
+`plait-parallel::RejoinCost` chooses the cheapest of strict ordering recovery,
 snapshot replay, and deterministic recomputation. Recompute is selected when
 it is cheaper than communication plus replay; it does not bypass consensus for
 already committed commands.
