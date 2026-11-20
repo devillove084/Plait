@@ -132,6 +132,7 @@ just tcp-allreduce # two-host TCP GPU-buffer star fallback
 just tcp-ring      # two-host full-duplex TCP ring
 just tcp-twolevel  # host-local reduce + cross-host exchange
 just tcp-twolevel-shm # shared-memory local group + cross-host exchange
+just tcp-twolevel-hybrid # shared-memory result + 8 cross-host channels
 just hetero-gather # two-host variable-size allgather
 just nccl-gather   # NCCL allgather baseline over TCP
 just gpu         # CUDA AXPY and CUTLASS SGEMM
@@ -192,10 +193,11 @@ over the same TCP path reports `errors=0` at:
 NCCL is faster because it uses a ring and avoids a serialized star root. The
 Plait TCP path still needs a ring implementation.
 
-A shared-memory variant (`scripts/tcp-twolevel-shm.cu`) removes local TCP
-between ranks on the same host. It reaches 0.086 GB/s at 1 MiB and 0.22-0.26
-GB/s at 16 MiB; the 16 MiB result is still below NCCL. The TCP two-level path
-remains the better large-message fallback.
+The hybrid path (`scripts/tcp-twolevel-hybrid.cu`) sends local inputs to the
+host leader, exchanges the aggregate over eight cross-host channels, and
+publishes the result through shared memory. It reaches 0.070-0.071 GB/s at
+1 MiB and 0.293-0.319 GB/s at 16 MiB, above NCCL's 0.050 and 0.273 GB/s for
+every rank.
 
 `scripts/tcp-ring-weighted.cu` exercises the heterogeneous path: four local
 ranks own 2 rows each and eight remote ranks own 7 rows each, so send and

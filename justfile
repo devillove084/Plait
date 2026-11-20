@@ -66,6 +66,9 @@ tcp-twolevel: setup
 tcp-twolevel-shm: setup
     ./scripts/tcp-twolevel-shm-two-host.sh
 
+tcp-twolevel-hybrid: setup
+    ./scripts/tcp-twolevel-hybrid-two-host.sh
+
 hetero-gather: setup
     ./scripts/tcp-ring-weighted-two-host.sh
 
