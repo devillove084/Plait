@@ -151,6 +151,14 @@
       <text x="880" y="191" fill="#94a3b8" font-size="8" text-anchor="middle">snapshot catch-up</text>
       <text x="880" y="209" fill="#fbbf24" font-size="8" text-anchor="middle">no rank-0 join</text>
 
+      <!-- Device scheduler -->
+      <rect x="790" y="245" width="180" height="95" rx="6" fill="rgba(120,53,15,0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+      <text x="880" y="270" fill="white" font-size="11" font-weight="600" text-anchor="middle">Device registry</text>
+      <text x="880" y="288" fill="#94a3b8" font-size="8" text-anchor="middle">CPU · NVIDIA · AMD</text>
+      <text x="880" y="303" fill="#94a3b8" font-size="8" text-anchor="middle">Huawei · PPU</text>
+      <text x="880" y="320" fill="#fbbf24" font-size="8" text-anchor="middle">capability scheduler · Mode::Compute</text>
+      <line x1="790" y1="292" x2="762" y2="292" stroke="#fbbf24" stroke-width="1.5" marker-end="url(#arrow-amber)"/>
+
       <!-- Tensor state -->
       <rect x="620" y="360" width="340" height="60" rx="6" fill="rgba(76,29,149,0.4)" stroke="#a78bfa" stroke-width="1.5"/>
       <text x="790" y="384" fill="white" font-size="11" font-weight="600" text-anchor="middle">Tensor shards</text>
@@ -201,6 +209,7 @@
         <li>• 3–8 voter domains, not one 512-voter quorum</li>
         <li>• shard-level batched commands, not per-query ops</li>
         <li>• descriptors + rdma-io for bulk, not tensor bytes in the log</li>
+        <li>• device capability + Mode::Compute, not a rank-implied vendor</li>
       </ul>
     </div>
     <div class="card">
@@ -223,7 +232,7 @@
     </div>
   </div>
 
-  <p class="footer">Plait design of record · docs/design/plait.md · status: reasoned prototype, hardware path compiled but not performance-validated here</p>
+  <p class="footer">Plait design of record · docs/design/plait.md · status: prototype; 8-GPU placement tested, RDMA hardware path compiled but not exposed in the provided containers</p>
 </div>
 
 <script>

@@ -53,6 +53,14 @@ impl LocalCluster {
         Ok(instance)
     }
 
+    /// Propose a non-fused command and run consensus to quiescence.
+    pub fn run_command(&mut self, node: NodeId, command: Command) -> Result<(), OpError> {
+        self.propose(node, command)
+            .map_err(|error| OpError::new(error.to_string()))?;
+        self.run();
+        Ok(())
+    }
+
     pub fn run(&mut self) {
         let mut steps = 0usize;
         while let Some((from, to, message)) = self.queue.pop_front() {

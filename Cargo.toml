@@ -2,6 +2,7 @@
 members = [
     "crates/plait-core",
     "crates/plait-consensus",
+    "crates/plait-device",
     "crates/plait-mem",
     "crates/plait-fabric",
     "crates/plait-parallel",
@@ -22,6 +23,7 @@ repository = "https://github.com/devillove084/Plait"
 bincode = "1.3"
 plait-core = { path = "crates/plait-core" }
 plait-consensus = { path = "crates/plait-consensus" }
+plait-device = { path = "crates/plait-device" }
 plait-fabric = { path = "crates/plait-fabric" }
 plait-mem = { path = "crates/plait-mem" }
 plait-parallel = { path = "crates/plait-parallel" }

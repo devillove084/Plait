@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
+use crate::device::{ComputeRequirement, DeviceId, DeviceProfile};
 use crate::identity::NodeId;
 use crate::tensor::{ShardId, TensorId, TensorKey};
 
@@ -58,6 +59,10 @@ pub struct OpSpec {
 pub enum Mode {
     Read,
     Write,
+    /// Reserves a device or capability slot. Compute conflicts with reads and
+    /// writes of the same key, exactly like a write, but is named separately so
+    /// planners and telemetry can distinguish data mutation from execution.
+    Compute,
 }
 
 /// A key plus the access mode used for EPaxos conflict detection.
@@ -77,6 +82,9 @@ pub enum Key {
     Op(OpId),
     /// A materialized tensor shard.
     Tensor(TensorKey),
+    /// A physical accelerator. Compute tasks that reserve the same device
+    /// conflict; tasks on different devices can execute concurrently.
+    Device(DeviceId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +106,21 @@ impl MembershipChange {
     pub fn is_stage(&self) -> bool {
         matches!(self, Self::StageAdd { .. } | Self::StageRemove { .. })
     }
+}
+
+/// A replicated compute placement and result. The device field is the scheduler's
+/// decision; the values are produced by the local executor before the proposal.
+/// Production deployments move the values through a registered region instead.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ComputeTask {
+    pub task: OpId,
+    pub kernel: String,
+    pub device: DeviceId,
+    pub requirement: ComputeRequirement,
+    pub inputs: Vec<TensorKey>,
+    pub output: TensorKey,
+    pub version: u64,
+    pub values: Vec<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -129,6 +152,11 @@ pub enum Command {
         version: u64,
         values: Vec<f64>,
     },
+    /// Advertise a device and its capabilities as replicated data.
+    RegisterDevice(DeviceProfile),
+    /// Execute a kernel on a chosen device. The command carries the placement
+    /// and result; EPaxos orders it by input/output tensors and device key.
+    Compute(ComputeTask),
     Membership(MembershipChange),
 }
 
@@ -177,6 +205,31 @@ impl Command {
                 });
                 accesses
             }
+            Self::RegisterDevice(profile) => vec![
+                read_config,
+                Access {
+                    key: Key::Device(profile.id),
+                    mode: Mode::Write,
+                },
+            ],
+            Self::Compute(task) => {
+                let mut accesses = vec![read_config];
+                for input in &task.inputs {
+                    accesses.push(Access {
+                        key: Key::Tensor(*input),
+                        mode: Mode::Read,
+                    });
+                }
+                accesses.push(Access {
+                    key: Key::Tensor(task.output),
+                    mode: Mode::Write,
+                });
+                accesses.push(Access {
+                    key: Key::Device(task.device),
+                    mode: Mode::Compute,
+                });
+                accesses
+            }
             Self::Membership(_) => vec![Access {
                 key: Key::Config,
                 mode: Mode::Write,
@@ -188,13 +241,14 @@ impl Command {
         matches!(self, Self::Membership(_))
     }
 
-    /// EPaxos conflict rule: same key and at least one side writes.
+    /// EPaxos conflict rule: same key and at least one side is not a read.
+    /// `Compute` is exclusive so two kernels cannot reserve one device at once.
     pub fn conflicts_with(&self, other: &Self) -> bool {
         let mine = self.accesses();
         let theirs = other.accesses();
         mine.iter().any(|left| {
             theirs.iter().any(|right| {
-                left.key == right.key && (left.mode == Mode::Write || right.mode == Mode::Write)
+                left.key == right.key && (left.mode != Mode::Read || right.mode != Mode::Read)
             })
         })
     }
@@ -238,6 +292,18 @@ impl Command {
             } => format!(
                 "stage {input:?} -> {output:?} v{version} ({} values)",
                 values.len()
+            ),
+            Self::RegisterDevice(profile) => format!(
+                "register {} {} ({} MiB)",
+                profile.arch,
+                profile.name,
+                profile.memory_bytes / (1024 * 1024)
+            ),
+            Self::Compute(task) => format!(
+                "compute {} on {} ({} values)",
+                task.kernel,
+                task.device,
+                task.values.len()
             ),
             Self::Membership(change) => format!("membership {change:?}"),
         }
@@ -299,6 +365,52 @@ mod tests {
             values: vec![2.0],
         };
         assert!(!a.conflicts_with(&b));
+    }
+
+    fn device(ordinal: u32) -> crate::DeviceProfile {
+        crate::DeviceProfile {
+            id: crate::DeviceId::new(node("device-owner"), ordinal),
+            name: format!("gpu-{ordinal}"),
+            arch: crate::AcceleratorKind::Nvidia,
+            memory_bytes: 1024,
+            flops: 10,
+            compute_units: 1,
+            supports_fp16: true,
+            supports_bf16: true,
+            supports_fp64: true,
+            rdma_capable: true,
+            numa_node: None,
+        }
+    }
+
+    fn compute(device: crate::DeviceProfile, output: TensorId) -> Command {
+        Command::Compute(ComputeTask {
+            task: OpId::new(node("task"), 1),
+            kernel: "test".into(),
+            device: device.id,
+            requirement: crate::ComputeRequirement::default(),
+            inputs: vec![TensorKey::new(TensorId(1), ShardId(0))],
+            output: TensorKey::new(output, ShardId(0)),
+            version: 1,
+            values: vec![1.0],
+        })
+    }
+
+    #[test]
+    fn compute_tasks_conflict_only_on_the_same_device_or_data() {
+        let gpu0 = device(0);
+        let gpu1 = device(1);
+        let first = compute(gpu0.clone(), TensorId(10));
+        let second_same_device = compute(gpu0, TensorId(11));
+        let other_device = compute(gpu1, TensorId(12));
+        assert!(first.conflicts_with(&second_same_device));
+        assert!(!first.conflicts_with(&other_device));
+        let publish = Command::Publish {
+            key: TensorKey::new(TensorId(10), ShardId(0)),
+            version: 1,
+            values: vec![2.0],
+        };
+        assert!(first.conflicts_with(&publish));
     }
 
     #[test]

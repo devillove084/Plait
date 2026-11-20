@@ -24,6 +24,9 @@ move bulk bytes through registered memory instead of through the log.
    `libibverbs` RC queue pairs are available for one-sided read/write.
 6. **Observable status.** A client can query an op's declaration/result,
    executed-instance count, and current voter set from any node.
+7. **Heterogeneous compute placement.** Advertise CPU, NVIDIA, AMD, Huawei, PPU,
+   and other devices as replicated capability profiles; schedule a compute task
+   onto an eligible device; serialize compute per device through EPaxos.
 
 ## Non-functional requirements
 
@@ -39,6 +42,8 @@ move bulk bytes through registered memory instead of through the log.
 | Security | Production: authenticated `NodeId`, mTLS control, authorized membership | Prototype transport is trusted-network only |
 | Bulk bandwidth | 100–400 Gb/s per node; RDMA one-sided for tensors | Control must not serialize megabytes into consensus |
 | Payload policy | Inline ≤ ~1 KB control; descriptor + RDMA above that | Keeps log bandwidth and CPU bounded |
+| Device heterogeneity | CPU + NVIDIA + AMD + Huawei + PPU profiles in one plan | Scheduling cannot assume one vendor or one backend |
+| Compute conflict | Same device serialized; different devices concurrent | A device is a scarce execution resource, not just data |
 
 ## Out of scope (explicit)
 
@@ -64,9 +69,12 @@ move bulk bytes through registered memory instead of through the log.
 - **A4.** DSA is the representative sparse-attention workload: 61 layers, 128
   heads, head_dim 128, seq 64k, top-k 2048. Numbers are illustrative, not a
   benchmark claim.
-- **A5.** RDMA hardware is not present in the development container; the real
-  backend compiles and links, but the two-QP path is validated only on a host with
-  an RNIC or configured Soft-RoCE.
+- **A5.** RDMA hardware is not present in the development container or the
+  provided remote container; the real backend compiles and links, but the two-QP
+  path is validated only on a host with an RNIC or configured Soft-RoCE.
+- **A7.** Vendor kernel execution is an adapter layer. Device discovery,
+  capability matching, compute conflicts, and placement are in scope now; CUDA,
+  ROCm, CANN, and PPU kernels are future adapters.
 - **A6.** Membership changes are rare and can tolerate a full-quorum pause.
 
 ## Key numbers (→ back-of-the-envelope)
@@ -83,6 +91,8 @@ move bulk bytes through registered memory instead of through the log.
 | RDMA bulk Q per node/layer | ~14 MB | 64k seq × 16 heads × 128 dim × 2 B / shard |
 | KV cache per 64k sequence | ~262 GB | 2 × 61 × 64k × 128 × 128 × 2 B; sharded |
 | Same-rack commit budget | ≤2 ms p99 | One fast-path RTT + local apply |
+| Remote GPU discovery | 8× RTX PRO 5000 72GB + CPU | `pro5000` test run |
+| Hetero demo tasks | 32 planned ops | placements `{Nvidia: 29, Cpu: 3}` |
 
 ## Validation gate
 

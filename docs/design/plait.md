@@ -3,7 +3,8 @@
 Status: research prototype. This document is the design of record; the code is
 the reference implementation, not a production training system. Requirements and
 assumptions are in [plait-requirements.md](plait-requirements.md); the rendered
-architecture is [plait-architecture.html](plait-architecture.html).
+architecture is [plait-architecture.html](plait-architecture.html). Remote
+validation evidence is in [../validation/pro5000.md](../validation/pro5000.md).
 
 ## 0. Executive summary
 
@@ -33,6 +34,9 @@ while the reference runners use finer-grained commands to prove exactness.
 - Executable reference operators: TP/CP DSA, EP MoE, DP optimizer, PP stages.
 - Identity-based join/leave with snapshot catch-up.
 - Descriptor-based bulk movement with a real ibverbs backend.
+- Heterogeneous compute: replicated device profiles, capability matching, a
+  compute access mode, and deterministic placement across CPU/NVIDIA/AMD/Huawei/
+  PPU.
 
 ### Non-functional targets
 
@@ -46,12 +50,32 @@ while the reference runners use finer-grained commands to prove exactness.
 | State freshness | A query sees only executed state; per-domain linearizable log |
 | Durability | Prototype in-memory; production WAL/snapshot target, RPO 0 for committed |
 | Security | Production mTLS + authorized membership; prototype trusted network |
+| Heterogeneous devices | CPU + NVIDIA + AMD + Huawei + PPU profiles in one registry | A rank cannot imply a vendor; placement is capability-driven |
 
 ### Out of scope
 
 Model frontend/autograd, kernels, production scheduler, multi-region consensus,
 GPUDirect RDMA, multi-NIC striping, authentication, and durable restart. The
 reference runners are forward-only where stated.
+
+### Heterogeneous compute requirement
+
+A compute task is not just a read or write. It reserves a physical device and
+must be schedulable on a CPU or an accelerator family with sufficient memory,
+dtype support, and advertised capability:
+
+```text
+DeviceProfile { id, name, arch, memory, flops hint, compute_units,
+                 fp16/bf16/fp64, rdma_capable, numa }
+ComputeRequirement { arch?, min_memory, min_flops, dtype, prefer_rdma }
+Command::Compute { task, kernel, device, requirement, inputs, output, values }
+```
+
+`Command::Compute` adds reads of its inputs, a write of its output, and a
+`Mode::Compute` reservation on `Key::Device(device)`. Two kernels on one device
+conflict and are ordered; kernels on different devices do not. The registered
+profiles are replicated data, so every replica evaluates the same eligibility
+rule and records the same placement.
 
 ### Assumptions that drive the design
 
@@ -63,8 +87,12 @@ reference runners are forward-only where stated.
 - **A3 — workload.** 61 DSA layers, 128 heads, head_dim 128, 64k context, top-k
   2048; training ~0.25–1 step/s, serving ~5 forwards/s. Illustrative, not a
   benchmark.
-- **A4 — hardware.** No RDMA device in this container; the backend compiles and
-  links, and its two-QP path runs only on a host with an RNIC or Soft-RoCE.
+- **A4 — hardware.** No RDMA device in the local or remote container; the backend
+  compiles and links, and its two-QP path runs only on a host with an RNIC or
+  Soft-RoCE. The remote host does expose 8 NVIDIA RTX PRO 5000 72GB GPUs.
+- **A5 — vendor kernels are adapters.** Discovery, capability matching, compute
+  conflicts, scheduling, and placement are implemented; CUDA/ROCm/CANN/PPU
+  kernel execution is the next adapter layer.
 
 ## 2. Scale estimates
 
@@ -83,6 +111,7 @@ throughput. Units and assumptions are explicit.
 | Q bulk per node per layer | ~14 MB | 64k seq × 16 heads × 128 dim × 2 B / TP-CP shard |
 | KV cache per 64k sequence | ~262 GB | 2 × 61 × 64k × 128 × 128 × 2 B, sharded by CP/TP |
 | Same-rack commit budget | ≤2 ms | One fast-path RTT + local apply |
+| Hetero demo | 9 devices / 32 tasks | 8 NVIDIA + CPU; placements 29/3 |
 
 What the numbers force:
 
@@ -153,6 +182,27 @@ RegionDescriptor {
 Small values remain inline. Bulk values use a descriptor and a one-sided
 `RDMA_WRITE`/`RDMA_READ`; the log never carries the bytes.
 
+### Compute and device entry points
+
+```text
+RegisterDevice(DeviceProfile) -> replicated device capability record
+Compute {
+  task: OpId,
+  kernel: string,
+  device: DeviceId,
+  requirement: ComputeRequirement,
+  inputs: [TensorKey],
+  output: TensorKey,
+  version: u64,
+  values: [f64]
+} -> placement recorded on every replica
+```
+
+The scheduler picks `device` before proposal. The command is accepted only when
+the registered profile satisfies the requirement; the device key serializes
+kernels on that device. A production adapter would carry a descriptor instead of
+`values` and execute the kernel on the owning node.
+
 ### Real RDMA endpoint
 
 ```text
@@ -183,6 +233,7 @@ dark-theme template. Components and the requirement/number each earns:
 | Registered memory + RDMA | Moves bulk bytes outside log | 14 MB Q shard/layer, 100–400 Gb/s |
 | DSA / MoE / DP / PP runners | Executable axis mappings | TP/PP/EP/DP/CP/SP |
 | TCP control | Portable submission/query/snapshot fallback | No RDMA device required |
+| Device registry + scheduler | Maps compute to CPU/NVIDIA/AMD/Huawei/PPU capability | Heterogeneous replicas, device conflicts |
 
 Flow:
 
@@ -211,6 +262,17 @@ Record     { value: Value, phase: PreAccepted|Accepted|Committed|Executed,
 Indexes: `records: InstanceId -> Record`, `record_index: Key -> set<InstanceId>`,
 `executed: set<InstanceId>`, per-proposer `counters`, and `active` proposals.
 The conflict index is the only derived structure needed for EPaxos dependencies.
+
+### Device and placement state
+
+```text
+devices:   DeviceId -> DeviceProfile
+placement: OpId -> DeviceId
+```
+
+Device profiles are replicated through `RegisterDevice`; placement is a
+deterministic result of applying `Compute`. No scheduler state is hidden in a
+rank-local table, so any replica can answer where a task ran.
 
 ### Runtime state
 
@@ -257,6 +319,9 @@ global barrier.
 | Unanimous membership change | Removes the split-brain window between old/new majorities | Any voter down stalls join/leave; not online-reconfigurable | Membership changes happen during failures or >1 voter is down → joint consensus / Raft-style joint config |
 | Snapshot catch-up | New nodes join without replaying all history | Snapshot transfer can be GBs; stale existing voters are not auto-repaired | Snapshot > ~1 GB or join latency > 30 s → incremental log catch-up + chunked snapshot |
 | Reference runners use loopback/tcp | CI runs everywhere; exactness tests are deterministic | No performance evidence for the real data plane; per-query demo granularity is not production | Hardware available or a performance SLO is claimed → wire runners to verbs, batch commands, benchmark |
+| `Mode::Compute` + `Key::Device` alongside read/write | Two kernels cannot reserve one device; unrelated devices run concurrently | Adds a scarce-resource dimension and more conflict keys; a device becomes a serialization point | Device queue depth/latency dominates; shard the device into virtual slots or partition by SM/MIG |
+| Replicated device profiles + scheduler | Vendor-neutral placement; every replica agrees on eligibility | Profile advertisement is another replicated record; stale profile can mis-schedule | A device is hot-swapped, or profile churn exceeds ~1 command/min → lease/versioned profiles |
+| CPU result placeholder for compute tasks | End-to-end scheduling is testable without vendor kernels | Not a throughput claim; device work is not actually executed | First vendor adapter lands; replace values with a descriptor/result path |
 
 ### Why not a community RDMA library from the start?
 
@@ -297,6 +362,8 @@ design is trying to avoid.
 | RDMA QP/NIC failure | Completion timeout; one-sided transfer does not complete | Tensor stage stalls; control plane still commits unrelated work | Timeout + QP teardown/reconnect; fall back to TCP copy for the payload; do not resend a non-idempotent bulk write blindly |
 | RDMA completion lost | Local CQ never sees `wr_id` | Caller waits | Bounded poll; fence/teardown; retry with a new idempotent descriptor |
 | Log growth | Memory/disk pressure; snapshot transfer grows | Longer recovery/join; eventual OOM | Compaction/WAL; snapshot trigger at ~1 GB or 7 days |
+| Device dies / profile stale | Compute on that device stalls or is ineligible; queued tasks wait | A shard stops; other devices continue | Heartbeat/lease on device profiles; requeue the task with a new device reservation |
+| One device saturated | All tasks on that device serialize behind the device key | Other devices idle; tail latency rises | Scheduler load/queue metric; split by virtual slots or add devices |
 | Unauthenticated peer | Any process can propose/query | Integrity/confidentiality failure | Production mTLS + authorized membership; out of scope now |
 
 **Degradation stance:** the log is CP — under a partition the minority rejects
@@ -342,6 +409,10 @@ meaning of a contribution.
    read-repair protocol?
 6. Does GPUDirect RDMA change the contribution boundary (device memory
    descriptors) enough to split the command type?
+7. What is the right device lease protocol when a GPU is reset or a profile is
+   replaced — a new `DeviceProfile` command, a lease epoch, or both?
+8. Should compute placement be fixed before proposal (current) or negotiated by
+   a plan-level scheduler that reserves several devices atomically?
 
 ## Self-assessment (skill quality bar)
 
@@ -359,5 +430,6 @@ meaning of a contribution.
 **Total: 31/40. Weakest dimension: measured scale/performance evidence.** The
 next move that raises it is a 3/5/8-voter benchmark on a Soft-RoCE host measuring
 fast-path p99, command throughput, and RDMA bulk completion, with the same
-batched command shape the scale plan assumes. Until then, the architecture is a
-reasoned hypothesis, not a validated performance claim.
+batched command shape the scale plan assumes. The heterogeneous path is tested
+on 8 NVIDIA GPUs for discovery and placement, but vendor kernel execution and
+real RDMA hardware remain unmeasured.

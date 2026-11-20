@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use plait_core::{FuseKind, NodeId, OpId};
+use plait_core::{ComputeRequirement, DType, FuseKind, NodeId, OpId};
 use serde::{Deserialize, Serialize};
 
 use crate::dsa::DsaConfig;
@@ -46,6 +46,21 @@ pub struct ParallelOp {
     pub participants: Vec<NodeId>,
     pub conflict_key: String,
     pub transfer: TransferPolicy,
+}
+
+impl ParallelOp {
+    /// Compute requirements inferred from the axis. A planner can override this
+    /// when a concrete kernel needs more memory or a different dtype.
+    pub fn requirement(&self) -> ComputeRequirement {
+        let dtype = match self.axis {
+            Axis::Context | Axis::Expert | Axis::Pipeline | Axis::Sequence => DType::F16,
+            Axis::Data | Axis::Tensor => DType::F32,
+        };
+        ComputeRequirement {
+            dtype,
+            ..ComputeRequirement::default()
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

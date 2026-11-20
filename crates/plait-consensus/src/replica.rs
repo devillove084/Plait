@@ -500,7 +500,7 @@ impl<S: StateMachine> Replica<S> {
     }
 
     fn conflicts_on(command: &Command, access: &Access) -> bool {
-        if access.mode == Mode::Write {
+        if access.mode != Mode::Read {
             command
                 .accesses()
                 .iter()
@@ -509,7 +509,7 @@ impl<S: StateMachine> Replica<S> {
             command
                 .accesses()
                 .iter()
-                .any(|candidate| candidate.key == access.key && candidate.mode == Mode::Write)
+                .any(|candidate| candidate.key == access.key && candidate.mode != Mode::Read)
         }
     }
 

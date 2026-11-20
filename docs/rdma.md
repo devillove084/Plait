@@ -94,8 +94,12 @@ The container cannot execute the hardware path:
   so `rdma link add ... type rxe` and `modprobe rdma_rxe` cannot work.
 
 The backend still compiles and links against the installed `libibverbs`
-(`rdma-core` 55 headers/libraries). The self-test exits successfully with a
-clear skip:
+(`rdma-core` 55 headers/libraries locally; `rdma-core` 48 on the remote
+`pro5000` container). On `pro5000`, `/sys/class/infiniband` and
+`/dev/infiniband` are also empty; only a virtio NIC is exposed (no Mellanox/
+Broadcom RDMA PCI function), the kernel has no `rdma_rxe` module, and the
+container lacks `CAP_NET_ADMIN` and `CAP_SYS_MODULE`. The self-test therefore
+exits successfully with a clear skip there too.
 
 ```text
 plait rdma: skipped (no verbs device; configure Soft-RoCE or an RNIC)

@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use plait_consensus::{InstanceId, StateMachine};
 use plait_core::{
-    Command, FuseKind, MembershipChange, NodeId, OpId, OpSpec, TensorKey, TensorVersion, TensorView,
+    AcceleratorKind, Command, ComputeTask, DeviceId, DeviceProfile, FuseKind, MembershipChange,
+    NodeId, OpId, OpSpec, TensorKey, TensorVersion, TensorView,
 };
 
 /// A deterministic event emitted while applying replicated commands. Nodes use
@@ -29,6 +30,17 @@ pub enum Event {
         addr: String,
     },
     MemberRemoved(NodeId),
+    DeviceRegistered {
+        device: DeviceId,
+        arch: AcceleratorKind,
+        memory_bytes: u64,
+    },
+    Computed {
+        task: OpId,
+        kernel: String,
+        device: DeviceId,
+        output: TensorKey,
+    },
     Error(String),
 }
 
@@ -47,6 +59,8 @@ pub struct Runtime {
     results: BTreeMap<OpId, Vec<f64>>,
     shards: BTreeMap<TensorKey, TensorView>,
     members: BTreeMap<NodeId, String>,
+    devices: BTreeMap<DeviceId, DeviceProfile>,
+    placements: BTreeMap<OpId, DeviceId>,
     applied: BTreeSet<InstanceId>,
     events: Vec<Event>,
 }
@@ -70,6 +84,14 @@ impl Runtime {
 
     pub fn members(&self) -> &BTreeMap<NodeId, String> {
         &self.members
+    }
+
+    pub fn devices(&self) -> &BTreeMap<DeviceId, DeviceProfile> {
+        &self.devices
+    }
+
+    pub fn placement(&self, task: OpId) -> Option<DeviceId> {
+        self.placements.get(&task).copied()
     }
 
     pub fn events(&self) -> &[Event] {
@@ -147,6 +169,27 @@ impl Runtime {
                 }
                 Ok(())
             }
+            Command::RegisterDevice(profile) => {
+                if profile.name.is_empty() {
+                    return Err("a device profile needs a name".to_owned());
+                }
+                Ok(())
+            }
+            Command::Compute(task) => {
+                if task.values.is_empty() {
+                    return Err("a compute result cannot be empty".to_owned());
+                }
+                let Some(profile) = self.devices.get(&task.device) else {
+                    return Err(format!("device {} is not registered", task.device));
+                };
+                if !task.requirement.matches(profile) {
+                    return Err(format!(
+                        "device {} does not satisfy the compute requirement",
+                        task.device
+                    ));
+                }
+                Ok(())
+            }
             Command::Nop | Command::Membership(_) => Ok(()),
         }
     }
@@ -175,8 +218,47 @@ impl Runtime {
             } => {
                 self.publish(*output, *version, values);
             }
+            Command::RegisterDevice(profile) => self.register_device(profile.clone()),
+            Command::Compute(task) => self.compute(task.clone()),
             Command::Membership(change) => self.membership(change),
         }
+    }
+
+    fn register_device(&mut self, profile: DeviceProfile) {
+        let device = profile.id;
+        let arch = profile.arch;
+        let memory_bytes = profile.memory_bytes;
+        self.devices.insert(device, profile);
+        self.events.push(Event::DeviceRegistered {
+            device,
+            arch,
+            memory_bytes,
+        });
+    }
+
+    fn compute(&mut self, task: ComputeTask) {
+        let Some(profile) = self.devices.get(&task.device).cloned() else {
+            self.events.push(Event::Error(format!(
+                "compute task {:?} targets unknown device {}",
+                task.task, task.device
+            )));
+            return;
+        };
+        if !task.requirement.matches(&profile) {
+            self.events.push(Event::Error(format!(
+                "device {} does not satisfy task {:?}",
+                task.device, task.task
+            )));
+            return;
+        }
+        self.publish(task.output, task.version, &task.values);
+        self.placements.insert(task.task, task.device);
+        self.events.push(Event::Computed {
+            task: task.task,
+            kernel: task.kernel,
+            device: task.device,
+            output: task.output,
+        });
     }
 
     fn publish(&mut self, key: TensorKey, version: u64, values: &[f64]) {
@@ -459,7 +541,7 @@ impl StateMachine for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plait_core::{ShardId, TensorId};
+    use plait_core::{ComputeRequirement, ShardId, TensorId};
 
     fn node(label: &str) -> NodeId {
         NodeId::derive(label)
@@ -702,6 +784,45 @@ mod tests {
         let denominator: f64 = weights.iter().sum();
         let expected = (20.0 * weights[0] + 10.0 * weights[1] + 30.0 * weights[2]) / denominator;
         assert!((combined[2] / sum - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn registered_device_receives_compute_placement() {
+        let nodes = [node("a"), node("b"), node("c")];
+        let mut runtime = Runtime::new();
+        let device = plait_core::DeviceProfile {
+            id: plait_core::DeviceId::new(nodes[0], 0),
+            name: "gpu-0".into(),
+            arch: AcceleratorKind::Nvidia,
+            memory_bytes: 1024,
+            flops: 10,
+            compute_units: 1,
+            supports_fp16: true,
+            supports_bf16: true,
+            supports_fp64: true,
+            rdma_capable: true,
+            numa_node: None,
+        };
+        apply(&mut runtime, 1, Command::RegisterDevice(device.clone()));
+        let task = OpId::new(nodes[0], 1);
+        let output = TensorKey::new(TensorId(22), ShardId(0));
+        apply(
+            &mut runtime,
+            2,
+            Command::Compute(ComputeTask {
+                task,
+                kernel: "dsa.attention".into(),
+                device: device.id,
+                requirement: ComputeRequirement::default(),
+                inputs: Vec::new(),
+                output,
+                version: 1,
+                values: vec![4.0, 5.0],
+            }),
+        );
+        assert_eq!(runtime.placement(task), Some(device.id));
+        assert_eq!(runtime.shard(output).unwrap().values, vec![4.0, 5.0]);
+        assert!(runtime.devices().contains_key(&device.id));
     }
 
     #[test]

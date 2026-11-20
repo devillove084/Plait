@@ -45,9 +45,11 @@ acknowledges the promotion. It does not need a rank-zero endpoint.
 
 ## 2. Commands and conflict keys
 
-A command declares `(Key, Mode)` accesses. The conflict rule is ordinary
-EPaxos: two commands conflict when they share a key and at least one access is a
-write.
+A command declares `(Key, Mode)` accesses. `Mode` is `Read`, `Write`, or
+`Compute`. Two commands conflict when they share a key and at least one access is
+not a read. A compute task reads its inputs, writes its output, and reserves its
+device; two kernels on one device conflict, while kernels on different devices
+are independent.
 
 | Command | Keys |
 | --- | --- |
@@ -56,6 +58,8 @@ write.
 | `Contribute` | read `Config`, write `Op(op)` |
 | `Publish` | read `Config`, write `Tensor(tensor, shard)` |
 | `Stage` | read `Config` + input tensor, write output tensor |
+| `RegisterDevice` | read `Config`, write `Device(device)` |
+| `Compute` | read `Config` + inputs, write output, **compute** `Device(device)` |
 | `Membership` | write `Config` |
 
 Because every command reads `Config` and membership writes it, reconfiguration
@@ -148,6 +152,9 @@ execution and recovery.
 - `Stage` installs a pipeline-stage activation and declares a read dependency on
   its predecessor tensor. This is how a pipeline stage is ordered after its
   input without a global barrier.
+- `RegisterDevice` records a `DeviceProfile`; `Compute` records the chosen
+  device and result. Device profiles are replicated data, so every replica
+  evaluates the same capability requirement and sees the same placement.
 - Membership commands update the runtime's member/address map and are also
   applied to `ClusterConfig` by the consensus layer.
 
@@ -179,6 +186,12 @@ real `ibverbs` backend can replace it without changing consensus or planning.
 portable deployment path. It reuses send and receive buffers. The DSA reference
 runner uses the registered-memory path for bulk Q and consensus commands for
 small index/partial values.
+
+`plait-device` discovers CPU/NVIDIA/AMD/Huawei/PPU profiles and provides a
+deterministic capability scheduler. `ParallelOp::requirement()` supplies the
+dtype/architecture constraints; the node registers profiles and emits `Compute`
+commands with the selected device. The reference kernels are CPU placeholders;
+vendor kernels plug in behind the executor.
 
 `plait-rdma` is the real hardware path. It uses the community `rdma-io` crate
 for the verbs ABI, device/PD/CQ/MR wrappers, work-request builders, and

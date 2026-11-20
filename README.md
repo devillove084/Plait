@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  Rust 2024 · EPaxos-style replication · no rank 0 · TP/PP/EP/DP/CP/SP · registered-memory data plane
+  Rust 2024 · EPaxos-style replication · no rank 0 · TP/PP/EP/DP/CP/SP · heterogeneous accelerators · registered-memory data plane
 </p>
 
 Plait is an experimental runtime in which **communication is the replicated log**.
@@ -21,8 +21,9 @@ no array position that has to mean "leader".
 
 This repository is a from-scratch Rust rewrite. The previous C++/CMake
 foundation has been removed; the workspace now contains the protocol, fused
-runtime, TCP transport, registered-memory data plane, parallelism planner, and
-runnable TP/CP/SP DSA, EP MoE, DP optimizer, and PP stage-handoff operators.
+runtime, TCP transport, registered-memory data plane, parallelism planner,
+capability-aware device scheduling, and runnable TP/CP/SP DSA, EP MoE, DP
+optimizer, and PP stage-handoff operators.
 
 > **Status:** research prototype, not a production training system. Correctness
 > and the end-to-end mechanism are exercised by tests; security, persistence,
@@ -62,6 +63,12 @@ The important properties are:
 - **Bulk data stays out of the log.** Small indices and partials travel inline;
   large tensors live in registered regions and move through one-sided
   descriptor operations.
+- **Compute is a first-class access mode.** A compute task reserves a device and
+  reads/writes its tensors; two kernels on one device conflict, while kernels on
+  different devices can execute concurrently.
+- **Devices are replicated capability data.** NVIDIA, AMD, Huawei, PPU, and CPU
+  profiles are advertised as `DeviceProfile` commands; a scheduler chooses an
+  eligible device from memory, dtype, architecture, load, and stable identity.
 
 EPaxos is used here as a **design point**, not a claim of a byte-for-byte paper
 implementation. The implementation includes fast-path dependency agreement,
@@ -128,6 +135,32 @@ plait dsa: context-parallel output matches reference (max error 1.110e-16, 110 i
 plait dsa: tensor-parallel output matches reference (max error 1.110e-16, 55 instances)
 ```
 
+## Heterogeneous compute
+
+`plait-device` discovers accelerators and advertises them as replicated data.
+`plait-core` adds `Mode::Compute`, `Key::Device`, `RegisterDevice`, and
+`Command::Compute`; `plait-fabric` records the resulting placement. The planner
+exposes `ParallelOp::requirement()`, so a plan can be assigned across vendor
+families:
+
+```sh
+cargo run -q -p plait-node -- devices
+cargo run -q -p plait-node -- hetero
+```
+
+On the 8-GPU `pro5000` host this discovered 8× NVIDIA RTX PRO 5000 72GB
+Blackwell + CPU and scheduled 32 planned operations:
+
+```text
+plait hetero: 9 devices, 32 compute tasks, placements {Cpu: 3, Nvidia: 29}
+```
+
+This is **placement and consensus**, not yet a vendor kernel runtime: the
+reference compute result is deterministic CPU data, while the device
+registration, eligibility check, device reservation, and replicated placement
+are the real code path. AMD/Huawei/PPU discovery is best-effort and covered by
+synthetic scheduler tests; adding a vendor kernel executor is a separate adapter.
+
 ## EP / DP / PP execution
 
 `cargo run -q -p plait-node -- parallel` runs all three remaining axes through
@@ -186,6 +219,8 @@ cargo test --workspace
 cargo run -p plait-node -- demo          # three real TCP nodes, fused sum
 cargo run -p plait-node -- dsa           # TP/CP DSA vs single-node reference
 cargo run -p plait-node -- parallel      # EP MoE, DP optimizer, PP stages
+cargo run -p plait-node -- devices       # discovered NVIDIA/AMD/Huawei/PPU/CPU
+cargo run -p plait-node -- hetero        # capability-aware compute placement
 cargo run -p plait-node -- rdma-selftest # real ibverbs or a clear skip
 ```
 
@@ -225,6 +260,7 @@ the unanimous promotion, and then proposes like every other voter.
 | `plait-rdma` | real `libibverbs` RC QP, one-sided read/write, completion polling |
 | `plait-net` | framed TCP transport and the wire protocol |
 | `plait-parallel` | TP/PP/EP/DP/CP/SP planner; DSA, MoE, DP, and PP reference runners |
+| `plait-device` | vendor discovery, `DeviceProfile` capability model, deterministic scheduler |
 | `plait-node` | real cluster process, join/snapshot flow, client, demos |
 
 See the design of record in [docs/design/plait.md](docs/design/plait.md) with
@@ -232,7 +268,8 @@ its [requirements](docs/design/plait-requirements.md) and
 [rendered architecture](docs/design/plait-architecture.html). Protocol details
 are in [docs/architecture.md](docs/architecture.md), axis mapping in
 [docs/parallelism.md](docs/parallelism.md), and the verbs backend in
-[docs/rdma.md](docs/rdma.md).
+[docs/rdma.md](docs/rdma.md). The remote validation record is
+[docs/validation/pro5000.md](docs/validation/pro5000.md).
 
 ## Guarantees and limits
 
@@ -249,6 +286,9 @@ What is implemented and tested:
 - CP and TP distributed DSA matching the single-node reference within `1e-16`;
 - EP MoE (top-1 and top-2), DP optimizer steps, and PP stage handoffs matching
   their single-node references;
+- heterogeneous device profiles, compute-mode conflict keys, and a scheduler
+  exercised across CPU/NVIDIA/AMD/Huawei/PPU profiles; 8 NVIDIA GPUs discovered
+  and 32 compute placements replicated on `pro5000`;
 - a compiling/linking real `libibverbs` backend with a two-QP self-test that
   runs when a device is present;
 - pooled/aligned memory, registered descriptors, and one-sided loopback
@@ -258,9 +298,14 @@ Deliberate limits of this prototype:
 
 - **No authentication or encryption.** The transport trusts the network. A
   production deployment must authenticate `NodeId` and authorize membership.
-- **RDMA hardware was not available in this container.** The backend is real and
-  compiles/links, but the two-QP path is validated only on hosts with an RNIC or
-  a configured Soft-RoCE link; it is not claimed as hardware-tested here.
+- **RDMA hardware was not available in this container or the provided remote
+  container.** The backend is real and compiles/links, but the two-QP path is
+  validated only on hosts with an RNIC or a configured Soft-RoCE link. The
+  `pro5000` container has 8 GPUs but no `/dev/infiniband`, no verbs device, and no
+  `CAP_NET_ADMIN`/`CAP_SYS_MODULE`, so it also reports a clear skip.
+- **Vendor compute dispatch is not implemented yet.** Device discovery,
+  capability matching, compute conflicts, scheduling, and placement are real;
+  NVIDIA/AMD/Huawei/PPU kernel adapters are the next layer.
 - **No durable state.** Node restart with the same identity is not handled;
   instances and counters live in memory. A voter that misses a membership
   change while partitioned must be restarted/rejoined; automatic snapshot
@@ -292,6 +337,8 @@ Deliberate limits of this prototype:
 - [x] Context- and tensor-parallel DSA reference execution
 - [x] Registered-memory descriptors, pooling, and loopback data plane
 - [x] Real `ibverbs` backend and two-QP self-test (hardware execution blocked here)
+- [x] Heterogeneous device profiles, compute access mode, and capability scheduler
+- [ ] Vendor kernel adapters (CUDA, ROCm, CANN, PPU) and GPU memory descriptors
 - [ ] GPUDirect RDMA and real multi-host hardware validation
 - [ ] Descriptor-only bulk contribution commands and completion queues
 - [ ] Per-domain consensus groups and hierarchical membership

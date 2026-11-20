@@ -93,6 +93,8 @@ impl std::error::Error for ShapeError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DType {
+    F16,
+    BF16,
     F32,
     F64,
 }
@@ -100,6 +102,7 @@ pub enum DType {
 impl DType {
     pub const fn size_bytes(self) -> usize {
         match self {
+            Self::F16 | Self::BF16 => 2,
             Self::F32 => 4,
             Self::F64 => 8,
         }

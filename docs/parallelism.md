@@ -38,6 +38,11 @@ pub struct OpSpec {
 }
 ```
 
+Every operation also exposes a compute requirement (dtype, architecture,
+memory, RDMA preference). `plait-device` selects an eligible device and serializes
+kernels on the same device through `Mode::Compute`; compute on different devices
+does not conflict.
+
 The planner's job is to preserve the model's semantics while keeping the
 conflict domain as small as possible. A collective that all-gathers a 64 MiB
 activation becomes a `Gather` command with a registered-memory descriptor; a
@@ -170,6 +175,7 @@ share a key, or the fabric will serialize work that could run concurrently.
 | `MoeRunner` | EP, top-1 and top-2 | single-node MoE |
 | `DpRunner` | DP, 2–4 parameter shards | single global-gradient optimizer |
 | `PpRunner` | PP, 2–3 stages, multiple microbatches | single-node sequential forward |
+| `hetero` | CPU + NVIDIA (+ AMD/Huawei/PPU when present) | replicated placement, 32 planned ops |
 
 All four use `LocalCluster`, which is the same `Replica<Runtime>` and EPaxos
 command path as the TCP node. The difference is only the transport.

@@ -1,0 +1,12 @@
+[package]
+name = "plait-device"
+description = "Heterogeneous accelerator discovery and capability-aware compute scheduling for Plait"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+plait-core.workspace = true
+serde.workspace = true

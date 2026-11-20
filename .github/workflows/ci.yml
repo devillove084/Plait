@@ -57,5 +57,11 @@ jobs:
       - name: Run EP, DP, and PP reference execution
         run: cargo run -q --locked -p plait-node -- parallel
 
+      - name: Discover available accelerators
+        run: cargo run -q --locked -p plait-node -- devices
+
+      - name: Schedule planned compute across discovered devices
+        run: cargo run -q --locked -p plait-node -- hetero
+
       - name: Exercise the real ibverbs backend (skips without a device)
         run: cargo run -q --locked -p plait-node -- rdma-selftest

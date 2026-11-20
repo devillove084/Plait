@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 
 use plait_consensus::{Options, Replica};
 use plait_core::{
-    ClusterConfig, Command, FuseKind, NodeId, OpId, OpSpec, ShardId, TensorId, TensorKey,
+    AcceleratorKind, ClusterConfig, Command, ComputeRequirement, ComputeTask, DeviceId, FuseKind,
+    NodeId, OpId, OpSpec, ShardId, TensorId, TensorKey,
 };
 use plait_fabric::Runtime;
 use plait_net::{TcpTransport, Wire};
@@ -90,6 +91,7 @@ impl RunningNode {
             joined: false,
             staged_proposed: BTreeSet::new(),
             commit_proposed: BTreeSet::new(),
+            devices_registered: false,
             last_join_poll: 0,
             last_ready: 0,
             started: Instant::now(),
@@ -130,6 +132,7 @@ struct NodeState {
     joined: bool,
     staged_proposed: BTreeSet<NodeId>,
     commit_proposed: BTreeSet<NodeId>,
+    devices_registered: bool,
     last_join_poll: u64,
     last_ready: u64,
     started: Instant,
@@ -147,6 +150,7 @@ impl NodeState {
                 self.handle(from, wire, now);
             }
             self.replica.tick(now);
+            self.maybe_register_devices(now);
             self.drive_join(now);
             self.refresh_peers();
             self.flush();
@@ -260,6 +264,17 @@ impl NodeState {
             }
             Wire::Hello { .. } | Wire::Pong | Wire::Ack { .. } | Wire::QueryReply { .. } => {}
         }
+    }
+
+    fn maybe_register_devices(&mut self, now: u64) {
+        if self.devices_registered || !self.replica.config().is_voter(self.id) {
+            return;
+        }
+        let profiles = plait_device::discover(self.id);
+        for profile in &profiles {
+            self.propose(Command::RegisterDevice(profile.clone()), now);
+        }
+        self.devices_registered = true;
     }
 
     fn drive_join(&mut self, now: u64) {
@@ -661,6 +676,119 @@ pub fn run_rdma_selftest() -> Result<(), Box<dyn std::error::Error>> {
         plait_rdma::SelfTest::Passed { device, bytes } => {
             println!("plait rdma: {device} loopback write/read passed ({bytes} bytes)");
         }
+    }
+    Ok(())
+}
+
+/// Print the accelerators visible to this process.
+pub fn run_devices() -> Result<(), Box<dyn std::error::Error>> {
+    let node = NodeId::derive("local-device-discovery");
+    let profiles = plait_device::discover(node);
+    if profiles.is_empty() {
+        println!("plait devices: none");
+        return Ok(());
+    }
+    for profile in profiles {
+        println!(
+            "{}  arch={}  name={}  memory_mib={}  flops={}  rdma={}",
+            profile.id,
+            profile.arch,
+            profile.name,
+            profile.memory_bytes / (1024 * 1024),
+            profile.flops,
+            profile.rdma_capable
+        );
+    }
+    Ok(())
+}
+
+/// Discover local devices, replicate their profiles, then schedule planned
+/// operations onto eligible devices through the same EPaxos cluster. The
+/// compute result is a deterministic placeholder; the placement and device
+/// reservation are real replicated commands.
+pub fn run_hetero_demo() -> Result<(), Box<dyn std::error::Error>> {
+    use plait_device::{DeviceRegistry, SchedulingPolicy};
+    use plait_parallel::{AxisSizes, DsaConfig, Topology, dsa_plan};
+
+    let local = NodeId::derive("hetero-discovery");
+    let discovered = plait_device::discover(local);
+    if discovered.is_empty() {
+        return Err("no devices discovered".into());
+    }
+    let topology = Topology::with_prefix(AxisSizes::new(3, 1, 1, 1, 1, 1), "hetero")?;
+    let nodes = topology.nodes().to_vec();
+    let mut cluster = plait_parallel::LocalCluster::new(nodes.iter().copied());
+    let mut registry = DeviceRegistry::new();
+
+    // Spread discovered devices over the three simulated replicas. A real
+    // cluster would discover profiles on each node and replicate them directly.
+    let mut profiles = Vec::new();
+    for (index, profile) in discovered.into_iter().enumerate() {
+        let node = nodes[index % nodes.len()];
+        let mut profile = profile;
+        profile.id = DeviceId::new(node, profile.id.ordinal);
+        profiles.push(profile);
+    }
+    for profile in &profiles {
+        registry.register(profile.clone());
+        cluster.run_command(profile.id.node, Command::RegisterDevice(profile.clone()))?;
+    }
+
+    let plan = dsa_plan(&topology, &DsaConfig::small());
+    let operations: Vec<_> = plan.plan.ops.iter().take(32).cloned().collect();
+    let arch_order: Vec<AcceleratorKind> = profiles.iter().map(|p| p.arch).collect();
+    let mut assignments = Vec::new();
+    for (index, op) in operations.iter().enumerate() {
+        let requirement = ComputeRequirement {
+            arch: Some(arch_order[index % arch_order.len()]),
+            ..op.requirement()
+        };
+        let Some(device) = registry.select(&requirement, SchedulingPolicy::LeastLoaded) else {
+            continue;
+        };
+        registry.reserve(device);
+        let task = OpId::new(NodeId::derive("hetero-plan"), index as u64 + 1);
+        let output = TensorKey::new(TensorId(30_000 + index as u128), ShardId(0));
+        cluster.run_command(
+            device.node,
+            Command::Compute(ComputeTask {
+                task,
+                kernel: op.name.clone(),
+                device,
+                requirement,
+                inputs: Vec::new(),
+                output,
+                version: 1,
+                values: vec![index as f64],
+            }),
+        )?;
+        assignments.push((task, device, op.name.clone()));
+    }
+
+    for (task, device, kernel) in &assignments {
+        for node in &nodes {
+            if cluster.runtime(*node).placement(*task) != Some(*device) {
+                return Err(format!(
+                    "placement mismatch for {kernel} on {node}: expected {device}"
+                )
+                .into());
+            }
+        }
+    }
+    let mut counts: BTreeMap<AcceleratorKind, usize> = BTreeMap::new();
+    for (_, device, _) in &assignments {
+        if let Some(profile) = registry.profiles().get(device) {
+            *counts.entry(profile.arch).or_default() += 1;
+        }
+    }
+    println!(
+        "plait hetero: {} devices, {} compute tasks, placements {:?}",
+        profiles.len(),
+        assignments.len(),
+        counts
+    );
+    for (task, device, kernel) in assignments.iter().take(8) {
+        println!("  {task:?} -> {device} ({kernel})");
     }
     Ok(())
 }

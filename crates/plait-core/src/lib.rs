@@ -7,11 +7,15 @@
 
 pub mod command;
 pub mod config;
+pub mod device;
 pub mod identity;
 pub mod tensor;
 
-pub use command::{Access, Command, FuseKind, Key, MembershipChange, Mode, OpId, OpSpec};
+pub use command::{
+    Access, Command, ComputeTask, FuseKind, Key, MembershipChange, Mode, OpId, OpSpec,
+};
 pub use config::{ClusterConfig, ConfigError, QuorumPolicy};
+pub use device::{AcceleratorKind, ComputeRequirement, DeviceId, DeviceProfile};
 pub use identity::NodeId;
 pub use tensor::{
     DType, Placement, Shape, ShardId, TensorId, TensorKey, TensorSpec, TensorVersion, TensorView,
