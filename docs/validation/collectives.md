@@ -56,10 +56,12 @@ Eight RTX PRO 5000, 1 MiB, 8 ranks, 5 warmups / 10 timed iterations:
 | Plait reduce+broadcast | 3.728 | 0.281 | 0.492 |
 | NCCL 2.30.4 all-reduce | 0.218 | 4.821 | 8.436 |
 
-This is **not faster than NCCL**. The current implementation synchronizes the
-host after every ring step and launches one chunk copy/reduction at a time. NCCL
-uses channels, multiple in-flight chunks, LL/LL128 protocols, and topology-aware
-paths. A performance claim would require fixing those before measuring.
+This is **not faster than NCCL**. The ring path now enqueues all steps and
+synchronizes once per collective instead of synchronizing the host after every
+step, but it still uses one stream per rank and one chunk copy/reduction at a
+time. NCCL uses channels, multiple in-flight chunks, LL/LL128 protocols, and
+topology-aware paths. A performance claim would require fixing those before
+measuring.
 
 The ring result is also correct: `just collectives` verifies every rank against
 the CPU sum; the collectives test suite covers 2 through 8 visible GPUs.
@@ -75,8 +77,8 @@ the CPU sum; the collectives test suite covers 2 through 8 visible GPUs.
 | All-gather / reduce-scatter | ring/tree, multiple channels | ring, host-synchronized | Channelized kernels and nonblocking pipeline |
 | Broadcast / reduce | tree and chain | chain/root fan-out | Topology-aware trees, in-network reduction |
 | All-to-all | pairwise/topology-aware | pairwise | Chunked pipelines and buffer reuse |
-| Protocols | LL, LL128, Simple | f32 peer copy + scalar add | Vectorized/local kernels, flags, no host barrier per step |
-| Channels | multiple per GPU, topology-derived | one stream per GPU | Channel scheduler and stream pools |
+| Protocols | LL, LL128, Simple | f32 peer copy + scalar add | Vectorized/local kernels, flags, protocol selection |
+| Channels | multiple per GPU, topology-derived | one stream per GPU | Channel scheduler and stream pools; per-step host barrier removed but not channelized |
 | Bootstrap | TCP store (control only) | EPaxos TCP control plane | Not a data-plane substitute; keep bootstrap separate from transport |
 | Memory allocation | caching allocator, registered regions | cudarc primary-context allocations | Reusable peer pool, pinned host buffers, registered regions |
 | Performance harness | nccl-tests matrix | one-size benchmark + correctness tests | Full size/protocol sweep and regression thresholds |

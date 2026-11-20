@@ -312,7 +312,10 @@ are in [docs/architecture.md](docs/architecture.md), axis mapping in
 [docs/parallelism.md](docs/parallelism.md), and the verbs backend in
 [docs/rdma.md](docs/rdma.md). Remote validation is recorded in
 [docs/validation/pro5000.md](docs/validation/pro5000.md); the NCCL equivalence
-check is in [docs/validation/nccl.md](docs/validation/nccl.md).
+check is in [docs/validation/nccl.md](docs/validation/nccl.md); peer-memory
+collectives and remaining gaps are in
+[docs/validation/collectives.md](docs/validation/collectives.md), and the gated
+parity plan is in [docs/goals/nccl-parity.md](docs/goals/nccl-parity.md).
 
 ## Guarantees and limits
 

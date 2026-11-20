@@ -496,8 +496,8 @@ impl PeerGroup {
                     range,
                 )?;
             }
-            self.sync()?;
         }
+        self.sync()?;
         self.collect(&data, width * n)
     }
 
@@ -536,6 +536,7 @@ impl PeerGroup {
             );
         }
         self.reduce_scatter_core(&mut data, &mut receive, width)?;
+        self.sync()?;
         let mut output = Vec::with_capacity(n);
         for rank in 0..n {
             let host = self.ranks[rank]
@@ -641,6 +642,7 @@ impl PeerGroup {
         }
         self.reduce_scatter_core(&mut data, &mut receive, width)?;
         self.all_gather_after_reduce(&mut data, &mut receive, width)?;
+        self.sync()?;
         let mut output = Vec::with_capacity(n);
         for rank in 0..n {
             let host = self.ranks[rank]
@@ -680,7 +682,6 @@ impl PeerGroup {
                     0..width,
                 )?;
             }
-            self.sync()?;
         }
         Ok(())
     }
@@ -714,7 +715,6 @@ impl PeerGroup {
                     range,
                 )?;
             }
-            self.sync()?;
         }
         Ok(())
     }
@@ -754,9 +754,9 @@ impl PeerGroup {
             for rank in 0..n {
                 self.add(rank, &mut data[rank], 0..count, &receive[rank], 0..count)?;
             }
-            self.sync()?;
             step <<= 1;
         }
+        self.sync()?;
         self.collect(&data, count)
     }
 
