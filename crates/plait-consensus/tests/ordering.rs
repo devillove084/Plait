@@ -369,3 +369,34 @@ fn recovery_preserves_an_accepted_value() {
     assert_eq!(sim.book(ids[0]).value, 42);
     assert!(sim.accepts > 0);
 }
+
+#[test]
+fn ordering_message_trace_maps_to_tla_actions() {
+    let ids = [node("trace-a"), node("trace-b"), node("trace-c")];
+    let mut sim = Sim::new(&ids);
+    sim.propose(ids[0], publish(7));
+
+    let mut actions = Vec::new();
+    while let Some((from, to, message)) = sim.queue.pop_front() {
+        actions.push(match &message {
+            Message::PreAccept { .. } => "PreAccept",
+            Message::PreAcceptReply { .. } => "PreAcceptReply",
+            Message::Accept { .. } => "Accept",
+            Message::AcceptReply { .. } => "AcceptReply",
+            Message::Commit { .. } => "Commit",
+            Message::Recover { .. } => "Recover",
+            Message::RecoverReply { .. } => "RecoverReply",
+            Message::TryPreAccept { .. } => "TryPreAccept",
+            Message::TryPreAcceptReply { .. } => "TryPreAcceptReply",
+        });
+        sim.deliver(from, to, message);
+        sim.drain_outbox();
+    }
+
+    sim.assert_consistent(1);
+    assert!(actions.contains(&"PreAccept"));
+    assert!(actions.contains(&"PreAcceptReply"));
+    assert!(actions.contains(&"Commit"));
+    assert!(!actions.contains(&"Accept"));
+    assert!(!actions.contains(&"Recover"));
+}

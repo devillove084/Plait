@@ -76,7 +76,9 @@ conditional on a correct SCC partition.
 - [ ] Add/modify invariants and a refinement mapping.
 - [ ] Model-check counterexamples and liveness.
 - [ ] Lean proof for the core invariant if the TLA+ state space is too large.
-- [ ] Map every model action to a Rust handler and add conformance traces.
+- [x] Record a Rust message trace for the uncontended fast path and map it
+  to PreAccept, PreAcceptReply, and Commit.
+- [ ] Map every recovery and slow-path action to a step-by-step refinement.
 
 ## System-level model
 
