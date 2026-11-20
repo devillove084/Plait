@@ -70,8 +70,11 @@ the single-node reference.
 - A stage that has not received its dependency does not execute; unrelated
   microbatches continue.
 
-The planner emits these operations. Full pipeline scheduling is future work;
-the DSA runner uses a single stage.
+The planner emits these operations, and `PpRunner` executes them: a wavefront
+scheduler proposes every ready `(stage, microbatch)` task, and the `Stage`
+command's read dependency orders it after its predecessor. The reference test
+checks that multiple microbatches are in flight and that the final activations
+match a single-node run.
 
 ### EP — expert parallel
 
@@ -81,9 +84,11 @@ the DSA runner uses a single stage.
   outputs.
 - Conflict keys are per expert (`ep:<expert>:dispatch`, `ep:<expert>:combine`),
   so experts do not wait for a global all-to-all.
-- The planner emits dispatch/combine for every expert coordinate. MoE execution
-  is a planned extension; the DSA reference runner currently uses a single
-  expert coordinate.
+- The planner emits dispatch/combine for every expert coordinate. `MoeRunner`
+  executes EP MoE: routing is replicated, each expert owns one EP coordinate,
+  expert deltas are contributed with zeros outside the routed tokens, and the
+  `Combine` operation fuses them. Both top-1 and top-2 routing match the
+  single-node reference.
 
 ### DP — data parallel
 
@@ -93,7 +98,10 @@ the DSA runner uses a single stage.
 - There is no global optimizer barrier: a parameter shard can materialize as
   soon as all of its DP contributions are ordered. The optimizer still needs a
   per-shard readiness condition, but it is not a rank-ordered collective.
-- Conflict key: `dp:<replica>:gradient:<shard>`.
+- `DpRunner` computes local gradients from each replica's batch, runs one fused
+  sum per `(step, shard)`, and updates weights after the shard result; the
+  result matches a single global-gradient run.
+- Conflict key: `dp:<step>:gradient:<shard>`.
 
 ### CP — context parallel
 
@@ -108,7 +116,8 @@ the DSA runner uses a single stage.
 - Conflict keys: `ctx:<tp>:<head>:<query>:candidates|attention`.
 
 The reference DSA runner executes a three-shard CP topology and matches the
-single-node reference.
+single-node reference. `cargo run -p plait-node -- parallel` executes the EP,
+DP, and PP reference runners; `-- dsa` executes TP/CP DSA.
 
 ### SP — sequence parallel
 
@@ -153,3 +162,14 @@ contribution per participant. No phase has a rank-zero driver.
 
 The invariant to preserve: commands that do not model a real conflict must not
 share a key, or the fabric will serialize work that could run concurrently.
+## What is actually executed
+
+| Runner | Topology exercised | Reference check |
+| --- | --- | --- |
+| `DsaRunner` | TP and CP/SP | single-node DSA, `1.1e-16` max error |
+| `MoeRunner` | EP, top-1 and top-2 | single-node MoE |
+| `DpRunner` | DP, 2–4 parameter shards | single global-gradient optimizer |
+| `PpRunner` | PP, 2–3 stages, multiple microbatches | single-node sequential forward |
+
+All four use `LocalCluster`, which is the same `Replica<Runtime>` and EPaxos
+command path as the TCP node. The difference is only the transport.

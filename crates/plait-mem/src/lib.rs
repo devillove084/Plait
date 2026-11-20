@@ -251,6 +251,9 @@ pub enum MemoryKind {
 pub struct RegionDescriptor {
     pub node: NodeId,
     pub region: RegionId,
+    /// Absolute virtual address of the registered allocation. A real verbs
+    /// backend uses this as `remote_addr`; the loopback backend ignores it.
+    pub addr: u64,
     pub offset: u64,
     pub len: u64,
     pub rkey: u64,
@@ -306,9 +309,14 @@ impl RegionHandle {
                 "descriptor exceeds the registered region",
             ));
         }
+        let base = {
+            let buffer = self.buffer.lock().expect("region poisoned");
+            buffer.as_ptr() as u64
+        };
         Ok(RegionDescriptor {
             node,
             region: self.id,
+            addr: base,
             offset,
             len,
             rkey: self.rkey,

@@ -16,5 +16,6 @@ plait-core.workspace = true
 plait-consensus.workspace = true
 plait-fabric.workspace = true
 plait-parallel.workspace = true
+plait-rdma.workspace = true
 plait-net.workspace = true
 rand.workspace = true

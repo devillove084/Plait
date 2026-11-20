@@ -141,7 +141,7 @@ impl Runtime {
                 }
                 Ok(())
             }
-            Command::Publish { values, .. } => {
+            Command::Publish { values, .. } | Command::Stage { values, .. } => {
                 if values.is_empty() {
                     return Err("a published shard cannot be empty".to_owned());
                 }
@@ -165,21 +165,30 @@ impl Runtime {
                 version,
                 values,
             } => {
-                self.shards.insert(
-                    *key,
-                    TensorView {
-                        key: *key,
-                        version: TensorVersion(*version),
-                        values: values.clone(),
-                    },
-                );
-                self.events.push(Event::Published {
-                    key: *key,
-                    version: *version,
-                });
+                self.publish(*key, *version, values);
+            }
+            Command::Stage {
+                output,
+                version,
+                values,
+                ..
+            } => {
+                self.publish(*output, *version, values);
             }
             Command::Membership(change) => self.membership(change),
         }
+    }
+
+    fn publish(&mut self, key: TensorKey, version: u64, values: &[f64]) {
+        self.shards.insert(
+            key,
+            TensorView {
+                key,
+                version: TensorVersion(version),
+                values: values.to_vec(),
+            },
+        );
+        self.events.push(Event::Published { key, version });
     }
 
     fn declare(&mut self, spec: OpSpec) {

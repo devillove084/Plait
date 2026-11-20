@@ -9,9 +9,15 @@ Plait is a Rust 2024 workspace. The authoritative lock is the committed
 | `bincode` | 1.3 | Framed TCP payload codec |
 | `sha2` | 0.10 | Stable `NodeId` derivation from human labels |
 | `rand` | 0.8 | Fresh node and client identities when no id is supplied |
+| `rdma-io` | 0.0.2, no async features | Safe RAII wrappers over rdma-core: device, PD, CQ, MR, QP, WR builders |
+| `rdma-io-sys` | 0.0.1 | Generated rdma-core FFI used for QP attributes |
+| `pkg-config` | 0.3 (build) | Exposes the system `libibverbs`/`librdmacm` link paths |
+| `libibverbs` | rdma-core 1.14+ (system) | Real RC queue pairs, MRs, one-sided RDMA |
+| `librdmacm` | rdma-core 1.3+ (system) | Link dependency of rdma-core; future CM integration |
 
 Standard library only is used for threads, sockets, channels, allocation, and
-time. There is no async runtime, C/C++ bridge, build script, or Git submodule.
+time. There is no async runtime, no C++ and no Git submodule. The RDMA path uses
+the community `rdma-io` crate rather than a project-local ABI shim.
 
 ## Updating a dependency
 
@@ -25,6 +31,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 cargo run --locked -p plait-node -- demo
 cargo run --locked -p plait-node -- dsa
+cargo run --locked -p plait-node -- parallel
+cargo run --locked -p plait-node -- rdma-selftest
 ```
 
 4. Update this table in the same change.

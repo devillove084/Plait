@@ -5,6 +5,7 @@ members = [
     "crates/plait-mem",
     "crates/plait-fabric",
     "crates/plait-parallel",
+    "crates/plait-rdma",
     "crates/plait-net",
     "crates/plait-node",
 ]
@@ -24,6 +25,7 @@ plait-consensus = { path = "crates/plait-consensus" }
 plait-fabric = { path = "crates/plait-fabric" }
 plait-mem = { path = "crates/plait-mem" }
 plait-parallel = { path = "crates/plait-parallel" }
+plait-rdma = { path = "crates/plait-rdma" }
 plait-net = { path = "crates/plait-net" }
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }

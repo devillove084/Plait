@@ -576,3 +576,91 @@ pub fn run_dsa_demo() -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
+
+/// Execute the three remaining parallelism axes for real: expert-parallel MoE,
+/// data-parallel gradient accumulation, and pipeline-parallel stage handoffs.
+/// Each runner uses the same EPaxos cluster and fused runtime as the node.
+pub fn run_parallel_demo() -> Result<(), Box<dyn std::error::Error>> {
+    use plait_parallel::{
+        AxisSizes, DpConfig, DpRunner, GlobalDp, GlobalMoe, GlobalPp, MoeConfig, MoeRunner,
+        PpConfig, PpRunner, Topology,
+    };
+
+    let moe_config = MoeConfig::small();
+    let moe_global = GlobalMoe::new(&moe_config);
+    let moe_topology = Topology::with_prefix(
+        AxisSizes::new(1, 1, 1, moe_config.experts, 1, 1),
+        "demo-moe",
+    )?;
+    let moe = MoeRunner::new(moe_topology, moe_config.clone())?.run(&moe_global)?;
+    let moe_expected = moe_global.reference(&moe_config);
+    let moe_error = max_error(&moe.values, &moe_expected);
+    println!(
+        "plait moe: EP output matches reference (max error {moe_error:.3e}, {} instances)",
+        moe.instances
+    );
+
+    let dp_config = DpConfig::small();
+    let dp_global = GlobalDp::new(&dp_config);
+    let dp_topology =
+        Topology::with_prefix(AxisSizes::new(dp_config.replicas, 1, 1, 1, 1, 1), "demo-dp")?;
+    let dp = DpRunner::new(dp_topology, dp_config.clone())?.run(&dp_global)?;
+    let (dp_weights, dp_losses) = dp_global.reference(&dp_config);
+    let dp_error = dp
+        .weights
+        .iter()
+        .zip(&dp_weights)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f64::max)
+        .max(
+            dp.losses
+                .iter()
+                .zip(&dp_losses)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f64::max),
+        );
+    println!(
+        "plait dp: {}-replica optimizer matches reference (max error {dp_error:.3e}, {} instances)",
+        dp_config.replicas, dp.instances
+    );
+
+    let pp_config = PpConfig::small();
+    let pp_global = GlobalPp::new(&pp_config);
+    let pp_topology =
+        Topology::with_prefix(AxisSizes::new(1, pp_config.stages, 1, 1, 1, 1), "demo-pp")?;
+    let pp = PpRunner::new(pp_topology, pp_config.clone())?.run(&pp_global)?;
+    let pp_expected = pp_global.reference(&pp_config);
+    let pp_error = max_error(&pp.values, &pp_expected);
+    println!(
+        "plait pp: {} stages / {} microbatches match reference (max error {pp_error:.3e}, max in flight {}, {} instances)",
+        pp_config.stages, pp_config.microbatches, pp.max_in_flight, pp.instances
+    );
+    Ok(())
+}
+
+fn max_error(actual: &[Vec<f64>], expected: &[Vec<f64>]) -> f64 {
+    let mut error = 0.0f64;
+    for (left, right) in actual.iter().zip(expected) {
+        for (a, b) in left.iter().zip(right) {
+            error = error.max((a - b).abs());
+        }
+    }
+    error
+}
+
+/// Run the real ibverbs self-test. Returns a skip message when no device is
+/// configured; this is expected on hosts without an RNIC or Soft-RoCE.
+pub fn run_rdma_selftest() -> Result<(), Box<dyn std::error::Error>> {
+    match plait_rdma::selftest()? {
+        plait_rdma::SelfTest::Skipped(reason) => {
+            println!("plait rdma: skipped ({reason})");
+            println!(
+                "Set up Soft-RoCE: sudo modprobe rdma_rxe && sudo rdma link add rxe0 type rxe netdev <iface>"
+            );
+        }
+        plait_rdma::SelfTest::Passed { device, bytes } => {
+            println!("plait rdma: {device} loopback write/read passed ({bytes} bytes)");
+        }
+    }
+    Ok(())
+}

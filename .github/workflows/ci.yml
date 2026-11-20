@@ -25,6 +25,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install RDMA build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            pkg-config libibverbs-dev librdmacm-dev
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -47,3 +53,9 @@ jobs:
 
       - name: Run the distributed DSA reference
         run: cargo run -q --locked -p plait-node -- dsa
+
+      - name: Run EP, DP, and PP reference execution
+        run: cargo run -q --locked -p plait-node -- parallel
+
+      - name: Exercise the real ibverbs backend (skips without a device)
+        run: cargo run -q --locked -p plait-node -- rdma-selftest

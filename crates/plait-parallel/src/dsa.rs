@@ -2,11 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use plait_consensus::ProposeError;
-use plait_core::{Command, NodeId, OpId, OpSpec, ShardId, TensorId, TensorKey};
+use plait_core::NodeId;
 use plait_mem::{BufferPool, LoopbackRdma, MemoryKind, PoolStats, RdmaPlane, RegionHandle};
 
 use crate::cluster::LocalCluster;
-use crate::plan::{DsaPlan, ParallelOp, dsa_plan, fuse_kind, seq_range};
+use crate::plan::{DsaPlan, ParallelOp, dsa_plan, seq_range};
 use crate::topology::{Axis, Topology, TopologyError};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -268,7 +268,6 @@ pub struct DsaRunner {
     plane: Arc<LoopbackRdma>,
     pool: BufferPool,
     nodes: BTreeMap<NodeId, DsaNode>,
-    declared: BTreeSet<OpId>,
     gathered_q: BTreeMap<u32, Vec<Vec<f64>>>,
     gathered_qi: BTreeMap<u32, Vec<Vec<f64>>>,
     selected: BTreeMap<(u32, u32), Vec<u32>>,
@@ -393,7 +392,6 @@ impl DsaRunner {
             plane,
             pool,
             nodes,
-            declared: BTreeSet::new(),
             gathered_q: BTreeMap::new(),
             gathered_qi: BTreeMap::new(),
             selected: BTreeMap::new(),
@@ -738,42 +736,9 @@ impl DsaRunner {
         op: &ParallelOp,
         contributions: BTreeMap<NodeId, Vec<f64>>,
     ) -> Result<Vec<f64>, DsaError> {
-        let coordinator = *op
-            .participants
-            .iter()
-            .min()
-            .ok_or_else(|| DsaError::Plan("operation has no participants".into()))?;
-        if self.declared.insert(op.op_id) {
-            let kind = fuse_kind(op.sync)
-                .ok_or_else(|| DsaError::Plan("operation is not a fused reduction".into()))?;
-            let spec = OpSpec {
-                id: op.op_id,
-                kind,
-                contributors: op.participants.iter().copied().collect(),
-                tensor: TensorKey::new(tensor_id(op.op_id), ShardId(0)),
-                epoch: 0,
-            };
-            self.cluster
-                .propose(coordinator, Command::DeclareOp(spec))
-                .map_err(DsaError::Consensus)?;
-            self.cluster.run();
-        }
-        for (node, values) in contributions {
-            self.cluster
-                .propose(
-                    node,
-                    Command::Contribute {
-                        op: op.op_id,
-                        contributor: node,
-                        values,
-                    },
-                )
-                .map_err(DsaError::Consensus)?;
-        }
-        self.cluster.run();
         self.cluster
-            .result(coordinator, op.op_id)
-            .ok_or_else(|| DsaError::Plan(format!("no fused result for {}", op.name)))
+            .run_op(op, contributions)
+            .map_err(|error| DsaError::Plan(error.to_string()))
     }
 
     fn read_matrix(
@@ -796,10 +761,6 @@ impl DsaRunner {
         self.plane.read(&descriptor, &mut bytes)?;
         Ok(unpack(&bytes))
     }
-}
-
-fn tensor_id(op: OpId) -> TensorId {
-    TensorId(u128::from_be_bytes(*op.origin.as_bytes()) ^ u128::from(op.counter))
 }
 
 fn register_tensor(

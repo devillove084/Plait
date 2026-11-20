@@ -3,7 +3,9 @@ use std::thread;
 use std::time::Duration;
 
 use plait_core::NodeId;
-use plait_node::{NodeConfig, RunningNode, run_demo, run_dsa_demo};
+use plait_node::{
+    NodeConfig, RunningNode, run_demo, run_dsa_demo, run_parallel_demo, run_rdma_selftest,
+};
 
 fn main() {
     if let Err(error) = real_main() {
@@ -18,6 +20,8 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
     match command.as_str() {
         "demo" => run_demo(),
         "dsa" => run_dsa_demo(),
+        "parallel" => run_parallel_demo(),
+        "rdma-selftest" => run_rdma_selftest(),
         "id" => {
             println!("{}", NodeId::random());
             Ok(())
@@ -60,7 +64,10 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 thread::sleep(Duration::from_secs(3600));
             }
         }
-        other => Err(format!("unknown command {other}; expected run, demo, dsa, or id").into()),
+        other => Err(format!(
+            "unknown command {other}; expected run, demo, dsa, parallel, rdma-selftest, or id"
+        )
+        .into()),
     }
 }
 

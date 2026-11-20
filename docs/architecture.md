@@ -55,6 +55,7 @@ write.
 | `DeclareOp` | read `Config`, write `Op(op)` |
 | `Contribute` | read `Config`, write `Op(op)` |
 | `Publish` | read `Config`, write `Tensor(tensor, shard)` |
+| `Stage` | read `Config` + input tensor, write output tensor |
 | `Membership` | write `Config` |
 
 Because every command reads `Config` and membership writes it, reconfiguration
@@ -144,6 +145,9 @@ execution and recovery.
   declared contributor has been applied, the runtime combines the partials and
   installs a `TensorView`.
 - `Publish` installs an externally produced shard.
+- `Stage` installs a pipeline-stage activation and declares a read dependency on
+  its predecessor tensor. This is how a pipeline stage is ordered after its
+  input without a global barrier.
 - Membership commands update the runtime's member/address map and are also
   applied to `ClusterConfig` by the consensus layer.
 
@@ -175,6 +179,13 @@ real `ibverbs` backend can replace it without changing consensus or planning.
 portable deployment path. It reuses send and receive buffers. The DSA reference
 runner uses the registered-memory path for bulk Q and consensus commands for
 small index/partial values.
+
+`plait-rdma` is the real hardware path. It uses the community `rdma-io` crate
+for the verbs ABI, device/PD/CQ/MR wrappers, work-request builders, and
+completion types; Plait's wrapper adds endpoint exchange, registered aligned
+buffers, the `RegionDescriptor` bridge, and one-sided `RDMA_WRITE`/`RDMA_READ`.
+`RegionDescriptor` now carries the absolute registered address as well as the
+remote key, so the same descriptor is usable by loopback and verbs transports.
 
 ## 6. Failure and reconfiguration behavior
 

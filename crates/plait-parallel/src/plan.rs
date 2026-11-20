@@ -321,10 +321,10 @@ pub fn fuse_kind(sync: SyncKind) -> Option<FuseKind> {
         SyncKind::Gather => Some(FuseKind::Gather),
         SyncKind::TopK { k } => Some(FuseKind::TopK { k }),
         SyncKind::OnlineSoftmax => Some(FuseKind::OnlineSoftmax),
-        SyncKind::PipelineHandoff
-        | SyncKind::Dispatch
-        | SyncKind::Combine
-        | SyncKind::Replicate => None,
+        // Expert combine is a token-wise sum. Dispatch is a transfer;
+        // pipeline handoff is scheduled as a dependency.
+        SyncKind::Combine => Some(FuseKind::Sum),
+        SyncKind::PipelineHandoff | SyncKind::Dispatch | SyncKind::Replicate => None,
     }
 }
 

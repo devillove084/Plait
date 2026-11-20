@@ -119,6 +119,16 @@ pub enum Command {
         version: u64,
         values: Vec<f64>,
     },
+    /// Pipeline-stage handoff. The command reads the previous stage's tensor
+    /// (if any) and writes the next stage's tensor. EPaxos therefore orders a
+    /// stage after its input without a global step, while different
+    /// microbatches remain independent.
+    Stage {
+        input: Option<TensorKey>,
+        output: TensorKey,
+        version: u64,
+        values: Vec<f64>,
+    },
     Membership(MembershipChange),
 }
 
@@ -153,6 +163,20 @@ impl Command {
                     mode: Mode::Write,
                 },
             ],
+            Self::Stage { input, output, .. } => {
+                let mut accesses = vec![read_config];
+                if let Some(input) = input {
+                    accesses.push(Access {
+                        key: Key::Tensor(*input),
+                        mode: Mode::Read,
+                    });
+                }
+                accesses.push(Access {
+                    key: Key::Tensor(*output),
+                    mode: Mode::Write,
+                });
+                accesses
+            }
             Self::Membership(_) => vec![Access {
                 key: Key::Config,
                 mode: Mode::Write,
@@ -206,6 +230,15 @@ impl Command {
             } => {
                 format!("publish {key:?} v{version} ({} values)", values.len())
             }
+            Self::Stage {
+                input,
+                output,
+                version,
+                values,
+            } => format!(
+                "stage {input:?} -> {output:?} v{version} ({} values)",
+                values.len()
+            ),
             Self::Membership(change) => format!("membership {change:?}"),
         }
     }

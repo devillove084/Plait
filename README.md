@@ -21,8 +21,8 @@ no array position that has to mean "leader".
 
 This repository is a from-scratch Rust rewrite. The previous C++/CMake
 foundation has been removed; the workspace now contains the protocol, fused
-runtime, TCP transport, registered-memory data plane, parallelism planner, and a
-runnable distributed DSA reference operator.
+runtime, TCP transport, registered-memory data plane, parallelism planner, and
+runnable TP/CP/SP DSA, EP MoE, DP optimizer, and PP stage-handoff operators.
 
 > **Status:** research prototype, not a production training system. Correctness
 > and the end-to-end mechanism are exercised by tests; security, persistence,
@@ -79,9 +79,9 @@ planner and the consensus/runtime layer.
 | Axis | Work that is sharded | Plait mechanism | Conflict domain | Transfer |
 | --- | --- | --- | --- | --- |
 | **TP** tensor parallel | Attention heads / projection columns | Fused partial-sum output projection; per-head gathers | `tp:<cp>:output`, `seq:<tp>:<head>:*` | Registered for Q/K/V, inline for indices |
-| **PP** pipeline parallel | Layers into stages | Microbatch handoff command; dependency chain per activation | `pp:<stage>:<microbatch>` | Registered descriptor |
+| **PP** pipeline parallel | Layers into stages | `Stage` command reads predecessor activation, writes successor; wavefront scheduler overlaps microbatches | `pp:<stage>:<microbatch>` | Registered descriptor |
 | **EP** expert parallel | Tokens across experts | Sparse dispatch; per-expert compute; token combine as fused sum | `ep:<expert>:dispatch|combine` | Registered dispatch, inline combine |
-| **DP** data parallel | Replicated model replicas | Per-parameter-shard gradient accumulation; no global optimizer barrier | `dp:<replica>:gradient:<shard>` | Registered |
+| **DP** data parallel | Replicated model replicas | Per-parameter-shard gradient accumulation and optimizer step | `dp:<step>:gradient:<shard>` | Registered |
 | **CP** context parallel | Sequence into KV shards | Local top-k candidates → global top-k; online-softmax partials | `ctx:<tp>:<head>:<query>:*` | Inline scores/partials; RDMA for Q |
 | **SP** sequence parallel | Sequence shards within TP | Sequence gather for Q/Q-index; aliases the CP physical group in the reference runner | `seq:<tp>:<head>:*` | Inline index, registered activation |
 
@@ -97,8 +97,9 @@ The planner emits concrete fused operations with contributor sets and op ids:
 - `PipelineHandoff` and `Dispatch` are registered-memory transfers coordinated
   by a small command; the bytes never enter the log.
 
-`cargo test -p plait-parallel` checks that all six axes have an EPaxos mapping
-and that participant groups match the topology.
+`cargo test -p plait-parallel` checks that all six axes have an EPaxos mapping,
+that participant groups match the topology, and that the EP/DP/PP reference
+runners match single-node execution.
 
 ## Distributed DSA
 
@@ -127,30 +128,65 @@ plait dsa: context-parallel output matches reference (max error 1.110e-16, 110 i
 plait dsa: tensor-parallel output matches reference (max error 1.110e-16, 55 instances)
 ```
 
+## EP / DP / PP execution
+
+`cargo run -q -p plait-node -- parallel` runs all three remaining axes through
+the real consensus and fused runtime:
+
+```text
+plait moe: EP output matches reference (max error 0.000e0, 4 instances)
+plait dp: 3-replica optimizer matches reference (max error 1.388e-17, 24 instances)
+plait pp: 3 stages / 3 microbatches match reference (max error 0.000e0, max in flight 3, 9 instances)
+```
+
+- **EP MoE**: routing is replicated, expert compute is sharded, and each expert
+  contributes a token-major delta. A fused `Sum` combines experts; top-2 routing
+  is covered by a test.
+- **DP**: gradients are split into parameter shards, each shard is a fused sum
+  over DP replicas, and zeros in non-owned shards are avoided; the optimizer
+  matches a single global-gradient run.
+- **PP**: every stage emits a `Stage { input, output }` command. The EPaxos
+  dependency on the input tensor orders stages; a wavefront scheduler keeps
+  multiple microbatches in flight (`max in flight 3` in the demo).
+
 ## Registered memory and RDMA
 
 `plait-mem` provides the data-plane contract:
 
 - page-aligned `AlignedBuffer` allocations;
 - a size-class `BufferPool` that returns buffers on drop;
-- `RegionDescriptor { node, region, offset, len, rkey, kind }`, the only thing a
-  consensus command needs to reference bulk data;
+- `RegionDescriptor { node, region, addr, offset, len, rkey, kind }`, the only
+  thing a consensus command needs to reference bulk data;
 - `RdmaPlane` with one-sided `read`/`write`;
 - `LoopbackRdma`, a validated in-process implementation used by tests and the
-  DSA runner.
+  DSA runner;
+- `plait-rdma`, a real `libibverbs` Reliable Connection backend built on the
+  community `rdma-io` crate (safe RAII wrappers around rdma-core) with one-sided
+  `RDMA_WRITE`/`RDMA_READ` and completion polling.
 
 `plait-net` uses length-prefixed framed TCP with reusable send/receive buffers
-as the portable fallback. A real `ibverbs` backend plugs into `RdmaPlane`; the
-development container has no RNIC, so no hardware-specific FFI is claimed here.
-The important separation is already enforced: large tensors do not go through
-consensus, and consensus never needs to know a NIC queue-pair layout.
+as the portable fallback. `plait-rdma` now compiles and links against real
+`libibverbs`; it registers aligned buffers, exchanges RC endpoints, and posts
+one-sided writes/reads. The development container has no `/dev/infiniband`, no
+`rdma_rxe` module, and no `CAP_NET_ADMIN`, so the self-test reports a skip:
+
+```text
+$ cargo run -q -p plait-node -- rdma-selftest
+plait rdma: skipped (no verbs device; configure Soft-RoCE or an RNIC)
+```
+
+On a host with a device (or a configured Soft-RoCE `rxe` link), the same command
+passes two-QP loopback write/read; `docs/rdma.md` has the setup commands and the
+container limitation.
 
 ## Quick start
 
 ```sh
 cargo test --workspace
-cargo run -p plait-node -- demo   # three real TCP nodes, fused sum, all peers query
-cargo run -p plait-node -- dsa    # distributed DSA vs single-node reference
+cargo run -p plait-node -- demo          # three real TCP nodes, fused sum
+cargo run -p plait-node -- dsa           # TP/CP DSA vs single-node reference
+cargo run -p plait-node -- parallel      # EP MoE, DP optimizer, PP stages
+cargo run -p plait-node -- rdma-selftest # real ibverbs or a clear skip
 ```
 
 Run a cluster process:
@@ -186,12 +222,17 @@ the unanimous promotion, and then proposes like every other voter.
 | `plait-consensus` | leaderless EPaxos instances, ballots, recovery, SCC execution, snapshots |
 | `plait-fabric` | fused runtime (`Sum`, `Max`, `Gather`, `TopK`, `OnlineSoftmax`) and events |
 | `plait-mem` | aligned buffers, pooling, registered regions, RDMA contract, loopback plane |
+| `plait-rdma` | real `libibverbs` RC QP, one-sided read/write, completion polling |
 | `plait-net` | framed TCP transport and the wire protocol |
-| `plait-parallel` | TP/PP/EP/DP/CP/SP planner, in-process consensus cluster, distributed DSA |
+| `plait-parallel` | TP/PP/EP/DP/CP/SP planner; DSA, MoE, DP, and PP reference runners |
 | `plait-node` | real cluster process, join/snapshot flow, client, demos |
 
-See [docs/architecture.md](docs/architecture.md) for the protocol and execution
-details, and [docs/parallelism.md](docs/parallelism.md) for the axis mapping.
+See the design of record in [docs/design/plait.md](docs/design/plait.md) with
+its [requirements](docs/design/plait-requirements.md) and
+[rendered architecture](docs/design/plait-architecture.html). Protocol details
+are in [docs/architecture.md](docs/architecture.md), axis mapping in
+[docs/parallelism.md](docs/parallelism.md), and the verbs backend in
+[docs/rdma.md](docs/rdma.md).
 
 ## Guarantees and limits
 
@@ -206,6 +247,10 @@ What is implemented and tested:
 - three-node real-TCP submission, fusion, and query;
 - dynamic join over TCP, followed by a proposal from the new voter;
 - CP and TP distributed DSA matching the single-node reference within `1e-16`;
+- EP MoE (top-1 and top-2), DP optimizer steps, and PP stage handoffs matching
+  their single-node references;
+- a compiling/linking real `libibverbs` backend with a two-QP self-test that
+  runs when a device is present;
 - pooled/aligned memory, registered descriptors, and one-sided loopback
   transfers bounds-checked.
 
@@ -213,6 +258,9 @@ Deliberate limits of this prototype:
 
 - **No authentication or encryption.** The transport trusts the network. A
   production deployment must authenticate `NodeId` and authorize membership.
+- **RDMA hardware was not available in this container.** The backend is real and
+  compiles/links, but the two-QP path is validated only on hosts with an RNIC or
+  a configured Soft-RoCE link; it is not claimed as hardware-tested here.
 - **No durable state.** Node restart with the same identity is not handled;
   instances and counters live in memory. A voter that misses a membership
   change while partitioned must be restarted/rejoined; automatic snapshot
@@ -224,8 +272,9 @@ Deliberate limits of this prototype:
   work.
 - **Small payloads are inline.** The DSA reference uses descriptors for bulk Q
   and inline candidates/partials. The generic `Contribute` command still has an
-  inline `Vec<f64>` variant; a fully descriptor-based tensor command and
-  `ibverbs` backend are the next data-plane step.
+  inline `Vec<f64>` variant; a fully descriptor-based tensor command is the next
+  data-plane step. `plait-rdma` exposes descriptor-aware post methods, but the
+  reference runners use loopback memory by default.
 - **One replication group.** Every command is replicated by the configured
   voters. Per-domain consensus groups (for very large TP/EP deployments) are a
   planner/runtime extension, not yet implemented.
@@ -239,13 +288,14 @@ Deliberate limits of this prototype:
 - [x] Fused `Sum`/`Max`/`Gather`/`TopK`/`OnlineSoftmax` runtime
 - [x] Real-TCP cluster, snapshot join, and new-voter proposal
 - [x] TP/PP/EP/DP/CP/SP operation planner
+- [x] EP MoE, DP optimizer, and PP stage-handoff execution
 - [x] Context- and tensor-parallel DSA reference execution
 - [x] Registered-memory descriptors, pooling, and loopback data plane
-- [ ] Real `ibverbs`/GPUDirect RDMA backend
+- [x] Real `ibverbs` backend and two-QP self-test (hardware execution blocked here)
+- [ ] GPUDirect RDMA and real multi-host hardware validation
 - [ ] Descriptor-only bulk contribution commands and completion queues
 - [ ] Per-domain consensus groups and hierarchical membership
 - [ ] Durable snapshots, identity persistence, and authenticated transport
-- [ ] MoE EP execution and pipeline-parallel scheduling on the planner
 - [ ] Larger-model DSA and attention benchmarks with RDMA traffic accounting
 
 ## Relationship to Ferrule
