@@ -194,10 +194,11 @@ over the same TCP path reports `errors=0` at:
 NCCL is faster because it uses a ring and avoids a serialized star root. The
 Plait TCP path still needs a ring implementation.
 
-`crates/plait-collective/src/bin/tcp-twolevel.rs` is a Rust implementation of
-the same host-leader shape. It is correct but currently slower than the C++
-hybrid because the Rust prototype serializes the four cross-host channels and
-copies the result back to the GPU every iteration.
+`crates/plait-collective/src/bin/tcp-twolevel.rs` implements the same hybrid
+shape in Rust: TCP worker input, eight cross-host channels, shared-memory
+result publication, and a ready barrier. It is correct but currently slower
+than the C++ hybrid (about 0.016 GB/s at 1 MiB), so the C++ measurement remains
+the parity evidence until the Rust threading/copy path is tightened.
 
 The hybrid path (`scripts/tcp-twolevel-hybrid.cu`) sends local inputs to the
 host leader, exchanges the aggregate over eight cross-host channels, and

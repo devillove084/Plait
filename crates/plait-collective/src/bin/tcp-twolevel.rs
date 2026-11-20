@@ -1,21 +1,85 @@
-//! Host-staged, two-level TCP allreduce.
+//! Host-staged two-level TCP allreduce.
 //!
-//! Local ranks send their partials to a host leader. The two host leaders
-//! exchange four full-duplex streams, then each leader broadcasts the result.
-//! This is a TCP fallback for hosts without RDMA, not a GPUDirect path.
+//! Four local ranks reduce into a host leader. The two host leaders exchange
+//! eight full-duplex channels, then publish the aggregate through shared
+//! memory to their local workers. This is a TCP fallback, not GPUDirect.
 
 use std::env;
+use std::ffi::CString;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 
 use plait_collective::ipc::PeerRegion;
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+#[repr(C, align(64))]
+struct Header {
+    start: AtomicU32,
+    output_ready: AtomicU32,
+}
+
+struct SharedResult {
+    fd: i32,
+    map: *mut u8,
+    size: usize,
+}
+
+unsafe impl Send for SharedResult {}
+
+impl SharedResult {
+    fn create(path: &str, bytes: usize) -> AnyResult<Self> {
+        let c_path = CString::new(path)?;
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let size = std::mem::size_of::<Header>() + bytes;
+        if unsafe { libc::ftruncate(fd, size as libc::off_t) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        if map == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(Self {
+            fd,
+            map: map.cast(),
+            size,
+        })
+    }
+
+    fn header(&self) -> &Header {
+        unsafe { &*self.map.cast::<Header>() }
+    }
+
+    fn result_ptr(&self) -> *mut f32 {
+        unsafe { self.map.add(std::mem::size_of::<Header>()).cast::<f32>() }
+    }
+}
+
+impl Drop for SharedResult {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.map.cast(), self.size);
+            libc::close(self.fd);
+        }
+    }
+}
+
 fn listen(port: u16) -> AnyResult<TcpListener> {
-    let listener = TcpListener::bind(("0.0.0.0", port))?;
-    Ok(listener)
+    Ok(TcpListener::bind(("0.0.0.0", port))?)
 }
 
 fn connect(ip: &str, port: u16) -> AnyResult<TcpStream> {
@@ -41,7 +105,11 @@ fn accept(listener: &TcpListener) -> AnyResult<TcpStream> {
     Ok(stream)
 }
 
-fn send_all(mut stream: TcpStream, bytes: Vec<u8>) -> AnyResult<()> {
+fn send_values(mut stream: TcpStream, values: &[f32]) -> AnyResult<()> {
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for value in values {
+        bytes.extend_from_slice(&value.to_ne_bytes());
+    }
     stream.write_all(&bytes)?;
     stream.flush()?;
     Ok(())
@@ -57,14 +125,6 @@ fn receive(stream: &mut TcpStream, count: usize) -> AnyResult<Vec<f32>> {
     Ok(values)
 }
 
-fn send_values(stream: TcpStream, values: &[f32]) -> AnyResult<()> {
-    let mut bytes = Vec::with_capacity(values.len() * 4);
-    for value in values {
-        bytes.extend_from_slice(&value.to_ne_bytes());
-    }
-    send_all(stream, bytes)
-}
-
 fn exchange(stream: TcpStream, send: Vec<f32>, count: usize) -> AnyResult<Vec<f32>> {
     let mut reader = stream.try_clone()?;
     let writer = thread::spawn(move || send_values(stream, &send));
@@ -78,9 +138,10 @@ fn exchange(stream: TcpStream, send: Vec<f32>, count: usize) -> AnyResult<Vec<f3
 fn main() -> AnyResult<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() != 9 {
-        return Err(
-            "usage: tcp-twolevel rank world gpu bytes iters local_ip remote_ip base_port".into(),
-        );
+        return Err(std::io::Error::other(
+            "usage: tcp-twolevel rank world gpu bytes iters local_ip remote_ip base_port",
+        )
+        .into());
     }
     let rank: usize = args[1].parse()?;
     let world: usize = args[2].parse()?;
@@ -97,6 +158,9 @@ fn main() -> AnyResult<()> {
     let input: Vec<f32> = (0..count).map(|_| (rank + 1) as f32).collect();
     region.write_host(&input)?;
 
+    let shm_path = format!("/dev/shm/plait-rust-hybrid-{base}");
+    let shared = SharedResult::create(&shm_path, bytes)?;
+
     let mut workers: Vec<TcpStream> = Vec::new();
     let mut crosses: Vec<TcpStream> = Vec::new();
     if rank == 0 {
@@ -106,7 +170,7 @@ fn main() -> AnyResult<()> {
         }
         drop(listener);
         let listener = listen(base + 8)?;
-        for _ in 0..4 {
+        for _ in 0..8 {
             crosses.push(accept(&listener)?);
         }
     } else if rank == 4 {
@@ -115,7 +179,7 @@ fn main() -> AnyResult<()> {
             workers.push(accept(&listener)?);
         }
         drop(listener);
-        for _ in 0..4 {
+        for _ in 0..8 {
             crosses.push(connect(local_ip, base + 8)?);
         }
     } else if is_local {
@@ -124,21 +188,26 @@ fn main() -> AnyResult<()> {
         workers.push(connect(remote_ip, base + 4)?);
     }
 
-    // Setup skew must not be counted as collective time.
-    let ready = [1u8; 1];
+    // All shared-memory and socket setup is outside the benchmark interval.
     if rank == 0 || rank == 4 {
         for worker in &mut workers {
-            worker.write_all(&ready)?;
+            worker.write_all(&[1])?;
         }
+        shared.header().start.store(1, Ordering::Release);
     } else {
         let mut token = [0u8; 1];
         workers[0].read_exact(&mut token)?;
+        while shared.header().start.load(Ordering::Acquire) == 0 {
+            thread::yield_now();
+        }
     }
 
     let start = std::time::Instant::now();
     let mut received = vec![0.0f32; count];
     let mut sum = vec![0.0f32; count];
+    let mut generation = 0u32;
     for _ in 0..iters {
+        generation += 1;
         if rank == 0 || rank == 4 {
             sum.fill(0.0);
             for (index, value) in input.iter().enumerate() {
@@ -158,30 +227,53 @@ fn main() -> AnyResult<()> {
                     sum[index] += value;
                 }
             }
-            let part = count / 4;
-            let mut cross_values = vec![vec![0.0f32; count]; 4];
-            for channel in 0..4 {
-                let begin = channel * part;
-                let end = if channel == 3 { count } else { begin + part };
-                let stream = crosses[channel].try_clone()?;
-                let remote = exchange(stream, sum[begin..end].to_vec(), end - begin)?;
-                cross_values[channel][begin..end].copy_from_slice(&remote);
-            }
+
+            let part = count / 8;
+            let mut cross_values = vec![vec![0.0f32; count]; 8];
+            let (sender, receiver) = std::sync::mpsc::channel();
+            thread::scope(|scope| {
+                for channel in 0..8 {
+                    let begin = channel * part;
+                    let end = if channel == 7 { count } else { begin + part };
+                    let payload = sum[begin..end].to_vec();
+                    let stream = crosses[channel].try_clone().expect("cross clone");
+                    let sender = sender.clone();
+                    scope.spawn(move || {
+                        let result = exchange(stream, payload, end - begin)
+                            .map(|values| (channel, begin, values));
+                        let _ = sender.send(result);
+                    });
+                }
+                drop(sender);
+                for _ in 0..8 {
+                    let message = receiver.recv().expect("cross channel closed");
+                    let (channel, begin, values) = message.expect("cross exchange failed");
+                    cross_values[channel][begin..begin + values.len()].copy_from_slice(&values);
+                }
+            });
             for value in cross_values {
                 for (index, item) in value.iter().enumerate() {
                     sum[index] += item;
                 }
             }
-            thread::scope(|scope| {
-                for worker in workers.iter_mut() {
-                    let payload = &sum;
-                    scope.spawn(move || send_values(worker.try_clone()?, payload));
-                }
-            });
+
+            unsafe {
+                std::ptr::copy_nonoverlapping(sum.as_ptr(), shared.result_ptr(), count);
+            }
+            shared
+                .header()
+                .output_ready
+                .store(generation, Ordering::Release);
             received.copy_from_slice(&sum);
         } else {
             send_values(workers[0].try_clone()?, &input)?;
-            received = receive(&mut workers[0], count)?;
+            while shared.header().output_ready.load(Ordering::Acquire) != generation {
+                thread::yield_now();
+            }
+            unsafe {
+                let result = std::slice::from_raw_parts(shared.result_ptr(), count);
+                received.copy_from_slice(result);
+            }
         }
         region.write_host(&received)?;
     }
@@ -198,6 +290,5 @@ fn main() -> AnyResult<()> {
         seconds * 1e3,
         algbw
     );
-    let _ = received;
     Ok(())
 }
