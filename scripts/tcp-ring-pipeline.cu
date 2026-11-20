@@ -5,9 +5,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <atomic>
-#include <condition_variable>
-#include <mutex>
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/epoll.h>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -25,104 +25,72 @@
     }                                                                          \
   } while (0)
 
-static void send_all(int fd, const void* data, size_t size) {
-  const char* p = static_cast<const char*>(data);
-  while (size > 0) {
-    ssize_t n = ::send(fd, p, size, MSG_NOSIGNAL);
-    if (n <= 0) { std::perror("send"); std::exit(1); }
-    p += n; size -= static_cast<size_t>(n);
-  }
-}
-static void recv_all(int fd, void* data, size_t size) {
-  char* p = static_cast<char*>(data);
-  while (size > 0) {
-    ssize_t n = ::recv(fd, p, size, 0);
-    if (n <= 0) { std::perror("recv"); std::exit(1); }
-    p += n; size -= static_cast<size_t>(n);
-  }
-}
-
-class Barrier {
- public:
-  explicit Barrier(int total) : total_(total) {}
-  void arrive_and_wait() {
-    std::unique_lock<std::mutex> lock(mutex_);
-    int generation = generation_;
-    if (++count_ == total_) {
-      count_ = 0;
-      ++generation_;
-      cv_.notify_all();
-    } else {
-      cv_.wait(lock, [&] { return generation_ != generation; });
-    }
-  }
- private:
-  int total_;
-  int count_ = 0;
-  int generation_ = 0;
-  std::mutex mutex_;
-  std::condition_variable cv_;
-};
-
 class Pipeline {
  public:
-  Pipeline(int next_fd, int prev_fd)
-      : next_fd_(next_fd), prev_fd_(prev_fd), start_(3), done_(3) {
-    sender_ = std::thread([this] { sender_loop(); });
-    receiver_ = std::thread([this] { receiver_loop(); });
-  }
-  ~Pipeline() {
-    stop_.store(true);
-    start_.arrive_and_wait();
-    sender_.join();
-    receiver_.join();
+  Pipeline(int next_fd, int prev_fd) : next_fd_(next_fd), prev_fd_(prev_fd) {
+    epoll_ = ::epoll_create1(0);
+    if (epoll_ < 0) { std::perror("epoll_create1"); std::exit(1); }
+    auto nonblock = [](int fd) {
+      int flags = ::fcntl(fd, F_GETFL, 0);
+      if (::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        std::perror("fcntl"); std::exit(1);
+      }
+    };
+    nonblock(next_fd_);
+    nonblock(prev_fd_);
+    epoll_event event{};
+    event.events = EPOLLOUT;
+    event.data.fd = next_fd_;
+    if (::epoll_ctl(epoll_, EPOLL_CTL_ADD, next_fd_, &event) < 0) {
+      std::perror("epoll_ctl next"); std::exit(1);
+    }
+    event.events = EPOLLIN;
+    event.data.fd = prev_fd_;
+    if (::epoll_ctl(epoll_, EPOLL_CTL_ADD, prev_fd_, &event) < 0) {
+      std::perror("epoll_ctl prev"); std::exit(1);
+    }
   }
 
-  // Both send and receive run concurrently; the caller updates data after
-  // both sides rendezvous. This removes the send-then-receive serialization.
-  void step(const float* send_ptr, float* recv_ptr, size_t count,
-            bool add_to_existing) {
-    send_ptr_ = send_ptr;
-    recv_ptr_ = recv_ptr;
-    count_ = count;
-    add_ = add_to_existing;
-    start_.arrive_and_wait();
-    done_.arrive_and_wait();
-  }
+  ~Pipeline() { ::close(epoll_); }
 
-  void copy_to(float* dst, const float* src, size_t count) const {
-    std::memcpy(dst, src, count * sizeof(float));
+  void step(float* send_ptr, float* recv_ptr, size_t count) {
+    const char* send_data = reinterpret_cast<const char*>(send_ptr);
+    char* recv_data = reinterpret_cast<char*>(recv_ptr);
+    size_t send_size = count * sizeof(float);
+    size_t recv_size = count * sizeof(float);
+    size_t sent = 0;
+    size_t received = 0;
+    while (sent < send_size || received < recv_size) {
+      epoll_event events[2];
+      int ready = ::epoll_wait(epoll_, events, 2, -1);
+      if (ready < 0) {
+        if (errno == EINTR) continue;
+        std::perror("epoll_wait");
+        std::exit(1);
+      }
+      for (int i = 0; i < ready; ++i) {
+        if (events[i].data.fd == next_fd_ && sent < send_size) {
+          ssize_t n = ::send(next_fd_, send_data + sent, send_size - sent, MSG_NOSIGNAL);
+          if (n > 0) sent += static_cast<size_t>(n);
+          else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            std::perror("send"); std::exit(1);
+          }
+        } else if (events[i].data.fd == prev_fd_ && received < recv_size) {
+          ssize_t n = ::recv(prev_fd_, recv_data + received, recv_size - received, 0);
+          if (n > 0) received += static_cast<size_t>(n);
+          else if (n == 0) { std::fprintf(stderr, "recv: peer closed\n"); std::exit(1); }
+          else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            std::perror("recv"); std::exit(1);
+          }
+        }
+      }
+    }
   }
 
  private:
-  void sender_loop() {
-    while (true) {
-      start_.arrive_and_wait();
-      if (stop_.load()) return;
-      send_all(next_fd_, send_ptr_, count_ * sizeof(float));
-      done_.arrive_and_wait();
-    }
-  }
-  void receiver_loop() {
-    while (true) {
-      start_.arrive_and_wait();
-      if (stop_.load()) return;
-      recv_all(prev_fd_, recv_ptr_, count_ * sizeof(float));
-      done_.arrive_and_wait();
-    }
-  }
-
   int next_fd_;
   int prev_fd_;
-  Barrier start_;
-  Barrier done_;
-  std::thread sender_;
-  std::thread receiver_;
-  const float* send_ptr_ = nullptr;
-  float* recv_ptr_ = nullptr;
-  size_t count_ = 0;
-  bool add_ = false;
-  std::atomic<bool> stop_{false};
+  int epoll_;
 };
 
 int main(int argc, char** argv) {
@@ -196,13 +164,13 @@ int main(int argc, char** argv) {
     for (int step = 0; step < world - 1; ++step) {
       int send_chunk = (rank + world - step) % world;
       int recv_chunk = (rank + world - step - 1) % world;
-      pipeline.step(data.data() + send_chunk * width, tmp.data(), width, true);
+      pipeline.step(data.data() + send_chunk * width, tmp.data(), width);
       for (size_t i = 0; i < width; ++i) data[recv_chunk * width + i] += tmp[i];
     }
     for (int step = 0; step < world - 1; ++step) {
       int send_chunk = (rank + world - step + 1) % world;
       int recv_chunk = (rank + world - step) % world;
-      pipeline.step(data.data() + send_chunk * width, data.data() + recv_chunk * width, width, false);
+      pipeline.step(data.data() + send_chunk * width, data.data() + recv_chunk * width, width);
     }
   }
   auto end = std::chrono::steady_clock::now();
