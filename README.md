@@ -197,7 +197,7 @@ Plait TCP path still needs a ring implementation.
 `crates/plait-collective/src/bin/tcp-twolevel.rs` implements the same hybrid
 shape in Rust: TCP worker input, eight cross-host channels, shared-memory
 result publication, and a ready barrier. It is correct but currently slower
-than the C++ hybrid (about 0.055 GB/s at 1 MiB and 0.13 GB/s at 16 MiB), so
+than the C++ hybrid (about 0.055 GB/s at 1 MiB and 0.22 GB/s at 16 MiB), so
 the C++ measurement remains the parity evidence until the Rust cross-host
 aggregation is tightened.
 

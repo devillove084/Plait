@@ -116,17 +116,15 @@ fn send_values(mut stream: TcpStream, values: &[f32]) -> AnyResult<()> {
     Ok(())
 }
 
-fn receive(stream: &mut TcpStream, count: usize) -> AnyResult<Vec<f32>> {
-    let mut bytes = vec![0u8; count * 4];
-    stream.read_exact(&mut bytes)?;
-    let mut values = Vec::with_capacity(count);
-    for chunk in bytes.chunks_exact(4) {
-        values.push(f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-    }
-    Ok(values)
+fn receive_into(stream: &mut TcpStream, values: &mut [f32]) -> AnyResult<()> {
+    let bytes = unsafe {
+        std::slice::from_raw_parts_mut(values.as_mut_ptr().cast::<u8>(), values.len() * 4)
+    };
+    stream.read_exact(bytes)?;
+    Ok(())
 }
 
-fn exchange_poll(stream: TcpStream, send: &[f32], count: usize) -> AnyResult<Vec<f32>> {
+fn exchange_poll_into(stream: TcpStream, send: &[f32], recv: &mut [f32]) -> AnyResult<()> {
     let fd = stream.as_raw_fd();
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
     if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
@@ -134,9 +132,8 @@ fn exchange_poll(stream: TcpStream, send: &[f32], count: usize) -> AnyResult<Vec
     }
     let send_bytes =
         unsafe { std::slice::from_raw_parts(send.as_ptr().cast::<u8>(), send.len() * 4) };
-    let mut recv = vec![0.0f32; count];
     let recv_bytes =
-        unsafe { std::slice::from_raw_parts_mut(recv.as_mut_ptr().cast::<u8>(), count * 4) };
+        unsafe { std::slice::from_raw_parts_mut(recv.as_mut_ptr().cast::<u8>(), recv.len() * 4) };
     let mut sent = 0usize;
     let mut received = 0usize;
     while sent < send_bytes.len() || received < recv_bytes.len() {
@@ -187,7 +184,7 @@ fn exchange_poll(stream: TcpStream, send: &[f32], count: usize) -> AnyResult<Vec
             }
         }
     }
-    Ok(recv)
+    Ok(())
 }
 
 fn main() -> AnyResult<()> {
@@ -260,6 +257,16 @@ fn main() -> AnyResult<()> {
     let start = std::time::Instant::now();
     let mut received = vec![0.0f32; count];
     let mut sum = vec![0.0f32; count];
+    let mut worker_buffers: Vec<Vec<f32>> = if rank == 0 || rank == 4 {
+        (0..workers.len()).map(|_| vec![0.0; count]).collect()
+    } else {
+        Vec::new()
+    };
+    let mut cross_values: Vec<Vec<f32>> = if rank == 0 || rank == 4 {
+        (0..4).map(|_| vec![0.0; count]).collect()
+    } else {
+        Vec::new()
+    };
     let mut generation = 0u32;
     for _ in 0..iters {
         generation += 1;
@@ -268,45 +275,43 @@ fn main() -> AnyResult<()> {
             for (index, value) in input.iter().enumerate() {
                 sum[index] += value;
             }
-            let mut buffers: Vec<Vec<f32>> = (0..workers.len()).map(|_| vec![0.0; count]).collect();
             thread::scope(|scope| {
-                for (worker, buffer) in workers.iter_mut().zip(buffers.iter_mut()) {
-                    scope.spawn(|| -> AnyResult<()> {
-                        buffer.copy_from_slice(&receive(worker, count)?);
-                        Ok(())
-                    });
+                for (worker, buffer) in workers.iter_mut().zip(worker_buffers.iter_mut()) {
+                    scope.spawn(|| receive_into(worker, buffer));
                 }
             });
-            for buffer in &buffers {
+            for buffer in &worker_buffers {
                 for (index, value) in buffer.iter().enumerate() {
                     sum[index] += value;
                 }
             }
 
             let part = count / 4;
-            let mut cross_values = vec![vec![0.0f32; count]; 4];
+            let mut cross_owned: Vec<Option<Vec<f32>>> = cross_values.drain(..).map(Some).collect();
             let (sender, receiver) = std::sync::mpsc::channel();
             thread::scope(|scope| {
                 for (channel, source) in crosses.iter().enumerate() {
                     let begin = channel * part;
                     let end = if channel == 3 { count } else { begin + part };
-                    let payload = sum[begin..end].to_vec();
+                    let mut buffer = cross_owned[channel].take().expect("cross buffer");
                     let stream = source.try_clone().expect("cross clone");
+                    let payload = &sum[begin..end];
                     let sender = sender.clone();
                     scope.spawn(move || {
-                        let result = exchange_poll(stream, &payload, end - begin)
-                            .map(|values| (channel, begin, values));
+                        let result = exchange_poll_into(stream, payload, &mut buffer[begin..end])
+                            .map(|_| (channel, buffer));
                         let _ = sender.send(result);
                     });
                 }
                 drop(sender);
                 for _ in 0..4 {
                     let message = receiver.recv().expect("cross channel closed");
-                    let (channel, begin, values) = message.expect("cross exchange failed");
-                    cross_values[channel][begin..begin + values.len()].copy_from_slice(&values);
+                    let (channel, buffer) = message.expect("cross exchange failed");
+                    cross_owned[channel] = Some(buffer);
                 }
             });
-            for value in cross_values {
+            cross_values.extend(cross_owned.into_iter().map(|v| v.expect("cross buffer")));
+            for value in &cross_values {
                 for (index, item) in value.iter().enumerate() {
                     sum[index] += item;
                 }
