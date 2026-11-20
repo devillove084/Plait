@@ -103,10 +103,11 @@ ordinary container exposes an active ibverbs device.
 
 - [x] Plait-side benchmark matrix with correctness checks for all six
   collectives (`--op`).
-- [ ] NCCL-side matrix for all six collectives (currently allreduce only).
-- [ ] Same rank counts, byte sizes, warmup, and iterations.
-- [ ] Correctness check with finite tolerance and per-rank errors.
-- [ ] JSON timeline and benchmark artifact per run.
+- [x] NCCL-side matrix for all six collectives (`just nccl-ops`).
+- [x] Same rank counts, byte sizes, warmup, and iterations for the 1 MiB run.
+- [x] Correctness checks with finite tolerance and per-rank errors.
+- [ ] Full size sweep across 4 KiB–64 MiB.
+- [ ] JSON timeline and benchmark artifact per run in CI.
 - [ ] CI gate on a GPU host; explicit skip only when hardware is absent.
 
 ## Current measured baseline

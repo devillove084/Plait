@@ -170,22 +170,22 @@ same `algbw_GB/s` / `busbw_GB/s` fields. On `pro5000` (8 ranks, 1 MiB):
 | reducescatter | 6.186 | 0.297 |
 | alltoall | 22.908 | 0.080 |
 
-`just nccl-ops` runs the NCCL and Plait sides for allreduce, broadcast, reduce,
-allgather, and reducescatter. 1 MiB, 8 ranks, one run:
+`just nccl-ops` runs the NCCL and Plait sides for all six core collectives.
+1 MiB, 8 ranks, one run:
 
 | Op | NCCL Bus BW (GB/s) | Plait Bus BW (GB/s) |
 |---|---:|---:|
-| allreduce | 0.894 | 0.063 |
-| broadcast | 1.308 | 0.090 |
-| reduce | 3.214 | 0.708 |
-| allgather | 0.934 | 0.067 |
-| reducescatter | 3.486 | 0.294 |
+| allreduce | 8.446 | 0.087 |
+| broadcast | 6.193 | 0.106 |
+| reduce | 3.219 | 0.704 |
+| allgather | 14.644 | 0.084 |
+| reducescatter | 12.775 | 0.295 |
+| alltoall | 14.213 | 0.099 |
 
-All correctness checks pass. NCCL alltoall is not in the current NCCL public
-header used here; Plait alltoall is validated separately. The performance gap is
-still large. `just nccl-ops` is the M7 artifact generator; JSON trace files are
-written by the Plait side when `--trace` is supplied. The full size sweep and
-alltoall NCCL path remain open.
+All correctness checks pass. The performance gap is still large. `just nccl-ops`
+is the M7 artifact generator; JSON trace files are written by the Plait side when
+`--trace` is supplied. The full size sweep and a CI performance threshold remain
+open. NCCL alltoall is implemented with grouped `ncclSend`/`ncclRecv`.
 
 ## Measured performance
 

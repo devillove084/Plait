@@ -270,7 +270,7 @@ static int run_matrix(Comm& state, const Options& options) {
     return errors == 0 ? 0 : 1;
 }
 
-enum class Op { AllReduce, Broadcast, Reduce, AllGather, ReduceScatter };
+enum class Op { AllReduce, Broadcast, Reduce, AllGather, ReduceScatter, AllToAll };
 
 static Op parse_op(const std::string& op) {
     if (op == "allreduce") return Op::AllReduce;
@@ -278,6 +278,7 @@ static Op parse_op(const std::string& op) {
     if (op == "reduce") return Op::Reduce;
     if (op == "allgather") return Op::AllGather;
     if (op == "reducescatter") return Op::ReduceScatter;
+    if (op == "alltoall") return Op::AllToAll;
     std::fprintf(stderr, "unknown op %s\n", op.c_str());
     std::exit(2);
 }
@@ -308,6 +309,25 @@ static void run_nccl_op(Comm& state, Op op, const std::vector<float*>& send,
                 NCCL_CHECK(ncclReduceScatter(send[i], recv[i], recv_count, ncclFloat,
                                              ncclSum, state.comms[i], state.streams[i]));
                 break;
+            case Op::AllToAll: {
+                const size_t chunk = count / state.comms.size();
+                for (size_t peer = 0; peer < state.comms.size(); ++peer) {
+                    if (peer == i) {
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            recv[i] + peer * chunk, send[i] + peer * chunk,
+                            chunk * sizeof(float), cudaMemcpyDeviceToDevice,
+                            state.streams[i]));
+                    } else {
+                        NCCL_CHECK(ncclSend(send[i] + peer * chunk, chunk, ncclFloat,
+                                            static_cast<int>(peer), state.comms[i],
+                                            state.streams[i]));
+                        NCCL_CHECK(ncclRecv(recv[i] + peer * chunk, chunk, ncclFloat,
+                                            static_cast<int>(peer), state.comms[i],
+                                            state.streams[i]));
+                    }
+                }
+                break;
+            }
         }
     }
     NCCL_CHECK(ncclGroupEnd());
@@ -323,7 +343,8 @@ static int run_collective(Comm& state, const Options& options) {
     size_t bytes = options.min_bytes;
     while (bytes <= options.max_bytes) {
         size_t count = std::max<size_t>(bytes / sizeof(float), 1);
-        if ((op == Op::AllGather || op == Op::ReduceScatter) && count % gpus != 0) {
+        if ((op == Op::AllGather || op == Op::ReduceScatter || op == Op::AllToAll)
+            && count % gpus != 0) {
             std::fprintf(stderr, "count must divide by ranks for %s\n", options.op.c_str());
             return 2;
         }
@@ -407,6 +428,18 @@ static int run_collective(Comm& state, const Options& options) {
                         }
                     }
                     errors = std::max(errors, count_errors(host_recv[rank], expected));
+                }
+            } else if (op == Op::AllToAll) {
+                const size_t chunk = count / gpus;
+                for (int destination = 0; destination < gpus; ++destination) {
+                    std::vector<double> expected(count);
+                    for (int source = 0; source < gpus; ++source) {
+                        for (size_t i = 0; i < chunk; ++i) {
+                            expected[source * chunk + i] =
+                                host_send[source][destination * chunk + i];
+                        }
+                    }
+                    errors = std::max(errors, count_errors(host_recv[destination], expected));
                 }
             }
         }

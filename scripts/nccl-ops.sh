@@ -10,7 +10,7 @@ if [ ! -x target/nccl-allreduce ] || [ scripts/nccl-allreduce.cu -nt target/nccl
 fi
 gpus=${PLAIT_NCCL_GPUS:-8}
 bytes=${PLAIT_BYTES:-1048576}
-for op in allreduce broadcast reduce allgather reducescatter; do
+for op in allreduce broadcast reduce allgather reducescatter alltoall; do
   target/nccl-allreduce --gpus "$gpus" --op "$op" --min-bytes "$bytes" \
     --max-bytes "$bytes" --warmup 5 --iters 20 | tail -1
   cargo run -q --locked -p plait-node -- collectives --gpus "$gpus" \
