@@ -90,6 +90,11 @@ impl std::error::Error for CollectiveError {}
 
 type Result<T, E = CollectiveError> = std::result::Result<T, E>;
 
+pub struct BroadcastPullWorkspace {
+    data: DeviceRingWorkspace,
+    width: usize,
+}
+
 pub struct AllToAllWorkspace {
     _data: Vec<crate::ipc::PeerRegion>,
     output: Vec<crate::ipc::PeerRegion>,
@@ -211,7 +216,7 @@ impl PeerGroup {
                 .load_function("plait_alltoall_push")
                 .map_err(|error| CollectiveError::new(format!("load alltoall kernel: {error}")))?;
             let scatter = module
-                .load_function("plait_scatter_root")
+                .load_function("plait_scatter_pull")
                 .map_err(|error| CollectiveError::new(format!("load scatter kernel: {error}")))?;
             ranks.push(GpuRank {
                 ctx,
@@ -440,9 +445,30 @@ impl PeerGroup {
     }
 
     pub fn broadcast_device(&self, value: Vec<f32>) -> Result<Vec<Vec<f32>>> {
+        let mut workspace = self.prepare_broadcast_pull(value)?;
+        self.launch_broadcast_pull(&mut workspace)?;
+        self.read_device_ring(&workspace.data)
+    }
+
+    pub fn broadcast_device_resident(
+        &self,
+        value: Vec<f32>,
+        iterations: usize,
+    ) -> Result<(std::time::Duration, Vec<Vec<f32>>)> {
+        let mut workspace = self.prepare_broadcast_pull(value)?;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            self.launch_broadcast_pull(&mut workspace)?;
+        }
+        let elapsed = start.elapsed();
+        Ok((elapsed, self.read_device_ring(&workspace.data)?))
+    }
+
+    fn prepare_broadcast_pull(&self, value: Vec<f32>) -> Result<BroadcastPullWorkspace> {
         use crate::ipc::PeerRegion;
         let n = self.world_size();
         let count = value.len();
+        let width = count.div_ceil(n);
         let mut data = Vec::with_capacity(n);
         for rank in 0..n {
             let region = PeerRegion::alloc(rank, count * std::mem::size_of::<f32>())?;
@@ -453,51 +479,39 @@ impl PeerGroup {
             }
             data.push(region);
         }
-        let pointer_vec: Vec<u64> = data.iter().map(|region| region.as_ptr() as u64).collect();
-        let mut pointer_bytes = Vec::with_capacity(n * 8);
-        for pointer in &pointer_vec {
-            pointer_bytes.extend_from_slice(&pointer.to_ne_bytes());
-        }
-        let table = PeerRegion::alloc(0, n * 8)?;
-        table.write_bytes(&pointer_bytes)?;
-        let width = count.div_ceil(n);
-        let stream = self.ranks[0].stream.clone();
-        let function = &self.ranks[0].scatter;
-        let source_ptr = data[0].as_ptr() as u64;
-        let table_ptr = table.as_ptr() as u64;
-        let n_i = n as i32;
-        let width_i = width as i32;
-        let mut launch = stream.launch_builder(function);
-        launch.arg(&source_ptr);
-        launch.arg(&table_ptr);
-        launch.arg(&n_i);
-        launch.arg(&width_i);
-        unsafe {
-            launch.launch(LaunchConfig {
-                grid_dim: (width.div_ceil(1024) as u32, 1, 1),
-                block_dim: (1024, 1, 1),
-                shared_mem_bytes: 0,
-            })
-        }
-        .map_err(driver("broadcast scatter launch"))?;
-        self.sync()?;
-        let mut workspace = self.prepare_allgather_from_data(data, count)?;
-        self.launch_device_ring(&mut workspace)?;
-        self.sync()?;
-        self.read_device_ring(&workspace)
+        let allgather = self.prepare_allgather_from_data(data, count)?;
+        Ok(BroadcastPullWorkspace {
+            data: allgather,
+            width,
+        })
     }
 
-    pub fn broadcast_device_resident(
-        &self,
-        value: Vec<f32>,
-        iterations: usize,
-    ) -> Result<(std::time::Duration, Vec<Vec<f32>>)> {
-        let start = std::time::Instant::now();
-        let mut output = Vec::new();
-        for _ in 0..iterations {
-            output = self.broadcast_device(value.clone())?;
+    fn launch_broadcast_pull(&self, workspace: &mut BroadcastPullWorkspace) -> Result<()> {
+        let n = self.world_size();
+        let root_ptr = workspace.data.data[0].as_ptr() as u64;
+        for rank in 0..n {
+            let stream = self.ranks[rank].stream.clone();
+            let function = &self.ranks[rank].scatter;
+            let local_ptr = workspace.data.data[rank].as_ptr() as u64;
+            let rank_i = rank as i32;
+            let width_i = workspace.width as i32;
+            let mut launch = stream.launch_builder(function);
+            launch.arg(&root_ptr);
+            launch.arg(&local_ptr);
+            launch.arg(&rank_i);
+            launch.arg(&width_i);
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (workspace.width.div_ceil(1024) as u32, 1, 1),
+                    block_dim: (1024, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(driver("broadcast pull launch"))?;
         }
-        Ok((start.elapsed(), output))
+        self.sync()?;
+        self.launch_device_ring(&mut workspace.data)?;
+        self.sync()
     }
 
     pub fn all_to_all_device(&self, inputs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {

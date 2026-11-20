@@ -1099,6 +1099,20 @@ pub fn run_collectives_demo(
             elapsed * 1e3
         );
     } else if device_ring {
+        if op == "broadcast" {
+            let checked = group.broadcast_device(inputs[0].clone())?;
+            validate_device_output("broadcast", &inputs, &expected, &checked)?;
+            let (duration, _) = group.broadcast_device_resident(inputs[0].clone(), iters)?;
+            let elapsed = duration.as_secs_f64() / iters as f64;
+            let bw = allreduce_bytes_f64(bytes) / elapsed / 1e9;
+            let busbw = bw * 2.0 * (ranks - 1) as f64 / ranks as f64;
+            println!(
+                "plait collectives: device-ring broadcast ranks={ranks} bytes={} time_ms={:.6} algbw_GB/s={bw:.3} busbw_GB/s={busbw:.3}",
+                (bytes / std::mem::size_of::<f32>()).max(1) * std::mem::size_of::<f32>(),
+                elapsed * 1e3
+            );
+            return Ok(());
+        }
         if op == "allgather" {
             let width = inputs[0].len() / ranks;
             let chunks: Vec<Vec<f32>> = inputs

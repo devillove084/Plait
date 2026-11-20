@@ -210,3 +210,16 @@ extern "C" __global__ void plait_scatter_root(
         }
     }
 }
+
+extern "C" __global__ void plait_scatter_pull(
+    const float* root,
+    float* local,
+    int rank,
+    int width)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int i = tid; i < width; i += stride) {
+        local[rank * width + i] = root[rank * width + i];
+    }
+}
