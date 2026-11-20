@@ -122,9 +122,14 @@ int main(int argc, char** argv) {
   CHECK(cudaMemcpy(data.data(), device, bytes, cudaMemcpyDeviceToHost));
 
   auto ip_for = [&](int r) -> const char* { return r < 4 ? local_ip : remote_ip; };
+  // Alternate local/remote ranks across the first eight ring positions.
+  const int order[12] = {0, 4, 1, 5, 2, 6, 3, 7, 8, 9, 10, 11};
+  int position = 0;
+  for (int i = 0; i < 12; ++i) if (order[i] == rank) position = i;
   int listen_port = base_port + rank;
-  int next_port = base_port + ((rank + 1) % world);
-  const char* next_ip = ip_for((rank + 1) % world);
+  int next_rank = order[(position + 1) % 12];
+  int next_port = base_port + next_rank;
+  const char* next_ip = ip_for(next_rank);
 
   int server = ::socket(AF_INET, SOCK_STREAM, 0);
   int yes = 1;
@@ -162,14 +167,14 @@ int main(int argc, char** argv) {
   for (int iteration = 0; iteration < iters; ++iteration) {
     data = initial;
     for (int step = 0; step < world - 1; ++step) {
-      int send_chunk = (rank + world - step) % world;
-      int recv_chunk = (rank + world - step - 1) % world;
+      int send_chunk = (position + world - step) % world;
+      int recv_chunk = (position + world - step - 1) % world;
       pipeline.step(data.data() + send_chunk * width, tmp.data(), width);
       for (size_t i = 0; i < width; ++i) data[recv_chunk * width + i] += tmp[i];
     }
     for (int step = 0; step < world - 1; ++step) {
-      int send_chunk = (rank + world - step + 1) % world;
-      int recv_chunk = (rank + world - step) % world;
+      int send_chunk = (position + world - step + 1) % world;
+      int recv_chunk = (position + world - step) % world;
       pipeline.step(data.data() + send_chunk * width, data.data() + recv_chunk * width, width);
     }
   }

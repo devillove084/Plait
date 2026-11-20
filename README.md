@@ -164,9 +164,11 @@ pair it completed with `errors=0` at 1 MiB and 16 MiB:
 
 A nonblocking ring variant is in `scripts/tcp-ring-pipeline.cu`. It uses
 `epoll` and nonblocking sockets, with send and receive in the same event loop.
-It completes with `errors=0`; 1 MiB ranges from 0.005 to 0.077 GB/s and 16 MiB
-from 0.046 to 0.283 GB/s depending on rank. The fastest ranks reach NCCL's
-0.273 GB/s at 16 MiB; the slowest ranks still trail badly.
+It completes with `errors=0`. With local and remote ranks interleaved around
+the ring, 1 MiB ranges from 0.019 to 0.024 GB/s and 16 MiB from 0.106 to
+0.216 GB/s. The spread is smaller than the unpinned ring, but NCCL's 0.050 and
+0.273 GB/s are still better. The TCP host-staged path remains a correctness
+fallback, not a winner.
 
 The star path is a correctness fallback, not a performance result. NCCL 2.28.9
 over the same TCP path reports `errors=0` at:
