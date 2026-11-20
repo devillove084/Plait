@@ -1,35 +1,37 @@
 ---- MODULE PlaitOrdering ----
 \* Finite ordering protocol safety model for the Plait control plane.
 \*
-\* This model abstracts messages and dependency metadata to the properties that
-\* matter for agreement: proposal, preaccept, accept, fast/slow commit, and
+\* This model abstracts messages but carries explicit dependency metadata for
+\* the properties that matter for agreement: proposal, preaccept, accept, fast/slow commit, and
 \* recovery with a committed-value guard. It is intentionally finite so TLC can
 \* enumerate every reachable state.
 EXTENDS Naturals, FiniteSets, TLC
 
-CONSTANTS Replicas, Instances, Commands, MaxBallot
+CONSTANTS Replicas, Instances, Commands, MaxBallot, Deps
 
 None == 0
 NoneRecord == [cmd |-> 0, ballot |-> 0, deps |-> {}, seq |-> 0]
 Quorums == {Q \in SUBSET Replicas : Cardinality(Q) * 2 > Cardinality(Replicas)}
 Leader(i) == CHOOSE r \in Replicas : TRUE
+DepsOf(i) == {j \in Instances : <<i, j>> \in Deps}
 
-VARIABLES proposed, preaccepted, accepted, committed, ballot
+VARIABLES proposed, preaccepted, accepted, committed, committed_deps, ballot
 
-vars == <<proposed, preaccepted, accepted, committed, ballot>>
+vars == <<proposed, preaccepted, accepted, committed, committed_deps, ballot>>
 
 Init ==
     /\ proposed = [i \in Instances |-> None]
     /\ preaccepted = [r \in Replicas |-> [i \in Instances |-> NoneRecord]]
     /\ accepted = [r \in Replicas |-> [i \in Instances |-> NoneRecord]]
     /\ committed = [r \in Replicas |-> [i \in Instances |-> None]]
+    /\ committed_deps = [r \in Replicas |-> [i \in Instances |-> {}]]
     /\ ballot = [i \in Instances |-> 1]
 
 Propose(i, c) ==
     /\ proposed[i] = None
     /\ c \in Commands
     /\ proposed' = [proposed EXCEPT ![i] = c]
-    /\ UNCHANGED <<preaccepted, accepted, committed, ballot>>
+    /\ UNCHANGED <<preaccepted, accepted, committed, committed_deps, ballot>>
 
 PreAccept(r, i) ==
     /\ proposed[i] # None
@@ -37,8 +39,8 @@ PreAccept(r, i) ==
     /\ accepted[r][i] = NoneRecord
     /\ preaccepted' =
         [preaccepted EXCEPT ![r][i] =
-            [cmd |-> proposed[i], ballot |-> ballot[i], deps |-> {}, seq |-> 1]]
-    /\ UNCHANGED <<proposed, accepted, committed, ballot>>
+            [cmd |-> proposed[i], ballot |-> ballot[i], deps |-> DepsOf(i), seq |-> 1]]
+    /\ UNCHANGED <<proposed, accepted, committed, committed_deps, ballot>>
 
 Accept(r, i) ==
     /\ preaccepted[r][i] # NoneRecord
@@ -49,7 +51,7 @@ Accept(r, i) ==
              ballot |-> ballot[i],
              deps |-> preaccepted[r][i].deps,
              seq |-> preaccepted[r][i].seq]]
-    /\ UNCHANGED <<proposed, preaccepted, committed, ballot>>
+    /\ UNCHANGED <<proposed, preaccepted, committed, committed_deps, ballot>>
 
 FastCommit(i) ==
     /\ proposed[i] # None
@@ -59,6 +61,8 @@ FastCommit(i) ==
             /\ preaccepted[r][i].cmd = proposed[i]
             /\ preaccepted[r][i].ballot = ballot[i]
     /\ committed' = [r \in Replicas |-> [committed[r] EXCEPT ![i] = proposed[i]]]
+    /\ committed_deps' =
+        [r \in Replicas |-> [committed_deps[r] EXCEPT ![i] = DepsOf(i)]]
     /\ UNCHANGED <<proposed, preaccepted, accepted, ballot>>
 
 SlowCommit(i) ==
@@ -68,6 +72,8 @@ SlowCommit(i) ==
                 accepted[r][i] # NoneRecord
                 /\ accepted[r][i].cmd = c
         /\ committed' = [r \in Replicas |-> [committed[r] EXCEPT ![i] = c]]
+        /\ committed_deps' =
+            [r \in Replicas |-> [committed_deps[r] EXCEPT ![i] = DepsOf(i)]]
         /\ UNCHANGED <<proposed, preaccepted, accepted, ballot>>
 
 \* A recovering leader may only choose a value that is either already committed
@@ -95,8 +101,8 @@ Recover(i) ==
        /\ proposed' = [proposed EXCEPT ![i] = value]
        /\ preaccepted' =
            [preaccepted EXCEPT ![Leader(i)][i] =
-               [cmd |-> value, ballot |-> ballot[i] + 1, deps |-> {}, seq |-> 1]]
-       /\ UNCHANGED <<accepted, committed>>
+               [cmd |-> value, ballot |-> ballot[i] + 1, deps |-> DepsOf(i), seq |-> 1]]
+       /\ UNCHANGED <<accepted, committed, committed_deps>>
 
 Next ==
     \/ \E i \in Instances, c \in Commands : Propose(i, c)
@@ -114,6 +120,12 @@ Agreement ==
         \A r1, r2 \in Replicas :
             committed[r1][i] # None /\ committed[r2][i] # None =>
                 committed[r1][i] = committed[r2][i]
+
+CommittedDepsStable ==
+    \A i \in Instances :
+        \A r1, r2 \in Replicas :
+            committed[r1][i] # None /\ committed[r2][i] # None =>
+                committed_deps[r1][i] = committed_deps[r2][i]
 
 \* A committed instance does not change value.
 CommittedStable ==

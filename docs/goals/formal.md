@@ -61,9 +61,9 @@ conditional on a correct SCC partition.
 - [x] Finite TLC model of ballots, preaccept/accept/commit, fast/slow commit,
   and recovery (`specs/PlaitOrdering.tla`); TLC checked Agreement and
   CommittedStable over 271,441 distinct states.
-- [x] Check agreement and committed stability for 3 replicas, 2 instances,
-  2 commands, ballots bounded by 2.
-- [ ] Model dependency merge explicitly; current records carry empty deps.
+- [x] Check agreement, committed stability, and committed dependency stability
+  for 3 replicas, 2 instances, 2 commands, ballots bounded by 2.
+- [x] Model explicit dependency merge; `CommittedDepsStable` is checked by TLC.
 - [ ] Model message loss, duplication, and reordering.
 - [ ] Check liveness for the recovery protocol; unified compute/fusion liveness
   is checked on the tiny instance.
