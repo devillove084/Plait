@@ -1501,7 +1501,7 @@ impl<S: StateMachine> Replica<S> {
 
     fn execute_ready(&mut self, now_ms: u64) {
         loop {
-            let batches = self.execution.ready_batches();
+            let batches = self.execution.ready_batches_for(self.id);
             if batches.is_empty() {
                 return;
             }

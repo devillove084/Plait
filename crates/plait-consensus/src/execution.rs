@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use plait_core::{Command, KeyClass, Mode};
+use plait_core::{Command, Key, KeyClass, Mode, NodeId};
 
 use crate::types::InstanceId;
 
@@ -280,6 +280,47 @@ impl ExecutionGraph {
                 .iter()
                 .map(|id| (self.nodes.get(id).map(|meta| meta.seq).unwrap_or(0), *id))
                 .min()
+        });
+        batches
+    }
+
+    /// Ready components with a locality bias for asymmetric scheduling.
+    /// Local device components sort before remote-only ones; independent
+    /// components commute, so this changes dispatch order, not state.
+    pub fn ready_batches_for(&self, local: NodeId) -> Vec<Vec<InstanceId>> {
+        let mut batches = self.ready_batches();
+        batches.sort_by_key(|batch| {
+            let remote = batch
+                .iter()
+                .map(|id| {
+                    self.nodes
+                        .get(id)
+                        .map(|meta| {
+                            meta.accesses
+                                .iter()
+                                .filter(|access| {
+                                    matches!(
+                                        access.key,
+                                        Key::Device(device) if device.node != local
+                                    )
+                                })
+                                .count()
+                        })
+                        .unwrap_or(0)
+                })
+                .sum::<usize>();
+            let key = batch
+                .iter()
+                .map(|id| (self.nodes.get(id).map(|meta| meta.seq).unwrap_or(0), *id))
+                .min()
+                .unwrap_or((
+                    0,
+                    InstanceId {
+                        proposer: local,
+                        counter: 0,
+                    },
+                ));
+            (remote, key)
         });
         batches
     }
