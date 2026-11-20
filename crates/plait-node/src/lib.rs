@@ -267,7 +267,10 @@ impl NodeState {
     }
 
     fn maybe_register_devices(&mut self, now: u64) {
-        if self.devices_registered || !self.replica.config().is_voter(self.id) {
+        if self.devices_registered
+            || !self.replica.config().is_voter(self.id)
+            || (self.join.is_some() && !self.joined)
+        {
             return;
         }
         let profiles = plait_device::discover(self.id);
