@@ -1022,15 +1022,19 @@ pub fn run_collectives_demo(
     bytes: usize,
     iters: usize,
     algorithm: &str,
+    channels: usize,
     trace: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use plait_collective::{AllReduceAlgorithm, PeerGroup};
     use std::time::Instant;
 
+    let requested = algorithm.to_owned();
     let algorithm = match algorithm {
         "ring" => AllReduceAlgorithm::Ring,
         "recursive" => AllReduceAlgorithm::RecursiveDoubling,
-        "tree" | "reduce-broadcast" => AllReduceAlgorithm::ReduceBroadcast,
+        "tree" => AllReduceAlgorithm::Tree,
+        "reduce-broadcast" => AllReduceAlgorithm::ReduceBroadcast,
+        "auto" => AllReduceAlgorithm::Ring,
         other => return Err(format!("unknown allreduce algorithm {other}").into()),
     };
 
@@ -1039,7 +1043,12 @@ pub fn run_collectives_demo(
     if ranks < 2 {
         return Err(format!("collectives need at least 2 ranks, found {available}").into());
     }
-    let mut group = PeerGroup::new(ranks)?;
+    let mut group = PeerGroup::new_with_channels(ranks, channels)?;
+    let algorithm = if requested == "auto" {
+        group.recommended_allreduce(bytes)
+    } else {
+        algorithm
+    };
     let count = (bytes / std::mem::size_of::<f32>()).max(1);
     let inputs: Vec<Vec<f32>> = (0..ranks)
         .map(|rank| {
@@ -1077,8 +1086,9 @@ pub fn run_collectives_demo(
     let algbw = allreduce_bytes as f64 / seconds / 1e9;
     let busbw = algbw * 2.0 * (ranks - 1) as f64 / ranks as f64;
     println!(
-        "plait collectives: {algorithm:?} allreduce ranks={} bytes={allreduce_bytes} time_ms={:.6} algbw_GB/s={algbw:.3} busbw_GB/s={busbw:.3}",
+        "plait collectives: {algorithm:?} allreduce ranks={} channels={} bytes={allreduce_bytes} time_ms={:.6} algbw_GB/s={algbw:.3} busbw_GB/s={busbw:.3}",
         group.world_size(),
+        group.channels(),
         seconds * 1e3
     );
     if let Some(path) = trace {

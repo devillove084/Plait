@@ -45,6 +45,48 @@ The trace is opt-in: when disabled there is no mutex on the collective hot
 path. The buffer is preallocated, event names are static strings, and no
 per-event `String` is allocated.
 
+## Channelized ring
+
+`PeerGroup::new_with_channels(world_size, channels)` creates one default stream
+plus `channels - 1` nonblocking streams per rank. Ring allreduce splits the
+message into disjoint channel segments; each channel runs on its own stream and
+the trace lane is `tid = rank * channels + channel`.
+
+```sh
+cargo run -q --locked -p plait-node -- collectives --gpus 8 --channels 2 --bytes 1048576 --iters 10
+```
+
+1 MiB, 8 ranks on `pro5000`:
+
+| Channels | Time (ms) | Bus BW (GB/s) |
+|---:|---:|---:|
+| 1 | 13.353 | 0.137 |
+| 2 | 30.422 | 0.060 |
+| 4 | 52.162 | 0.035 |
+
+More channels are currently **slower**. The stream pool and trace lanes are
+implemented, but the copy/kernel launch and cross-stream event overhead dominate
+at this size. This is recorded as a failed performance gate, not hidden.
+
+## Topology and tree
+
+`plait-collective/src/topology.rs` parses `nvidia-smi topo -m` into
+`LinkClass::{NvLink, Pix, Pxb, Phb, Node, Sys, Unknown}`. `--algorithm auto`
+uses the conservative `GpuTopology::recommended_allreduce`; an unavailable
+topology falls back to ring.
+
+The binary tree allreduce builds parent `rank & (rank - 1)` and runs a
+bottom-up reduce plus top-down broadcast. 1 MiB, 8 ranks on `pro5000`:
+
+| Algorithm | Time (ms) | Bus BW (GB/s) |
+|---|---:|---:|
+| Ring | 6.276 | 0.292 |
+| Tree | 3.996 | 0.459 |
+| NCCL | 0.218 | 8.436 |
+
+Tree is faster than the current ring at this size but still far below NCCL.
+CollNet/NVLS/PAT are not implemented and are never reported as available.
+
 ## Cross-process CUDA IPC
 
 `crates/plait-collective/src/ipc.rs` exports a real `cuMemAlloc` region with

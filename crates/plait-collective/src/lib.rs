@@ -12,6 +12,7 @@
 #![allow(clippy::needless_range_loop)]
 
 pub mod ipc;
+pub mod topology;
 
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
@@ -64,8 +65,10 @@ pub enum AllReduceAlgorithm {
     Ring,
     /// Log-step exchange; requires a power-of-two rank count.
     RecursiveDoubling,
-    /// Reduce to the root, then broadcast; a simple tree-shaped reference.
+    /// Reduce to the root, then broadcast; a chain/star reference.
     ReduceBroadcast,
+    /// Binary tree reduce followed by tree broadcast.
+    Tree,
 }
 
 #[derive(Debug)]
@@ -87,8 +90,19 @@ impl std::error::Error for CollectiveError {}
 
 type Result<T, E = CollectiveError> = std::result::Result<T, E>;
 
+struct ChannelBuffers {
+    channel: usize,
+    start: usize,
+    len: usize,
+    width: usize,
+    data: Vec<CudaSlice<f32>>,
+    receive: Vec<CudaSlice<f32>>,
+}
+
 struct GpuRank {
+    /// Channel 0 alias, kept for the single-stream path.
     stream: Arc<CudaStream>,
+    streams: Box<[Arc<CudaStream>]>,
     function: CudaFunction,
     _module: Arc<CudaModule>,
 }
@@ -102,6 +116,8 @@ pub struct TraceEvent {
     pub duration_us: f64,
     pub bytes: usize,
     pub algorithm: Option<&'static str>,
+    pub channel: usize,
+    pub channels: usize,
 }
 
 struct TraceBuffer {
@@ -112,11 +128,19 @@ struct TraceBuffer {
 /// One process owning one peer-enabled context per GPU.
 pub struct PeerGroup {
     ranks: Box<[GpuRank]>,
+    channels: usize,
     trace: Option<Mutex<TraceBuffer>>,
 }
 
 impl PeerGroup {
     pub fn new(gpus: usize) -> Result<Self> {
+        Self::new_with_channels(gpus, 1)
+    }
+
+    /// Create one primary context per rank and `channels` nonblocking streams
+    /// per context. Channel 0 is the default stream.
+    pub fn new_with_channels(gpus: usize, channels: usize) -> Result<Self> {
+        let channels = channels.max(1);
         let available = CudaContext::device_count()
             .map_err(|error| CollectiveError::new(format!("CUDA device count: {error}")))?;
         if gpus < 2 || gpus > available as usize {
@@ -129,7 +153,15 @@ impl PeerGroup {
             let ctx = CudaContext::new(ordinal).map_err(|error| {
                 CollectiveError::new(format!("CUDA context {ordinal}: {error}"))
             })?;
+            let mut streams = Vec::with_capacity(channels);
             let stream = ctx.default_stream();
+            streams.push(stream.clone());
+            for _ in 1..channels {
+                streams.push(
+                    ctx.new_stream()
+                        .map_err(|error| CollectiveError::new(format!("new stream: {error}")))?,
+                );
+            }
             #[cfg(plait_collective_cubin)]
             let ptx = {
                 use cudarc::nvrtc::Ptx;
@@ -148,12 +180,14 @@ impl PeerGroup {
                 .map_err(|error| CollectiveError::new(format!("load kernel: {error}")))?;
             ranks.push(GpuRank {
                 stream,
+                streams: streams.into_boxed_slice(),
                 function,
                 _module: module,
             });
         }
         let group = Self {
             ranks: ranks.into_boxed_slice(),
+            channels,
             trace: None,
         };
         group.peer_copy_check()?;
@@ -162,6 +196,18 @@ impl PeerGroup {
 
     pub fn world_size(&self) -> usize {
         self.ranks.len()
+    }
+
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
+
+    /// Select a conservative algorithm from the detected interconnect. A
+    /// missing topology falls back to ring rather than failing a collective.
+    pub fn recommended_allreduce(&self, bytes: usize) -> AllReduceAlgorithm {
+        topology::GpuTopology::detect()
+            .map(|topology| topology.recommended_allreduce(bytes))
+            .unwrap_or(AllReduceAlgorithm::Ring)
     }
 
     /// Compatibility alias for callers that think in devices rather than ranks.
@@ -211,16 +257,18 @@ impl PeerGroup {
             }
             write!(
                 output,
-                "{{\"name\":\"{}\",\"cat\":\"{}\",\"ph\":\"X\",\"ts\":{:.3},\"dur\":{:.3},\"pid\":1,\"tid\":{},\"args\":{{\"rank\":{},\"world_size\":{},\"bytes\":{},\"algorithm\":\"{}\"}}}}",
+                "{{\"name\":\"{}\",\"cat\":\"{}\",\"ph\":\"X\",\"ts\":{:.3},\"dur\":{:.3},\"pid\":1,\"tid\":{},\"args\":{{\"rank\":{},\"world_size\":{},\"bytes\":{},\"algorithm\":\"{}\",\"channel\":{},\"channels\":{}}}}}",
                 event.name,
                 event.category,
                 event.start_us,
                 event.duration_us,
-                event.rank.index(),
+                event.rank.index() * event.channels + event.channel,
                 event.rank.index(),
                 self.world_size(),
                 event.bytes,
                 event.algorithm.unwrap_or(""),
+                event.channel,
+                event.channels,
             )
             .map_err(|error| CollectiveError::new(format!("trace encoding: {error}")))?;
         }
@@ -239,6 +287,7 @@ impl PeerGroup {
         category: &'static str,
         bytes: usize,
         algorithm: Option<&'static str>,
+        channels: usize,
         started: Option<Instant>,
     ) {
         let (Some(started), Some(trace)) = (started, &self.trace) else {
@@ -248,16 +297,21 @@ impl PeerGroup {
         let mut trace = trace.lock().expect("trace mutex");
         let start_us = started.duration_since(trace.epoch).as_secs_f64() * 1e6;
         let duration_us = now.duration_since(started).as_secs_f64() * 1e6;
+        let channels = channels.max(1);
         for rank in 0..self.world_size() {
-            trace.events.push(TraceEvent {
-                name,
-                category,
-                rank: RankId::new(rank),
-                start_us,
-                duration_us,
-                bytes,
-                algorithm,
-            });
+            for channel in 0..channels {
+                trace.events.push(TraceEvent {
+                    name,
+                    category,
+                    rank: RankId::new(rank),
+                    start_us,
+                    duration_us,
+                    bytes,
+                    algorithm,
+                    channel,
+                    channels,
+                });
+            }
         }
     }
 
@@ -313,6 +367,12 @@ impl PeerGroup {
             if algorithm == AllReduceAlgorithm::ReduceBroadcast {
                 return self.all_reduce_reduce_broadcast(inputs);
             }
+            if algorithm == AllReduceAlgorithm::Tree {
+                return self.all_reduce_tree(inputs);
+            }
+            if self.channels > 1 {
+                return self.all_reduce_ring_channels(inputs);
+            }
             self.all_reduce_ring(inputs)
         })();
         if result.is_ok() {
@@ -320,8 +380,21 @@ impl PeerGroup {
                 AllReduceAlgorithm::Ring => "Ring",
                 AllReduceAlgorithm::RecursiveDoubling => "RecursiveDoubling",
                 AllReduceAlgorithm::ReduceBroadcast => "ReduceBroadcast",
+                AllReduceAlgorithm::Tree => "Tree",
             };
-            self.trace_record("all_reduce", "collective", bytes, Some(name), started);
+            let channels = if algorithm == AllReduceAlgorithm::Ring {
+                self.channels
+            } else {
+                1
+            };
+            self.trace_record(
+                "all_reduce",
+                "collective",
+                bytes,
+                Some(name),
+                channels,
+                started,
+            );
         }
         result
     }
@@ -331,7 +404,7 @@ impl PeerGroup {
         let bytes = value.len() * std::mem::size_of::<f32>();
         let result = self.broadcast_inner(value, root);
         if result.is_ok() {
-            self.trace_record("broadcast", "collective", bytes, None, started);
+            self.trace_record("broadcast", "collective", bytes, None, 1, started);
         }
         result
     }
@@ -392,7 +465,7 @@ impl PeerGroup {
         let bytes = inputs.first().map_or(0, Vec::len) * std::mem::size_of::<f32>();
         let result = self.reduce_inner(inputs, root);
         if result.is_ok() {
-            self.trace_record("reduce", "collective", bytes, None, started);
+            self.trace_record("reduce", "collective", bytes, None, 1, started);
         }
         result
     }
@@ -440,7 +513,7 @@ impl PeerGroup {
             chunks.first().map_or(0, Vec::len) * self.world_size() * std::mem::size_of::<f32>();
         let result = self.all_gather_inner(chunks);
         if result.is_ok() {
-            self.trace_record("all_gather", "collective", bytes, None, started);
+            self.trace_record("all_gather", "collective", bytes, None, 1, started);
         }
         result
     }
@@ -508,7 +581,7 @@ impl PeerGroup {
         let bytes = inputs.first().map_or(0, Vec::len) * std::mem::size_of::<f32>();
         let result = self.reduce_scatter_inner(inputs);
         if result.is_ok() {
-            self.trace_record("reduce_scatter", "collective", bytes, None, started);
+            self.trace_record("reduce_scatter", "collective", bytes, None, 1, started);
         }
         result
     }
@@ -555,7 +628,7 @@ impl PeerGroup {
         let bytes = inputs.first().map_or(0, Vec::len) * std::mem::size_of::<f32>();
         let result = self.all_to_all_inner(inputs);
         if result.is_ok() {
-            self.trace_record("all_to_all", "collective", bytes, None, started);
+            self.trace_record("all_to_all", "collective", bytes, None, 1, started);
         }
         result
     }
@@ -617,6 +690,145 @@ impl PeerGroup {
         }
         self.sync()?;
         self.collect(&output, count)
+    }
+
+    fn all_reduce_ring_channels(&self, inputs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
+        let n = self.ranks.len();
+        let count = inputs[0].len();
+        let segment = count.div_ceil(self.channels);
+        let mut channels = Vec::with_capacity(self.channels);
+        for channel in 0..self.channels {
+            let start = channel * segment;
+            if start >= count {
+                break;
+            }
+            let len = (count - start).min(segment);
+            let width = len.div_ceil(n);
+            let padded = width * n;
+            let mut data = Vec::with_capacity(n);
+            let mut receive = Vec::with_capacity(n);
+            for (rank, input) in inputs.iter().enumerate() {
+                let mut host = vec![0.0f32; padded];
+                host[..len].copy_from_slice(&input[start..start + len]);
+                data.push(
+                    self.ranks[rank].streams[channel]
+                        .clone_htod(&host)
+                        .map_err(driver("channel allocation"))?,
+                );
+                receive.push(
+                    self.ranks[rank].streams[channel]
+                        .alloc_zeros::<f32>(width)
+                        .map_err(driver("channel receive"))?,
+                );
+            }
+            channels.push(ChannelBuffers {
+                channel,
+                start,
+                len,
+                width,
+                data,
+                receive,
+            });
+        }
+
+        for buffers in &mut channels {
+            self.reduce_scatter_core_on(
+                buffers.channel,
+                &mut buffers.data,
+                &mut buffers.receive,
+                buffers.width,
+            )?;
+            self.all_gather_after_reduce_on(
+                buffers.channel,
+                &mut buffers.data,
+                &mut buffers.receive,
+                buffers.width,
+            )?;
+        }
+        self.sync()?;
+
+        let mut output = vec![vec![0.0f32; count]; n];
+        for buffers in &channels {
+            for rank in 0..n {
+                let host = self.ranks[rank].streams[buffers.channel]
+                    .clone_dtoh(&buffers.data[rank])
+                    .map_err(driver("channel copy"))?;
+                output[rank][buffers.start..buffers.start + buffers.len]
+                    .copy_from_slice(&host[..buffers.len]);
+            }
+        }
+        Ok(output)
+    }
+
+    fn reduce_scatter_core_on(
+        &self,
+        channel: usize,
+        data: &mut [CudaSlice<f32>],
+        receive: &mut [CudaSlice<f32>],
+        width: usize,
+    ) -> Result<()> {
+        let n = self.ranks.len();
+        for step in 0..n - 1 {
+            for rank in 0..n {
+                let destination = (rank + 1) % n;
+                let chunk = (rank + n - step) % n;
+                let range = chunk * width..(chunk + 1) * width;
+                self.copy_on(
+                    channel,
+                    rank,
+                    &data[rank],
+                    range.clone(),
+                    destination,
+                    &mut receive[destination],
+                    0..width,
+                )?;
+                self.add_on(
+                    channel,
+                    destination,
+                    &mut data[destination],
+                    range,
+                    &receive[destination],
+                    0..width,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn all_gather_after_reduce_on(
+        &self,
+        channel: usize,
+        data: &mut [CudaSlice<f32>],
+        receive: &mut [CudaSlice<f32>],
+        width: usize,
+    ) -> Result<()> {
+        let n = self.ranks.len();
+        for step in 0..n - 1 {
+            for rank in 0..n {
+                let destination = (rank + 1) % n;
+                let chunk = (rank + n - step + 1) % n;
+                let range = chunk * width..(chunk + 1) * width;
+                self.copy_on(
+                    channel,
+                    rank,
+                    &data[rank],
+                    range.clone(),
+                    destination,
+                    &mut receive[destination],
+                    0..width,
+                )?;
+                self.copy_on(
+                    channel,
+                    destination,
+                    &receive[destination],
+                    0..width,
+                    destination,
+                    &mut data[destination],
+                    range,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn all_reduce_ring(&self, inputs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
@@ -762,6 +974,84 @@ impl PeerGroup {
         self.collect(&data, count)
     }
 
+    fn all_reduce_tree(&self, inputs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
+        let n = self.ranks.len();
+        let count = inputs[0].len();
+        let mut data = Vec::with_capacity(n);
+        let mut receive = Vec::with_capacity(n);
+        for (rank, input) in inputs.iter().enumerate() {
+            data.push(
+                self.ranks[rank]
+                    .stream
+                    .clone_htod(input)
+                    .map_err(driver("tree allocation"))?,
+            );
+            receive.push(
+                self.ranks[rank]
+                    .stream
+                    .alloc_zeros::<f32>(count)
+                    .map_err(driver("tree receive"))?,
+            );
+        }
+
+        // Bottom-up reduction: rank r contributes to parent r & (r - 1).
+        for rank in (1..n).rev() {
+            let parent = rank & (rank - 1);
+            self.copy(
+                rank,
+                &data[rank],
+                0..count,
+                parent,
+                &mut receive[parent],
+                0..count,
+            )?;
+            self.add(
+                parent,
+                &mut data[parent],
+                0..count,
+                &receive[parent],
+                0..count,
+            )?;
+            self.ranks[parent]
+                .stream
+                .synchronize()
+                .map_err(driver("tree reduce sync"))?;
+        }
+        // Top-down broadcast.
+        for rank in 1..n {
+            let parent = rank & (rank - 1);
+            self.copy(
+                parent,
+                &data[parent],
+                0..count,
+                rank,
+                &mut receive[rank],
+                0..count,
+            )?;
+            self.copy(
+                rank,
+                &receive[rank],
+                0..count,
+                rank,
+                &mut data[rank],
+                0..count,
+            )?;
+            self.ranks[rank]
+                .stream
+                .synchronize()
+                .map_err(driver("tree broadcast sync"))?;
+        }
+        let mut output = Vec::with_capacity(n);
+        for rank in 0..n {
+            let host = self.ranks[rank]
+                .stream
+                .clone_dtoh(&data[rank])
+                .map_err(driver("tree copy"))?;
+            output.push(host[..count].to_vec());
+        }
+        Ok(output)
+    }
+
     fn all_reduce_reduce_broadcast(&self, inputs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
         let reduced = self.reduce_inner(inputs, 0)?;
         self.broadcast_inner(reduced, 0)
@@ -791,10 +1081,32 @@ impl PeerGroup {
         destination_buffer: &mut CudaSlice<f32>,
         destination_range: std::ops::Range<usize>,
     ) -> Result<()> {
+        self.copy_on(
+            0,
+            source,
+            source_buffer,
+            source_range,
+            destination,
+            destination_buffer,
+            destination_range,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_on(
+        &self,
+        channel: usize,
+        source: usize,
+        source_buffer: &CudaSlice<f32>,
+        source_range: std::ops::Range<usize>,
+        destination: usize,
+        destination_buffer: &mut CudaSlice<f32>,
+        destination_range: std::ops::Range<usize>,
+    ) -> Result<()> {
         let source_view = source_buffer.slice(source_range);
         let mut destination_view = destination_buffer.slice_mut(destination_range);
-        self.ranks[destination]
-            .stream
+        let stream = &self.ranks[destination].streams[channel];
+        stream
             .memcpy_dtod(&source_view, &mut destination_view)
             .map_err(driver("peer copy"))?;
         let _ = source;
@@ -809,11 +1121,30 @@ impl PeerGroup {
         source: &CudaSlice<f32>,
         source_range: std::ops::Range<usize>,
     ) -> Result<()> {
+        self.add_on(
+            0,
+            rank,
+            destination,
+            destination_range,
+            source,
+            source_range,
+        )
+    }
+
+    fn add_on(
+        &self,
+        channel: usize,
+        rank: usize,
+        destination: &mut CudaSlice<f32>,
+        destination_range: std::ops::Range<usize>,
+        source: &CudaSlice<f32>,
+        source_range: std::ops::Range<usize>,
+    ) -> Result<()> {
         let count = destination_range.len();
         if count == 0 {
             return Ok(());
         }
-        let stream = self.ranks[rank].stream.clone();
+        let stream = self.ranks[rank].streams[channel].clone();
         let function = &self.ranks[rank].function;
         let mut destination_view = destination.slice_mut(destination_range);
         let source_view = source.slice(source_range);
@@ -831,9 +1162,9 @@ impl PeerGroup {
 
     fn sync(&self) -> Result<()> {
         for rank in &self.ranks {
-            rank.stream
-                .synchronize()
-                .map_err(driver("collective sync"))?;
+            for stream in &rank.streams {
+                stream.synchronize().map_err(driver("collective sync"))?;
+            }
         }
         Ok(())
     }
@@ -898,6 +1229,7 @@ mod tests {
         for algorithm in [
             AllReduceAlgorithm::Ring,
             AllReduceAlgorithm::ReduceBroadcast,
+            AllReduceAlgorithm::Tree,
         ] {
             let output = group.all_reduce(&inputs, algorithm).expect("all_reduce");
             for values in output {
@@ -1025,6 +1357,39 @@ mod tests {
         assert!(text.contains("\"tid\":0"));
         assert!(text.contains("\"tid\":1"));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn channelized_allreduce_matches_cpu_reference_or_skips() {
+        let mut group = match PeerGroup::new_with_channels(2, 2) {
+            Ok(group) => group,
+            Err(error) => {
+                eprintln!("channelized allreduce skipped: {error}");
+                return;
+            }
+        };
+        let inputs = vec![
+            (0..65).map(|index| index as f32).collect::<Vec<_>>(),
+            (0..65)
+                .map(|index| (index * 2 + 1) as f32)
+                .collect::<Vec<_>>(),
+        ];
+        let expected = reference_sum(&inputs);
+        group.enable_trace(16);
+        let output = group
+            .all_reduce(&inputs, AllReduceAlgorithm::Ring)
+            .expect("channelized ring");
+        for values in output {
+            assert_eq!(values, expected);
+        }
+        let events = group.trace_events();
+        assert_eq!(events.len(), 4, "two ranks x two channels");
+        let mut tids: Vec<usize> = events
+            .iter()
+            .map(|event| event.rank.index() * event.channels + event.channel)
+            .collect();
+        tids.sort();
+        assert_eq!(tids, vec![0, 1, 2, 3]);
     }
 
     #[test]

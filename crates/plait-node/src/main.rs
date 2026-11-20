@@ -30,6 +30,7 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             let mut bytes = 1usize << 20;
             let mut iters = 20usize;
             let mut algorithm = "ring".to_owned();
+            let mut channels = 1usize;
             let mut trace = None;
             while let Some(arg) = args.next() {
                 match arg.as_str() {
@@ -39,13 +40,16 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     "--bytes" => bytes = args.next().ok_or("--bytes needs a number")?.parse()?,
                     "--iters" => iters = args.next().ok_or("--iters needs a number")?.parse()?,
                     "--algorithm" => algorithm = args.next().ok_or("--algorithm needs a value")?,
+                    "--channels" => {
+                        channels = args.next().ok_or("--channels needs a number")?.parse()?
+                    }
                     "--trace" => {
                         trace = Some(args.next().ok_or("--trace needs a path")?);
                     }
                     other => return Err(format!("unknown collectives argument {other}").into()),
                 }
             }
-            run_collectives_demo(gpus, bytes, iters, &algorithm, trace.as_deref())
+            run_collectives_demo(gpus, bytes, iters, &algorithm, channels, trace.as_deref())
         }
         "matrix" => {
             let mut manifest = None;

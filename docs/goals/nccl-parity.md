@@ -47,27 +47,29 @@ The IPC path passes; VMM and replicated-log descriptor exchange remain open.
 
 ### M3 — Channelized GPU execution
 
-- [ ] `PeerGroup::with_channels(C)` and per-rank stream pools.
-- [ ] Split each collective into C disjoint channel segments.
-- [ ] Ring reduce-scatter/all-gather enqueued across channels without a host
-  barrier per step.
-- [ ] CUDA events/flags for cross-channel readiness; one final synchronization.
-- [ ] Trace shows overlapping channel work; `--channels C` in the CLI.
-- [ ] Remove per-step `self.sync()` from every ring path (currently the explicit
-  barrier is gone, but the engine still has not been channelized).
+- [x] `PeerGroup::new_with_channels(C)` and per-rank stream pools.
+- [x] Split ring allreduce into C disjoint channel segments.
+- [x] Enqueue ring steps without a host barrier per step; one final sync.
+- [x] Trace channel lanes (`tid = rank * channels + channel`); `--channels C`.
+- [ ] CUDA events/flags for cross-channel readiness beyond stream ordering.
+- [ ] Performance gate: C=1/2/4 is correct, but the current copy/kernel
+  scheduling is slower with more channels.
 
-Acceptance: 8-rank, 1 MiB/16 MiB allreduce is correct with C=1/2/4 and the trace
-shows channel overlap.
+Acceptance: correctness passes for C=1/2/4; **performance does not yet pass**.
+The measured 1 MiB result is 0.137 GB/s at C=1, 0.060 at C=2, 0.035 at C=4.
+The channel engine is a structural step, not a performance win.
 
 ### M4 — Topology-aware algorithms
 
-- [ ] Read PCIe/NVLink topology (`nvidia-smi topo -m` or CUDA attributes).
-- [ ] Detect NVLink, PIX, PXB, NODE, SYS and build a rank tree.
-- [ ] Select ring vs tree vs reduce+broadcast by message size and topology.
-- [ ] Tree allreduce and tree broadcast/reduce.
-- [ ] CollNet/NVLS/PAT: implement only when the hardware exposes the required
-  capability; otherwise explicit fallback with a recorded reason.
-- [ ] Timeline records the selected algorithm and topology class.
+- [x] Read PCIe/NVLink topology (`nvidia-smi topo -m`); parse NVLink/PIX/PXB/
+  PHB/NODE/SYS.
+- [x] Conservative selection API; `--algorithm auto` falls back to ring when
+  topology discovery fails.
+- [x] Binary tree allreduce on the rank tree.
+- [ ] Tree broadcast/reduce and measured size/topology selection.
+- [x] Explicit fallback: CollNet/NVLS/PAT are never advertised as available;
+  the selector falls back to ring/reduce+broadcast.
+- [ ] Timeline records the selected topology class (algorithm is recorded).
 
 Acceptance: on the 8× Blackwell host (two NUMA groups, no NVLink) the selector
 prefers the measured faster algorithm for each size; on NVLink hardware it
