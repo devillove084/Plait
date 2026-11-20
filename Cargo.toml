@@ -26,6 +26,8 @@ bytes = "1"
 futures-util = { version = "0.3", features = ["sink"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
 tokio-util = { version = "0.7", features = ["codec"] }
+petgraph = "0.8"
+rayon = "1"
 plait-core = { path = "crates/plait-core" }
 plait-consensus = { path = "crates/plait-consensus" }
 plait-device = { path = "crates/plait-device" }

@@ -319,7 +319,8 @@ What is implemented and tested:
 - fast-path agreement and slow-path acceptance for conflicting proposals;
 - concurrent conflicting proposals from every node converging to the same state;
 - recovery by any replica after the original proposer stops;
-- dependency cycles executed through strongly connected components;
+- dependency cycles executed through cached strongly connected components,
+  with data/device/config/control edge classes and parallel ready-SCC batches;
 - membership add/remove with snapshots, staged learners, and unanimous
   promotion/removal;
 - three-node real-TCP submission, fusion, and query;

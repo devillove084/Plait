@@ -1,7 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use rayon::prelude::*;
+
 use plait_core::{Access, ClusterConfig, Command, Key, Mode, NodeId, QuorumPolicy};
 
+use crate::execution::ExecutionGraph;
 use crate::types::{
     Attrs, Ballot, InstanceId, Message, Options, Outbound, Phase, ProposeError, Record, Snapshot,
     Value, ValueState,
@@ -10,8 +13,28 @@ use crate::types::{
 /// The replicated state machine. The consensus layer is generic over it so the
 /// same protocol can drive tensor fusion, placement metadata, or a future
 /// device-control plane.
-pub trait StateMachine {
+pub trait StateMachine: Send + Sync {
     fn apply(&mut self, instance: InstanceId, command: &Command);
+
+    /// Whether independent SCC batches may run concurrently. A state machine
+    /// that returns true must implement `fork_batch`/`merge_batch` so the final
+    /// state is the same as sequential execution in batch order.
+    fn supports_parallel(&self) -> bool {
+        false
+    }
+
+    fn fork_batch(&self) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
+    fn merge_batch(&mut self, _other: Self)
+    where
+        Self: Sized,
+    {
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -56,6 +79,7 @@ pub struct Replica<S: StateMachine> {
     record_index: BTreeMap<Key, BTreeSet<InstanceId>>,
     indexed: BTreeSet<InstanceId>,
     executed: BTreeSet<InstanceId>,
+    execution: ExecutionGraph,
     executed_order: Vec<InstanceId>,
     counters: BTreeMap<NodeId, u64>,
     active: BTreeMap<InstanceId, Active>,
@@ -75,6 +99,7 @@ impl<S: StateMachine> Replica<S> {
             record_index: BTreeMap::new(),
             indexed: BTreeSet::new(),
             executed: BTreeSet::new(),
+            execution: ExecutionGraph::new(),
             executed_order: Vec::new(),
             counters: BTreeMap::new(),
             active: BTreeMap::new(),
@@ -1193,6 +1218,12 @@ impl<S: StateMachine> Replica<S> {
             self.insert_record(id, record);
         }
         self.active.remove(&id);
+        self.execution.commit(
+            id,
+            value.command.clone(),
+            value.attrs.seq,
+            &value.attrs.deps,
+        );
         if newly_committed {
             self.broadcast_commit(id, &value);
         }
@@ -1470,88 +1501,65 @@ impl<S: StateMachine> Replica<S> {
 
     fn execute_ready(&mut self, now_ms: u64) {
         loop {
-            let pending: BTreeSet<InstanceId> = self
-                .records
-                .iter()
-                .filter(|(id, record)| {
-                    matches!(record.phase, Phase::Committed) && !self.executed.contains(*id)
-                })
-                .map(|(id, _)| *id)
-                .collect();
-            if pending.is_empty() {
+            let batches = self.execution.ready_batches(&self.executed);
+            if batches.is_empty() {
                 return;
             }
-
-            let mut adjacency: BTreeMap<InstanceId, Vec<InstanceId>> = BTreeMap::new();
-            for id in &pending {
-                let deps = self
-                    .records
-                    .get(id)
-                    .map(|record| {
-                        record
-                            .value
-                            .attrs
-                            .deps
-                            .iter()
-                            .filter(|dep| pending.contains(*dep))
-                            .copied()
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                adjacency.insert(*id, deps);
-            }
-
-            let components = strongly_connected(&pending, &adjacency);
-            let mut best: Option<((u64, InstanceId), Vec<InstanceId>)> = None;
-            for component in components {
-                let ready =
-                    component.iter().all(|id| {
-                        self.records
-                            .get(id)
-                            .map(|record| {
-                                record.value.attrs.deps.iter().all(|dep| {
-                                    self.executed.contains(dep) || component.contains(dep)
-                                })
-                            })
-                            .unwrap_or(false)
-                    });
-                if !ready {
-                    continue;
-                }
-                let key = component
-                    .iter()
-                    .map(|id| {
-                        (
-                            self.records
-                                .get(id)
-                                .map(|record| record.value.attrs.seq)
-                                .unwrap_or(0),
-                            *id,
-                        )
-                    })
-                    .min()
-                    .expect("component is non-empty");
-                if best.as_ref().is_none_or(|(current, _)| key < *current) {
-                    best = Some((key, component));
-                }
-            }
-
-            let Some((_, mut component)) = best else {
-                // Everything is committed but at least one dependency is not.
-                // New commits will re-enter this function.
-                return;
-            };
-            component.sort_by_key(|id| {
-                (
+            if batches.len() > 1
+                && self.machine.supports_parallel()
+                && !batches.iter().flatten().any(|id| {
                     self.records
                         .get(id)
-                        .map(|record| record.value.attrs.seq)
-                        .unwrap_or(0),
-                    *id,
-                )
-            });
-            for id in component {
-                self.execute_instance(id, now_ms);
+                        .map(|record| record.value.command.is_membership())
+                        .unwrap_or(false)
+                })
+            {
+                self.execute_batches_parallel(batches, now_ms);
+            } else {
+                for batch in batches {
+                    for id in batch {
+                        self.execute_instance(id, now_ms);
+                    }
+                }
+            }
+        }
+    }
+
+    fn execute_batches_parallel(&mut self, batches: Vec<Vec<InstanceId>>, now_ms: u64)
+    where
+        S: Send + Sync,
+    {
+        let commands: Vec<Vec<(InstanceId, Command)>> = batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .iter()
+                    .filter_map(|id| {
+                        self.execution
+                            .command(*id)
+                            .cloned()
+                            .map(|command| (*id, command))
+                    })
+                    .collect()
+            })
+            .collect();
+        let results: Vec<(Vec<InstanceId>, S)> = commands
+            .into_par_iter()
+            .map(|commands| {
+                let mut machine = self
+                    .machine
+                    .fork_batch()
+                    .expect("supports_parallel implies fork_batch");
+                for (id, command) in &commands {
+                    machine.apply(*id, command);
+                }
+                (commands.iter().map(|(id, _)| *id).collect(), machine)
+            })
+            .collect();
+        for (batch, machine) in results {
+            self.machine.merge_batch(machine);
+            for id in batch {
+                self.finish_instance(id, now_ms);
             }
         }
     }
@@ -1564,6 +1572,24 @@ impl<S: StateMachine> Replica<S> {
             return;
         };
         let command = record.value.command.clone();
+        self.apply_membership(id, &command);
+        self.machine.apply(id, &command);
+        self.mark_instance_executed(id, now_ms);
+    }
+
+    fn finish_instance(&mut self, id: InstanceId, now_ms: u64) {
+        if self.executed.contains(&id) {
+            return;
+        }
+        let Some(record) = self.records.get(&id) else {
+            return;
+        };
+        let command = record.value.command.clone();
+        self.apply_membership(id, &command);
+        self.mark_instance_executed(id, now_ms);
+    }
+
+    fn apply_membership(&mut self, id: InstanceId, command: &Command) {
         if let Some(change) = command.membership() {
             if let Err(error) = self.config.apply(change) {
                 self.violations
@@ -1576,12 +1602,15 @@ impl<S: StateMachine> Replica<S> {
             self.active
                 .retain(|_, active| active.config_version == version);
         }
-        self.machine.apply(id, &command);
+    }
+
+    fn mark_instance_executed(&mut self, id: InstanceId, now_ms: u64) {
         if let Some(record) = self.records.get_mut(&id) {
             record.phase = Phase::Executed;
             record.updated_ms = now_ms;
         }
         self.executed.insert(id);
+        self.execution.mark_executed(id);
         self.executed_order.push(id);
         self.active.remove(&id);
     }
@@ -1596,7 +1625,18 @@ impl<S: StateMachine + Default> Replica<S> {
         }
         replica.executed = snapshot.executed_order.iter().copied().collect();
         replica.executed_order = snapshot.executed_order;
+        for (instance, record) in replica.records.clone() {
+            if matches!(record.phase, Phase::Committed | Phase::Executed) {
+                replica.execution.commit(
+                    instance,
+                    record.value.command.clone(),
+                    record.value.attrs.seq,
+                    &record.value.attrs.deps,
+                );
+            }
+        }
         for instance in replica.executed_order.clone() {
+            replica.execution.mark_executed(instance);
             let Some(record) = replica.records.get(&instance) else {
                 replica.violations.push(format!(
                     "{instance:?}: executed snapshot entry has no record"
@@ -1613,100 +1653,108 @@ impl<S: StateMachine + Default> Replica<S> {
     }
 }
 
-/// Tarjan's strongly connected components, used to order dependency cycles
-/// deterministically. Cycles arise from concurrent conflicting proposals; a
-/// topological sort alone would deadlock on them.
-fn strongly_connected(
-    nodes: &BTreeSet<InstanceId>,
-    adjacency: &BTreeMap<InstanceId, Vec<InstanceId>>,
-) -> Vec<Vec<InstanceId>> {
-    struct State<'a> {
-        adjacency: &'a BTreeMap<InstanceId, Vec<InstanceId>>,
-        index: usize,
-        indices: BTreeMap<InstanceId, usize>,
-        lowlink: BTreeMap<InstanceId, usize>,
-        stack: Vec<InstanceId>,
-        on_stack: BTreeSet<InstanceId>,
-        components: Vec<Vec<InstanceId>>,
-    }
-
-    fn visit(state: &mut State<'_>, node: InstanceId) {
-        let current = state.index;
-        state.index += 1;
-        state.indices.insert(node, current);
-        state.lowlink.insert(node, current);
-        state.stack.push(node);
-        state.on_stack.insert(node);
-
-        if let Some(neighbors) = state.adjacency.get(&node) {
-            for neighbor in neighbors {
-                if !state.indices.contains_key(neighbor) {
-                    visit(state, *neighbor);
-                    let low = state.lowlink[&node].min(state.lowlink[neighbor]);
-                    state.lowlink.insert(node, low);
-                } else if state.on_stack.contains(neighbor) {
-                    let low = state.lowlink[&node].min(state.indices[neighbor]);
-                    state.lowlink.insert(node, low);
-                }
-            }
-        }
-
-        if state.lowlink[&node] == state.indices[&node] {
-            let mut component = Vec::new();
-            loop {
-                let member = state.stack.pop().expect("stack has the SCC root");
-                state.on_stack.remove(&member);
-                component.push(member);
-                if member == node {
-                    break;
-                }
-            }
-            state.components.push(component);
-        }
-    }
-
-    let mut state = State {
-        adjacency,
-        index: 0,
-        indices: BTreeMap::new(),
-        lowlink: BTreeMap::new(),
-        stack: Vec::new(),
-        on_stack: BTreeSet::new(),
-        components: Vec::new(),
-    };
-    for node in nodes {
-        if !state.indices.contains_key(node) {
-            visit(&mut state, *node);
-        }
-    }
-    state.components
-}
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn instance(name: &str, counter: u64) -> InstanceId {
-        InstanceId {
-            proposer: NodeId::derive(name),
-            counter,
+    #[derive(Clone, Default)]
+    struct ParallelProbe {
+        seen: BTreeSet<InstanceId>,
+        current: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        max: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl StateMachine for ParallelProbe {
+        fn apply(&mut self, instance: InstanceId, _command: &Command) {
+            use std::sync::atomic::Ordering;
+            let current = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max.fetch_max(current, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            self.seen.insert(instance);
+            self.current.fetch_sub(1, Ordering::SeqCst);
+        }
+
+        fn supports_parallel(&self) -> bool {
+            true
+        }
+
+        fn fork_batch(&self) -> Option<Self> {
+            Some(self.clone())
+        }
+
+        fn merge_batch(&mut self, other: Self) {
+            self.seen.extend(other.seen);
         }
     }
 
     #[test]
-    fn strongly_connected_handles_dependency_cycles() {
-        let a = instance("scc-a", 1);
-        let b = instance("scc-b", 1);
-        let c = instance("scc-c", 1);
-        let nodes = BTreeSet::from([a, b, c]);
-        let adjacency = BTreeMap::from([(a, vec![b]), (b, vec![a]), (c, vec![a])]);
-        let mut components = strongly_connected(&nodes, &adjacency);
-        for component in &mut components {
-            component.sort();
-        }
-        components.sort();
-        assert_eq!(components.len(), 2);
-        assert!(components.contains(&vec![a, b]));
-        assert!(components.contains(&vec![c]));
+    fn independent_sccs_run_in_parallel() {
+        let node = NodeId::derive("parallel-probe");
+        let voters = BTreeSet::from([node]);
+        let config = ClusterConfig::bootstrap(voters.iter().copied());
+        let instance = |counter| InstanceId {
+            proposer: node,
+            counter,
+        };
+        let command = |value: f64, tensor: u128| Command::Publish {
+            key: plait_core::TensorKey::new(plait_core::TensorId(tensor), plait_core::ShardId(0)),
+            version: 1,
+            values: vec![value],
+        };
+        let records = vec![
+            (
+                instance(1),
+                Record {
+                    value: Value {
+                        command: command(1.0, 1),
+                        attrs: Attrs::new(1, BTreeSet::new()),
+                        ballot: Ballot::zero(node),
+                    },
+                    phase: Phase::Committed,
+                    quorum: QuorumPolicy::majority(&voters),
+                    config_version: 0,
+                    updated_ms: 1,
+                },
+            ),
+            (
+                instance(2),
+                Record {
+                    value: Value {
+                        command: command(2.0, 2),
+                        attrs: Attrs::new(2, BTreeSet::new()),
+                        ballot: Ballot::zero(node),
+                    },
+                    phase: Phase::Committed,
+                    quorum: QuorumPolicy::majority(&voters),
+                    config_version: 0,
+                    updated_ms: 1,
+                },
+            ),
+        ];
+        let mut replica: Replica<ParallelProbe> = Replica::from_snapshot(
+            node,
+            Snapshot {
+                config,
+                counters: BTreeMap::new(),
+                records,
+                executed_order: Vec::new(),
+            },
+            Options::default(),
+        );
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("test pool");
+        pool.install(|| replica.execute_ready(2));
+        assert_eq!(replica.executed_count(), 2);
+        assert!(
+            replica
+                .machine()
+                .max
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 2,
+            "independent SCCs should overlap"
+        );
     }
 
     #[test]

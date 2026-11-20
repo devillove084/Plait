@@ -160,6 +160,26 @@ pub enum Command {
     Membership(MembershipChange),
 }
 
+impl Key {
+    /// Coarse class used by the execution graph. Data and operator keys form
+    /// dataflow edges; device keys form resource edges; membership writes form
+    /// configuration edges.
+    pub const fn class(self) -> KeyClass {
+        match self {
+            Self::Tensor(_) | Self::Op(_) => KeyClass::Data,
+            Self::Device(_) => KeyClass::Device,
+            Self::Config => KeyClass::Config,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum KeyClass {
+    Data,
+    Device,
+    Config,
+}
+
 impl Command {
     /// Keys used by EPaxos conflict detection. The read of `Key::Config` means
     /// ordinary commands only conflict with a concurrent membership write.

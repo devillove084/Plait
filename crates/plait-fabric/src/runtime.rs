@@ -52,7 +52,7 @@ pub enum Event {
 /// runtime combines the partials locally and installs the resulting tensor
 /// shard. There is no rank-zero driver, no global barrier, and no separate
 /// all-reduce message.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Runtime {
     ops: BTreeMap<OpId, OpSpec>,
     pending: BTreeMap<OpId, BTreeMap<NodeId, Vec<f64>>>,
@@ -536,6 +536,31 @@ impl StateMachine for Runtime {
         }
         self.apply_command(command);
     }
+
+    fn supports_parallel(&self) -> bool {
+        true
+    }
+
+    /// Independent SCCs have disjoint write keys. Each worker starts from the
+    /// same replicated state and applies one complete SCC; the parent then
+    /// merges the resulting maps in deterministic batch order.
+    fn fork_batch(&self) -> Option<Self> {
+        let mut fork = self.clone();
+        fork.events.clear();
+        Some(fork)
+    }
+
+    fn merge_batch(&mut self, mut other: Self) {
+        self.applied.extend(other.applied);
+        self.ops.extend(other.ops);
+        self.pending.extend(other.pending);
+        self.results.extend(other.results);
+        self.shards.extend(other.shards);
+        self.members.extend(other.members);
+        self.devices.extend(other.devices);
+        self.placements.extend(other.placements);
+        self.events.append(&mut other.events);
+    }
 }
 
 #[cfg(test)]
@@ -584,6 +609,47 @@ mod tests {
                 values: vec![5.0, 6.0],
             },
         ]
+    }
+
+    #[test]
+    fn parallel_forks_merge_independent_writes() {
+        let base = Runtime::new();
+        let id = |counter| InstanceId {
+            proposer: node("fork"),
+            counter,
+        };
+        let publish = |tensor, value| Command::Publish {
+            key: TensorKey::new(TensorId(tensor), ShardId(0)),
+            version: 1,
+            values: vec![value],
+        };
+        let mut left = base
+            .fork_batch()
+            .expect("runtime supports parallel forking");
+        left.apply(id(1), &publish(1, 1.0));
+        let mut right = base
+            .fork_batch()
+            .expect("runtime supports parallel forking");
+        right.apply(id(2), &publish(2, 2.0));
+
+        let mut merged = base;
+        merged.merge_batch(left);
+        merged.merge_batch(right);
+        assert_eq!(
+            merged
+                .shard(TensorKey::new(TensorId(1), ShardId(0)))
+                .unwrap()
+                .values,
+            vec![1.0]
+        );
+        assert_eq!(
+            merged
+                .shard(TensorKey::new(TensorId(2), ShardId(0)))
+                .unwrap()
+                .values,
+            vec![2.0]
+        );
+        assert_eq!(merged.events().len(), 2);
     }
 
     #[test]

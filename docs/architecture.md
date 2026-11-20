@@ -120,16 +120,29 @@ recovery leader.
 
 ### Deterministic execution
 
-A committed instance is executable when every dependency is either executed or
-inside the same strongly connected component. Plait runs Tarjan's algorithm over
-committed-but-unexecuted instances, picks a ready component by
-`(minimum seq, minimum instance id)`, and executes its instances in
-`(seq, instance id)` order.
+`ExecutionGraph` is the explicit dynamic scheduler:
+
+- nodes are committed, unexecuted instances;
+- edges are EPaxos dependencies, classified from the conflicting access keys as
+  `Data` (tensor/operator), `Device` (compute reservation), `Config`
+  (membership), or `Control` (an explicit dependency with no shared key);
+- SCCs are computed with `petgraph`'s Tarjan implementation and cached until a
+  commit changes the graph. Executing a complete component removes it without
+  invalidating unrelated components;
+- `ready_batches` returns every component whose external dependencies are
+  executed, sorted by `(minimum seq, minimum instance id)`.
 
 Dependency cycles are the normal consequence of concurrent conflicting
-proposals; the SCC order is what prevents a topological-sort deadlock.
-Non-conflicting components commute, so replicas that learn them in different
-orders still reach the same tensor state.
+proposals; SCC order prevents a topological-sort deadlock. Independent
+components commute, so replicas that learn them in different orders still reach
+the same tensor state.
+
+`Runtime` opts into SCC-level parallel execution: each ready component is
+applied to a forked `Runtime`, then forks are merged in deterministic batch
+order. Batches containing membership commands stay serialized. A state machine
+that does not implement `fork_batch`/`merge_batch` keeps the sequential path.
+Forking currently clones the runtime state; the next step is a persistent or
+sharded state representation so parallel dispatch does not pay O(state) per SCC.
 
 ### Snapshots
 

@@ -13,6 +13,8 @@ Plait is a Rust 2024 workspace. The authoritative lock is the committed
 | `tokio-util` | 0.7 | Length-delimited framing |
 | `futures-util` | 0.3 | `Framed` stream/sink adapters |
 | `bytes` | 1 | Zero-copy framed payloads |
+| `petgraph` | 0.8 | Explicit execution graph and Tarjan SCC condensation |
+| `rayon` | 1 | Parallel ready-SCC dispatch and fork/merge execution |
 | `cudarc` | 0.19 | CUDA driver, NVRTC, kernel launch |
 | `CUTLASS` | v4.8.1 (cloned by `just setup`) | Official NVIDIA C++ GEMM templates, FFI shim |
 | `rdma-io` | 0.0.2, no async features | Safe RAII wrappers over rdma-core: device, PD, CQ, MR, QP, WR builders |
@@ -21,9 +23,10 @@ Plait is a Rust 2024 workspace. The authoritative lock is the committed
 | `libibverbs` | rdma-core 1.14+ (system) | Real RC queue pairs, MRs, one-sided RDMA |
 | `librdmacm` | rdma-core 1.3+ (system) | Link dependency of rdma-core; future CM integration |
 
-Standard library only is used for threads, sockets, channels, allocation, and
-time. There is no async runtime, no C++ and no Git submodule. The RDMA path uses
-the community `rdma-io` crate rather than a project-local ABI shim.
+Tokio is the only async runtime; Rayon provides the bounded CPU worker pool for
+parallel SCC dispatch. No C++ submodule is used: CUTLASS is cloned by `just
+setup` into `target/cutlass`. The RDMA path uses the community `rdma-io` crate
+rather than a project-local ABI shim.
 
 ## Updating a dependency
 

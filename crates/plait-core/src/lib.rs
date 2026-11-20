@@ -12,7 +12,7 @@ pub mod identity;
 pub mod tensor;
 
 pub use command::{
-    Access, Command, ComputeTask, FuseKind, Key, MembershipChange, Mode, OpId, OpSpec,
+    Access, Command, ComputeTask, FuseKind, Key, KeyClass, MembershipChange, Mode, OpId, OpSpec,
 };
 pub use config::{ClusterConfig, ConfigError, QuorumPolicy};
 pub use device::{AcceleratorKind, ComputeRequirement, DeviceId, DeviceProfile};

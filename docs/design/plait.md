@@ -53,6 +53,8 @@ while the reference runners use finer-grained commands to prove exactness.
 | Durability | Prototype in-memory; production WAL/snapshot target, RPO 0 for committed |
 | Security | Production mTLS + authorized membership; prototype trusted network |
 | Heterogeneous devices | CPU + NVIDIA + AMD + Huawei + PPU profiles in one registry | A rank cannot imply a vendor; placement is capability-driven |
+| Explicit dynamic execution graph | `petgraph` SCCs over committed EPaxos instances; cached between commits; edges classified as data/device/config/control | Ready components are visible to the scheduler; no per-tick O(V+E) rebuild; graph is the ordering authority | Fork/merge copies state per SCC; large state needs persistent/sharded maps |
+| SCC batch parallel dispatch | `Runtime` forks independent ready components and merges in deterministic batch order via Rayon | Uses available cores without breaking convergent state; conflict keys remain the parallelism contract | Membership batches are serialized; independent components must have disjoint write effects |
 
 ### Out of scope
 

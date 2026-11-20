@@ -8,5 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+petgraph.workspace = true
+rayon.workspace = true
 plait-core.workspace = true
 serde.workspace = true
