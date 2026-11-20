@@ -8,3 +8,4 @@ tlc -deadlock -config specs/PlaitOrderingTiny.cfg specs/PlaitOrderingTiny.tla
 tlc -deadlock -config specs/PlaitUnifiedSmall.cfg specs/PlaitUnifiedSmall.tla
 tlc -deadlock -config specs/PlaitUnifiedTiny.cfg specs/PlaitUnifiedTiny.tla
 tlc -deadlock -config specs/PlaitOrderingLive.cfg specs/PlaitOrderingSmall.tla
+tlc -deadlock -config specs/PlaitOrderingNetwork.cfg specs/PlaitOrderingNetwork.tla
