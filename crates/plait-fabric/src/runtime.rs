@@ -914,4 +914,36 @@ mod tests {
         );
         assert!(!runtime.members().contains_key(&new));
     }
+    #[test]
+    fn fused_runtime_events_conform_to_unified_tla_actions() {
+        let nodes = [node("a"), node("b"), node("c")];
+        let op = OpId::new(nodes[0], 1);
+        let mut runtime = Runtime::new();
+        apply(
+            &mut runtime,
+            1,
+            Command::DeclareOp(spec(op, FuseKind::Sum, nodes)),
+        );
+        for (index, command) in contributions().into_iter().enumerate() {
+            apply(&mut runtime, index as u64 + 2, command);
+        }
+
+        let expected = vec!["Declare", "Contribute", "Contribute", "Contribute", "Fuse"];
+        let observed: Vec<&str> = runtime
+            .events()
+            .iter()
+            .map(|event| match event {
+                Event::OpDeclared(_) => "Declare",
+                Event::Contribution { .. } => "Contribute",
+                Event::Fused { .. } => "Fuse",
+                _ => "Other",
+            })
+            .collect();
+        assert_eq!(observed, expected);
+        assert_eq!(
+            runtime.result(op),
+            Some([9.0, 12.0].as_slice()),
+            "Fuse must follow all three TLA Contribute actions"
+        );
+    }
 }
