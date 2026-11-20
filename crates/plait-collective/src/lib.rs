@@ -11,6 +11,8 @@
 
 #![allow(clippy::needless_range_loop)]
 
+pub mod ipc;
+
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -866,6 +868,15 @@ mod tests {
             }
         }
         output
+    }
+
+    #[test]
+    fn ipc_handle_roundtrips() {
+        let handle = crate::ipc::IpcHandle([0x5a; 64]);
+        assert_eq!(
+            crate::ipc::IpcHandle::from_hex(&handle.to_hex()).unwrap(),
+            handle
+        );
     }
 
     #[test]

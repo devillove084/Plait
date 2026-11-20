@@ -347,6 +347,8 @@ What is implemented and tested:
 - real CUDA peer-memory collectives across all visible GPUs, with correctness
   tests for ring/recursive/reduce-broadcast all-reduce, broadcast, reduce,
   all-gather, reduce-scatter, and all-to-all;
+- cross-process CUDA IPC peer memory and a two-process allreduce with no host
+  staging after setup (`just ipc`);
 - pooled/aligned memory, registered descriptors, and one-sided loopback
   transfers bounds-checked.
 

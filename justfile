@@ -48,6 +48,9 @@ hetero: setup
 collectives: setup
     cargo run -q --locked -p plait-node -- collectives --trace target/collectives-trace.json
 
+ipc: setup
+    ./scripts/ipc-peer.sh
+
 matrix: setup
     ./scripts/matrix-local.sh
 

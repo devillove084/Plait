@@ -45,6 +45,37 @@ The trace is opt-in: when disabled there is no mutex on the collective hot
 path. The buffer is preallocated, event names are static strings, and no
 per-event `String` is allocated.
 
+## Cross-process CUDA IPC
+
+`crates/plait-collective/src/ipc.rs` exports a real `cuMemAlloc` region with
+`cuIpcGetMemHandle`, imports it with `cuIpcOpenMemHandle`, and copies with
+`cuMemcpyPeerAsync`. `crates/plait-collective/src/bin/ipc-peer.rs` runs two OS
+processes, exchanges the receive handle over TCP, and runs a two-rank allreduce
+with the same cubin add kernel.
+
+```sh
+just ipc
+PLAIT_IPC_DEV0=0 PLAIT_IPC_DEV1=1 just ipc
+```
+
+Local result (same-GPU cross-process path; this host refuses cross-GPU IPC):
+
+```text
+ipc-peer: rank=1 gpu=0 bytes=256 checksum=381.000 ok
+ipc-peer: rank=0 gpu=0 bytes=256 checksum=381.000 ok
+```
+
+`pro5000` result (cross-GPU IPC):
+
+```text
+ipc-peer: rank=1 gpu=1 bytes=256 checksum=381.000 ok
+ipc-peer: rank=0 gpu=0 bytes=256 checksum=381.000 ok
+```
+
+The descriptor exchange in this harness is a TCP control test, not the EPaxos
+replicated log. VMM export is not implemented; the IPC path is the first half of
+M2. Host copies occur only for the initial input and final verification.
+
 ## Measured performance
 
 Eight RTX PRO 5000, 1 MiB, 8 ranks, 5 warmups / 10 timed iterations:

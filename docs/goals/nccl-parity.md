@@ -33,14 +33,17 @@ when the harness records correctness and a repeated benchmark result.
 
 ### M2 — Cross-process peer memory
 
-- [ ] CUDA IPC handle export/import for a peer allocation.
+- [x] CUDA IPC handle export/import for a peer allocation.
 - [ ] VMM (`cuMemCreate` + POSIX fd) path for allocations that cannot use IPC.
-- [ ] Descriptor exchange through the replicated log / TCP bootstrap.
-- [ ] Two-process, two-GPU allreduce with no host staging.
-- [ ] Timeline includes process/rank lanes.
+- [x] Experimental TCP descriptor exchange for the IPC peer test.
+- [ ] Integrate peer descriptors into the replicated log.
+- [x] Two-process, two-GPU allreduce with no host staging.
+- [ ] Timeline includes process/rank lanes (the two-process harness is not yet
+  part of the node trace).
 
 Acceptance: a two-process test imports a peer region, performs allreduce, and
 matches the CPU reference; no `cudaMemcpy` through the host after setup.
+The IPC path passes; VMM and replicated-log descriptor exchange remain open.
 
 ### M3 — Channelized GPU execution
 
