@@ -937,6 +937,58 @@ pub fn run_hetero_demo() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Execute real CUDA work on every visible NVIDIA device. The AXPY path uses a
 /// compact embedded cubin; the GEMM path goes through the CUTLASS C++ FFI.
+/// Benchmark one CUTLASS SGEMM per visible NVIDIA device.
+pub fn run_gpu_bench() -> Result<(), Box<dyn std::error::Error>> {
+    use std::time::Instant;
+    let node = NodeId::derive("gpu-bench");
+    let profiles = plait_device::discover(node);
+    let gpus: Vec<_> = profiles
+        .iter()
+        .filter(|profile| profile.arch == AcceleratorKind::Nvidia)
+        .collect();
+    if gpus.is_empty() {
+        println!("plait gpu-bench: no NVIDIA device discovered");
+        return Ok(());
+    }
+    let (m, n, k) = (1024usize, 1024usize, 1024usize);
+    let a: Vec<f32> = (0..m * k)
+        .map(|index| ((index * 17 + 3) % 23) as f32 * 0.125 - 1.0)
+        .collect();
+    let b: Vec<f32> = (0..k * n)
+        .map(|index| ((index * 11 + 5) % 19) as f32 * 0.25 - 2.0)
+        .collect();
+    let c = vec![0.0f32; m * n];
+    for profile in gpus {
+        let ordinal = profile.id.ordinal as usize;
+        let executor = match plait_gpu::GpuExecutor::new(ordinal) {
+            Ok(executor) => executor,
+            Err(error) => {
+                println!("plait gpu-bench: ordinal={ordinal} skipped: {error}");
+                continue;
+            }
+        };
+        // Warmup, then median-ish mean of five launches.
+        let _ = executor.sgemm(&a, &b, &c, m, n, k, 1.0, 0.0)?;
+        let iterations = 5usize;
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let output = executor.sgemm(&a, &b, &c, m, n, k, 1.0, 0.0)?;
+            if output.len() != m * n {
+                return Err("SGEMM output length mismatch".into());
+            }
+        }
+        let seconds = start.elapsed().as_secs_f64() / iterations as f64;
+        let gflops = (2.0 * m as f64 * n as f64 * k as f64) / seconds / 1e9;
+        println!(
+            "plait gpu-bench: ordinal={ordinal} name=\"{}\" m={m} n={n} k={k} ms={:.3} gflops={:.1}",
+            profile.name,
+            seconds * 1e3,
+            gflops
+        );
+    }
+    Ok(())
+}
+
 pub fn run_gpu_demo() -> Result<(), Box<dyn std::error::Error>> {
     let node = NodeId::derive("gpu-demo");
     let profiles = plait_device::discover(node);
@@ -1516,7 +1568,10 @@ pub fn run_gpu_rdma_probe() -> Result<(), Box<dyn std::error::Error>> {
 /// host A, the last six are host B. Only the driver host submits the command;
 /// both hosts keep their nodes alive for `hold_seconds`.
 /// Demonstrate the heterogeneous max-min planner on the real 4+8 mix.
-pub fn run_hetero_plan() -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_hetero_plan(
+    local_gflops: f64,
+    remote_gflops: f64,
+) -> Result<(), Box<dyn std::error::Error>> {
     use plait_parallel::{
         AsymmetricLayout, HeterogeneousLayout, LinkKind, RankProfile, RankWeight,
     };
@@ -1526,7 +1581,7 @@ pub fn run_hetero_plan() -> Result<(), Box<dyn std::error::Error>> {
         profiles.push(RankProfile {
             node: NodeId::derive(&format!("3090-{index}")),
             gpus: 1,
-            compute_units: 1.0,
+            compute_units: local_gflops / 1000.0,
             link: LinkKind::Pcie,
             bandwidth_gbps: Some(25.0),
             latency_us: Some(5.0),
@@ -1536,7 +1591,7 @@ pub fn run_hetero_plan() -> Result<(), Box<dyn std::error::Error>> {
         profiles.push(RankProfile {
             node: NodeId::derive(&format!("pro5000-{index}")),
             gpus: 1,
-            compute_units: 4.0,
+            compute_units: remote_gflops / 1000.0,
             link: LinkKind::Ub,
             bandwidth_gbps: Some(200.0),
             latency_us: Some(2.0),
@@ -1546,7 +1601,7 @@ pub fn run_hetero_plan() -> Result<(), Box<dyn std::error::Error>> {
     let message_bytes = 64 * 1024 * 1024;
     let plan = HeterogeneousLayout::plan_detailed(&profiles, message_bytes)?;
     println!(
-        "plait hetero-plan: ranks=12 message_mib=64 local_share={:.3} remote_share={:.3}",
+        "plait hetero-plan: local_gflops={local_gflops:.1} remote_gflops={remote_gflops:.1} ranks=12 message_mib=64 local_share={:.3} remote_share={:.3}",
         plan.shares[..4].iter().map(|(_, share)| share).sum::<f64>(),
         plan.shares[4..].iter().map(|(_, share)| share).sum::<f64>()
     );

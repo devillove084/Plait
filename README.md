@@ -125,9 +125,11 @@ just parallel    # EP MoE, DP optimizer, PP stage handoff
 just devices     # discovered device profiles
 just hetero      # capability-aware compute placement
 just hetero-plan # 4+8 heterogeneous LP demo
+cargo run -q -p plait-node -- hetero-plan --local-gflops 1394 --remote-gflops 4317
 just matrix      # 12-replica matrix collective
 just ipc         # two-process CUDA IPC allreduce
 just gpu         # CUDA AXPY and CUTLASS SGEMM
+just gpu-bench   # per-GPU CUTLASS SGEMM throughput
 just rdma        # real ibverbs or an explicit skip
 just ci          # fmt, lint, tests, demos
 ```

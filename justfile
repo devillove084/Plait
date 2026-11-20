@@ -79,6 +79,9 @@ profile: setup
 gpu: setup
     cargo run -q --locked -p plait-node -- gpu-demo
 
+gpu-bench: setup
+    cargo run -q --locked -p plait-node -- gpu-bench
+
 gpu-rdma: setup
     cargo run -q --locked -p plait-node -- gpu-rdma
 

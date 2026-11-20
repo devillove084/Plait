@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use plait_core::NodeId;
 use plait_node::{
     NodeConfig, RunningNode, run_collectives_demo, run_demo, run_devices, run_dsa_demo,
-    run_gpu_demo, run_gpu_rdma_probe, run_hetero_demo, run_hetero_plan, run_matrix_node,
-    run_parallel_demo, run_rdma_selftest,
+    run_gpu_bench, run_gpu_demo, run_gpu_rdma_probe, run_hetero_demo, run_hetero_plan,
+    run_matrix_node, run_parallel_demo, run_rdma_selftest,
 };
 
 #[tokio::main]
@@ -25,8 +25,24 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         "rdma-selftest" => run_rdma_selftest().await,
         "devices" => run_devices(),
         "hetero" => run_hetero_demo(),
-        "hetero-plan" => run_hetero_plan(),
+        "hetero-plan" => {
+            let mut local_gflops = 1.0;
+            let mut remote_gflops = 4.0;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--local-gflops" => {
+                        local_gflops = args.next().ok_or("--local-gflops needs a number")?.parse()?
+                    }
+                    "--remote-gflops" => {
+                        remote_gflops = args.next().ok_or("--remote-gflops needs a number")?.parse()?
+                    }
+                    other => return Err(format!("unknown hetero-plan argument {other}").into()),
+                }
+            }
+            run_hetero_plan(local_gflops, remote_gflops)
+        }
         "gpu-demo" => run_gpu_demo(),
+        "gpu-bench" => run_gpu_bench(),
         "gpu-rdma" => run_gpu_rdma_probe(),
         "collectives" => {
             let mut gpus = 0usize;
@@ -144,7 +160,7 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         other => Err(format!(
-            "unknown command {other}; expected run, demo, dsa, parallel, rdma-selftest, devices, hetero, gpu-demo, or id"
+            "unknown command {other}; expected run, demo, dsa, parallel, rdma-selftest, devices, hetero, gpu-demo, gpu-bench, gpu-rdma, or id"
         )
         .into()),
     }
