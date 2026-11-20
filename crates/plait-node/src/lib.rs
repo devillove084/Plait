@@ -1014,6 +1014,83 @@ pub fn run_gpu_demo() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Benchmark the peer-memory all-reduce against the same byte count used by
+/// the NCCL `all_reduce_perf` harness. This is intentionally separate from the
+/// consensus matrix runner: it measures the GPU data plane, not agreement.
+pub fn run_collectives_demo(
+    gpus: usize,
+    bytes: usize,
+    iters: usize,
+    algorithm: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use plait_collective::{AllReduceAlgorithm, PeerGroup};
+    use std::time::Instant;
+
+    let algorithm = match algorithm {
+        "ring" => AllReduceAlgorithm::Ring,
+        "recursive" => AllReduceAlgorithm::RecursiveDoubling,
+        "tree" | "reduce-broadcast" => AllReduceAlgorithm::ReduceBroadcast,
+        other => return Err(format!("unknown allreduce algorithm {other}").into()),
+    };
+
+    let available = cudarc_device_count();
+    let gpus = if gpus == 0 { available } else { gpus };
+    if gpus < 2 {
+        return Err(format!("collectives need at least 2 GPUs, found {available}").into());
+    }
+    let group = PeerGroup::new(gpus)?;
+    let count = (bytes / std::mem::size_of::<f32>()).max(1);
+    let inputs: Vec<Vec<f32>> = (0..gpus)
+        .map(|rank| {
+            (0..count)
+                .map(|index| (rank + 1) as f32 + (index % 17) as f32 * 0.001)
+                .collect()
+        })
+        .collect();
+    let expected: Vec<f32> = (0..count)
+        .map(|index| {
+            let sum = (1..=gpus).sum::<usize>() as f32;
+            sum + (index % 17) as f32 * 0.001 * gpus as f32
+        })
+        .collect();
+    for _ in 0..5 {
+        for values in group.all_reduce(&inputs, algorithm)? {
+            if values
+                .iter()
+                .zip(&expected)
+                .any(|(actual, expected)| (*actual - *expected).abs() > 1e-3)
+            {
+                return Err("collective correctness check failed".into());
+            }
+        }
+    }
+    let start = Instant::now();
+    for _ in 0..iters {
+        group.all_reduce(&inputs, algorithm)?;
+    }
+    let seconds = start.elapsed().as_secs_f64() / iters as f64;
+    let allreduce_bytes = count * std::mem::size_of::<f32>();
+    let algbw = allreduce_bytes as f64 / seconds / 1e9;
+    let busbw = algbw * 2.0 * (gpus - 1) as f64 / gpus as f64;
+    println!(
+        "plait collectives: {algorithm:?} allreduce gpus={gpus} bytes={allreduce_bytes} time_ms={:.6} algbw_GB/s={algbw:.3} busbw_GB/s={busbw:.3}",
+        seconds * 1e3
+    );
+    Ok(())
+}
+
+fn cudarc_device_count() -> usize {
+    // Keep the dependency-contained probe local to the demo; a host without
+    // CUDA reports zero rather than panicking.
+    std::process::Command::new("nvidia-smi")
+        .args(["-L"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).lines().count())
+        .unwrap_or(0)
+}
+
 /// Run one host's share of a two-host 12-replica matrix collective.
 ///
 /// Manifest lines are `hex-node-id@listen-address`. The first six entries are

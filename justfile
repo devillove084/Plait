@@ -45,6 +45,9 @@ devices: setup
 hetero: setup
     cargo run -q --locked -p plait-node -- hetero
 
+collectives: setup
+    cargo run -q --locked -p plait-node -- collectives
+
 matrix: setup
     ./scripts/matrix-local.sh
 

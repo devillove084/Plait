@@ -6,6 +6,7 @@ members = [
     "crates/plait-mem",
     "crates/plait-fabric",
     "crates/plait-gpu",
+    "crates/plait-collective",
     "crates/plait-parallel",
     "crates/plait-rdma",
     "crates/plait-net",
@@ -33,6 +34,7 @@ plait-consensus = { path = "crates/plait-consensus" }
 plait-device = { path = "crates/plait-device" }
 plait-fabric = { path = "crates/plait-fabric" }
 plait-gpu = { path = "crates/plait-gpu" }
+plait-collective = { path = "crates/plait-collective" }
 plait-mem = { path = "crates/plait-mem" }
 plait-parallel = { path = "crates/plait-parallel" }
 plait-rdma = { path = "crates/plait-rdma" }

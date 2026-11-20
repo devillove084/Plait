@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use plait_core::NodeId;
 use plait_node::{
-    NodeConfig, RunningNode, run_demo, run_devices, run_dsa_demo, run_gpu_demo, run_hetero_demo,
-    run_matrix_node, run_parallel_demo, run_rdma_selftest,
+    NodeConfig, RunningNode, run_collectives_demo, run_demo, run_devices, run_dsa_demo,
+    run_gpu_demo, run_hetero_demo, run_matrix_node, run_parallel_demo, run_rdma_selftest,
 };
 
 #[tokio::main]
@@ -25,6 +25,22 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         "devices" => run_devices(),
         "hetero" => run_hetero_demo(),
         "gpu-demo" => run_gpu_demo(),
+        "collectives" => {
+            let mut gpus = 0usize;
+            let mut bytes = 1usize << 20;
+            let mut iters = 20usize;
+            let mut algorithm = "ring".to_owned();
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--gpus" => gpus = args.next().ok_or("--gpus needs a number")?.parse()?,
+                    "--bytes" => bytes = args.next().ok_or("--bytes needs a number")?.parse()?,
+                    "--iters" => iters = args.next().ok_or("--iters needs a number")?.parse()?,
+                    "--algorithm" => algorithm = args.next().ok_or("--algorithm needs a value")?,
+                    other => return Err(format!("unknown collectives argument {other}").into()),
+                }
+            }
+            run_collectives_demo(gpus, bytes, iters, &algorithm)
+        }
         "matrix" => {
             let mut manifest = None;
             let mut start = 0usize;

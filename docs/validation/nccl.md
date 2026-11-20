@@ -63,7 +63,9 @@ NCCL all-reduce bandwidth sweep (`just nccl-sweep`):
   change the packing without changing the reference.
 - The Plait matrix currently carries values in consensus commands. Bulk
   registered-memory/RDMA transfer and GPU-resident all-reduce are separate work;
-  this comparison must not be used as a bandwidth claim.
+  this comparison must not be used as a bandwidth claim. The peer-memory
+  collective implementation and its measured gap are in
+  [collectives.md](collectives.md).
 
 ## Reproduce
 

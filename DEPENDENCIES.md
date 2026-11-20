@@ -16,7 +16,7 @@ Plait is a Rust 2024 workspace. The authoritative lock is the committed
 | `petgraph` | 0.8 | Test-oracle Tarjan SCC reference for the online execution graph |
 | `rayon` | 1 | Parallel ready-SCC dispatch and fork/merge execution |
 | `NCCL` | 2.30.4 (system, optional) | Validation harness comparison; not a Plait runtime dependency |
-| `cudarc` | 0.19 | CUDA driver, NVRTC, kernel launch |
+| `cudarc` | 0.19 | CUDA driver, NVRTC, kernel launch, peer-context copies |
 | `CUTLASS` | v4.8.1 (cloned by `just setup`) | Official NVIDIA C++ GEMM templates, FFI shim |
 | `rdma-io` | 0.0.2, no async features | Safe RAII wrappers over rdma-core: device, PD, CQ, MR, QP, WR builders |
 | `rdma-io-sys` | 0.0.1 | Generated rdma-core FFI used for QP attributes |

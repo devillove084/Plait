@@ -302,6 +302,7 @@ the unanimous promotion, and then proposes like every other voter.
 | `plait-parallel` | TP/PP/EP/DP/CP/SP planner; DSA, MoE, DP, and PP reference runners |
 | `plait-device` | vendor discovery, `DeviceProfile` capability model, deterministic scheduler |
 | `plait-gpu` | real CUDA AXPY and CUTLASS SGEMM execution |
+| `plait-collective` | peer-memory GPU collectives; ring/recursive/tree all-reduce, broadcast, reduce, all-gather, reduce-scatter, all-to-all |
 | `plait-node` | real cluster process, join/snapshot flow, client, demos |
 
 See the design of record in [docs/design/plait.md](docs/design/plait.md) with
@@ -339,6 +340,9 @@ What is implemented and tested:
   runs when a device is present;
 - a 12-contribution matrix checksum matching NVIDIA NCCL all-reduce at 8x8x6
   and 64x64x64, using `nccl-tests`-style warmup, timing, and bus bandwidth;
+- real CUDA peer-memory collectives across all visible GPUs, with correctness
+  tests for ring/recursive/reduce-broadcast all-reduce, broadcast, reduce,
+  all-gather, reduce-scatter, and all-to-all;
 - pooled/aligned memory, registered descriptors, and one-sided loopback
   transfers bounds-checked.
 

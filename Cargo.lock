@@ -313,6 +313,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
+name = "plait-collective"
+version = "0.2.0"
+dependencies = [
+ "cudarc",
+]
+
+[[package]]
 name = "plait-consensus"
 version = "0.2.0"
 dependencies = [
@@ -380,6 +387,7 @@ dependencies = [
 name = "plait-node"
 version = "0.2.0"
 dependencies = [
+ "plait-collective",
  "plait-consensus",
  "plait-core",
  "plait-device",

@@ -17,6 +17,7 @@ plait-consensus.workspace = true
 plait-device.workspace = true
 plait-fabric.workspace = true
 plait-gpu.workspace = true
+plait-collective.workspace = true
 plait-parallel.workspace = true
 plait-rdma.workspace = true
 plait-net.workspace = true
