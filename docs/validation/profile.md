@@ -83,9 +83,10 @@ Resident measurements on `pro5000`, 8 ranks, C=4:
 | 16 MiB | 27.401 GB/s | 22.282 GB/s | 1.23× |
 | 64 MiB | 27.349 GB/s | 23.817 GB/s | 1.15× |
 
-At 1 MiB and 16 MiB the device paths now beat NCCL for all six operations. The
-device paths are selected with `--device-ring`; the host-driven path remains
-available for comparison.
+At 1 MiB and 16 MiB the device paths beat NCCL for all six operations. At 64 MiB,
+allreduce/reduce/allgather still lead; broadcast/reducescatter/alltoall are
+within a few percent of NCCL. Device paths are selected with `--device-ring`;
+the host-driven path remains available for comparison.
 
 ## What would change the result
 

@@ -193,6 +193,9 @@ At 16 MiB all six device paths are faster than NCCL:
 | reducescatter | 37.54 | 41.85 |
 | alltoall | 39.31 | 43.46 |
 
+At 64 MiB the result is mixed: allreduce/reduce/allgather remain faster;
+broadcast, reducescatter, and alltoall are within roughly 2–8% below NCCL.
+
 All correctness checks pass. At 1 MiB all six device paths beat NCCL. At larger
 sizes the result is not uniform: at 16 MiB allreduce/reduce/allgather/
 reducescatter/alltoall are faster, while broadcast still trails NCCL. `just nccl-ops` is
