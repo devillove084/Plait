@@ -1,7 +1,7 @@
 //! Parallelism planning and a runnable distributed DSA operator.
 //!
 //! TP/PP/EP/DP/CP/SP are placement coordinates. Each axis maps to a fused
-//! EPaxos operation with an explicit conflict key and participant group; the
+//! Plait ordering operation with an explicit conflict key and participant group; the
 //! DSA reference operator executes the TP/CP/SP path over the real consensus
 //! and registered-memory data plane.
 

@@ -7,7 +7,7 @@ use crate::identity::NodeId;
 
 /// Replicated membership. There is no bootstrap rank and no permanent
 /// coordinator: every voter may propose, and every configuration change is
-/// itself an EPaxos instance.
+/// itself an Plait ordering instance.
 ///
 /// Reconfiguration is deliberately conservative:
 ///
@@ -17,7 +17,7 @@ use crate::identity::NodeId;
 ///
 /// This gives up availability during a membership change but removes the
 /// split-brain window between two disjoint majorities. Steady-state commands
-/// still commit with an ordinary majority and take the EPaxos fast path when
+/// still commit with an ordinary majority and take the Plait ordering fast path when
 /// their dependency sets agree.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterConfig {
@@ -176,7 +176,7 @@ impl ClusterConfig {
 }
 
 /// The acknowledgement set for one consensus instance. `ack_required` is the
-/// number of distinct voters needed to decide; `fast_acks` is the larger EPaxos
+/// number of distinct voters needed to decide; `fast_acks` is the larger Plait ordering
 /// fast quorum whose members must have identical attributes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuorumPolicy {
@@ -189,7 +189,7 @@ impl QuorumPolicy {
     pub fn majority(voters: &BTreeSet<NodeId>) -> Self {
         let n = voters.len();
         let majority = n / 2 + 1;
-        // EPaxos fast quorum. For 3 voters this is 2, for 5 it is 3, for 7 it
+        // Plait ordering fast quorum. For 3 voters this is 2, for 5 it is 3, for 7 it
         // is 5. Two fast quorums always intersect, and every fast quorum
         // intersects every recovery (majority) quorum.
         let fast = majority.max(3 * n / 4);

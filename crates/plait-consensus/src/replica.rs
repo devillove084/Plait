@@ -68,7 +68,7 @@ enum ActivePhase {
     },
 }
 
-/// One EPaxos replica. There is no distinguished replica: [`propose`] works on
+/// One Plait ordering replica. There is no distinguished replica: [`propose`] works on
 /// every voter, and every replica runs the same recovery watchdog.
 pub struct Replica<S: StateMachine> {
     id: NodeId,
@@ -484,7 +484,7 @@ impl<S: StateMachine> Replica<S> {
 
     /// Merge the dependencies visible to this replica into an incoming
     /// attribute set. Adding the newest instance per proposer is standard
-    /// EPaxos conflict tracking; it is transitively sufficient.
+    /// Plait ordering conflict tracking; it is transitively sufficient.
     fn merge_attrs(&self, mut base: Attrs, command: &Command, exclude: InstanceId) -> Attrs {
         let mut candidates: BTreeSet<InstanceId> = BTreeSet::new();
         for access in command.accesses() {

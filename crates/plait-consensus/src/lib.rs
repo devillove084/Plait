@@ -1,4 +1,4 @@
-//! Leaderless EPaxos replication.
+//! Leaderless Plait ordering replication.
 //!
 //! Every voter can propose, every voter can recover, and no operation depends
 //! on a distinguished rank. The only privileged thing in the protocol is a

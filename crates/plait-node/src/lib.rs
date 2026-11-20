@@ -619,7 +619,7 @@ async fn wait_declared(client: &mut Client, node: NodeId, op: OpId) -> io::Resul
     }
 }
 
-/// Run the distributed DSA reference operator over three in-process EPaxos
+/// Run the distributed DSA reference operator over three in-process Plait ordering
 /// replicas and compare it with the single-node reference.
 pub fn run_dsa_demo() -> Result<(), Box<dyn std::error::Error>> {
     use plait_parallel::{AxisSizes, DsaConfig, DsaRunner, GlobalDsa, Topology};
@@ -654,7 +654,7 @@ pub fn run_dsa_demo() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Execute the three remaining parallelism axes for real: expert-parallel MoE,
 /// data-parallel gradient accumulation, and pipeline-parallel stage handoffs.
-/// Each runner uses the same EPaxos cluster and fused runtime as the node.
+/// Each runner uses the same Plait ordering cluster and fused runtime as the node.
 pub fn run_parallel_demo() -> Result<(), Box<dyn std::error::Error>> {
     use plait_parallel::{
         AxisSizes, DpConfig, DpRunner, GlobalDp, GlobalMoe, GlobalPp, MoeConfig, MoeRunner,
@@ -802,7 +802,7 @@ pub fn run_devices() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Discover local devices, replicate their profiles, then schedule planned
-/// operations onto eligible devices through the same EPaxos cluster. NVIDIA
+/// operations onto eligible devices through the same Plait ordering cluster. NVIDIA
 /// tasks execute real CUTLASS GEMMs; CPU tasks execute a CPU GEMM reference.
 /// Placements and compute results are replicated commands.
 pub fn run_hetero_demo() -> Result<(), Box<dyn std::error::Error>> {

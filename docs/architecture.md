@@ -6,7 +6,7 @@ Plait has four layers with deliberately small contracts:
 
 1. **Core vocabulary** (`plait-core`): node identities, tensors, commands,
    access keys, membership configurations, and quorum policies.
-2. **Leaderless replication** (`plait-consensus`): EPaxos-style instances,
+2. **Leaderless replication** (`plait-consensus`): leaderless ordering instances,
    ballots, recovery, deterministic execution, and snapshots.
 3. **Fused runtime** (`plait-fabric`): the replicated state machine that
    combines contributions into tensor shards.
@@ -28,7 +28,7 @@ staged_remove: voters in the middle of leaving
 version:      incremented when the voter set changes
 ```
 
-Ordinary consensus instances use a majority quorum and a larger EPaxos fast
+Ordinary consensus instances use a majority quorum and a larger Plait ordering fast
 quorum. Membership instances use a **unanimous** policy:
 
 - `StageAdd` / `StageRemove` require every current voter.
@@ -67,7 +67,7 @@ is serialized with all commands. Contributions to the same operator conflict
 and are ordered; different operators have disjoint keys and execute
 concurrently.
 
-## 3. EPaxos-style replication
+## 3. leaderless ordering replication
 
 Every proposal has a global identity `InstanceId { proposer, counter }`. The
 counter is local to the proposer, so there is no global instance allocator.
@@ -123,7 +123,7 @@ recovery leader.
 `ExecutionGraph` is the explicit dynamic scheduler:
 
 - nodes are committed, unexecuted instances;
-- edges are EPaxos dependencies, classified from the conflicting access keys as
+- edges are Plait ordering dependencies, classified from the conflicting access keys as
   `Data` (tensor/operator), `Device` (compute reservation), `Config`
   (membership), or `Control` (an explicit dependency with no shared key);
 - the SCC condensation is maintained online. A commit creates a singleton;

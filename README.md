@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  Rust 2024 · EPaxos-style replication · no rank 0 · TP/PP/EP/DP/CP/SP · heterogeneous accelerators · async TCP control · registered-memory data plane
+  Rust 2024 · leaderless ordering replication · no rank 0 · TP/PP/EP/DP/CP/SP · heterogeneous accelerators · async TCP control · registered-memory data plane
 </p>
 
 Plait is an experimental runtime in which **communication is the replicated log**.
@@ -34,7 +34,7 @@ optimizer, and PP stage-handoff operators.
 
 ```mermaid
 flowchart LR
-  A[Node A] -->|propose| L[(EPaxos log)]
+  A[Node A] -->|propose| L[(Plait ordering log)]
   B[Node B] -->|propose| L
   C[Node C] -->|propose| L
   L -->|ordered commands| R[Fused runtime]
@@ -45,7 +45,7 @@ flowchart LR
 A command such as "contribute a local partial to operator `op`" is replicated.
 When the last declared contributor has executed, every replica combines the
 partials locally. The result is materialized without a separate all-reduce
-phase. Conflicting commands are ordered by EPaxos dependencies; independent
+phase. Conflicting commands are ordered by Plait ordering dependencies; independent
 operators proceed concurrently.
 
 The control plane is an Asio-style Tokio actor: a single connection manager owns
@@ -75,7 +75,7 @@ The important properties are:
   profiles are advertised as `DeviceProfile` commands; a scheduler chooses an
   eligible device from memory, dtype, architecture, load, and stable identity.
 
-EPaxos is used here as a **design point**, not a claim of a byte-for-byte paper
+Plait ordering is used here as a **design point**, not a claim of a byte-for-byte paper
 implementation. The implementation includes fast-path dependency agreement,
 Paxos slow-path acceptance, dependency-cycle execution, ballot-based recovery,
 and snapshot catch-up. The deliberate deviations are documented under
@@ -109,7 +109,7 @@ The planner emits concrete fused operations with contributor sets and op ids:
 - `PipelineHandoff` and `Dispatch` are registered-memory transfers coordinated
   by a small command; the bytes never enter the log.
 
-`cargo test -p plait-parallel` checks that all six axes have an EPaxos mapping,
+`cargo test -p plait-parallel` checks that all six axes have an Plait ordering mapping,
 that participant groups match the topology, and that the EP/DP/PP reference
 runners match single-node execution.
 
@@ -206,7 +206,7 @@ plait pp: 3 stages / 3 microbatches match reference (max error 0.000e0, max in f
 - **DP**: gradients are split into parameter shards, each shard is a fused sum
   over DP replicas, and zeros in non-owned shards are avoided; the optimizer
   matches a single global-gradient run.
-- **PP**: every stage emits a `Stage { input, output }` command. The EPaxos
+- **PP**: every stage emits a `Stage { input, output }` command. The Plait ordering
   dependency on the input tensor orders stages; a wavefront scheduler keeps
   multiple microbatches in flight (`max in flight 3` in the demo).
 
@@ -294,7 +294,7 @@ the unanimous promotion, and then proposes like every other voter.
 | Crate | Responsibility |
 | --- | --- |
 | `plait-core` | identities, tensors/placement, commands, conflict keys, membership/quorums |
-| `plait-consensus` | leaderless EPaxos instances, ballots, recovery, SCC execution, snapshots |
+| `plait-consensus` | leaderless Plait ordering instances, ballots, recovery, SCC execution, snapshots |
 | `plait-fabric` | fused runtime (`Sum`, `Max`, `Gather`, `TopK`, `OnlineSoftmax`) and events |
 | `plait-mem` | aligned buffers, pooling, registered regions, RDMA contract, loopback plane |
 | `plait-rdma` | real `libibverbs` RC QP, one-sided read/write, completion polling |
@@ -319,8 +319,8 @@ parity plan is in [docs/goals/nccl-parity.md](docs/goals/nccl-parity.md), the
 asymmetric 4+8 design in [docs/design/asymmetric.md](docs/design/asymmetric.md),
 the profile breakdown in [docs/validation/profile.md](docs/validation/profile.md),
 protocol status in [docs/validation/protocols.md](docs/validation/protocols.md),
-and the formal EPaxos workstream in
-[docs/goals/epaxos-formal.md](docs/goals/epaxos-formal.md).
+and the formal Plait ordering workstream in
+[docs/goals/formal.md](docs/goals/formal.md).
 
 ## Guarantees and limits
 

@@ -43,7 +43,7 @@ impl Ballot {
     }
 }
 
-/// EPaxos attributes: a dependency set plus a sequence number that gives a
+/// Plait ordering attributes: a dependency set plus a sequence number that gives a
 /// deterministic order inside strongly connected components.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attrs {

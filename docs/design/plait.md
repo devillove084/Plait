@@ -54,7 +54,7 @@ while the reference runners use finer-grained commands to prove exactness.
 | Security | Production mTLS + authorized membership; prototype trusted network |
 | Heterogeneous devices | CPU + NVIDIA + AMD + Huawei + PPU profiles in one registry | A rank cannot imply a vendor; placement is capability-driven |
 | Explicit online execution graph | Commit adds a singleton; edge insertion either joins the condensation DAG or merges the reachability intersection that closes a cycle; ready frontier is maintained incrementally; edges classified as data/device/config/control | No per-tick or per-commit Tarjan rebuild; late dependencies and component removal update the frontier directly; graph is the ordering authority | Cycle merges do a reachability search over the pending condensation; complete Haeupler-style amortized bounds are not implemented |
-| SCC versus alternatives | SCC condensation is the canonical EPaxos execution order: cycles have no topological extension, so they must execute as a deterministic group | Preserves conflict safety and convergent execution; does not need abort/retry | Optimistic transactional schedulers could avoid SCCs but add abort, validation, and retry semantics that EPaxos does not provide |
+| SCC versus alternatives | SCC condensation is the canonical Plait ordering execution order: cycles have no topological extension, so they must execute as a deterministic group | Preserves conflict safety and convergent execution; does not need abort/retry | Optimistic transactional schedulers could avoid SCCs but add abort, validation, and retry semantics that Plait ordering does not provide |
 | SCC batch parallel dispatch | `Runtime` forks independent ready components and merges in deterministic batch order via Rayon | Uses available cores without breaking convergent state; conflict keys remain the parallelism contract | Membership batches are serialized; independent components must have disjoint write effects |
 | Peer-memory collectives | One primary CUDA context and stream per GPU; cross-context `memcpy_dtod` takes the driver's peer path; cubin add kernel | Real GPU peer memory and collectives without host staging | No cross-process CUDA IPC/VMM yet; host-synchronized ring steps are far slower than NCCL |
 
@@ -233,7 +233,7 @@ dark-theme template. Components and the requirement/number each earns:
 | Component | Why it exists | Requirement / number |
 |---|---|---|
 | Peer process / `NodeId` | Equal proposer, recoverer, snapshot server | Leaderless steady state |
-| EPaxos log | Orders conflicting commands, survives proposer failure | Majority/fast quorum, p99 commit |
+| Plait ordering log | Orders conflicting commands, survives proposer failure | Majority/fast quorum, p99 commit |
 | Fused runtime | Applies commands and materializes tensors | Communication = computation |
 | Membership config | Join/leave without rank 0 | Identity-based membership |
 | Registered memory + RDMA | Moves bulk bytes outside log | 14 MB Q shard/layer, 100–400 Gb/s |
@@ -268,7 +268,7 @@ Record     { value: Value, phase: PreAccepted|Accepted|Committed|Executed,
 
 Indexes: `records: InstanceId -> Record`, `record_index: Key -> set<InstanceId>`,
 `executed: set<InstanceId>`, per-proposer `counters`, and `active` proposals.
-The conflict index is the only derived structure needed for EPaxos dependencies.
+The conflict index is the only derived structure needed for Plait ordering dependencies.
 
 ### Device and placement state
 
@@ -311,14 +311,14 @@ seq:<tp>:<head>:q-index
 ```
 
 The access mode is part of the key evaluation: a `Stage` command reads its input
-and writes its output, so EPaxos orders it after the predecessor without a
+and writes its output, so Plait ordering orders it after the predecessor without a
 global barrier.
 
 ## 6. Key decisions & trade-offs
 
 | Decision | Solves | Worsens | Change it when |
 |---|---|---|---|
-| Leaderless EPaxos-style log | No rank-0 SPOF; any proposer/recoverer; parallel non-conflicting work | Recovery, ballots, and conflict handling are more complex than Raft; a fast-path conflict falls back to an accept round | Conflict rate makes slow-path p99 exceed 10 ms, or the workload becomes single-writer per key → Raft/primary |
+| Leaderless leaderless ordering log | No rank-0 SPOF; any proposer/recoverer; parallel non-conflicting work | Recovery, ballots, and conflict handling are more complex than Raft; a fast-path conflict falls back to an accept round | Conflict rate makes slow-path p99 exceed 10 ms, or the workload becomes single-writer per key → Raft/primary |
 | One global `ClusterConfig` (prototype) | Simple membership and snapshot story; all nodes see the same voter set | O(N) fanout per command; 512 voters is untenable | Any domain exceeds ~8 voters or command sends exceed ~50k/s → per-domain consensus groups |
 | Shard-level batched commands | Keeps instance rate ~1.5k/forward; large payloads amortize RTT | A slow shard straggles the whole layer; payload size grows and needs RDMA | Median shard command payload > ~1 MB or one shard dominates tail → split the domain / pipeline the batch |
 | Descriptor + RDMA for bulk, inline for small control | Removes MB-scale bytes from consensus; uses one RTT per bulk transfer | NIC/QP failure becomes a data-plane dependency; descriptor lifecycle is complex | Payload <1 KB (inline is cheaper) or no device (TCP copy fallback) |
@@ -352,7 +352,7 @@ one-sided WRs or a future stable crate is a contained change.
 ### Why not Raft?
 
 Raft is the simpler correct choice when a single leader is acceptable. Plait's
-premise is equal processes and no permanent coordinator; EPaxos lets any voter
+premise is equal processes and no permanent coordinator; Plait ordering lets any voter
 propose conflicting work concurrently and preserves per-key order through
 dependencies. If a workload is naturally single-writer per parameter shard, Raft
 would be easier, but it would reintroduce the coordinator/leader bottleneck the
@@ -391,7 +391,7 @@ errors/retries, and per-shard straggler time.
 
 | Rung | Scale | Move | Breaking point / signal |
 |---|---|---|---|
-| 0 | 3 nodes | Single global EPaxos; per-query demo runners | Works for correctness, not rate |
+| 0 | 3 nodes | Single global Plait ordering; per-query demo runners | Works for correctness, not rate |
 | 1 | 8–64 nodes | Shard-level batching; descriptor-only bulk; snapshot compaction | Command rate >20k/s or p99 commit >10 ms |
 | 2 | 64–512 nodes | Per-domain 3–8 voter groups; hierarchical membership; cross-domain dependency only at layer boundaries | A domain's fanout >8 or global config changes weekly |
 | 3 | 512+ / multi-region | Two-level consensus, domain leaders only for cross-domain ordering, multi-QP RDMA | Cross-region RTT >100 ms or a region loss must not stop progress |
@@ -429,7 +429,7 @@ meaning of a contribution.
 
 | Dimension | Score | Evidence / gap |
 |---|---:|---|
-| Distributed fundamentals | 4/5 | EPaxos fast/slow, recovery, SCC tests; formal safety proof absent |
+| Distributed fundamentals | 4/5 | Plait ordering fast/slow, recovery, SCC tests; formal safety proof absent |
 | Building blocks opened | 4/5 | Consensus, RDMA, membership, failure behavior documented; no measured NIC behavior |
 | Requirements scoped | 4/5 | Functional/non-functional/out-of-scope explicit; workload numbers illustrative |
 | Trade-offs articulated | 5/5 | Eight decision rows with concrete change triggers |

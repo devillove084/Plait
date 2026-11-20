@@ -1,7 +1,7 @@
 //! Pipeline-parallel execution through ordered stage handoffs.
 //!
 //! Each stage owns its weights and emits a `Stage` command that reads the
-//! previous stage's activation and writes the next one. EPaxos orders a stage
+//! previous stage's activation and writes the next one. Plait ordering orders a stage
 //! after its input but leaves different microbatches independent, so the
 //! runner can put several microbatches in flight without a per-stage barrier.
 

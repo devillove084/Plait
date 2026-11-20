@@ -6,7 +6,7 @@ use plait_fabric::Runtime;
 
 use crate::plan::{ParallelOp, fuse_kind};
 
-/// An in-process EPaxos cluster with the real consensus engine and the same
+/// An in-process Plait ordering cluster with the real consensus engine and the same
 /// command/runtime path as the TCP node. It is used by the DSA reference
 /// operator and by tests that need deterministic message delivery.
 pub struct LocalCluster {
@@ -70,7 +70,10 @@ impl LocalCluster {
             }
             self.drain_outbox();
             steps += 1;
-            assert!(steps < 2_000_000, "local EPaxos cluster did not quiesce");
+            assert!(
+                steps < 2_000_000,
+                "local Plait ordering cluster did not quiesce"
+            );
         }
     }
 

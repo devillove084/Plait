@@ -1,7 +1,7 @@
 //! Asymmetric rank-group work partitioning.
 //!
 //! A cluster can contain groups with different accelerator counts (for
-//! example 4 local GPUs and 8 remote GPUs). EPaxos quorum membership stays
+//! example 4 local GPUs and 8 remote GPUs). Plait ordering quorum membership stays
 //! one-vote-per-node; only data-parallel work is weighted. Weighted row ranges
 //! are contiguous and cover the matrix exactly once.
 

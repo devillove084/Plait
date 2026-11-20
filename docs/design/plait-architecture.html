@@ -54,13 +54,13 @@
         <button class="toolbar-toggle" onclick="this.parentElement.classList.toggle('expanded')" title="Export options" aria-label="Export options">⋯</button>
       </div>
     </div>
-    <p class="subtitle">Equal peers · EPaxos-style ordering · fused runtime · descriptors + one-sided RDMA · no rank 0</p>
+    <p class="subtitle">Equal peers · Plait ordering · fused runtime · descriptors + one-sided RDMA · no rank 0</p>
   </div>
 
   <div class="diagram-container">
     <svg viewBox="0 0 1000 680" role="img" aria-labelledby="diagram-title diagram-desc">
       <title id="diagram-title">Plait architecture</title>
-      <desc id="diagram-desc">Clients submit commands to any peer. Peers order commands in a small EPaxos consensus domain, the committed commands drive a fused runtime, and bulk tensor bytes move between registered memory regions over RDMA. Membership and snapshot catch-up are replicated.</desc>
+      <desc id="diagram-desc">Clients submit commands to any peer. Peers order commands in a small Plait ordering domain, the committed commands drive a fused runtime, and bulk tensor bytes move between registered memory regions over RDMA. Membership and snapshot catch-up are replicated.</desc>
       <defs>
         <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
           <polygon points="0 0, 10 3.5, 0 7" fill="#64748b" />
@@ -127,9 +127,9 @@
       <text x="620" y="159" fill="#94a3b8" font-size="9" text-anchor="middle">NodeId</text>
       <text x="620" y="173" fill="#34d399" font-size="8" text-anchor="middle">propose · recover</text>
 
-      <!-- EPaxos log -->
+      <!-- Plait ordering log -->
       <rect x="285" y="245" width="225" height="110" rx="6" fill="rgba(76,29,149,0.4)" stroke="#a78bfa" stroke-width="1.5"/>
-      <text x="397" y="270" fill="white" font-size="11" font-weight="600" text-anchor="middle">EPaxos log</text>
+      <text x="397" y="270" fill="white" font-size="11" font-weight="600" text-anchor="middle">Plait ordering log</text>
       <text x="397" y="288" fill="#94a3b8" font-size="8" text-anchor="middle">InstanceId = proposer + counter</text>
       <text x="397" y="303" fill="#94a3b8" font-size="8" text-anchor="middle">dependencies + seq + ballot</text>
       <text x="397" y="318" fill="#94a3b8" font-size="8" text-anchor="middle">fast path / accept / recovery</text>
@@ -205,7 +205,7 @@
     <div class="card">
       <div class="card-header"><div class="card-dot emerald"></div><h3>Key decisions</h3></div>
       <ul>
-        <li>• EPaxos-style leaderless log, not a permanent leader</li>
+        <li>• Plait ordering leaderless log, not a permanent leader</li>
         <li>• 3–8 voter domains, not one 512-voter quorum</li>
         <li>• shard-level batched commands, not per-query ops</li>
         <li>• descriptors + rdma-io for bulk, not tensor bytes in the log</li>

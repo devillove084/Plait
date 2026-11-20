@@ -177,5 +177,5 @@ share a key, or the fabric will serialize work that could run concurrently.
 | `PpRunner` | PP, 2–3 stages, multiple microbatches | single-node sequential forward |
 | `hetero` | CPU + NVIDIA (+ AMD/Huawei/PPU when present) | replicated placement, 32 planned ops |
 
-All four use `LocalCluster`, which is the same `Replica<Runtime>` and EPaxos
+All four use `LocalCluster`, which is the same `Replica<Runtime>` and Plait ordering
 command path as the TCP node. The difference is only the transport.

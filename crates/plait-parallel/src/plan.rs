@@ -377,7 +377,7 @@ mod tests {
     }
 
     #[test]
-    fn every_axis_has_an_epaxos_mapping() {
+    fn every_axis_has_an_ordering_mapping() {
         let topology = Topology::with_prefix(AxisSizes::new(2, 2, 2, 2, 3, 3), "plan").unwrap();
         let plan = dsa_plan(&topology, &config());
         for axis in [

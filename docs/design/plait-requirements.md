@@ -26,7 +26,7 @@ move bulk bytes through registered memory instead of through the log.
    executed-instance count, and current voter set from any node.
 7. **Heterogeneous compute placement.** Advertise CPU, NVIDIA, AMD, Huawei, PPU,
    and other devices as replicated capability profiles; schedule a compute task
-   onto an eligible device; serialize compute per device through EPaxos.
+   onto an eligible device; serialize compute per device through Plait ordering.
 8. **Async control plane.** Use a Tokio actor for TCP: one owner of outbound
    sockets and the peer table, bounded channels, no application mutex, no
    blocking receive; async submission/query and node loop.

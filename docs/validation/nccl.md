@@ -55,7 +55,7 @@ NCCL all-reduce bandwidth sweep (`just nccl-sweep`):
 
 - It proves the fused sum semantics: NCCL's float all-reduce of the same 12
   partials and Plait's replicated `FuseKind::Sum` produce the same checksum.
-- It does not compare throughput. Plait's matrix run includes EPaxos agreement
+- It does not compare throughput. Plait's matrix run includes Plait ordering agreement
   over TCP, 12 proposal submissions, and a CPU f64 reference path. The NCCL path
   is GPU collective only.
 - The NCCL matrix maps 12 logical contributors onto 8 physical ranks. This is

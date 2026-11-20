@@ -1,6 +1,6 @@
 //! Rejoin policy for heterogeneous ranks.
 //!
-//! A strict EPaxos recovery is not always the cheapest way to bring a rank
+//! A strict Plait ordering recovery is not always the cheapest way to bring a rank
 //! back. If the lost shard is small and deterministic, recomputing it can beat
 //! replaying a snapshot or running a recovery ballot. This module makes that
 //! choice explicit and testable; it does not weaken consensus for commands

@@ -65,7 +65,7 @@ pub enum Mode {
     Compute,
 }
 
-/// A key plus the access mode used for EPaxos conflict detection.
+/// A key plus the access mode used for Plait ordering conflict detection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Access {
     pub key: Key,
@@ -143,7 +143,7 @@ pub enum Command {
         values: Vec<f64>,
     },
     /// Pipeline-stage handoff. The command reads the previous stage's tensor
-    /// (if any) and writes the next stage's tensor. EPaxos therefore orders a
+    /// (if any) and writes the next stage's tensor. Plait ordering therefore orders a
     /// stage after its input without a global step, while different
     /// microbatches remain independent.
     Stage {
@@ -155,7 +155,7 @@ pub enum Command {
     /// Advertise a device and its capabilities as replicated data.
     RegisterDevice(DeviceProfile),
     /// Execute a kernel on a chosen device. The command carries the placement
-    /// and result; EPaxos orders it by input/output tensors and device key.
+    /// and result; Plait ordering orders it by input/output tensors and device key.
     Compute(ComputeTask),
     Membership(MembershipChange),
 }
@@ -181,7 +181,7 @@ pub enum KeyClass {
 }
 
 impl Command {
-    /// Keys used by EPaxos conflict detection. The read of `Key::Config` means
+    /// Keys used by Plait ordering conflict detection. The read of `Key::Config` means
     /// ordinary commands only conflict with a concurrent membership write.
     pub fn accesses(&self) -> Vec<Access> {
         let read_config = Access {
@@ -261,7 +261,7 @@ impl Command {
         matches!(self, Self::Membership(_))
     }
 
-    /// EPaxos conflict rule: same key and at least one side is not a read.
+    /// Plait ordering conflict rule: same key and at least one side is not a read.
     /// `Compute` is exclusive so two kernels cannot reserve one device at once.
     pub fn conflicts_with(&self, other: &Self) -> bool {
         let mine = self.accesses();

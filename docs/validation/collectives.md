@@ -117,7 +117,7 @@ ipc-peer: rank=1 gpu=1 bytes=256 checksum=381.000 ok
 ipc-peer: rank=0 gpu=0 bytes=256 checksum=381.000 ok
 ```
 
-The descriptor exchange in this harness is a TCP control test, not the EPaxos
+The descriptor exchange in this harness is a TCP control test, not the Plait ordering
 replicated log. Host copies occur only for the initial input and final
 verification.
 
@@ -252,7 +252,7 @@ the CPU sum; the collectives test suite covers 2 through 8 visible GPUs.
 | All-to-all | pairwise/topology-aware | pairwise | Chunked pipelines and buffer reuse |
 | Protocols | LL, LL128, Simple | f32 peer copy + scalar add | Vectorized/local kernels, flags, protocol selection |
 | Channels | multiple per GPU, topology-derived | one stream per GPU | Channel scheduler and stream pools; per-step host barrier removed but not channelized |
-| Bootstrap | TCP store (control only) | EPaxos TCP control plane | Not a data-plane substitute; keep bootstrap separate from transport |
+| Bootstrap | TCP store (control only) | Plait ordering TCP control plane | Not a data-plane substitute; keep bootstrap separate from transport |
 | Memory allocation | caching allocator, registered regions | cudarc primary-context allocations | Reusable peer pool, pinned host buffers, registered regions |
 | Performance harness | nccl-tests matrix | one-size benchmark + correctness tests | Full size/protocol sweep and regression thresholds |
 
@@ -261,7 +261,7 @@ the CPU sum; the collectives test suite covers 2 through 8 visible GPUs.
 NCCL's TCP store is a **bootstrap/rendezvous** mechanism: it exchanges addresses,
 sizes, and communicator metadata. Tensor bytes move over NVLink, PCIe P2P, or
 RDMA. Plait's consensus TCP control plane is also control metadata; it does not
-make the data path faster. Replacing NCCL's store with EPaxos would not change
+make the data path faster. Replacing NCCL's store with Plait ordering would not change
 NCCL's collective bandwidth. Plait must win on the data plane: peer memory,
 channels, protocols, and topology.
 
