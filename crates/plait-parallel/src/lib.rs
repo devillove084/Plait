@@ -5,6 +5,7 @@
 //! DSA reference operator executes the TP/CP/SP path over the real consensus
 //! and registered-memory data plane.
 
+pub mod asymmetric;
 pub mod cluster;
 pub mod dp;
 pub mod dsa;
@@ -13,6 +14,7 @@ pub mod plan;
 pub mod pp;
 pub mod topology;
 
+pub use asymmetric::{AsymmetricLayout, RankWeight, WeightedRowRange};
 pub use cluster::LocalCluster;
 pub use dp::{DpConfig, DpError, DpOutput, DpRunner, GlobalDp};
 pub use dsa::{DsaConfig, DsaError, DsaOutput, DsaRunner, GlobalDsa};

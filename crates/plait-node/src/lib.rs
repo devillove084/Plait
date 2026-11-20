@@ -1496,8 +1496,9 @@ pub async fn run_matrix_node(
     driver: bool,
     hold_seconds: u64,
     shape: (usize, usize, usize),
+    asymmetric: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use plait_parallel::{AxisSizes, Topology};
+    use plait_parallel::{AsymmetricLayout, AxisSizes, RankWeight, Topology};
 
     let text = std::fs::read_to_string(manifest)?;
     let mut entries = Vec::new();
@@ -1589,22 +1590,42 @@ pub async fn run_matrix_node(
         }
 
         let collective_start = Instant::now();
+        let row_ranges = if asymmetric {
+            let ranks: Vec<RankWeight> = entries
+                .iter()
+                .map(|(node, _)| RankWeight {
+                    node: *node,
+                    gpus: 1,
+                    // Four local ranks and eight remote ranks split work
+                    // 1/3 : 2/3 by equal per-rank weight.
+                    weight: 1,
+                })
+                .collect();
+            let layout = AsymmetricLayout::new(ranks)?;
+            Some(layout.row_ranges(m))
+        } else {
+            None
+        };
         let mut contributions = 0usize;
-        for (id, _) in &entries {
+        for (index, (id, _)) in entries.iter().enumerate() {
             let coord = topology.coord(*id).ok_or("node missing from topology")?;
-            let values = matrix_partial(
-                &a,
-                &b,
-                m,
-                n,
-                k,
-                coord.data as usize,
-                coord.tensor as usize,
-                coord.expert as usize,
-                2,
-                3,
-                2,
-            );
+            let values = if let Some(ranges) = &row_ranges {
+                matrix_partial_rows(&a, &b, m, n, k, ranges[index].range.clone())
+            } else {
+                matrix_partial(
+                    &a,
+                    &b,
+                    m,
+                    n,
+                    k,
+                    coord.data as usize,
+                    coord.tensor as usize,
+                    coord.expert as usize,
+                    2,
+                    3,
+                    2,
+                )
+            };
             client
                 .submit(
                     *id,
@@ -1642,7 +1663,12 @@ pub async fn run_matrix_node(
         }
         let checksum: f64 = values.iter().sum();
         println!(
-            "plait matrix: 12 replicas DP2×TP3×EP2, {m}x{n}x{k}, {contributions} contributions, checksum {checksum}, collective_ms {:.3}",
+            "plait matrix: 12 replicas {}, {m}x{n}x{k}, {contributions} contributions, checksum {checksum}, collective_ms {:.3}",
+            if asymmetric {
+                "4+8 asymmetric row split"
+            } else {
+                "DP2×TP3×EP2"
+            },
             collective_start.elapsed().as_secs_f64() * 1e3
         );
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1651,6 +1677,27 @@ pub async fn run_matrix_node(
     }
     drop(nodes);
     Ok(())
+}
+
+fn matrix_partial_rows(
+    a: &[f64],
+    b: &[f64],
+    m: usize,
+    n: usize,
+    k: usize,
+    rows: std::ops::Range<usize>,
+) -> Vec<f64> {
+    let mut out = vec![0.0; m * n];
+    for row in rows {
+        for col in 0..n {
+            let mut sum = 0.0;
+            for inner in 0..k {
+                sum += a[row * k + inner] * b[inner * n + col];
+            }
+            out[row * n + col] = sum;
+        }
+    }
+    out
 }
 
 fn matrix_inputs(m: usize, n: usize, k: usize) -> (Vec<f64>, Vec<f64>) {

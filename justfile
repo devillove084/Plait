@@ -54,6 +54,9 @@ ipc: setup
 matrix: setup
     ./scripts/matrix-local.sh
 
+matrix-asymmetric: setup
+    ./scripts/matrix-asymmetric-local.sh
+
 nccl: setup
     ./scripts/nccl-compare.sh
 

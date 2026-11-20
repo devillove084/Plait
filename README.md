@@ -316,7 +316,8 @@ check is in [docs/validation/nccl.md](docs/validation/nccl.md); peer-memory
 collectives and remaining gaps are in
 [docs/validation/collectives.md](docs/validation/collectives.md), and the gated
 parity plan is in [docs/goals/nccl-parity.md](docs/goals/nccl-parity.md), the
-profile breakdown in [docs/validation/profile.md](docs/validation/profile.md),
+asymmetric 4+8 design in [docs/design/asymmetric.md](docs/design/asymmetric.md),
+the profile breakdown in [docs/validation/profile.md](docs/validation/profile.md),
 and the formal EPaxos workstream in
 [docs/goals/epaxos-formal.md](docs/goals/epaxos-formal.md).
 

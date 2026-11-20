@@ -78,6 +78,7 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             let mut m = 8usize;
             let mut n = 8usize;
             let mut k = 6usize;
+            let mut asymmetric = false;
             while let Some(arg) = args.next() {
                 match arg.as_str() {
                     "--manifest" => manifest = Some(args.next().ok_or("--manifest needs a path")?),
@@ -88,11 +89,12 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     "--m" => m = args.next().ok_or("--m needs a number")?.parse()?,
                     "--n" => n = args.next().ok_or("--n needs a number")?.parse()?,
                     "--k" => k = args.next().ok_or("--k needs a number")?.parse()?,
+                    "--asymmetric" => asymmetric = true,
                     other => return Err(format!("unknown matrix argument {other}").into()),
                 }
             }
             let manifest = manifest.ok_or("--manifest is required")?;
-            run_matrix_node(&manifest, start, count, driver, hold, (m, n, k)).await
+            run_matrix_node(&manifest, start, count, driver, hold, (m, n, k), asymmetric).await
         }
         "id" => {
             println!("{}", NodeId::random());
