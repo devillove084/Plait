@@ -76,6 +76,93 @@ impl AsymmetricLayout {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkKind {
+    NvLink,
+    Pcie,
+    Ub,
+    Network,
+}
+
+impl LinkKind {
+    pub fn nominal_bandwidth_gbps(self) -> f64 {
+        match self {
+            Self::NvLink => 300.0,
+            Self::Ub => 200.0,
+            Self::Pcie => 50.0,
+            Self::Network => 25.0,
+        }
+    }
+
+    pub fn nominal_latency_us(self) -> f64 {
+        match self {
+            Self::NvLink => 1.0,
+            Self::Ub => 2.0,
+            Self::Pcie => 5.0,
+            Self::Network => 20.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RankProfile {
+    pub node: NodeId,
+    pub gpus: u32,
+    /// Relative compute rate. A value of 2 means twice as many rows per unit time.
+    pub compute_units: f64,
+    pub link: LinkKind,
+    /// Measured effective bandwidth; falls back to the link class nominal value.
+    pub bandwidth_gbps: Option<f64>,
+    /// Measured collective latency; falls back to the link class nominal value.
+    pub latency_us: Option<f64>,
+}
+
+pub struct HeterogeneousLayout;
+
+impl HeterogeneousLayout {
+    /// Plan row weights from compute rate and effective collective bandwidth.
+    ///
+    /// The linear model minimizes the maximum per-rank time:
+    /// `cost_i = 1 / compute_i + message_bytes / bandwidth_i + latency_i`.
+    /// The share is proportional to `1 / cost_i`, which is the max-min
+    /// allocation for a sum of independent costs. This is deliberately a
+    /// small LP-style planner, not a global MILP over every link.
+    pub fn plan(
+        profiles: &[RankProfile],
+        message_bytes: usize,
+    ) -> Result<AsymmetricLayout, String> {
+        if profiles.is_empty() {
+            return Err("heterogeneous layout needs at least one rank".to_owned());
+        }
+        let mut ranks = Vec::with_capacity(profiles.len());
+        for profile in profiles {
+            if !profile.compute_units.is_finite() || profile.compute_units <= 0.0 {
+                return Err(format!("rank {} has invalid compute rate", profile.node));
+            }
+            let bandwidth = profile
+                .bandwidth_gbps
+                .unwrap_or_else(|| profile.link.nominal_bandwidth_gbps());
+            if !bandwidth.is_finite() || bandwidth <= 0.0 {
+                return Err(format!("rank {} has invalid bandwidth", profile.node));
+            }
+            let latency_us = profile
+                .latency_us
+                .unwrap_or_else(|| profile.link.nominal_latency_us());
+            let compute_cost = 1.0 / profile.compute_units;
+            let communication_cost = message_bytes as f64 / (bandwidth * 1e9);
+            let latency_cost = latency_us / 1e6;
+            let cost = compute_cost + communication_cost + latency_cost;
+            let weight = (1_000_000.0 / cost).round().clamp(1.0, u32::MAX as f64) as u32;
+            ranks.push(RankWeight {
+                node: profile.node,
+                gpus: profile.gpus,
+                weight,
+            });
+        }
+        AsymmetricLayout::new(ranks)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +226,36 @@ mod tests {
         let remote: usize = ranges[4..].iter().map(|r| r.range.len()).sum();
         assert_eq!(local, 40);
         assert_eq!(remote, 80);
+    }
+    #[test]
+    fn heterogeneous_four_local_eight_remote_weights_compute_and_link() {
+        let mut profiles = Vec::new();
+        for index in 0..4 {
+            profiles.push(RankProfile {
+                node: NodeId::derive(&format!("local-{index}")),
+                gpus: 4,
+                compute_units: 4.0,
+                link: LinkKind::NvLink,
+                bandwidth_gbps: Some(400.0),
+                latency_us: Some(1.0),
+            });
+        }
+        for index in 0..8 {
+            profiles.push(RankProfile {
+                node: NodeId::derive(&format!("remote-{index}")),
+                gpus: 8,
+                compute_units: 1.0,
+                link: LinkKind::Ub,
+                bandwidth_gbps: Some(50.0),
+                latency_us: Some(2.0),
+            });
+        }
+        let layout = HeterogeneousLayout::plan(&profiles, 1 << 20).expect("plan");
+        let ranges = layout.row_ranges(120);
+        let local: usize = ranges[..4].iter().map(|r| r.range.len()).sum();
+        let remote: usize = ranges[4..].iter().map(|r| r.range.len()).sum();
+        assert_eq!(local + remote, 120);
+        assert!(local > remote, "faster local ranks should own more rows");
+        assert!(ranges[0].range.len() > ranges[4].range.len());
     }
 }

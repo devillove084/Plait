@@ -1524,7 +1524,7 @@ pub async fn run_matrix_node(
     shape: (usize, usize, usize),
     asymmetric: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use plait_parallel::{AsymmetricLayout, AxisSizes, RankWeight, Topology};
+    use plait_parallel::{AxisSizes, HeterogeneousLayout, LinkKind, RankProfile, Topology};
 
     let text = std::fs::read_to_string(manifest)?;
     let mut entries = Vec::new();
@@ -1617,18 +1617,40 @@ pub async fn run_matrix_node(
 
         let collective_start = Instant::now();
         let row_ranges = if asymmetric {
-            let ranks: Vec<RankWeight> = entries
+            let profiles: Vec<RankProfile> = entries
                 .iter()
-                .map(|(node, _)| RankWeight {
-                    node: *node,
-                    gpus: 1,
-                    // Four local ranks and eight remote ranks split work
-                    // 1/3 : 2/3 by equal per-rank weight.
-                    weight: 1,
+                .enumerate()
+                .map(|(index, (node, _))| {
+                    if index < 4 {
+                        RankProfile {
+                            node: *node,
+                            gpus: 4,
+                            compute_units: 4.0,
+                            link: LinkKind::NvLink,
+                            bandwidth_gbps: Some(400.0),
+                            latency_us: Some(1.0),
+                        }
+                    } else {
+                        RankProfile {
+                            node: *node,
+                            gpus: 8,
+                            compute_units: 1.0,
+                            link: LinkKind::Ub,
+                            bandwidth_gbps: Some(50.0),
+                            latency_us: Some(2.0),
+                        }
+                    }
                 })
                 .collect();
-            let layout = AsymmetricLayout::new(ranks)?;
-            Some(layout.row_ranges(m))
+            let layout = HeterogeneousLayout::plan(&profiles, m * k * 4)?;
+            let ranges = layout.row_ranges(m);
+            let local: usize = ranges.iter().take(4).map(|range| range.range.len()).sum();
+            let remote: usize = ranges.iter().skip(4).map(|range| range.range.len()).sum();
+            println!(
+                "plait matrix: heterogeneous weights local_rows={local} remote_rows={remote} message_bytes={}",
+                m * k * 4
+            );
+            Some(ranges)
         } else {
             None
         };

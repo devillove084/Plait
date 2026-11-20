@@ -14,7 +14,9 @@ pub mod plan;
 pub mod pp;
 pub mod topology;
 
-pub use asymmetric::{AsymmetricLayout, RankWeight, WeightedRowRange};
+pub use asymmetric::{
+    AsymmetricLayout, HeterogeneousLayout, LinkKind, RankProfile, RankWeight, WeightedRowRange,
+};
 pub use cluster::LocalCluster;
 pub use dp::{DpConfig, DpError, DpOutput, DpRunner, GlobalDp};
 pub use dsa::{DsaConfig, DsaError, DsaOutput, DsaRunner, GlobalDsa};
