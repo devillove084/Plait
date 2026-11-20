@@ -305,3 +305,218 @@ fn check(result: sys::CUresult, operation: &'static str) -> Result<()> {
 fn _driver_error(error: DriverError) -> CollectiveError {
     CollectiveError::new(error.to_string())
 }
+
+/// VMM allocation exported as a POSIX file descriptor.
+///
+/// This is the path for allocations that cannot use legacy CUDA IPC, and the
+/// path that can later be registered with GPUDirect RDMA.
+pub struct VmmRegion {
+    context: Arc<CudaContext>,
+    ptr: sys::CUdeviceptr,
+    bytes: usize,
+    handle: sys::CUmemGenericAllocationHandle,
+}
+
+impl VmmRegion {
+    pub fn alloc(device: usize, bytes: usize) -> Result<Self> {
+        if bytes == 0 {
+            return Err(CollectiveError::new("VMM region cannot be empty"));
+        }
+        let context = CudaContext::new(device)
+            .map_err(|error| CollectiveError::new(format!("CUDA context {device}: {error}")))?;
+        context
+            .bind_to_thread()
+            .map_err(|error| CollectiveError::new(format!("bind context: {error}")))?;
+
+        let mut prop: sys::CUmemAllocationProp = unsafe { std::mem::zeroed() };
+        prop.type_ = sys::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.requestedHandleTypes =
+            sys::CUmemAllocationHandleType_enum::CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+        prop.location = sys::CUmemLocation {
+            type_: sys::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE,
+            __bindgen_anon_1: sys::CUmemLocation_st__bindgen_ty_1 { id: device as i32 },
+        };
+        let mut granularity = 0usize;
+        check(
+            unsafe {
+                sys::cuMemGetAllocationGranularity(
+                    &mut granularity,
+                    &prop,
+                    sys::CUmemAllocationGranularity_flags::CU_MEM_ALLOC_GRANULARITY_MINIMUM,
+                )
+            },
+            "cuMemGetAllocationGranularity",
+        )?;
+        let bytes = bytes.div_ceil(granularity) * granularity;
+        let mut handle = 0;
+        check(
+            unsafe { sys::cuMemCreate(&mut handle, bytes, &prop, 0) },
+            "cuMemCreate",
+        )?;
+        let mut ptr = 0;
+        check(
+            unsafe { sys::cuMemAddressReserve(&mut ptr, bytes, granularity, 0, 0) },
+            "cuMemAddressReserve",
+        )?;
+        if let Err(error) = check(
+            unsafe { sys::cuMemMap(ptr, bytes, 0, handle, 0) },
+            "cuMemMap",
+        ) {
+            unsafe {
+                let _ = sys::cuMemAddressFree(ptr, bytes);
+                let _ = sys::cuMemRelease(handle);
+            }
+            return Err(error);
+        }
+        let access = sys::CUmemAccessDesc {
+            location: prop.location,
+            flags: sys::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
+        };
+        if let Err(error) = check(
+            unsafe { sys::cuMemSetAccess(ptr, bytes, &access, 1) },
+            "cuMemSetAccess",
+        ) {
+            unsafe {
+                let _ = sys::cuMemUnmap(ptr, bytes);
+                let _ = sys::cuMemAddressFree(ptr, bytes);
+                let _ = sys::cuMemRelease(handle);
+            }
+            return Err(error);
+        }
+        Ok(Self {
+            context,
+            ptr,
+            bytes,
+            handle,
+        })
+    }
+
+    pub fn export_fd(&self) -> Result<i32> {
+        self.context
+            .bind_to_thread()
+            .map_err(|error| CollectiveError::new(format!("bind context: {error}")))?;
+        let mut fd = 0i32;
+        check(
+            unsafe {
+                sys::cuMemExportToShareableHandle(
+                    (&mut fd as *mut i32).cast::<c_void>(),
+                    self.handle,
+                    sys::CUmemAllocationHandleType_enum::CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+                    0,
+                )
+            },
+            "cuMemExportToShareableHandle",
+        )?;
+        Ok(fd)
+    }
+
+    pub fn import_fd(fd: i32, device: usize, bytes: usize) -> Result<Self> {
+        let context = CudaContext::new(device)
+            .map_err(|error| CollectiveError::new(format!("CUDA context {device}: {error}")))?;
+        context
+            .bind_to_thread()
+            .map_err(|error| CollectiveError::new(format!("bind context: {error}")))?;
+        let mut handle = 0;
+        check(
+            unsafe {
+                sys::cuMemImportFromShareableHandle(
+                    &mut handle,
+                    fd as *mut c_void,
+                    sys::CUmemAllocationHandleType_enum::CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+                )
+            },
+            "cuMemImportFromShareableHandle",
+        )?;
+        let mut granularity = 0usize;
+        let mut prop: sys::CUmemAllocationProp = unsafe { std::mem::zeroed() };
+        prop.type_ = sys::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location = sys::CUmemLocation {
+            type_: sys::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE,
+            __bindgen_anon_1: sys::CUmemLocation_st__bindgen_ty_1 { id: device as i32 },
+        };
+        check(
+            unsafe {
+                sys::cuMemGetAllocationGranularity(
+                    &mut granularity,
+                    &prop,
+                    sys::CUmemAllocationGranularity_flags::CU_MEM_ALLOC_GRANULARITY_MINIMUM,
+                )
+            },
+            "cuMemGetAllocationGranularity",
+        )?;
+        let bytes = bytes.div_ceil(granularity) * granularity;
+        let mut ptr = 0;
+        check(
+            unsafe { sys::cuMemAddressReserve(&mut ptr, bytes, granularity, 0, 0) },
+            "cuMemAddressReserve",
+        )?;
+        if let Err(error) = check(
+            unsafe { sys::cuMemMap(ptr, bytes, 0, handle, 0) },
+            "cuMemMap",
+        ) {
+            unsafe {
+                let _ = sys::cuMemAddressFree(ptr, bytes);
+                let _ = sys::cuMemRelease(handle);
+            }
+            return Err(error);
+        }
+        let access = sys::CUmemAccessDesc {
+            location: prop.location,
+            flags: sys::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
+        };
+        check(
+            unsafe { sys::cuMemSetAccess(ptr, bytes, &access, 1) },
+            "cuMemSetAccess",
+        )?;
+        Ok(Self {
+            context,
+            ptr,
+            bytes,
+            handle,
+        })
+    }
+
+    pub fn write_host(&self, values: &[f32]) -> Result<()> {
+        let bytes = std::mem::size_of_val(values);
+        if bytes > self.bytes {
+            return Err(CollectiveError::new("VMM write exceeds region"));
+        }
+        self.context
+            .bind_to_thread()
+            .map_err(|error| CollectiveError::new(format!("bind context: {error}")))?;
+        check(
+            unsafe { sys::cuMemcpyHtoD_v2(self.ptr, values.as_ptr().cast::<c_void>(), bytes) },
+            "cuMemcpyHtoD",
+        )
+    }
+
+    pub fn read_host(&self, count: usize) -> Result<Vec<f32>> {
+        let bytes = count * std::mem::size_of::<f32>();
+        if bytes > self.bytes {
+            return Err(CollectiveError::new("VMM read exceeds region"));
+        }
+        let mut values = vec![0.0f32; count];
+        self.context
+            .bind_to_thread()
+            .map_err(|error| CollectiveError::new(format!("bind context: {error}")))?;
+        check(
+            unsafe { sys::cuMemcpyDtoH_v2(values.as_mut_ptr().cast::<c_void>(), self.ptr, bytes) },
+            "cuMemcpyDtoH",
+        )?;
+        Ok(values)
+    }
+}
+
+impl Drop for VmmRegion {
+    fn drop(&mut self) {
+        if self.ptr == 0 {
+            return;
+        }
+        let _ = self.context.bind_to_thread();
+        unsafe {
+            let _ = sys::cuMemUnmap(self.ptr, self.bytes);
+            let _ = sys::cuMemAddressFree(self.ptr, self.bytes);
+            let _ = sys::cuMemRelease(self.handle);
+        }
+    }
+}

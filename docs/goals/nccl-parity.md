@@ -34,7 +34,8 @@ when the harness records correctness and a repeated benchmark result.
 ### M2 — Cross-process peer memory
 
 - [x] CUDA IPC handle export/import for a peer allocation.
-- [ ] VMM (`cuMemCreate` + POSIX fd) path for allocations that cannot use IPC.
+- [x] VMM (`cuMemCreate` + POSIX fd) region allocation, export, and import.
+- [ ] Cross-process VMM fd transport (SCM_RIGHTS/Unix socket).
 - [x] Experimental TCP descriptor exchange for the IPC peer test.
 - [ ] Integrate peer descriptors into the replicated log.
 - [x] Two-process, two-GPU allreduce with no host staging.

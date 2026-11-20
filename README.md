@@ -348,7 +348,7 @@ What is implemented and tested:
   tests for ring/recursive/reduce-broadcast all-reduce, broadcast, reduce,
   all-gather, reduce-scatter, and all-to-all;
 - cross-process CUDA IPC peer memory and a two-process allreduce with no host
-  staging after setup (`just ipc`);
+  staging after setup (`just ipc`), plus VMM export/import;
 - pooled/aligned memory, registered descriptors, and one-sided loopback
   transfers bounds-checked.
 

@@ -1333,6 +1333,26 @@ mod tests {
     }
 
     #[test]
+    fn vmm_region_exports_and_imports_fd_or_skips() {
+        let region = match crate::ipc::VmmRegion::alloc(0, 256) {
+            Ok(region) => region,
+            Err(error) => {
+                eprintln!("VMM test skipped: {error}");
+                return;
+            }
+        };
+        let values: Vec<f32> = (0..64).map(|index| index as f32).collect();
+        region.write_host(&values).expect("VMM write");
+        let fd = region.export_fd().expect("VMM export");
+        let imported = crate::ipc::VmmRegion::import_fd(fd, 0, 256).expect("VMM import");
+        assert_eq!(imported.read_host(64).expect("VMM read"), values);
+        unsafe {
+            use std::os::fd::FromRawFd;
+            drop(std::os::fd::OwnedFd::from_raw_fd(fd));
+        }
+    }
+
+    #[test]
     fn ipc_handle_roundtrips() {
         let handle = crate::ipc::IpcHandle([0x5a; 64]);
         assert_eq!(

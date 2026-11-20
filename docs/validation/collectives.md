@@ -118,8 +118,21 @@ ipc-peer: rank=0 gpu=0 bytes=256 checksum=381.000 ok
 ```
 
 The descriptor exchange in this harness is a TCP control test, not the EPaxos
-replicated log. VMM export is not implemented; the IPC path is the first half of
-M2. Host copies occur only for the initial input and final verification.
+replicated log. Host copies occur only for the initial input and final
+verification.
+
+### VMM path
+
+`crates/plait-collective/src/ipc.rs` also implements `VmmRegion`:
+
+- `cuMemGetAllocationGranularity`;
+- `cuMemCreate` with `CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR`;
+- `cuMemAddressReserve` + `cuMemMap` + `cuMemSetAccess`;
+- `cuMemExportToShareableHandle` and `cuMemImportFromShareableHandle`.
+
+The TLA/I PC harness does not yet pass the fd over a Unix socket; the VMM test
+covers export/import in one process. Cross-process fd transport is the remaining
+M2 item. Both local and `pro5000` VMM tests pass.
 
 ## Measured performance
 
