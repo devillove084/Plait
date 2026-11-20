@@ -346,6 +346,54 @@ impl PeerGroup {
         Ok(())
     }
 
+    /// Device-resident ring allreduce benchmark path. Inputs are uploaded once;
+    /// the timed loop contains no H2D/D2H or per-iteration allocation.
+    pub fn all_reduce_resident(
+        &self,
+        inputs: &[Vec<f32>],
+        iterations: usize,
+    ) -> Result<(std::time::Duration, Vec<Vec<f32>>)> {
+        self.validate(inputs)?;
+        let n = self.ranks.len();
+        let count = inputs[0].len();
+        let width = count.div_ceil(n);
+        let padded = width * n;
+        let mut data = Vec::with_capacity(n);
+        let mut receive = Vec::with_capacity(n);
+        for (rank, input) in inputs.iter().enumerate() {
+            let mut host = input.clone();
+            host.resize(padded, 0.0);
+            data.push(
+                self.ranks[rank]
+                    .stream
+                    .clone_htod(&host)
+                    .map_err(driver("resident allocation"))?,
+            );
+            receive.push(
+                self.ranks[rank]
+                    .stream
+                    .alloc_zeros::<f32>(width)
+                    .map_err(driver("resident receive"))?,
+            );
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            self.reduce_scatter_core(&mut data, &mut receive, width)?;
+            self.all_gather_after_reduce(&mut data, &mut receive, width)?;
+        }
+        self.sync()?;
+        let elapsed = start.elapsed();
+        let mut output = Vec::with_capacity(n);
+        for rank in 0..n {
+            let host = self.ranks[rank]
+                .stream
+                .clone_dtoh(&data[rank])
+                .map_err(driver("resident copy"))?;
+            output.push(host[..count].to_vec());
+        }
+        Ok((elapsed, output))
+    }
+
     pub fn all_reduce(
         &self,
         inputs: &[Vec<f32>],

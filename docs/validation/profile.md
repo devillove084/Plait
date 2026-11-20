@@ -54,6 +54,23 @@ GPU work:
   host-issued copies without reducing the number of API calls enough; measured
   bus bandwidth fell from 0.137 to 0.060/0.035 GB/s.
 
+## Device-resident measurement
+
+`all_reduce_resident` uploads once and excludes H2D/D2H and per-call allocation
+from the timed loop. It is a performance probe, not a correctness run: repeated
+iterations keep reducing the previous result.
+
+8 ranks, 1 MiB, 5 iterations:
+
+| Path | Time (ms) | Bus BW (GB/s) |
+|---|---:|---:|
+| Host-inclusive `all_reduce` | 21.031 | 0.087 |
+| Device-resident `all_reduce_resident` | 3.416 | 0.537 |
+
+So H2D/D2H plus per-call allocation account for roughly 17.6 ms of the 21 ms.
+The remaining 3.4 ms is still dominated by the 112 host-issued peer copies and
+the final stream synchronizations; it is not kernel-bound.
+
 ## What would change the result
 
 1. Device-resident input/output API: allocate once, time only the collective.

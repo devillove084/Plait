@@ -46,7 +46,7 @@ hetero: setup
     cargo run -q --locked -p plait-node -- hetero
 
 collectives: setup
-    cargo run -q --locked -p plait-node -- collectives --channels ${PLAIT_CHANNELS:-1} --trace target/collectives-trace.json
+    cargo run -q --locked -p plait-node -- collectives --channels ${PLAIT_CHANNELS:-1} --resident --trace target/collectives-trace.json
 
 ipc: setup
     ./scripts/ipc-peer.sh

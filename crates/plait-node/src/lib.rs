@@ -1017,6 +1017,7 @@ pub fn run_gpu_demo() -> Result<(), Box<dyn std::error::Error>> {
 /// Benchmark the peer-memory all-reduce against the same byte count used by
 /// the NCCL `all_reduce_perf` harness. This is intentionally separate from the
 /// consensus matrix runner: it measures the GPU data plane, not agreement.
+#[allow(clippy::too_many_arguments)]
 pub fn run_collectives_demo(
     ranks: usize,
     bytes: usize,
@@ -1024,6 +1025,7 @@ pub fn run_collectives_demo(
     algorithm: &str,
     op: &str,
     channels: usize,
+    resident: bool,
     trace: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use plait_collective::{AllReduceAlgorithm, PeerGroup};
@@ -1082,6 +1084,20 @@ pub fn run_collectives_demo(
         run_collective_op(&group, op, &inputs, &expected, algorithm)?;
     }
     let seconds = start.elapsed().as_secs_f64() / iters as f64;
+    if resident && op == "allreduce" {
+        let (elapsed, output) = group.all_reduce_resident(&inputs, iters)?;
+        if output.iter().any(|values| values.len() != inputs[0].len()) {
+            return Err("resident allreduce output length mismatch".into());
+        }
+        let resident_seconds = elapsed.as_secs_f64() / iters as f64;
+        let resident_algbw = allreduce_bytes_f64(bytes) / resident_seconds / 1e9;
+        let resident_busbw = resident_algbw * 2.0 * (ranks - 1) as f64 / ranks as f64;
+        println!(
+            "plait collectives: resident allreduce ranks={ranks} bytes={} time_ms={:.6} algbw_GB/s={resident_algbw:.3} busbw_GB/s={resident_busbw:.3}",
+            (bytes / std::mem::size_of::<f32>()).max(1) * std::mem::size_of::<f32>(),
+            resident_seconds * 1e3
+        );
+    }
     let allreduce_bytes = count * std::mem::size_of::<f32>();
     let algbw = allreduce_bytes as f64 / seconds / 1e9;
     let busbw = algbw * 2.0 * (ranks - 1) as f64 / ranks as f64;
@@ -1099,6 +1115,10 @@ pub fn run_collectives_demo(
         );
     }
     Ok(())
+}
+
+fn allreduce_bytes_f64(bytes: usize) -> f64 {
+    (bytes / std::mem::size_of::<f32>()).max(1) as f64 * std::mem::size_of::<f32>() as f64
 }
 
 fn run_collective_op(
