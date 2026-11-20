@@ -21,7 +21,8 @@ Averages are not enough. The slowest rank must pass.
 | Size | Plait two-level min rank | NCCL TCP | Status |
 |---:|---:|---:|---|
 | 1 MiB | 0.091 GB/s | 0.050 GB/s | pass |
-| 16 MiB | 0.258 GB/s | 0.273 GB/s | fail |
+| 16 MiB | 0.258 GB/s (TCP two-level) | 0.273 GB/s | fail |
+| 16 MiB (shm variant) | 0.220-0.255 GB/s | 0.273 GB/s | fail |
 | 64 MiB | not measured | not measured | open |
 
 The 1 MiB result uses:
