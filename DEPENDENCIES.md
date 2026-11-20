@@ -9,6 +9,12 @@ Plait is a Rust 2024 workspace. The authoritative lock is the committed
 | `bincode` | 1.3 | Framed TCP payload codec |
 | `sha2` | 0.10 | Stable `NodeId` derivation from human labels |
 | `rand` | 0.8 | Fresh node and client identities when no id is supplied |
+| `tokio` | 1 | Async TCP control plane, timers, cancellation |
+| `tokio-util` | 0.7 | Length-delimited framing |
+| `futures-util` | 0.3 | `Framed` stream/sink adapters |
+| `bytes` | 1 | Zero-copy framed payloads |
+| `cudarc` | 0.19 | CUDA driver, NVRTC, kernel launch |
+| `CUTLASS` | v4.8.1 (cloned by `just setup`) | Official NVIDIA C++ GEMM templates, FFI shim |
 | `rdma-io` | 0.0.2, no async features | Safe RAII wrappers over rdma-core: device, PD, CQ, MR, QP, WR builders |
 | `rdma-io-sys` | 0.0.1 | Generated rdma-core FFI used for QP attributes |
 | `pkg-config` | 0.3 (build) | Exposes the system `libibverbs`/`librdmacm` link paths |
@@ -29,10 +35,12 @@ the community `rdma-io` crate rather than a project-local ABI shim.
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
-cargo run --locked -p plait-node -- demo
-cargo run --locked -p plait-node -- dsa
-cargo run --locked -p plait-node -- parallel
-cargo run --locked -p plait-node -- rdma-selftest
+just test
+just demo
+just dsa
+just parallel
+just gpu
+just rdma
 ```
 
 4. Update this table in the same change.

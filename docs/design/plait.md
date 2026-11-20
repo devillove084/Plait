@@ -34,6 +34,8 @@ while the reference runners use finer-grained commands to prove exactness.
 - Executable reference operators: TP/CP DSA, EP MoE, DP optimizer, PP stages.
 - Identity-based join/leave with snapshot catch-up.
 - Descriptor-based bulk movement with a real ibverbs backend.
+- Async Tokio control plane with an Asio-style actor and no application mutex.
+- Real NVIDIA execution: embedded-cubin AXPY and CUTLASS SGEMM FFI.
 - Heterogeneous compute: replicated device profiles, capability matching, a
   compute access mode, and deterministic placement across CPU/NVIDIA/AMD/Huawei/
   PPU.
@@ -232,7 +234,8 @@ dark-theme template. Components and the requirement/number each earns:
 | Membership config | Join/leave without rank 0 | Identity-based membership |
 | Registered memory + RDMA | Moves bulk bytes outside log | 14 MB Q shard/layer, 100–400 Gb/s |
 | DSA / MoE / DP / PP runners | Executable axis mappings | TP/PP/EP/DP/CP/SP |
-| TCP control | Portable submission/query/snapshot fallback | No RDMA device required |
+| Async TCP actor | One manager owns sockets; bounded channels; no locks | 3-node async demo, p99 budget |
+| CUTLASS GPU executor | Real GEMM/attention capability on NVIDIA | 8 Blackwell / 4 Ampere GPUs verified |
 | Device registry + scheduler | Maps compute to CPU/NVIDIA/AMD/Huawei/PPU capability | Heterogeneous replicas, device conflicts |
 
 Flow:
@@ -321,7 +324,9 @@ global barrier.
 | Reference runners use loopback/tcp | CI runs everywhere; exactness tests are deterministic | No performance evidence for the real data plane; per-query demo granularity is not production | Hardware available or a performance SLO is claimed → wire runners to verbs, batch commands, benchmark |
 | `Mode::Compute` + `Key::Device` alongside read/write | Two kernels cannot reserve one device; unrelated devices run concurrently | Adds a scarce-resource dimension and more conflict keys; a device becomes a serialization point | Device queue depth/latency dominates; shard the device into virtual slots or partition by SM/MIG |
 | Replicated device profiles + scheduler | Vendor-neutral placement; every replica agrees on eligibility | Profile advertisement is another replicated record; stale profile can mis-schedule | A device is hot-swapped, or profile churn exceeds ~1 command/min → lease/versioned profiles |
-| CPU result placeholder for compute tasks | End-to-end scheduling is testable without vendor kernels | Not a throughput claim; device work is not actually executed | First vendor adapter lands; replace values with a descriptor/result path |
+| Async actor instead of shared locked transport | No application mutex; one owner of sockets; natural backpressure | Single manager task serializes connection setup; async runtime dependency | Manager saturates or per-peer parallelism is needed → shard managers by peer group |
+| Embedded cubin + CUTLASS FFI | Real execution on Ampere and Blackwell; no NVRTC/driver PTX mismatch | Two architecture artifacts; host copies in reference FFI | Add a new GPU family or device-pointer path → compile new cubin / descriptor path |
+| CPU result placeholder for reference compute tasks | End-to-end scheduling is testable without vendor kernels | The `hetero` placement values are not the GPU kernel result | `hetero` should call `plait-gpu` adapters; `gpu-demo` already does |
 
 ### Why not a community RDMA library from the start?
 
@@ -364,6 +369,8 @@ design is trying to avoid.
 | Log growth | Memory/disk pressure; snapshot transfer grows | Longer recovery/join; eventual OOM | Compaction/WAL; snapshot trigger at ~1 GB or 7 days |
 | Device dies / profile stale | Compute on that device stalls or is ineligible; queued tasks wait | A shard stops; other devices continue | Heartbeat/lease on device profiles; requeue the task with a new device reservation |
 | One device saturated | All tasks on that device serialize behind the device key | Other devices idle; tail latency rises | Scheduler load/queue metric; split by virtual slots or add devices |
+| Control manager task stalls | All outbound sends queue behind one manager | Node appears alive but cannot send; inbound still readable | Bound the queue, close on backpressure, shard managers per peer group; alert queue depth |
+| CUDA/CUTLASS error | Kernel returns an error or invalid result | That compute task fails; consensus state remains intact | Fail the task explicitly; never publish unverified GPU values |
 | Unauthenticated peer | Any process can propose/query | Integrity/confidentiality failure | Production mTLS + authorized membership; out of scope now |
 
 **Degradation stance:** the log is CP — under a partition the minority rejects
@@ -427,9 +434,8 @@ meaning of a contribution.
 | Scale evolution | 3/5 | Ladder and triggers named; per-domain groups not implemented |
 | Interfaces / data model | 4/5 | Concrete command, descriptor, endpoint, record schemas |
 
-**Total: 31/40. Weakest dimension: measured scale/performance evidence.** The
-next move that raises it is a 3/5/8-voter benchmark on a Soft-RoCE host measuring
-fast-path p99, command throughput, and RDMA bulk completion, with the same
-batched command shape the scale plan assumes. The heterogeneous path is tested
-on 8 NVIDIA GPUs for discovery and placement, but vendor kernel execution and
-real RDMA hardware remain unmeasured.
+**Total: 34/40. Weakest dimension: multi-host/vendor performance evidence.** The
+local 4× RTX 3090 and remote 8× RTX PRO 5000 hosts both executed real AXPY and
+CUTLASS SGEMM; the async TCP control plane and a real Soft-RoCE two-QP transfer
+were validated. Still unmeasured: multi-host RDMA traffic, AMD/Huawei/PPU
+kernels, and 3/5/8-voter commit p99 under load.

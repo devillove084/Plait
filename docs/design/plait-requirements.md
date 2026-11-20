@@ -27,6 +27,9 @@ move bulk bytes through registered memory instead of through the log.
 7. **Heterogeneous compute placement.** Advertise CPU, NVIDIA, AMD, Huawei, PPU,
    and other devices as replicated capability profiles; schedule a compute task
    onto an eligible device; serialize compute per device through EPaxos.
+8. **Async control plane.** Use a Tokio actor for TCP: one owner of outbound
+   sockets and the peer table, bounded channels, no application mutex, no
+   blocking receive; async submission/query and node loop.
 
 ## Non-functional requirements
 
@@ -44,6 +47,8 @@ move bulk bytes through registered memory instead of through the log.
 | Payload policy | Inline ≤ ~1 KB control; descriptor + RDMA above that | Keeps log bandwidth and CPU bounded |
 | Device heterogeneity | CPU + NVIDIA + AMD + Huawei + PPU profiles in one plan | Scheduling cannot assume one vendor or one backend |
 | Compute conflict | Same device serialized; different devices concurrent | A device is a scarce execution resource, not just data |
+| Control concurrency | Tokio actor, channels, `select!`; no locks | Async runtime dependency; one manager task owns sockets |
+| GPU execution | Real CUDA AXPY + CUTLASS SGEMM on 3090 and Blackwell | Vendor-specific FFI; only NVIDIA adapter today |
 
 ## Out of scope (explicit)
 
@@ -72,9 +77,11 @@ move bulk bytes through registered memory instead of through the log.
 - **A5.** RDMA hardware is not present in the development container or the
   provided remote container; the real backend compiles and links, but the two-QP
   path is validated only on a host with an RNIC or configured Soft-RoCE.
-- **A7.** Vendor kernel execution is an adapter layer. Device discovery,
-  capability matching, compute conflicts, and placement are in scope now; CUDA,
-  ROCm, CANN, and PPU kernels are future adapters.
+- **A7.** Vendor kernel execution is an adapter layer. NVIDIA CUDA/CUTLASS is
+  implemented; AMD/Huawei/PPU adapters are future.
+- **A8.** Control-plane networking is async and lock-free at the application
+  level; the RDMA hardware layer remains blocking and is called from a blocking
+  task for the self-test.
 - **A6.** Membership changes are rare and can tolerate a full-quorum pause.
 
 ## Key numbers (→ back-of-the-envelope)

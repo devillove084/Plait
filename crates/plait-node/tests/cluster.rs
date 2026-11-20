@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use plait_core::{
@@ -14,10 +13,14 @@ fn ids(prefix: &str, count: usize) -> Vec<NodeId> {
         .collect()
 }
 
-fn start_bootstrap(ids: &[NodeId]) -> (Vec<RunningNode>, Vec<String>) {
+async fn start_bootstrap(ids: &[NodeId]) -> (Vec<RunningNode>, Vec<String>) {
     let mut transports = Vec::new();
     for id in ids {
-        transports.push(TcpTransport::bind(*id, "127.0.0.1:0", BTreeMap::new()).unwrap());
+        transports.push(
+            TcpTransport::bind(*id, "127.0.0.1:0", BTreeMap::new())
+                .await
+                .unwrap(),
+        );
     }
     let addrs: Vec<String> = transports
         .iter()
@@ -40,22 +43,37 @@ fn start_bootstrap(ids: &[NodeId]) -> (Vec<RunningNode>, Vec<String>) {
     (nodes, addrs)
 }
 
-fn wait_for<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(value) = check() {
-            return value;
+macro_rules! wait_until {
+    ($what:expr, $check:expr) => {{
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if $check {
+                break;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {}", $what);
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        thread::sleep(Duration::from_millis(50));
-    }
+    }};
 }
 
-#[test]
-fn tcp_cluster_proposes_and_fuses_from_every_node() {
+macro_rules! wait_value {
+    ($what:expr, $check:expr) => {{
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(value) = $check {
+                break value;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {}", $what);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }};
+}
+
+#[tokio::test]
+async fn tcp_cluster_proposes_and_fuses_from_every_node() {
     let ids = ids("tcp-fuse", 3);
-    let (_nodes, addrs) = start_bootstrap(&ids);
-    let mut client = Client::new().unwrap();
+    let (_nodes, addrs) = start_bootstrap(&ids).await;
+    let mut client = Client::new().await.unwrap();
     for (id, addr) in ids.iter().zip(&addrs) {
         client.add_peer(*id, addr.clone());
     }
@@ -67,13 +85,16 @@ fn tcp_cluster_proposes_and_fuses_from_every_node() {
         tensor: TensorKey::new(TensorId(9), ShardId(0)),
         epoch: 2,
     };
-    client.submit(ids[0], Command::DeclareOp(spec)).unwrap();
-    wait_for("declaration", || {
+    client
+        .submit(ids[0], Command::DeclareOp(spec))
+        .await
+        .unwrap();
+    wait_until!("declaration", {
         client
             .query(ids[0], op)
+            .await
             .ok()
-            .filter(|reply| reply.declared)
-            .map(|_| ())
+            .is_some_and(|reply| reply.declared)
     });
     let partials = [[1.0, 1.0], [2.0, 2.0], [4.0, 4.0]];
     for (index, id) in ids.iter().enumerate() {
@@ -86,20 +107,25 @@ fn tcp_cluster_proposes_and_fuses_from_every_node() {
                     values: partials[index].to_vec(),
                 },
             )
+            .await
             .unwrap();
     }
-    let values = wait_for("fused result", || {
-        client.query(ids[2], op).ok().and_then(|reply| reply.values)
+    let values = wait_value!("fused result", {
+        client
+            .query(ids[2], op)
+            .await
+            .ok()
+            .and_then(|reply| reply.values)
     });
     assert_eq!(values, vec![7.0, 7.0]);
 }
 
-#[test]
-fn a_joining_node_receives_a_snapshot_and_becomes_a_voter() {
+#[tokio::test]
+async fn a_joining_node_receives_a_snapshot_and_becomes_a_voter() {
     let ids = ids("join", 3);
     let bootstrap = [ids[0], ids[1]];
-    let (mut nodes, addrs) = start_bootstrap(&bootstrap);
-    let mut client = Client::new().unwrap();
+    let (mut nodes, addrs) = start_bootstrap(&bootstrap).await;
+    let mut client = Client::new().await.unwrap();
     for (id, addr) in bootstrap.iter().zip(&addrs) {
         client.add_peer(*id, addr.clone());
     }
@@ -114,18 +140,17 @@ fn a_joining_node_receives_a_snapshot_and_becomes_a_voter() {
         }),
         options: Default::default(),
     };
-    let joining = RunningNode::start(joining_config).unwrap();
+    let joining = RunningNode::start(joining_config).await.unwrap();
     client.add_peer(ids[2], joining.addr().to_owned());
 
     let op = OpId::new(NodeId::derive("join-op"), 1);
-    wait_for("three voters", || {
+    wait_until!("three voters", {
         client
             .query(ids[2], op)
+            .await
             .ok()
-            .filter(|reply| reply.voters.len() == 3)
-            .map(|_| ())
+            .is_some_and(|reply| reply.voters.len() == 3)
     });
-    // The new voter can propose and the old nodes can still form a quorum.
     let spec = OpSpec {
         id: op,
         kind: FuseKind::Max,
@@ -133,13 +158,16 @@ fn a_joining_node_receives_a_snapshot_and_becomes_a_voter() {
         tensor: TensorKey::new(TensorId(10), ShardId(0)),
         epoch: 3,
     };
-    client.submit(ids[2], Command::DeclareOp(spec)).unwrap();
-    wait_for("declaration", || {
+    client
+        .submit(ids[2], Command::DeclareOp(spec))
+        .await
+        .unwrap();
+    wait_until!("declaration", {
         client
             .query(ids[0], op)
+            .await
             .ok()
-            .filter(|reply| reply.declared)
-            .map(|_| ())
+            .is_some_and(|reply| reply.declared)
     });
     for (index, id) in ids.iter().enumerate() {
         client
@@ -151,14 +179,18 @@ fn a_joining_node_receives_a_snapshot_and_becomes_a_voter() {
                     values: vec![(index + 1) as f64],
                 },
             )
+            .await
             .unwrap();
     }
-    let values = wait_for("joined result", || {
-        client.query(ids[1], op).ok().and_then(|reply| reply.values)
+    let values = wait_value!("joined result", {
+        client
+            .query(ids[1], op)
+            .await
+            .ok()
+            .and_then(|reply| reply.values)
     });
     assert_eq!(values, vec![3.0]);
 
-    // Keep handles alive until all assertions finish.
     drop(joining);
     nodes.clear();
 }

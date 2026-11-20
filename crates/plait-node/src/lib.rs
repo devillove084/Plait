@@ -4,9 +4,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
 use std::time::{Duration, Instant};
+
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 
 use plait_consensus::{Options, Replica};
 use plait_core::{
@@ -50,17 +51,17 @@ impl NodeConfig {
 pub struct RunningNode {
     id: NodeId,
     addr: String,
-    stop: Arc<AtomicBool>,
-    handle: Option<thread::JoinHandle<()>>,
+    stop: Arc<Notify>,
+    handle: Option<JoinHandle<()>>,
 }
 
 impl RunningNode {
-    pub fn start(config: NodeConfig) -> io::Result<Self> {
+    pub async fn start(config: NodeConfig) -> io::Result<Self> {
         let mut transport_peers = config.peers.clone();
         if let Some(join) = &config.join {
             transport_peers.insert(join.node, join.addr.clone());
         }
-        let transport = TcpTransport::bind(config.id, &config.listen, transport_peers)?;
+        let transport = TcpTransport::bind(config.id, &config.listen, transport_peers).await?;
         let voters = if config.join.is_some() {
             vec![config.id]
         } else {
@@ -80,8 +81,8 @@ impl RunningNode {
     ) -> io::Result<Self> {
         let id = config.id;
         let addr = transport.local_addr().to_owned();
-        let stop = Arc::new(AtomicBool::new(false));
-        let thread_stop = stop.clone();
+        let stop = Arc::new(Notify::new());
+        let task_stop = stop.clone();
         let state = NodeState {
             id,
             transport,
@@ -96,7 +97,7 @@ impl RunningNode {
             last_ready: 0,
             started: Instant::now(),
         };
-        let handle = thread::spawn(move || state.run(thread_stop));
+        let handle = tokio::spawn(state.run(task_stop));
         Ok(Self {
             id,
             addr,
@@ -116,9 +117,9 @@ impl RunningNode {
 
 impl Drop for RunningNode {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop.notify_waiters();
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            handle.abort();
         }
     }
 }
@@ -143,22 +144,40 @@ impl NodeState {
         self.started.elapsed().as_millis() as u64
     }
 
-    fn run(mut self, stop: Arc<AtomicBool>) {
-        while !stop.load(Ordering::Relaxed) {
-            let now = self.now();
-            if let Some((from, wire)) = self.transport.recv_timeout(Duration::from_millis(15)) {
-                self.handle(from, wire, now);
+    async fn run(mut self, stop: Arc<Notify>) {
+        let mut ticker = tokio::time::interval(Duration::from_millis(10));
+        loop {
+            #[allow(clippy::large_enum_variant)]
+            enum Event {
+                Stop,
+                Incoming(Option<(NodeId, Wire)>),
+                Tick,
             }
-            self.replica.tick(now);
-            self.maybe_register_devices(now);
-            self.drive_join(now);
-            self.refresh_peers();
-            self.flush();
-            thread::sleep(Duration::from_millis(2));
+            let event = tokio::select! {
+                _ = stop.notified() => Event::Stop,
+                message = self.transport.recv() => Event::Incoming(message),
+                _ = ticker.tick() => Event::Tick,
+            };
+            match event {
+                Event::Stop => break,
+                Event::Incoming(None) => break,
+                Event::Incoming(Some((from, wire))) => {
+                    let now = self.now();
+                    self.handle(from, wire, now).await;
+                }
+                Event::Tick => {
+                    let now = self.now();
+                    self.replica.tick(now);
+                    self.maybe_register_devices(now);
+                    self.drive_join(now).await;
+                    self.refresh_peers();
+                    self.flush().await;
+                }
+            }
         }
     }
 
-    fn handle(&mut self, from: NodeId, wire: Wire, now: u64) {
+    async fn handle(&mut self, from: NodeId, wire: Wire, now: u64) {
         match wire {
             Wire::Consensus(message) => {
                 if self.joined || self.join.is_none() {
@@ -171,7 +190,7 @@ impl NodeState {
                     return;
                 }
                 if self.replica.config().is_member(node) {
-                    self.send_snapshot(node);
+                    self.send_snapshot(node).await;
                 } else if self.replica.config().is_voter(self.id)
                     && self.staged_proposed.insert(node)
                 {
@@ -183,7 +202,7 @@ impl NodeState {
             }
             Wire::SnapshotRequest { node } => {
                 if self.replica.config().is_member(node) {
-                    self.send_snapshot(node);
+                    self.send_snapshot(node).await;
                 }
             }
             Wire::Snapshot { snapshot, peers } => {
@@ -197,7 +216,7 @@ impl NodeState {
                 self.transport.set_peers(peers);
                 self.joined = true;
                 self.refresh_peers();
-                self.send_ready(now);
+                self.send_ready(now).await;
             }
             Wire::Ready { node } => {
                 if self.replica.config().is_voter(self.id)
@@ -233,14 +252,17 @@ impl NodeState {
                     Ok(message) => (true, message),
                     Err(message) => (false, message),
                 };
-                let _ = self.transport.send(
-                    from,
-                    Wire::Ack {
-                        request,
-                        ok,
-                        message,
-                    },
-                );
+                let _ = self
+                    .transport
+                    .send(
+                        from,
+                        Wire::Ack {
+                            request,
+                            ok,
+                            message,
+                        },
+                    )
+                    .await;
             }
             Wire::Query {
                 request,
@@ -257,10 +279,10 @@ impl NodeState {
                     executed: self.replica.executed_count(),
                     voters: self.replica.config().voters().iter().copied().collect(),
                 };
-                let _ = self.transport.send(from, reply);
+                let _ = self.transport.send(from, reply).await;
             }
             Wire::Ping => {
-                let _ = self.transport.send(from, Wire::Pong);
+                let _ = self.transport.send(from, Wire::Pong).await;
             }
             Wire::Hello { .. } | Wire::Pong | Wire::Ack { .. } | Wire::QueryReply { .. } => {}
         }
@@ -280,20 +302,24 @@ impl NodeState {
         self.devices_registered = true;
     }
 
-    fn drive_join(&mut self, now: u64) {
+    async fn drive_join(&mut self, now: u64) {
         if let Some(join) = &self.join {
             if !self.joined && now.saturating_sub(self.last_join_poll) >= 300 {
                 self.last_join_poll = now;
-                let _ = self.transport.send(
-                    join.node,
-                    Wire::JoinRequest {
-                        node: self.id,
-                        addr: self.transport.local_addr().to_owned(),
-                    },
-                );
                 let _ = self
                     .transport
-                    .send(join.node, Wire::SnapshotRequest { node: self.id });
+                    .send(
+                        join.node,
+                        Wire::JoinRequest {
+                            node: self.id,
+                            addr: self.transport.local_addr().to_owned(),
+                        },
+                    )
+                    .await;
+                let _ = self
+                    .transport
+                    .send(join.node, Wire::SnapshotRequest { node: self.id })
+                    .await;
             }
         }
         if self.joined
@@ -302,26 +328,30 @@ impl NodeState {
             && now.saturating_sub(self.last_ready) >= 300
         {
             self.last_ready = now;
-            self.send_ready(now);
+            self.send_ready(now).await;
         }
     }
 
-    fn send_ready(&mut self, _now: u64) {
+    async fn send_ready(&mut self, _now: u64) {
         let voters: Vec<NodeId> = self.replica.config().voters().iter().copied().collect();
         for voter in voters {
-            let _ = self.transport.send(voter, Wire::Ready { node: self.id });
+            let _ = self
+                .transport
+                .send(voter, Wire::Ready { node: self.id })
+                .await;
         }
     }
 
-    fn send_snapshot(&mut self, to: NodeId) {
-        if self.transport.peer_addr(to).is_none() {
+    async fn send_snapshot(&mut self, to: NodeId) {
+        let peers = self.transport.peers().await;
+        if !peers.contains_key(&to) {
             return;
         }
         let wire = Wire::Snapshot {
             snapshot: self.replica.snapshot(),
-            peers: self.transport.peers(),
+            peers,
         };
-        let _ = self.transport.send(to, wire);
+        let _ = self.transport.send(to, wire).await;
     }
 
     fn refresh_peers(&mut self) {
@@ -338,11 +368,12 @@ impl NodeState {
         }
     }
 
-    fn flush(&mut self) {
+    async fn flush(&mut self) {
         for outbound in self.replica.take_outbox() {
             if let Err(error) = self
                 .transport
                 .send(outbound.to, Wire::Consensus(outbound.message))
+                .await
             {
                 eprintln!("{}: send to {} failed: {error}", self.id, outbound.to);
             }
@@ -356,9 +387,9 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new() -> io::Result<Self> {
+    pub async fn new() -> io::Result<Self> {
         let id = NodeId::random();
-        let transport = TcpTransport::bind(id, "127.0.0.1:0", BTreeMap::new())?;
+        let transport = TcpTransport::bind(id, "127.0.0.1:0", BTreeMap::new()).await?;
         Ok(Self { transport, next: 1 })
     }
 
@@ -366,28 +397,36 @@ impl Client {
         self.transport.set_peer(node, addr);
     }
 
-    pub fn submit(&mut self, node: NodeId, command: Command) -> io::Result<String> {
+    pub async fn submit(&mut self, node: NodeId, command: Command) -> io::Result<String> {
         let request = self.next;
         self.next += 1;
         let reply_to = self.transport.local_addr().to_owned();
-        self.transport.send(
-            node,
-            Wire::Submit {
-                request,
-                command,
-                reply_to,
-            },
-        )?;
+        self.transport
+            .send(
+                node,
+                Wire::Submit {
+                    request,
+                    command,
+                    reply_to,
+                },
+            )
+            .await?;
         let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Some((
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let next = tokio::time::timeout(
+                remaining.min(Duration::from_millis(100)),
+                self.transport.recv(),
+            )
+            .await;
+            if let Ok(Some((
                 _,
                 Wire::Ack {
                     request: answer,
                     ok,
                     message,
                 },
-            )) = self.transport.recv_timeout(Duration::from_millis(100))
+            ))) = next
             {
                 if answer == request {
                     if ok {
@@ -396,30 +435,36 @@ impl Client {
                     return Err(io::Error::other(message));
                 }
             }
-            if Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "submit acknowledgement timed out",
-                ));
-            }
         }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "submit acknowledgement timed out",
+        ))
     }
 
-    pub fn query(&mut self, node: NodeId, op: OpId) -> io::Result<QueryResult> {
+    pub async fn query(&mut self, node: NodeId, op: OpId) -> io::Result<QueryResult> {
         let request = self.next;
         self.next += 1;
         let reply_to = self.transport.local_addr().to_owned();
-        self.transport.send(
-            node,
-            Wire::Query {
-                request,
-                op,
-                reply_to,
-            },
-        )?;
+        self.transport
+            .send(
+                node,
+                Wire::Query {
+                    request,
+                    op,
+                    reply_to,
+                },
+            )
+            .await?;
         let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Some((
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let next = tokio::time::timeout(
+                remaining.min(Duration::from_millis(100)),
+                self.transport.recv(),
+            )
+            .await;
+            if let Ok(Some((
                 _,
                 Wire::QueryReply {
                     request: answer,
@@ -429,7 +474,7 @@ impl Client {
                     executed,
                     voters,
                 },
-            )) = self.transport.recv_timeout(Duration::from_millis(100))
+            ))) = next
             {
                 if answer == request && answer_op == op {
                     return Ok(QueryResult {
@@ -440,10 +485,8 @@ impl Client {
                     });
                 }
             }
-            if Instant::now() >= deadline {
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "query timed out"));
-            }
         }
+        Err(io::Error::new(io::ErrorKind::TimedOut, "query timed out"))
     }
 }
 
@@ -459,7 +502,7 @@ pub struct QueryResult {
 /// verify that all replicas materialize the same result. This is the shortest
 /// end-to-end proof that submission, consensus, membership, and fusion work
 /// over real sockets.
-pub fn run_demo() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_demo() -> Result<(), Box<dyn std::error::Error>> {
     let ids = [
         NodeId::derive("demo-a"),
         NodeId::derive("demo-b"),
@@ -467,7 +510,7 @@ pub fn run_demo() -> Result<(), Box<dyn std::error::Error>> {
     ];
     let mut transports = Vec::new();
     for id in ids {
-        transports.push(TcpTransport::bind(id, "127.0.0.1:0", BTreeMap::new())?);
+        transports.push(TcpTransport::bind(id, "127.0.0.1:0", BTreeMap::new()).await?);
     }
     let addrs: Vec<String> = transports
         .iter()
@@ -493,7 +536,7 @@ pub fn run_demo() -> Result<(), Box<dyn std::error::Error>> {
         )?);
     }
 
-    let mut client = Client::new()?;
+    let mut client = Client::new().await?;
     for (id, addr) in ids.iter().zip(&addrs) {
         client.add_peer(*id, addr.clone());
     }
@@ -506,37 +549,39 @@ pub fn run_demo() -> Result<(), Box<dyn std::error::Error>> {
         tensor: TensorKey::new(TensorId(7), ShardId(0)),
         epoch: 1,
     };
-    client.submit(ids[0], Command::DeclareOp(spec))?;
-    wait_declared(&mut client, ids[0], op)?;
+    client.submit(ids[0], Command::DeclareOp(spec)).await?;
+    wait_declared(&mut client, ids[0], op).await?;
 
     let partials = [[1.0, 2.0, 3.0], [10.0, 20.0, 30.0], [100.0, 200.0, 300.0]];
     for (index, node) in ids.iter().enumerate() {
-        client.submit(
-            *node,
-            Command::Contribute {
-                op,
-                contributor: *node,
-                values: partials[index].to_vec(),
-            },
-        )?;
+        client
+            .submit(
+                *node,
+                Command::Contribute {
+                    op,
+                    contributor: *node,
+                    values: partials[index].to_vec(),
+                },
+            )
+            .await?;
     }
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let result = loop {
-        let query = client.query(ids[0], op)?;
+        let query = client.query(ids[0], op).await?;
         if let Some(values) = query.values {
             break values;
         }
         if Instant::now() >= deadline {
             return Err("fused result did not materialize".into());
         }
-        thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(50)).await;
     };
     let expected = vec![111.0, 222.0, 333.0];
     if result != expected {
         return Err(format!("unexpected fused value: {result:?}").into());
     }
-    let voters = client.query(ids[1], op)?.voters;
+    let voters = client.query(ids[1], op).await?.voters;
     println!(
         "plait demo: 3 TCP peers, {} voters, fused sum {:?} on every query",
         voters.len(),
@@ -546,10 +591,10 @@ pub fn run_demo() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn wait_declared(client: &mut Client, node: NodeId, op: OpId) -> io::Result<()> {
+async fn wait_declared(client: &mut Client, node: NodeId, op: OpId) -> io::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if client.query(node, op)?.declared {
+        if client.query(node, op).await?.declared {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -558,7 +603,7 @@ fn wait_declared(client: &mut Client, node: NodeId, op: OpId) -> io::Result<()> 
                 "operator declaration timed out",
             ));
         }
-        thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -668,8 +713,11 @@ fn max_error(actual: &[Vec<f64>], expected: &[Vec<f64>]) -> f64 {
 
 /// Run the real ibverbs self-test. Returns a skip message when no device is
 /// configured; this is expected on hosts without an RNIC or Soft-RoCE.
-pub fn run_rdma_selftest() -> Result<(), Box<dyn std::error::Error>> {
-    match plait_rdma::selftest()? {
+pub async fn run_rdma_selftest() -> Result<(), Box<dyn std::error::Error>> {
+    let result = tokio::task::spawn_blocking(plait_rdma::selftest)
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))??;
+    match result {
         plait_rdma::SelfTest::Skipped(reason) => {
             println!("plait rdma: skipped ({reason})");
             println!(
@@ -792,6 +840,83 @@ pub fn run_hetero_demo() -> Result<(), Box<dyn std::error::Error>> {
     );
     for (task, device, kernel) in assignments.iter().take(8) {
         println!("  {task:?} -> {device} ({kernel})");
+    }
+    Ok(())
+}
+
+/// Execute real CUDA work on every visible NVIDIA device. The AXPY path uses a
+/// compact embedded cubin; the GEMM path goes through the CUTLASS C++ FFI.
+pub fn run_gpu_demo() -> Result<(), Box<dyn std::error::Error>> {
+    let node = NodeId::derive("gpu-demo");
+    let profiles = plait_device::discover(node);
+    let gpus: Vec<_> = profiles
+        .iter()
+        .filter(|profile| profile.arch == AcceleratorKind::Nvidia)
+        .collect();
+    if gpus.is_empty() {
+        println!("plait gpu: no NVIDIA device discovered");
+        return Ok(());
+    }
+    let mut executed = 0usize;
+    for profile in &gpus {
+        let executor = match plait_gpu::GpuExecutor::new(profile.id.ordinal as usize) {
+            Ok(executor) => executor,
+            Err(error) => {
+                println!("plait gpu: {} skipped: {error}", profile.name);
+                continue;
+            }
+        };
+        let x: Vec<f32> = (0..4096).map(|index| index as f32 * 0.001).collect();
+        let y: Vec<f32> = (0..4096).map(|index| 1.0 - index as f32 * 0.0005).collect();
+        let alpha = 1.5f32;
+        let output = executor.axpy(&x, &y, alpha)?;
+        for (index, value) in output.iter().enumerate() {
+            let expected = alpha * x[index] + y[index];
+            if (value - expected).abs() > 1e-4 {
+                return Err(format!("{} AXPY mismatch at {index}", profile.name).into());
+            }
+        }
+        executed += 1;
+        println!(
+            "plait gpu: {} ({}) AXPY ok ({} elements, ordinal {})",
+            profile.name,
+            profile.arch,
+            output.len(),
+            profile.id.ordinal
+        );
+    }
+
+    let m = 128usize;
+    let n = 128usize;
+    let k = 128usize;
+    let a: Vec<f32> = (0..m * k)
+        .map(|index| (index % 13) as f32 * 0.125)
+        .collect();
+    let b: Vec<f32> = (0..k * n)
+        .map(|index| (index % 11) as f32 * 0.25 - 0.5)
+        .collect();
+    let c = vec![0.0f32; m * n];
+    match plait_gpu::cutlass_sgemm(&a, &b, &c, m, n, k, 1.0, 0.0) {
+        Ok(output) => {
+            for row in 0..m {
+                for col in 0..n {
+                    let mut expected = 0.0f32;
+                    for inner in 0..k {
+                        expected += a[row * k + inner] * b[inner * n + col];
+                    }
+                    if (output[row * n + col] - expected).abs() > 1e-2 {
+                        return Err(format!("CUTLASS SGEMM mismatch at [{row}][{col}]").into());
+                    }
+                }
+            }
+            println!(
+                "plait gpu: CUTLASS SGEMM {m}x{n}x{k} ok on {} visible GPU(s)",
+                executed
+            );
+        }
+        Err(error) => {
+            println!("plait gpu: CUTLASS SGEMM skipped: {error}");
+        }
     }
     Ok(())
 }

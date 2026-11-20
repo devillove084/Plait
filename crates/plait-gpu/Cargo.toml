@@ -1,0 +1,11 @@
+[package]
+name = "plait-gpu"
+description = "Real CUDA kernel execution for Plait compute tasks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "fallback-dynamic-loading", "cuda-13020"] }

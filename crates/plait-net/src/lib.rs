@@ -1,20 +1,27 @@
+//! Asynchronous, actor-owned TCP transport.
+//!
+//! The node owns a `TcpTransport` handle and a single connection-manager task
+//! owns every outbound socket and the peer table. No application state is behind
+//! a mutex: callers communicate through bounded channels, and the manager is the
+//! only writer of its connection map. This is the Asio-style proactor shape:
+//! completion/readiness events drive one owner, not shared locked state.
+
 use std::collections::BTreeMap;
-use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::io;
+use std::net::SocketAddr;
 use std::time::Duration;
 
+use bytes::Bytes;
+use futures_util::{SinkExt, StreamExt};
 use plait_consensus::{Message, Snapshot};
 use plait_core::{Command, NodeId, OpId};
 use serde::{Deserialize, Serialize};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 const MAX_FRAME: usize = 64 * 1024 * 1024;
 
-/// All traffic between Plait processes. Consensus messages are only one kind;
-/// membership catch-up and the small demo/control surface share the same
-/// framing.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Wire {
     Hello {
@@ -62,34 +69,49 @@ pub enum Wire {
     Pong,
 }
 
-/// A length-prefixed TCP transport. Each peer pair uses one outbound stream
-/// for sending; the peer's listener delivers inbound frames to its node loop.
-/// Failed writes drop the cached stream, so the next send reconnects.
+#[allow(clippy::large_enum_variant)]
+enum Outbound {
+    Send {
+        to: NodeId,
+        wire: Wire,
+        reply: oneshot::Sender<io::Result<()>>,
+    },
+    SetPeer {
+        node: NodeId,
+        addr: String,
+    },
+    Peers {
+        reply: oneshot::Sender<BTreeMap<NodeId, String>>,
+    },
+}
+
+/// Handle owned by the node. It is intentionally not `Clone`: a node has one
+/// inbound receiver and one ordered outbound command stream.
 pub struct TcpTransport {
     id: NodeId,
     local_addr: String,
-    peers: Arc<Mutex<BTreeMap<NodeId, String>>>,
-    outbound: Mutex<BTreeMap<NodeId, TcpStream>>,
-    frame_buffer: Mutex<Vec<u8>>,
-    inbound_tx: Sender<(NodeId, Wire)>,
-    inbound_rx: Receiver<(NodeId, Wire)>,
+    outbound: mpsc::Sender<Outbound>,
+    inbound: mpsc::Receiver<(NodeId, Wire)>,
 }
 
 impl TcpTransport {
-    pub fn bind(id: NodeId, listen: &str, peers: BTreeMap<NodeId, String>) -> io::Result<Self> {
-        let listener = TcpListener::bind(listen)?;
+    pub async fn bind(
+        id: NodeId,
+        listen: &str,
+        peers: BTreeMap<NodeId, String>,
+    ) -> io::Result<Self> {
+        let listener = TcpListener::bind(listen).await?;
         let local_addr = listener.local_addr()?.to_string();
-        let (inbound_tx, inbound_rx) = mpsc::channel();
-        let sender = inbound_tx.clone();
-        thread::spawn(move || accept_loop(listener, sender));
+        let (inbound_tx, inbound_rx) = mpsc::channel(1024);
+        tokio::spawn(accept_loop(listener, inbound_tx.clone()));
+
+        let (command_tx, command_rx) = mpsc::channel(1024);
+        tokio::spawn(manager(id, peers, command_rx));
         Ok(Self {
             id,
             local_addr,
-            peers: Arc::new(Mutex::new(peers)),
-            outbound: Mutex::new(BTreeMap::new()),
-            frame_buffer: Mutex::new(Vec::with_capacity(4096)),
-            inbound_tx,
-            inbound_rx,
+            outbound: command_tx,
+            inbound: inbound_rx,
         })
     }
 
@@ -101,191 +123,184 @@ impl TcpTransport {
         &self.local_addr
     }
 
+    /// Fire-and-forget peer update. The manager processes it in channel order,
+    /// so a later `send` to the same peer sees the address.
     pub fn set_peer(&self, node: NodeId, addr: impl Into<String>) {
-        self.peers
-            .lock()
-            .expect("peer map poisoned")
-            .insert(node, addr.into());
+        let _ = self.outbound.try_send(Outbound::SetPeer {
+            node,
+            addr: addr.into(),
+        });
     }
 
     pub fn set_peers(&self, peers: BTreeMap<NodeId, String>) {
-        let mut current = self.peers.lock().expect("peer map poisoned");
-        current.extend(peers);
-    }
-
-    pub fn peers(&self) -> BTreeMap<NodeId, String> {
-        self.peers.lock().expect("peer map poisoned").clone()
-    }
-
-    pub fn peer_addr(&self, node: NodeId) -> Option<String> {
-        self.peers
-            .lock()
-            .expect("peer map poisoned")
-            .get(&node)
-            .cloned()
-    }
-
-    pub fn send(&self, to: NodeId, wire: Wire) -> io::Result<()> {
-        if to == self.id {
-            let _ = self.inbound_tx.send((self.id, wire));
-            return Ok(());
-        }
-        let addr = self.peer_addr(to).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("no address known for peer {to}"),
-            )
-        })?;
-        let mut streams = self.outbound.lock().expect("outbound map poisoned");
-        let mut frame = self.frame_buffer.lock().expect("frame buffer poisoned");
-        encode(&wire, &mut frame)?;
-        if let std::collections::btree_map::Entry::Vacant(entry) = streams.entry(to) {
-            entry.insert(connect(&addr, self.id)?);
-        }
-        let stream = streams.get_mut(&to).expect("stream was inserted");
-        match write_frame(stream, &frame) {
-            Ok(()) => Ok(()),
-            Err(_) => {
-                streams.remove(&to);
-                let mut fresh = connect(&addr, self.id)?;
-                write_frame(&mut fresh, &frame)?;
-                streams.insert(to, fresh);
-                Ok(())
-            }
+        for (node, addr) in peers {
+            self.set_peer(node, addr);
         }
     }
 
-    pub fn recv_timeout(&self, timeout: Duration) -> Option<(NodeId, Wire)> {
-        self.inbound_rx.recv_timeout(timeout).ok()
+    pub async fn peers(&self) -> BTreeMap<NodeId, String> {
+        let (reply, receiver) = oneshot::channel();
+        if self.outbound.send(Outbound::Peers { reply }).await.is_err() {
+            return BTreeMap::new();
+        }
+        receiver.await.unwrap_or_default()
     }
 
-    pub fn try_recv(&self) -> Option<(NodeId, Wire)> {
-        self.inbound_rx.try_recv().ok()
+    pub async fn send(&self, to: NodeId, wire: Wire) -> io::Result<()> {
+        let (reply, receiver) = oneshot::channel();
+        self.outbound
+            .send(Outbound::Send { to, wire, reply })
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "transport closed"))?;
+        receiver
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "transport closed"))?
+    }
+
+    pub async fn recv(&mut self) -> Option<(NodeId, Wire)> {
+        self.inbound.recv().await
+    }
+
+    pub fn try_recv(&mut self) -> Option<(NodeId, Wire)> {
+        self.inbound.try_recv().ok()
     }
 }
 
-fn connect(addr: &str, from: NodeId) -> io::Result<TcpStream> {
-    let resolved = addr
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "address resolved to nothing"))?;
-    let mut stream = TcpStream::connect_timeout(&resolved, Duration::from_secs(3))?;
-    stream.set_nodelay(true)?;
-    let mut frame = Vec::with_capacity(64);
-    encode(&Wire::Hello { from }, &mut frame)?;
-    write_frame(&mut stream, &frame)?;
-    Ok(stream)
-}
-
-fn accept_loop(listener: TcpListener, sender: Sender<(NodeId, Wire)>) {
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let sender = sender.clone();
-                thread::spawn(move || read_connection(stream, sender));
-            }
-            Err(_) => break,
-        }
-    }
-}
-
-fn read_connection(mut stream: TcpStream, sender: Sender<(NodeId, Wire)>) {
-    let mut payload = Vec::with_capacity(4096);
-    let from = match read_frame_into(&mut stream, &mut payload) {
-        Ok(Wire::Hello { from }) => from,
-        Ok(_) | Err(_) => return,
-    };
+async fn accept_loop(listener: TcpListener, sender: mpsc::Sender<(NodeId, Wire)>) {
     loop {
-        match read_frame_into(&mut stream, &mut payload) {
-            Ok(wire) => {
-                if sender.send((from, wire)).is_err() {
-                    return;
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let sender = sender.clone();
+        tokio::spawn(read_connection(stream, sender));
+    }
+}
+
+async fn read_connection(stream: TcpStream, sender: mpsc::Sender<(NodeId, Wire)>) {
+    let mut framed = Framed::new(stream, codec());
+    let from = match framed.next().await {
+        Some(Ok(bytes)) => match bincode::deserialize::<Wire>(&bytes) {
+            Ok(Wire::Hello { from }) => from,
+            _ => return,
+        },
+        _ => return,
+    };
+    while let Some(Ok(bytes)) = framed.next().await {
+        let Ok(wire) = bincode::deserialize::<Wire>(&bytes) else {
+            return;
+        };
+        if sender.send((from, wire)).await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn manager(
+    id: NodeId,
+    peers: BTreeMap<NodeId, String>,
+    mut commands: mpsc::Receiver<Outbound>,
+) {
+    let mut peers = peers;
+    let mut connections: BTreeMap<NodeId, Framed<TcpStream, LengthDelimitedCodec>> =
+        BTreeMap::new();
+    while let Some(command) = commands.recv().await {
+        match command {
+            Outbound::SetPeer { node, addr } => {
+                peers.insert(node, addr);
+            }
+            Outbound::Peers { reply } => {
+                let _ = reply.send(peers.clone());
+            }
+            Outbound::Send { to, wire, reply } => {
+                let Some(addr) = peers.get(&to).cloned() else {
+                    let _ = reply.send(Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("no address known for peer {to}"),
+                    )));
+                    continue;
+                };
+                if let std::collections::btree_map::Entry::Vacant(entry) = connections.entry(to) {
+                    match connect(id, &addr).await {
+                        Ok(connection) => {
+                            entry.insert(connection);
+                        }
+                        Err(error) => {
+                            let _ = reply.send(Err(error));
+                            continue;
+                        }
+                    }
+                }
+                let result = send_frame(connections.get_mut(&to).expect("connection"), &wire).await;
+                if result.is_err() {
+                    connections.remove(&to);
+                    if let Ok(mut connection) = connect(id, &addr).await {
+                        let retry = send_frame(&mut connection, &wire).await;
+                        if retry.is_ok() {
+                            connections.insert(to, connection);
+                        }
+                        let _ = reply.send(retry);
+                    } else {
+                        let _ = reply.send(result);
+                    }
+                } else {
+                    let _ = reply.send(result);
                 }
             }
-            Err(_) => return,
         }
     }
 }
 
-fn encode(wire: &Wire, frame: &mut Vec<u8>) -> io::Result<()> {
-    frame.clear();
-    bincode::serialize_into(&mut *frame, wire)
+async fn connect(id: NodeId, addr: &str) -> io::Result<Framed<TcpStream, LengthDelimitedCodec>> {
+    let resolved: SocketAddr = tokio::net::lookup_host(addr)
+        .await?
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "address resolved to nothing"))?;
+    let stream = tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(resolved))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP connect timed out"))??;
+    stream.set_nodelay(true)?;
+    let mut framed = Framed::new(stream, codec());
+    send_frame(&mut framed, &Wire::Hello { from: id }).await?;
+    Ok(framed)
+}
+
+fn codec() -> LengthDelimitedCodec {
+    LengthDelimitedCodec::builder()
+        .max_frame_length(MAX_FRAME)
+        .new_codec()
+}
+
+async fn send_frame(
+    framed: &mut Framed<TcpStream, LengthDelimitedCodec>,
+    wire: &Wire,
+) -> io::Result<()> {
+    let bytes = bincode::serialize(wire)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    if frame.len() > MAX_FRAME {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "frame exceeds the size limit",
-        ));
-    }
-    Ok(())
-}
-
-fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> io::Result<()> {
-    stream.write_all(&(payload.len() as u32).to_be_bytes())?;
-    stream.write_all(payload)?;
-    stream.flush()
-}
-
-fn read_frame_into(stream: &mut TcpStream, payload: &mut Vec<u8>) -> io::Result<Wire> {
-    let mut length = [0u8; 4];
-    stream.read_exact(&mut length)?;
-    let length = u32::from_be_bytes(length) as usize;
-    if length > MAX_FRAME {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "frame exceeds the size limit",
-        ));
-    }
-    payload.resize(length, 0);
-    stream.read_exact(payload)?;
-    bincode::deserialize(payload)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+    framed.send(Bytes::from(bytes)).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
 
-    #[test]
-    fn sends_and_receives_frames() {
-        let a = NodeId::derive("net-a");
-        let b = NodeId::derive("net-b");
-        let ta = TcpTransport::bind(a, "127.0.0.1:0", BTreeMap::new()).unwrap();
-        let tb = TcpTransport::bind(b, "127.0.0.1:0", BTreeMap::new()).unwrap();
+    #[tokio::test]
+    async fn sends_and_receives_frames() {
+        let a = NodeId::derive("async-a");
+        let b = NodeId::derive("async-b");
+        let ta = TcpTransport::bind(a, "127.0.0.1:0", BTreeMap::new())
+            .await
+            .unwrap();
+        let mut tb = TcpTransport::bind(b, "127.0.0.1:0", BTreeMap::new())
+            .await
+            .unwrap();
         ta.set_peer(b, tb.local_addr());
         tb.set_peer(a, ta.local_addr());
-        ta.send(b, Wire::Ping).unwrap();
-
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            if let Some((from, wire)) = tb.recv_timeout(Duration::from_millis(100)) {
-                assert_eq!(from, a);
-                assert!(matches!(wire, Wire::Ping));
-                break;
-            }
-            assert!(Instant::now() < deadline, "frame did not arrive");
-        }
-    }
-
-    #[test]
-    fn reconnects_after_the_cached_stream_is_dropped() {
-        let a = NodeId::derive("net-c");
-        let b = NodeId::derive("net-d");
-        let ta = TcpTransport::bind(a, "127.0.0.1:0", BTreeMap::new()).unwrap();
-        let tb = TcpTransport::bind(b, "127.0.0.1:0", BTreeMap::new()).unwrap();
-        ta.set_peer(b, tb.local_addr());
-        tb.set_peer(a, ta.local_addr());
-        ta.send(b, Wire::Ping).unwrap();
-        ta.outbound.lock().unwrap().clear();
-        ta.send(b, Wire::Pong).unwrap();
-
-        let mut seen = Vec::new();
-        for _ in 0..2 {
-            if let Some((_, wire)) = tb.recv_timeout(Duration::from_secs(2)) {
-                seen.push(matches!(wire, Wire::Ping | Wire::Pong));
-            }
-        }
-        assert_eq!(seen.len(), 2);
+        ta.send(b, Wire::Ping).await.unwrap();
+        let (from, wire) = tokio::time::timeout(Duration::from_secs(3), tb.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(from, a);
+        assert!(matches!(wire, Wire::Ping));
     }
 }

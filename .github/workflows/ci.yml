@@ -39,29 +39,8 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+      - name: Install just
+        uses: taiki-e/install-action@just
 
-      - name: Lint every target as an error
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-
-      - name: Test the workspace
-        run: cargo test --workspace --locked
-
-      - name: Run the three-node TCP fusion demo
-        run: cargo run -q --locked -p plait-node -- demo
-
-      - name: Run the distributed DSA reference
-        run: cargo run -q --locked -p plait-node -- dsa
-
-      - name: Run EP, DP, and PP reference execution
-        run: cargo run -q --locked -p plait-node -- parallel
-
-      - name: Discover available accelerators
-        run: cargo run -q --locked -p plait-node -- devices
-
-      - name: Schedule planned compute across discovered devices
-        run: cargo run -q --locked -p plait-node -- hetero
-
-      - name: Exercise the real ibverbs backend (skips without a device)
-        run: cargo run -q --locked -p plait-node -- rdma-selftest
+      - name: Run the unified gate
+        run: just ci

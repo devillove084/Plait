@@ -1,30 +1,30 @@
 use std::collections::BTreeMap;
-use std::thread;
-use std::time::Duration;
 
 use plait_core::NodeId;
 use plait_node::{
-    NodeConfig, RunningNode, run_demo, run_devices, run_dsa_demo, run_hetero_demo,
+    NodeConfig, RunningNode, run_demo, run_devices, run_dsa_demo, run_gpu_demo, run_hetero_demo,
     run_parallel_demo, run_rdma_selftest,
 };
 
-fn main() {
-    if let Err(error) = real_main() {
+#[tokio::main]
+async fn main() {
+    if let Err(error) = real_main().await {
         eprintln!("plait-node: {error}");
         std::process::exit(1);
     }
 }
 
-fn real_main() -> Result<(), Box<dyn std::error::Error>> {
+async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let command = args.next().unwrap_or_else(|| "demo".to_owned());
     match command.as_str() {
-        "demo" => run_demo(),
+        "demo" => run_demo().await,
         "dsa" => run_dsa_demo(),
         "parallel" => run_parallel_demo(),
-        "rdma-selftest" => run_rdma_selftest(),
+        "rdma-selftest" => run_rdma_selftest().await,
         "devices" => run_devices(),
         "hetero" => run_hetero_demo(),
+        "gpu-demo" => run_gpu_demo(),
         "id" => {
             println!("{}", NodeId::random());
             Ok(())
@@ -61,14 +61,14 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 join,
                 options: Default::default(),
             };
-            let node = RunningNode::start(config)?;
+            let node = RunningNode::start(config).await?;
             println!("plait node {} listening on {}", node.id(), node.addr());
-            loop {
-                thread::sleep(Duration::from_secs(3600));
-            }
+            tokio::signal::ctrl_c().await?;
+            drop(node);
+            Ok(())
         }
         other => Err(format!(
-            "unknown command {other}; expected run, demo, dsa, parallel, rdma-selftest, devices, hetero, or id"
+            "unknown command {other}; expected run, demo, dsa, parallel, rdma-selftest, devices, hetero, gpu-demo, or id"
         )
         .into()),
     }

@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  Rust 2024 · EPaxos-style replication · no rank 0 · TP/PP/EP/DP/CP/SP · heterogeneous accelerators · registered-memory data plane
+  Rust 2024 · EPaxos-style replication · no rank 0 · TP/PP/EP/DP/CP/SP · heterogeneous accelerators · async TCP control · registered-memory data plane
 </p>
 
 Plait is an experimental runtime in which **communication is the replicated log**.
@@ -47,6 +47,11 @@ When the last declared contributor has executed, every replica combines the
 partials locally. The result is materialized without a separate all-reduce
 phase. Conflicting commands are ordered by EPaxos dependencies; independent
 operators proceed concurrently.
+
+The control plane is an Asio-style Tokio actor: a single connection manager owns
+the outbound socket table, callers communicate through bounded channels, and the
+node loop is a `tokio::select!` over inbound frames, timers, and cancellation.
+There is no application-level mutex or blocking receive on the control path.
 
 The important properties are:
 
@@ -214,15 +219,26 @@ container limitation.
 
 ## Quick start
 
+Install `just` once, then the recipes clone CUTLASS on demand and run the
+unified gate:
+
 ```sh
-cargo test --workspace
-cargo run -p plait-node -- demo          # three real TCP nodes, fused sum
-cargo run -p plait-node -- dsa           # TP/CP DSA vs single-node reference
-cargo run -p plait-node -- parallel      # EP MoE, DP optimizer, PP stages
-cargo run -p plait-node -- devices       # discovered NVIDIA/AMD/Huawei/PPU/CPU
-cargo run -p plait-node -- hetero        # capability-aware compute placement
-cargo run -p plait-node -- rdma-selftest # real ibverbs or a clear skip
+just test        # setup + workspace tests
+just demo        # three async TCP nodes, fused sum
+just dsa         # TP/CP DSA vs single-node reference
+just parallel    # EP MoE, DP optimizer, PP stages
+just devices     # discovered NVIDIA/AMD/Huawei/PPU/CPU
+just hetero      # capability-aware compute placement
+just gpu         # real CUDA AXPY + CUTLASS SGEMM
+just rdma        # real ibverbs or a clear skip
+just ci          # fmt + lint + tests + demos
 ```
+
+`just setup` clones the official NVIDIA CUTLASS repository into
+`target/cutlass` (default `v4.8.1`) if it is missing. The GPU build script
+detects the local compute capability: Ampere uses the CUDA 12.9 compiler when
+available (the 3090 driver predates 13.2), Blackwell uses CUDA 13.2. No CUTLASS
+checkout is committed to the repository.
 
 Run a cluster process:
 
@@ -261,6 +277,7 @@ the unanimous promotion, and then proposes like every other voter.
 | `plait-net` | framed TCP transport and the wire protocol |
 | `plait-parallel` | TP/PP/EP/DP/CP/SP planner; DSA, MoE, DP, and PP reference runners |
 | `plait-device` | vendor discovery, `DeviceProfile` capability model, deterministic scheduler |
+| `plait-gpu` | real CUDA AXPY and CUTLASS SGEMM execution |
 | `plait-node` | real cluster process, join/snapshot flow, client, demos |
 
 See the design of record in [docs/design/plait.md](docs/design/plait.md) with
@@ -286,6 +303,8 @@ What is implemented and tested:
 - CP and TP distributed DSA matching the single-node reference within `1e-16`;
 - EP MoE (top-1 and top-2), DP optimizer steps, and PP stage handoffs matching
   their single-node references;
+- real CUDA AXPY on 4× local RTX 3090 and 8× remote RTX PRO 5000 Blackwell, plus
+  CUTLASS 4.8.1 SGEMM verified against a CPU reference on both;
 - heterogeneous device profiles, compute-mode conflict keys, and a scheduler
   exercised across CPU/NVIDIA/AMD/Huawei/PPU profiles; 8 NVIDIA GPUs discovered
   and 32 compute placements replicated on `pro5000`;
@@ -305,9 +324,10 @@ Deliberate limits of this prototype:
   container still reports a clear skip because it has no `/dev/infiniband` and no
   `CAP_NET_ADMIN`/`CAP_SYS_MODULE`. See
   [docs/validation/pro5000.md](docs/validation/pro5000.md).
-- **Vendor compute dispatch is not implemented yet.** Device discovery,
-  capability matching, compute conflicts, scheduling, and placement are real;
-  NVIDIA/AMD/Huawei/PPU kernel adapters are the next layer.
+- **Only NVIDIA has a kernel adapter.** CUDA AXPY and CUTLASS SGEMM are real;
+  device discovery/capability/scheduling for AMD/Huawei/PPU exists, but their
+  kernel adapters are next. The reference `hetero` compute values are still CPU
+  placeholders; `gpu-demo` is the real device execution path.
 - **No durable state.** Node restart with the same identity is not handled;
   instances and counters live in memory. A voter that misses a membership
   change while partitioned must be restarted/rejoined; automatic snapshot

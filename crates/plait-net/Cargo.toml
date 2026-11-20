@@ -9,6 +9,10 @@ repository.workspace = true
 
 [dependencies]
 bincode.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
 plait-core.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
 plait-consensus.workspace = true
 serde.workspace = true

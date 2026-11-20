@@ -182,10 +182,17 @@ key, and memory kind. `RdmaPlane` exposes one-sided `read`/`write`. The shipped
 `LoopbackRdma` validates the same descriptor and bounds rules in process; a
 real `ibverbs` backend can replace it without changing consensus or planning.
 
-`plait-net` uses length-prefixed bincode over TCP for control and for the
-portable deployment path. It reuses send and receive buffers. The DSA reference
-runner uses the registered-memory path for bulk Q and consensus commands for
-small index/partial values.
+`plait-net` is an Asio-style Tokio actor. A single connection-manager task owns
+the outbound socket map and peer table; the node owns one inbound receiver and
+is driven by `tokio::select!`. Callers use bounded channels and oneshot replies,
+so the control plane has no application mutex and no blocking receive. Frames
+are length-delimited bincode.
+
+`plait-gpu` executes the real CUDA path: an embedded cubin for AXPY and a
+CUTLASS 4.8.1 C++ FFI shim for SGEMM. The build detects the local compute
+capability and chooses an ABI-compatible compiler (CUDA 12.9 for the Ampere
+3090, 13.2 for Blackwell). `just setup` clones CUTLASS into `target/cutlass` on
+demand.
 
 `plait-device` discovers CPU/NVIDIA/AMD/Huawei/PPU profiles and provides a
 deterministic capability scheduler. `ParallelOp::requirement()` supplies the

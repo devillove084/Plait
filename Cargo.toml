@@ -5,6 +5,7 @@ members = [
     "crates/plait-device",
     "crates/plait-mem",
     "crates/plait-fabric",
+    "crates/plait-gpu",
     "crates/plait-parallel",
     "crates/plait-rdma",
     "crates/plait-net",
@@ -21,10 +22,15 @@ repository = "https://github.com/devillove084/Plait"
 
 [workspace.dependencies]
 bincode = "1.3"
+bytes = "1"
+futures-util = { version = "0.3", features = ["sink"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+tokio-util = { version = "0.7", features = ["codec"] }
 plait-core = { path = "crates/plait-core" }
 plait-consensus = { path = "crates/plait-consensus" }
 plait-device = { path = "crates/plait-device" }
 plait-fabric = { path = "crates/plait-fabric" }
+plait-gpu = { path = "crates/plait-gpu" }
 plait-mem = { path = "crates/plait-mem" }
 plait-parallel = { path = "crates/plait-parallel" }
 plait-rdma = { path = "crates/plait-rdma" }
