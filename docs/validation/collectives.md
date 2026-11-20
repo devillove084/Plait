@@ -182,6 +182,8 @@ same `algbw_GB/s` / `busbw_GB/s` fields. On `pro5000` (8 ranks, 1 MiB):
 | reducescatter (device) | 13.070 | 26.475 |
 | alltoall (device) | 14.299 | 24.941 |
 
+At 16 MiB, alltoall reaches 45.60 GB/s versus NCCL 39.33 GB/s.
+
 All correctness checks pass. At 1 MiB all six device paths beat NCCL. At larger
 sizes the result is not uniform: at 16 MiB allreduce/reduce/allgather/
 reducescatter/alltoall are faster, while broadcast still trails NCCL. `just nccl-ops` is

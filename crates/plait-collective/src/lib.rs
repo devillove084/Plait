@@ -90,12 +90,6 @@ impl std::error::Error for CollectiveError {}
 
 type Result<T, E = CollectiveError> = std::result::Result<T, E>;
 
-pub struct BroadcastWorkspace {
-    data: Vec<crate::ipc::PeerRegion>,
-    table: crate::ipc::PeerRegion,
-    count: usize,
-}
-
 pub struct AllToAllWorkspace {
     _data: Vec<crate::ipc::PeerRegion>,
     output: Vec<crate::ipc::PeerRegion>,
@@ -135,7 +129,7 @@ struct GpuRank {
     function: CudaFunction,
     ring: CudaFunction,
     alltoall: CudaFunction,
-    broadcast: CudaFunction,
+    scatter: CudaFunction,
     _module: Arc<CudaModule>,
 }
 
@@ -216,9 +210,9 @@ impl PeerGroup {
             let alltoall = module
                 .load_function("plait_alltoall_push")
                 .map_err(|error| CollectiveError::new(format!("load alltoall kernel: {error}")))?;
-            let broadcast = module
-                .load_function("plait_broadcast_fanout")
-                .map_err(|error| CollectiveError::new(format!("load broadcast kernel: {error}")))?;
+            let scatter = module
+                .load_function("plait_scatter_root")
+                .map_err(|error| CollectiveError::new(format!("load scatter kernel: {error}")))?;
             ranks.push(GpuRank {
                 ctx,
                 stream,
@@ -226,7 +220,7 @@ impl PeerGroup {
                 function,
                 ring,
                 alltoall,
-                broadcast,
+                scatter,
                 _module: module,
             });
         }
@@ -446,29 +440,6 @@ impl PeerGroup {
     }
 
     pub fn broadcast_device(&self, value: Vec<f32>) -> Result<Vec<Vec<f32>>> {
-        let workspace = self.prepare_broadcast(value)?;
-        self.launch_broadcast(&workspace)?;
-        self.sync()?;
-        self.read_broadcast(&workspace)
-    }
-
-    pub fn broadcast_device_resident(
-        &self,
-        value: Vec<f32>,
-        iterations: usize,
-    ) -> Result<(std::time::Duration, Vec<Vec<f32>>)> {
-        let workspace = self.prepare_broadcast(value)?;
-        let start = std::time::Instant::now();
-        for _ in 0..iterations {
-            self.launch_broadcast(&workspace)?;
-        }
-        self.sync()?;
-        let elapsed = start.elapsed();
-        let output = self.read_broadcast(&workspace)?;
-        Ok((elapsed, output))
-    }
-
-    fn prepare_broadcast(&self, value: Vec<f32>) -> Result<BroadcastWorkspace> {
         use crate::ipc::PeerRegion;
         let n = self.world_size();
         let count = value.len();
@@ -489,33 +460,44 @@ impl PeerGroup {
         }
         let table = PeerRegion::alloc(0, n * 8)?;
         table.write_bytes(&pointer_bytes)?;
-        Ok(BroadcastWorkspace { data, table, count })
-    }
-
-    fn launch_broadcast(&self, workspace: &BroadcastWorkspace) -> Result<()> {
-        let n = self.world_size();
+        let width = count.div_ceil(n);
         let stream = self.ranks[0].stream.clone();
-        let function = &self.ranks[0].broadcast;
-        let source_ptr = workspace.data[0].as_ptr() as u64;
-        let table_ptr = workspace.table.as_ptr() as u64;
+        let function = &self.ranks[0].scatter;
+        let source_ptr = data[0].as_ptr() as u64;
+        let table_ptr = table.as_ptr() as u64;
         let n_i = n as i32;
-        let count_i = workspace.count as i32;
+        let width_i = width as i32;
         let mut launch = stream.launch_builder(function);
         launch.arg(&source_ptr);
         launch.arg(&table_ptr);
         launch.arg(&n_i);
-        launch.arg(&count_i);
-        unsafe { launch.launch(LaunchConfig::for_num_elems(workspace.count as u32)) }
-            .map(|_| ())
-            .map_err(driver("broadcast launch"))
+        launch.arg(&width_i);
+        unsafe {
+            launch.launch(LaunchConfig {
+                grid_dim: (width.div_ceil(1024) as u32, 1, 1),
+                block_dim: (1024, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(driver("broadcast scatter launch"))?;
+        self.sync()?;
+        let mut workspace = self.prepare_allgather_from_data(data, count)?;
+        self.launch_device_ring(&mut workspace)?;
+        self.sync()?;
+        self.read_device_ring(&workspace)
     }
 
-    fn read_broadcast(&self, workspace: &BroadcastWorkspace) -> Result<Vec<Vec<f32>>> {
-        let mut output = Vec::with_capacity(workspace.data.len());
-        for region in &workspace.data {
-            output.push(region.read_host(workspace.count)?);
+    pub fn broadcast_device_resident(
+        &self,
+        value: Vec<f32>,
+        iterations: usize,
+    ) -> Result<(std::time::Duration, Vec<Vec<f32>>)> {
+        let start = std::time::Instant::now();
+        let mut output = Vec::new();
+        for _ in 0..iterations {
+            output = self.broadcast_device(value.clone())?;
         }
-        Ok(output)
+        Ok((start.elapsed(), output))
     }
 
     pub fn all_to_all_device(&self, inputs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
@@ -682,6 +664,40 @@ impl PeerGroup {
         self.sync()?;
         let elapsed = start.elapsed();
         Ok((elapsed, self.read_device_ring(&workspace)?))
+    }
+
+    fn prepare_allgather_from_data(
+        &self,
+        data: Vec<crate::ipc::PeerRegion>,
+        count: usize,
+    ) -> Result<DeviceRingWorkspace> {
+        use crate::ipc::PeerRegion;
+        let n = self.world_size();
+        let width = count.div_ceil(n);
+        let mut receive = Vec::with_capacity(n);
+        let mut flags = Vec::with_capacity(n);
+        for rank in 0..n {
+            receive.push(PeerRegion::alloc(
+                rank,
+                width * (n - 1) * std::mem::size_of::<f32>(),
+            )?);
+            let flag = PeerRegion::alloc(rank, 2 * (n - 1) * 4)?;
+            flag.write_host(&vec![0.0f32; 2 * (n - 1)])?;
+            flags.push(flag);
+        }
+        Ok(DeviceRingWorkspace {
+            data,
+            receive,
+            flags,
+            count,
+            channels: 1,
+            segment: count,
+            width,
+            data_stride: width * n,
+            recv_stride: width * (n - 1),
+            flag_stride: 2 * (n - 1),
+            mode: 1,
+        })
     }
 
     fn prepare_device_ring(&self, inputs: &[Vec<f32>], mode: i32) -> Result<DeviceRingWorkspace> {

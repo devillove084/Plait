@@ -194,3 +194,19 @@ extern "C" __global__ void plait_alltoall_push(
         }
     }
 }
+
+extern "C" __global__ void plait_scatter_root(
+    const float* source,
+    unsigned long long* peers,
+    int ranks,
+    int width)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int peer = 0; peer < ranks; ++peer) {
+        float* destination = reinterpret_cast<float*>(peers[peer]);
+        for (int i = tid; i < width; i += stride) {
+            destination[peer * width + i] = source[peer * width + i];
+        }
+    }
+}
