@@ -234,7 +234,9 @@ extern "C" __global__ void plait_ll128_allreduce(
     int rank,
     int ranks,
     int width,
-    int lines)
+    int lines,
+    int line_begin,
+    int line_end)
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     float* next_data_ptr = reinterpret_cast<float*>(next_data);
@@ -244,7 +246,7 @@ extern "C" __global__ void plait_ll128_allreduce(
     for (int step = 0; step < ranks - 1; ++step) {
         int send_chunk = (rank + ranks - step) % ranks;
         int recv_chunk = (rank + ranks - step - 1) % ranks;
-        for (int line = 0; line < lines; ++line) {
+        for (int line = line_begin; line < line_end; ++line) {
             int start = line * 32;
             int end = min(width, start + 32);
             for (int i = start + tid; i < end; i += blockDim.x) {
@@ -268,7 +270,7 @@ extern "C" __global__ void plait_ll128_allreduce(
     }
     for (int step = 0; step < ranks - 1; ++step) {
         int send_chunk = (rank + ranks - step + 1) % ranks;
-        for (int line = 0; line < lines; ++line) {
+        for (int line = line_begin; line < line_end; ++line) {
             int start = line * 32;
             int end = min(width, start + 32);
             for (int i = start + tid; i < end; i += blockDim.x) {
