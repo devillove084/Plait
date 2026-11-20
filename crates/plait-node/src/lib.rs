@@ -701,6 +701,42 @@ pub fn run_parallel_demo() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn gemm_inputs(m: usize, n: usize, k: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let a = (0..m * k)
+        .map(|index| ((index * 17 + 3) % 23) as f32 * 0.125 - 1.0)
+        .collect();
+    let b = (0..k * n)
+        .map(|index| ((index * 11 + 5) % 19) as f32 * 0.25 - 2.0)
+        .collect();
+    (a, b, vec![0.0; m * n])
+}
+
+fn cpu_gemm(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; m * n];
+    for row in 0..m {
+        for col in 0..n {
+            let mut sum = 0.0f32;
+            for inner in 0..k {
+                sum += a[row * k + inner] * b[inner * n + col];
+            }
+            out[row * n + col] = sum;
+        }
+    }
+    out
+}
+
+fn verify_gemm(actual: &[f32], expected: &[f32]) -> Result<(), Box<dyn std::error::Error>> {
+    if actual.len() != expected.len() {
+        return Err("GEMM length mismatch".into());
+    }
+    for (index, (a, b)) in actual.iter().zip(expected).enumerate() {
+        if (a - b).abs() > 1e-2 {
+            return Err(format!("GEMM mismatch at {index}: {a} vs {b}").into());
+        }
+    }
+    Ok(())
+}
+
 fn max_error(actual: &[Vec<f64>], expected: &[Vec<f64>]) -> f64 {
     let mut error = 0.0f64;
     for (left, right) in actual.iter().zip(expected) {
@@ -754,9 +790,9 @@ pub fn run_devices() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Discover local devices, replicate their profiles, then schedule planned
-/// operations onto eligible devices through the same EPaxos cluster. The
-/// compute result is a deterministic placeholder; the placement and device
-/// reservation are real replicated commands.
+/// operations onto eligible devices through the same EPaxos cluster. NVIDIA
+/// tasks execute real CUTLASS GEMMs; CPU tasks execute a CPU GEMM reference.
+/// Placements and compute results are replicated commands.
 pub fn run_hetero_demo() -> Result<(), Box<dyn std::error::Error>> {
     use plait_device::{DeviceRegistry, SchedulingPolicy};
     use plait_parallel::{AxisSizes, DsaConfig, Topology, dsa_plan};
@@ -788,7 +824,17 @@ pub fn run_hetero_demo() -> Result<(), Box<dyn std::error::Error>> {
     let plan = dsa_plan(&topology, &DsaConfig::small());
     let operations: Vec<_> = plan.plan.ops.iter().take(32).cloned().collect();
     let arch_order: Vec<AcceleratorKind> = profiles.iter().map(|p| p.arch).collect();
+    let mut executors: BTreeMap<u32, plait_gpu::GpuExecutor> = BTreeMap::new();
     let mut assignments = Vec::new();
+    let mut gpu_tasks = 0usize;
+    let mut cpu_tasks = 0usize;
+
+    // A small GEMM is enough to exercise the real CUTLASS path while keeping the
+    // demo result small enough to travel inline.
+    let (rows, cols, inner) = (16usize, 16usize, 16usize);
+    let (a, b, zeros) = gemm_inputs(rows, cols, inner);
+    let cpu_expected = cpu_gemm(&a, &b, rows, cols, inner);
+
     for (index, op) in operations.iter().enumerate() {
         let requirement = ComputeRequirement {
             arch: Some(arch_order[index % arch_order.len()]),
@@ -797,7 +843,38 @@ pub fn run_hetero_demo() -> Result<(), Box<dyn std::error::Error>> {
         let Some(device) = registry.select(&requirement, SchedulingPolicy::LeastLoaded) else {
             continue;
         };
+        let Some(arch) = registry.profiles().get(&device).map(|profile| profile.arch) else {
+            continue;
+        };
         registry.reserve(device);
+
+        let values: Vec<f64> = match arch {
+            AcceleratorKind::Nvidia => {
+                let ordinal = device.ordinal;
+                if let std::collections::btree_map::Entry::Vacant(entry) = executors.entry(ordinal)
+                {
+                    entry.insert(plait_gpu::GpuExecutor::new(ordinal as usize)?);
+                }
+                let executor = executors.get(&ordinal).expect("executor inserted");
+                let output = executor.sgemm(&a, &b, &zeros, rows, cols, inner, 1.0, 0.0)?;
+                verify_gemm(&output, &cpu_expected)?;
+                gpu_tasks += 1;
+                output.into_iter().map(f64::from).collect()
+            }
+            AcceleratorKind::Cpu => {
+                let output = cpu_gemm(&a, &b, rows, cols, inner);
+                verify_gemm(&output, &cpu_expected)?;
+                cpu_tasks += 1;
+                output.into_iter().map(f64::from).collect()
+            }
+            other => {
+                return Err(format!(
+                    "no kernel adapter for {other}; refusing to use a placeholder"
+                )
+                .into());
+            }
+        };
+
         let task = OpId::new(NodeId::derive("hetero-plan"), index as u64 + 1);
         let output = TensorKey::new(TensorId(30_000 + index as u128), ShardId(0));
         cluster.run_command(
@@ -810,7 +887,7 @@ pub fn run_hetero_demo() -> Result<(), Box<dyn std::error::Error>> {
                 inputs: Vec::new(),
                 output,
                 version: 1,
-                values: vec![index as f64],
+                values,
             }),
         )?;
         assignments.push((task, device, op.name.clone()));
@@ -833,10 +910,12 @@ pub fn run_hetero_demo() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!(
-        "plait hetero: {} devices, {} compute tasks, placements {:?}",
+        "plait hetero: {} devices, {} compute tasks, placements {:?}, CUTLASS GEMM tasks {}, CPU GEMM tasks {}",
         profiles.len(),
         assignments.len(),
-        counts
+        counts,
+        gpu_tasks,
+        cpu_tasks
     );
     for (task, device, kernel) in assignments.iter().take(8) {
         println!("  {task:?} -> {device} ({kernel})");

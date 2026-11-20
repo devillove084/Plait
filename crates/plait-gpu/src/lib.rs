@@ -58,6 +58,9 @@ impl GpuExecutor {
         let module = context
             .load_module(ptx)
             .map_err(|error| GpuError::new(error.to_string()))?;
+        context
+            .bind_to_thread()
+            .map_err(|error| GpuError::new(error.to_string()))?;
         let function = module
             .load_function("plait_axpy")
             .map_err(|error| GpuError::new(error.to_string()))?;
@@ -66,6 +69,25 @@ impl GpuExecutor {
             _module: module,
             _context: context,
         })
+    }
+
+    /// Run a CUTLASS SGEMM on this device context.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sgemm(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        c: &[f32],
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        beta: f32,
+    ) -> Result<Vec<f32>, GpuError> {
+        self._context
+            .bind_to_thread()
+            .map_err(|error| GpuError::new(error.to_string()))?;
+        cutlass_sgemm(a, b, c, m, n, k, alpha, beta)
     }
 
     /// `out = alpha * x + y` on the device. Returns host-visible results.

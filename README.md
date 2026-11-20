@@ -160,11 +160,11 @@ Blackwell + CPU and scheduled 32 planned operations:
 plait hetero: 9 devices, 32 compute tasks, placements {Cpu: 3, Nvidia: 29}
 ```
 
-This is **placement and consensus**, not yet a vendor kernel runtime: the
-reference compute result is deterministic CPU data, while the device
-registration, eligibility check, device reservation, and replicated placement
-are the real code path. AMD/Huawei/PPU discovery is best-effort and covered by
-synthetic scheduler tests; adding a vendor kernel executor is a separate adapter.
+`hetero` now executes real work per placement: NVIDIA devices run CUTLASS
+SGEMM with CPU-reference verification, and CPU devices run the CPU reference
+GEMM. Device registration, eligibility, reservation, compute, and replicated
+placement are all real. AMD/Huawei/PPU adapters are still the next layer;
+they fail explicitly rather than silently using a CPU placeholder.
 
 ## EP / DP / PP execution
 
@@ -324,10 +324,10 @@ Deliberate limits of this prototype:
   container still reports a clear skip because it has no `/dev/infiniband` and no
   `CAP_NET_ADMIN`/`CAP_SYS_MODULE`. See
   [docs/validation/pro5000.md](docs/validation/pro5000.md).
-- **Only NVIDIA has a kernel adapter.** CUDA AXPY and CUTLASS SGEMM are real;
-  device discovery/capability/scheduling for AMD/Huawei/PPU exists, but their
-  kernel adapters are next. The reference `hetero` compute values are still CPU
-  placeholders; `gpu-demo` is the real device execution path.
+- **Only NVIDIA has a kernel adapter.** CUDA AXPY and CUTLASS SGEMM are real,
+  and `hetero` uses CUTLASS for every NVIDIA placement. Device discovery,
+  capability matching, and scheduling for AMD/Huawei/PPU exist, but their kernel
+  adapters are next; unsupported architectures fail explicitly.
 - **No durable state.** Node restart with the same identity is not handled;
   instances and counters live in memory. A voter that misses a membership
   change while partitioned must be restarted/rejoined; automatic snapshot

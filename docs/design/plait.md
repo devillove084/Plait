@@ -326,7 +326,7 @@ global barrier.
 | Replicated device profiles + scheduler | Vendor-neutral placement; every replica agrees on eligibility | Profile advertisement is another replicated record; stale profile can mis-schedule | A device is hot-swapped, or profile churn exceeds ~1 command/min → lease/versioned profiles |
 | Async actor instead of shared locked transport | No application mutex; one owner of sockets; natural backpressure | Single manager task serializes connection setup; async runtime dependency | Manager saturates or per-peer parallelism is needed → shard managers by peer group |
 | Embedded cubin + CUTLASS FFI | Real execution on Ampere and Blackwell; no NVRTC/driver PTX mismatch | Two architecture artifacts; host copies in reference FFI | Add a new GPU family or device-pointer path → compile new cubin / descriptor path |
-| CPU result placeholder for reference compute tasks | End-to-end scheduling is testable without vendor kernels | The `hetero` placement values are not the GPU kernel result | `hetero` should call `plait-gpu` adapters; `gpu-demo` already does |
+| GPU/CPU GEMM in `hetero` per placement | Placement and compute result are one replicated transition; no CPU placeholder for NVIDIA | CUTLASS host copies in the reference path; unsupported architectures fail | Device-pointer/stream path or AMD/Huawei/PPU adapters land |
 
 ### Why not a community RDMA library from the start?
 
