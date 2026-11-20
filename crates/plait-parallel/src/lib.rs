@@ -13,6 +13,7 @@ pub mod moe;
 pub mod plan;
 pub mod pp;
 mod recovery;
+pub mod scheduling;
 pub mod topology;
 
 pub use asymmetric::{
@@ -28,4 +29,5 @@ pub use plan::{
 };
 pub use pp::{GlobalPp, PpConfig, PpError, PpOutput, PpRunner};
 pub use recovery::{RejoinAction, RejoinCost, RejoinDecision};
+pub use scheduling::{ChunkPlan, CollectivePlan, HostPlan, LeaderEpoch};
 pub use topology::{Axis, AxisSizes, Coord, Topology, TopologyError};

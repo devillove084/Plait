@@ -272,8 +272,8 @@ fn main() -> AnyResult<()> {
         generation += 1;
         if rank == 0 || rank == 4 {
             sum.fill(0.0);
-            for (index, value) in input.iter().enumerate() {
-                sum[index] += value;
+            for (target, value) in sum.iter_mut().zip(&input) {
+                *target += *value;
             }
             thread::scope(|scope| {
                 for (worker, buffer) in workers.iter_mut().zip(worker_buffers.iter_mut()) {
@@ -281,8 +281,8 @@ fn main() -> AnyResult<()> {
                 }
             });
             for buffer in &worker_buffers {
-                for (index, value) in buffer.iter().enumerate() {
-                    sum[index] += value;
+                for (target, value) in sum.iter_mut().zip(buffer) {
+                    *target += *value;
                 }
             }
 
@@ -312,8 +312,8 @@ fn main() -> AnyResult<()> {
             });
             cross_values.extend(cross_owned.into_iter().map(|v| v.expect("cross buffer")));
             for value in &cross_values {
-                for (index, item) in value.iter().enumerate() {
-                    sum[index] += item;
+                for (target, item) in sum.iter_mut().zip(value) {
+                    *target += *item;
                 }
             }
 
