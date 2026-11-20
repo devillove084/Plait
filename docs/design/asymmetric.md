@@ -5,17 +5,32 @@ The asymmetric path separates **quorum membership** from **work weight**.
 ## Work partition
 
 `plait-parallel::AsymmetricLayout` assigns contiguous row ranges from positive
-per-rank weights. For 4 local ranks and 8 remote ranks with equal per-rank
-weight:
+per-rank weights. `HeterogeneousLayout` derives those weights with a max-min
+linear program:
 
 ```text
-local group   = 4/12 = 1/3 of rows
-remote group  = 8/12 = 2/3 of rows
+minimize T
+subject to  a_i * x_i + b_i <= T
+            sum x_i = 1, x_i >= 0
+
+a_i = 1 / compute_i + message_bytes / bandwidth_i
+b_i = latency_i
 ```
 
-The ranges are exact and cover `0..M` once. A device-capability weight can be
-added later (for example a Blackwell rank with a higher `weight` than a 3090)
-without changing EPaxos membership.
+The one-coupling-constraint LP is solved by parametric search on `T`; no
+external solver is required. The resulting shares are quantized to integer
+rank weights, then `row_ranges` covers `0..M` exactly once.
+
+For the 4+8 demo:
+
+```text
+4 local ranks:  NVLink, compute 4.0, 400 Gbps
+8 remote ranks: UB,     compute 1.0,  50 Gbps
+```
+
+the LP gives `local_share=0.667`, `remote_share=0.333`, so the local group owns
+two thirds of the rows. Changing the link class, latency, or message size
+changes the weights without changing EPaxos membership.
 
 ## EPaxos integration
 
@@ -43,7 +58,8 @@ entries; `run_matrix_node` takes `--asymmetric` only on the driver.
 
 ## Limits
 
-- Current weights are equal per rank; only group cardinality is asymmetric.
+- Weights currently feed the row dimension only; TP/EP dimensions are still
+  uniform.
 - Matrix rows are the weighted dimension; TP/EP dimensions are not yet
   independently weighted.
 - The demo runs 12 processes on one host for repeatability; the network

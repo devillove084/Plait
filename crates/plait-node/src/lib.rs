@@ -1642,12 +1642,15 @@ pub async fn run_matrix_node(
                     }
                 })
                 .collect();
-            let layout = HeterogeneousLayout::plan(&profiles, m * k * 4)?;
-            let ranges = layout.row_ranges(m);
+            let plan = HeterogeneousLayout::plan_detailed(&profiles, m * k * 4)?;
+            let ranges = plan.layout.row_ranges(m);
+            let local_share: f64 = plan.shares.iter().take(4).map(|(_, share)| share).sum();
+            let remote_share: f64 = plan.shares.iter().skip(4).map(|(_, share)| share).sum();
             let local: usize = ranges.iter().take(4).map(|range| range.range.len()).sum();
             let remote: usize = ranges.iter().skip(4).map(|range| range.range.len()).sum();
             println!(
-                "plait matrix: heterogeneous weights local_rows={local} remote_rows={remote} message_bytes={}",
+                "plait matrix: heterogeneous LP local_share={local_share:.3} remote_share={remote_share:.3} makespan={:.6} local_rows={local} remote_rows={remote} message_bytes={}",
+                plan.makespan,
                 m * k * 4
             );
             Some(ranges)

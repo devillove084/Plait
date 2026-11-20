@@ -117,6 +117,15 @@ pub struct RankProfile {
     pub latency_us: Option<f64>,
 }
 
+#[derive(Clone, Debug)]
+pub struct HeterogeneousPlan {
+    pub layout: AsymmetricLayout,
+    /// Fractional row share chosen by the LP, before integer quantization.
+    pub shares: Vec<(NodeId, f64)>,
+    /// LP optimum: the slowest rank's modeled time.
+    pub makespan: f64,
+}
+
 pub struct HeterogeneousLayout;
 
 impl HeterogeneousLayout {
@@ -131,10 +140,27 @@ impl HeterogeneousLayout {
         profiles: &[RankProfile],
         message_bytes: usize,
     ) -> Result<AsymmetricLayout, String> {
+        Self::plan_detailed(profiles, message_bytes).map(|plan| plan.layout)
+    }
+
+    /// Solve the max-min shard allocation LP:
+    ///
+    ///   minimize T
+    ///   subject to  a_i * x_i + b_i <= T   for every rank
+    ///               sum_i x_i = 1, x_i >= 0
+    ///
+    /// `a_i` is variable compute/communication cost per unit share and `b_i`
+    /// is fixed collective latency. This is a one-constraint LP; its optimum
+    /// is found by parametric search on T, so no external solver is needed.
+    pub fn plan_detailed(
+        profiles: &[RankProfile],
+        message_bytes: usize,
+    ) -> Result<HeterogeneousPlan, String> {
         if profiles.is_empty() {
             return Err("heterogeneous layout needs at least one rank".to_owned());
         }
-        let mut ranks = Vec::with_capacity(profiles.len());
+        let mut slopes = Vec::with_capacity(profiles.len());
+        let mut intercepts = Vec::with_capacity(profiles.len());
         for profile in profiles {
             if !profile.compute_units.is_finite() || profile.compute_units <= 0.0 {
                 return Err(format!("rank {} has invalid compute rate", profile.node));
@@ -148,18 +174,69 @@ impl HeterogeneousLayout {
             let latency_us = profile
                 .latency_us
                 .unwrap_or_else(|| profile.link.nominal_latency_us());
-            let compute_cost = 1.0 / profile.compute_units;
-            let communication_cost = message_bytes as f64 / (bandwidth * 1e9);
-            let latency_cost = latency_us / 1e6;
-            let cost = compute_cost + communication_cost + latency_cost;
-            let weight = (1_000_000.0 / cost).round().clamp(1.0, u32::MAX as f64) as u32;
+            let a = 1.0 / profile.compute_units + message_bytes as f64 / (bandwidth * 1e9);
+            let b = latency_us / 1e6;
+            if !a.is_finite() || a <= 0.0 || !b.is_finite() || b < 0.0 {
+                return Err(format!("rank {} has invalid cost model", profile.node));
+            }
+            slopes.push(a);
+            intercepts.push(b);
+        }
+
+        let lower = intercepts.iter().copied().fold(0.0_f64, f64::max);
+        let upper = slopes
+            .iter()
+            .zip(&intercepts)
+            .map(|(a, b)| a + b)
+            .fold(0.0_f64, f64::max);
+        let mut low = lower;
+        let mut high = upper;
+        for _ in 0..100 {
+            let mid = (low + high) * 0.5;
+            let capacity: f64 = slopes
+                .iter()
+                .zip(&intercepts)
+                .map(|(a, b)| ((mid - b) / a).max(0.0))
+                .sum();
+            if capacity >= 1.0 {
+                high = mid;
+            } else {
+                low = mid;
+            }
+        }
+        let makespan = high;
+        let mut shares: Vec<f64> = slopes
+            .iter()
+            .zip(&intercepts)
+            .map(|(a, b)| ((makespan - b) / a).max(0.0))
+            .collect();
+        let total: f64 = shares.iter().sum();
+        if total <= 0.0 || !total.is_finite() {
+            return Err("heterogeneous LP produced no feasible allocation".to_owned());
+        }
+        for share in &mut shares {
+            *share /= total;
+        }
+
+        let mut ranks = Vec::with_capacity(profiles.len());
+        for (profile, share) in profiles.iter().zip(&shares) {
+            let weight = (share * 1_000_000.0).round().clamp(1.0, u32::MAX as f64) as u32;
             ranks.push(RankWeight {
                 node: profile.node,
                 gpus: profile.gpus,
                 weight,
             });
         }
-        AsymmetricLayout::new(ranks)
+        let layout = AsymmetricLayout::new(ranks)?;
+        Ok(HeterogeneousPlan {
+            layout,
+            shares: profiles
+                .iter()
+                .zip(shares)
+                .map(|(profile, share)| (profile.node, share))
+                .collect(),
+            makespan,
+        })
     }
 }
 
@@ -257,5 +334,30 @@ mod tests {
         assert_eq!(local + remote, 120);
         assert!(local > remote, "faster local ranks should own more rows");
         assert!(ranges[0].range.len() > ranges[4].range.len());
+    }
+    #[test]
+    fn lp_matches_closed_form_for_two_ranks_without_latency() {
+        let profiles = vec![
+            RankProfile {
+                node: NodeId::derive("fast"),
+                gpus: 1,
+                compute_units: 4.0,
+                link: LinkKind::NvLink,
+                bandwidth_gbps: Some(1e9),
+                latency_us: Some(0.0),
+            },
+            RankProfile {
+                node: NodeId::derive("slow"),
+                gpus: 1,
+                compute_units: 1.0,
+                link: LinkKind::Pcie,
+                bandwidth_gbps: Some(1e9),
+                latency_us: Some(0.0),
+            },
+        ];
+        let plan = HeterogeneousLayout::plan_detailed(&profiles, 0).expect("plan");
+        assert!((plan.shares[0].1 - 0.8).abs() < 1e-9);
+        assert!((plan.shares[1].1 - 0.2).abs() < 1e-9);
+        assert!((plan.makespan - 0.2).abs() < 1e-9);
     }
 }
