@@ -56,16 +56,15 @@ conditional on a correct SCC partition.
   as a constant.
 - [ ] Prove no deadlock and eventual completion for every bounded graph.
 
-### F2 — Full EPaxos safety
+### F2 — EPaxos safety (finite model)
 
-- [ ] Model ballots, preaccept/accept/commit, recovery, dependency merge, and
-  execution.
-- [ ] Check agreement: two replicas never execute different values for one
-  instance.
-- [ ] Check dependency closure: a committed instance's dependency set is stable.
-- [ ] Check recovery: a recovered value preserves the committed dependency set.
-- [ ] TLC or Apalache bounds: 3/5 nodes, 3–6 instances, message loss and
-  duplication.
+- [x] Finite TLC model of ballots, preaccept/accept/commit, fast/slow commit,
+  and recovery (`specs/PlaitEPaxos.tla`).
+- [x] Check agreement and committed stability for 3 replicas, 2 instances,
+  2 commands, ballots bounded by 2.
+- [ ] Model dependency merge explicitly; current records carry empty deps.
+- [ ] Model message loss, duplication, and reordering.
+- [ ] Check liveness for recovery and execution.
 
 ### F3 — Modified protocol
 
@@ -74,6 +73,15 @@ conditional on a correct SCC partition.
 - [ ] Model-check counterexamples and liveness.
 - [ ] Lean proof for the core invariant if the TLA+ state space is too large.
 - [ ] Map every model action to a Rust handler and add conformance traces.
+
+## System-level model
+
+`specs/PlaitUnified.tla` models the layer above EPaxos: rank assignment under
+heterogeneous capacity, local compute, collective fusion groups, dependency-
+ordered group commit, and execution. TLC checks capacity bounds, disjoint
+fusion, commit/execute ordering, and eventual execution for a 3-rank/2-group
+instance. This is still an abstraction: it does not claim the Rust scheduler or
+GPU kernels are refined by TLC.
 
 ## Relationship to NCCL work
 
