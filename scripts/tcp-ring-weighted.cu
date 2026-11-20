@@ -210,7 +210,7 @@ int main(int argc, char** argv) {
   }
   double algbw = static_cast<double>(bytes) / seconds / 1e9;
   double busbw = algbw * 2.0 * 11.0 / 12.0;
-  std::printf("rank=%d world=12 gpu=%d bytes=%zu ms=%.3f algbw=%.3f busbw=%.3f errors=%d\\n",
+  std::printf("rank=%d world=12 gpu=%d bytes=%zu ms=%.3f algbw=%.3f busbw=%.3f errors=%d\n",
               rank, gpu, bytes, seconds * 1e3, algbw, busbw, errors);
   ::close(next_fd); ::close(prev_fd);
   CHECK(cudaFree(device));

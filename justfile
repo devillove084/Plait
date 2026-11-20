@@ -63,6 +63,9 @@ tcp-ring: setup
 hetero-gather: setup
     ./scripts/tcp-ring-weighted-two-host.sh
 
+nccl-gather: setup
+    ./scripts/nccl-gather-two-host.sh
+
 nccl-tcp: setup
     ./scripts/nccl-tcp-two-host.sh
 

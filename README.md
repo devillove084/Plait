@@ -131,6 +131,7 @@ just ipc         # two-process CUDA IPC allreduce
 just tcp-allreduce # two-host TCP GPU-buffer star fallback
 just tcp-ring      # two-host full-duplex TCP ring
 just hetero-gather # two-host variable-size allgather
+just nccl-gather   # NCCL allgather baseline over TCP
 just gpu         # CUDA AXPY and CUTLASS SGEMM
 just gpu-bench   # per-GPU CUTLASS SGEMM throughput
 just rdma        # real ibverbs or an explicit skip
@@ -184,8 +185,9 @@ Plait TCP path still needs a ring implementation.
 
 `scripts/tcp-ring-weighted.cu` exercises the heterogeneous path: four local
 ranks own 2 rows each and eight remote ranks own 7 rows each, so send and
-receive lengths differ and results are placed by offset. It is a variable-size
-allgather, not an allreduce, so it is not directly comparable to `ncclAllReduce`. `scripts/nccl-tcp-two-host.sh`
+receive lengths differ and results are placed by offset. At 12 MiB total it
+reaches about 0.25 GB/s. The matching `ncclAllGather` baseline reaches about
+1.15 GB/s, so the variable-size Plait path is still roughly 4.5x slower. `scripts/nccl-tcp-two-host.sh`
 expects the local CUDA 12.9 NCCL wheel at `PLAIT_LOCAL_NCCL` and the remote
 conda NCCL build at the same version.
 
