@@ -170,8 +170,22 @@ same `algbw_GB/s` / `busbw_GB/s` fields. On `pro5000` (8 ranks, 1 MiB):
 | reducescatter | 6.186 | 0.297 |
 | alltoall | 22.908 | 0.080 |
 
-The NCCL harness currently covers allreduce only. Extending it to every
-operation is still M7 work; these Plait numbers are not a comparison table.
+`just nccl-ops` runs the NCCL and Plait sides for allreduce, broadcast, reduce,
+allgather, and reducescatter. 1 MiB, 8 ranks, one run:
+
+| Op | NCCL Bus BW (GB/s) | Plait Bus BW (GB/s) |
+|---|---:|---:|
+| allreduce | 0.894 | 0.063 |
+| broadcast | 1.308 | 0.090 |
+| reduce | 3.214 | 0.708 |
+| allgather | 0.934 | 0.067 |
+| reducescatter | 3.486 | 0.294 |
+
+All correctness checks pass. NCCL alltoall is not in the current NCCL public
+header used here; Plait alltoall is validated separately. The performance gap is
+still large. `just nccl-ops` is the M7 artifact generator; JSON trace files are
+written by the Plait side when `--trace` is supplied. The full size sweep and
+alltoall NCCL path remain open.
 
 ## Measured performance
 

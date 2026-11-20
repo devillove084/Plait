@@ -60,6 +60,9 @@ nccl: setup
 nccl-sweep: setup
     ./scripts/nccl-compare.sh --sweep
 
+nccl-ops: setup
+    ./scripts/nccl-ops.sh
+
 gpu: setup
     cargo run -q --locked -p plait-node -- gpu-demo
 
