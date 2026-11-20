@@ -130,6 +130,7 @@ just matrix      # 12-replica matrix collective
 just ipc         # two-process CUDA IPC allreduce
 just tcp-allreduce # two-host TCP GPU-buffer star fallback
 just tcp-ring      # two-host full-duplex TCP ring
+just tcp-twolevel  # host-local reduce + cross-host exchange
 just hetero-gather # two-host variable-size allgather
 just nccl-gather   # NCCL allgather baseline over TCP
 just gpu         # CUDA AXPY and CUTLASS SGEMM
@@ -171,6 +172,12 @@ the ring, 1 MiB ranges from 0.019 to 0.024 GB/s and 16 MiB from 0.106 to
 0.216 GB/s. The spread is smaller than the unpinned ring, but NCCL's 0.050 and
 0.273 GB/s are still better. The TCP host-staged path remains a correctness
 fallback, not a winner.
+
+A two-level host-leader allreduce (`scripts/tcp-twolevel.cu`) reduces within
+the four local and eight remote ranks, exchanges one host aggregate, and
+broadcasts locally. With a ready barrier before timing it reports `errors=0`
+at 0.056-0.059 GB/s for 1 MiB, above NCCL's 0.050 GB/s. At 16 MiB it reaches
+0.113-0.124 GB/s and loses to NCCL's 0.273 GB/s.
 
 The star path is a correctness fallback, not a performance result. NCCL 2.28.9
 over the same TCP path reports `errors=0` at:

@@ -60,6 +60,9 @@ tcp-allreduce: setup
 tcp-ring: setup
     ./scripts/tcp-ring-pipeline-two-host.sh
 
+tcp-twolevel: setup
+    ./scripts/tcp-twolevel-two-host.sh
+
 hetero-gather: setup
     ./scripts/tcp-ring-weighted-two-host.sh
 
