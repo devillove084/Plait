@@ -101,8 +101,9 @@ ordinary container exposes an active ibverbs device.
 
 ### M7 — Validation gate
 
-- [ ] `nccl-tests`-style matrix: allreduce, broadcast, reduce, all-gather,
-  reduce-scatter, all-to-all.
+- [x] Plait-side benchmark matrix with correctness checks for all six
+  collectives (`--op`).
+- [ ] NCCL-side matrix for all six collectives (currently allreduce only).
 - [ ] Same rank counts, byte sizes, warmup, and iterations.
 - [ ] Correctness check with finite tolerance and per-rank errors.
 - [ ] JSON timeline and benchmark artifact per run.

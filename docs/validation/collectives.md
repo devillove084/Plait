@@ -148,6 +148,31 @@ is an explicit hardware absence, not a successful GPUDirect test. The next M5
 step requires an RNIC/rxe host and a peer-memory/dmabuf provider, then a
 two-host GPU-buffer collective.
 
+## All-collective benchmark matrix
+
+The Plait side now accepts `--op` for all core collectives:
+
+```sh
+for op in allreduce broadcast reduce allgather reducescatter alltoall; do
+  cargo run -q --locked -p plait-node -- collectives --gpus 8 --bytes 1048576 --op "$op"
+done
+```
+
+The benchmark validates the CPU reference for every operation and emits the
+same `algbw_GB/s` / `busbw_GB/s` fields. On `pro5000` (8 ranks, 1 MiB):
+
+| Op | Time (ms) | Bus BW (GB/s) |
+|---|---:|---:|
+| allreduce | 28.218 | 0.065 |
+| broadcast | 17.882 | 0.103 |
+| reduce | 7.280 | 0.252 |
+| allgather | 25.592 | 0.072 |
+| reducescatter | 6.186 | 0.297 |
+| alltoall | 22.908 | 0.080 |
+
+The NCCL harness currently covers allreduce only. Extending it to every
+operation is still M7 work; these Plait numbers are not a comparison table.
+
 ## Measured performance
 
 Eight RTX PRO 5000, 1 MiB, 8 ranks, 5 warmups / 10 timed iterations:

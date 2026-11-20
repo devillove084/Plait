@@ -1022,6 +1022,7 @@ pub fn run_collectives_demo(
     bytes: usize,
     iters: usize,
     algorithm: &str,
+    op: &str,
     channels: usize,
     trace: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1029,7 +1030,7 @@ pub fn run_collectives_demo(
     use std::time::Instant;
 
     let requested = algorithm.to_owned();
-    let algorithm = match algorithm {
+    let mut algorithm = match algorithm {
         "ring" => AllReduceAlgorithm::Ring,
         "recursive" => AllReduceAlgorithm::RecursiveDoubling,
         "tree" => AllReduceAlgorithm::Tree,
@@ -1043,12 +1044,18 @@ pub fn run_collectives_demo(
     if ranks < 2 {
         return Err(format!("collectives need at least 2 ranks, found {available}").into());
     }
+    if op == "alltoall" && bytes % (ranks * std::mem::size_of::<f32>()) != 0 {
+        return Err("alltoall bytes must divide by ranks".into());
+    }
+    if matches!(op, "allgather" | "reducescatter")
+        && bytes % (ranks * std::mem::size_of::<f32>()) != 0
+    {
+        return Err(format!("{op} bytes must divide by ranks").into());
+    }
     let mut group = PeerGroup::new_with_channels(ranks, channels)?;
-    let algorithm = if requested == "auto" {
-        group.recommended_allreduce(bytes)
-    } else {
-        algorithm
-    };
+    if requested == "auto" {
+        algorithm = group.recommended_allreduce(bytes);
+    }
     let count = (bytes / std::mem::size_of::<f32>()).max(1);
     let inputs: Vec<Vec<f32>> = (0..ranks)
         .map(|rank| {
@@ -1063,30 +1070,23 @@ pub fn run_collectives_demo(
             sum + (index % 17) as f32 * 0.001 * ranks as f32
         })
         .collect();
+
     for _ in 0..5 {
-        for values in group.all_reduce(&inputs, algorithm)? {
-            if values
-                .iter()
-                .zip(&expected)
-                .any(|(actual, expected)| (*actual - *expected).abs() > 1e-3)
-            {
-                return Err("collective correctness check failed".into());
-            }
-        }
+        run_collective_op(&group, op, &inputs, &expected, algorithm)?;
     }
-    let start = Instant::now();
     if trace.is_some() {
         group.enable_trace(iters.saturating_mul(group.world_size()).max(1));
     }
+    let start = Instant::now();
     for _ in 0..iters {
-        group.all_reduce(&inputs, algorithm)?;
+        run_collective_op(&group, op, &inputs, &expected, algorithm)?;
     }
     let seconds = start.elapsed().as_secs_f64() / iters as f64;
     let allreduce_bytes = count * std::mem::size_of::<f32>();
     let algbw = allreduce_bytes as f64 / seconds / 1e9;
     let busbw = algbw * 2.0 * (ranks - 1) as f64 / ranks as f64;
     println!(
-        "plait collectives: {algorithm:?} allreduce ranks={} channels={} bytes={allreduce_bytes} time_ms={:.6} algbw_GB/s={algbw:.3} busbw_GB/s={busbw:.3}",
+        "plait collectives: op={op} algorithm={algorithm:?} ranks={} channels={} bytes={allreduce_bytes} time_ms={:.6} algbw_GB/s={algbw:.3} busbw_GB/s={busbw:.3}",
         group.world_size(),
         group.channels(),
         seconds * 1e3
@@ -1097,6 +1097,109 @@ pub fn run_collectives_demo(
             "plait collectives: chrome trace {} events at {path}",
             group.trace_events().len()
         );
+    }
+    Ok(())
+}
+
+fn run_collective_op(
+    group: &plait_collective::PeerGroup,
+    op: &str,
+    inputs: &[Vec<f32>],
+    expected: &[f32],
+    algorithm: plait_collective::AllReduceAlgorithm,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let n = group.world_size();
+    let count = inputs[0].len();
+    let output = match op {
+        "allreduce" => group.all_reduce(inputs, algorithm)?,
+        "broadcast" => group.broadcast(inputs[0].clone(), 0)?,
+        "reduce" => {
+            let reduced = group.reduce(inputs, 0)?;
+            if reduced
+                .iter()
+                .zip(expected)
+                .any(|(actual, expected)| (*actual - *expected).abs() > 1e-2)
+            {
+                return Err("reduce correctness check failed".into());
+            }
+            return Ok(());
+        }
+        "allgather" => {
+            let width = count / n;
+            let chunks: Vec<Vec<f32>> = inputs
+                .iter()
+                .map(|values| values[..width].to_vec())
+                .collect();
+            group.all_gather(&chunks)?
+        }
+        "reducescatter" => group.reduce_scatter(inputs)?,
+        "alltoall" => group.all_to_all(inputs)?,
+        other => return Err(format!("unknown collective op {other}").into()),
+    };
+    match op {
+        "allreduce" | "broadcast" => {
+            let wanted = if op == "broadcast" {
+                &inputs[0][..]
+            } else {
+                expected
+            };
+            for values in output {
+                if values
+                    .iter()
+                    .zip(wanted)
+                    .any(|(actual, expected)| (*actual - *expected).abs() > 1e-2)
+                {
+                    return Err(format!("{op} correctness check failed").into());
+                }
+            }
+        }
+        "allgather" => {
+            let width = count / n;
+            let wanted: Vec<f32> = inputs
+                .iter()
+                .flat_map(|v| v[..width].iter().copied())
+                .collect();
+            for values in output {
+                if values
+                    .iter()
+                    .zip(&wanted)
+                    .any(|(actual, expected)| (*actual - *expected).abs() > 1e-2)
+                {
+                    return Err("allgather correctness check failed".into());
+                }
+            }
+        }
+        "reducescatter" => {
+            let width = count / n;
+            for (rank, values) in output.iter().enumerate() {
+                let chunk = (rank + 1) % n;
+                let wanted = &expected[chunk * width..(chunk + 1) * width];
+                if values[chunk * width..(chunk + 1) * width]
+                    .iter()
+                    .zip(wanted)
+                    .any(|(actual, expected)| (*actual - *expected).abs() > 1e-2)
+                {
+                    return Err("reducescatter correctness check failed".into());
+                }
+            }
+        }
+        "alltoall" => {
+            let width = count / n;
+            for destination in 0..n {
+                for source in 0..n {
+                    let send = &inputs[source][destination * width..(destination + 1) * width];
+                    let actual = &output[destination][source * width..(source + 1) * width];
+                    if actual
+                        .iter()
+                        .zip(send)
+                        .any(|(actual, expected)| (*actual - *expected).abs() > 1e-2)
+                    {
+                        return Err("alltoall correctness check failed".into());
+                    }
+                }
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
