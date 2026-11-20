@@ -133,6 +133,7 @@ just tcp-ring      # two-host full-duplex TCP ring
 just tcp-twolevel  # host-local reduce + cross-host exchange
 just tcp-twolevel-shm # shared-memory local group + cross-host exchange
 just tcp-twolevel-hybrid # shared-memory result + 8 cross-host channels
+just tcp-twolevel-rust # Rust host-staged two-level prototype
 just hetero-gather # two-host variable-size allgather
 just nccl-gather   # NCCL allgather baseline over TCP
 just gpu         # CUDA AXPY and CUTLASS SGEMM
@@ -192,6 +193,11 @@ over the same TCP path reports `errors=0` at:
 
 NCCL is faster because it uses a ring and avoids a serialized star root. The
 Plait TCP path still needs a ring implementation.
+
+`crates/plait-collective/src/bin/tcp-twolevel.rs` is a Rust implementation of
+the same host-leader shape. It is correct but currently slower than the C++
+hybrid because the Rust prototype serializes the four cross-host channels and
+copies the result back to the GPU every iteration.
 
 The hybrid path (`scripts/tcp-twolevel-hybrid.cu`) sends local inputs to the
 host leader, exchanges the aggregate over eight cross-host channels, and
