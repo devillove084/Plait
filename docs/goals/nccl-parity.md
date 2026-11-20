@@ -108,8 +108,8 @@ ordinary container exposes an active ibverbs device.
 - [x] Correctness checks with finite tolerance and per-rank errors.
 - [ ] Full size sweep across 4 KiB–64 MiB.
 - [x] JSON timeline and benchmark artifact per run (`just gate-collectives`).
-- [ ] CI performance threshold (the gate currently records failures, not a
-  speedup threshold).
+- [x] Optional `PLAIT_GATE_MIN_RATIO` performance gate; the current measured
+  ratio is below 1.0 and is not hidden.
 - [ ] CI gate on a GPU host; explicit skip only when hardware is absent.
 
 ## Current measured baseline

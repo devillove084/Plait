@@ -197,8 +197,10 @@ It fails if NCCL reports an error or Plait fails its own reference check.
 PLAIT_GATE_SIZES="4096 65536 1048576 16777216" just gate-collectives
 ```
 
-The gate currently records performance; it does not yet enforce a performance
-threshold.
+The gate records performance by default. Set `PLAIT_GATE_MIN_RATIO` to enforce a
+minimum Plait/NCCL bus-bandwidth ratio; the current implementation is far below
+1.0, so a production threshold must be raised only after the data-path work.
+The artifact preserves both strings and per-run traces.
 
 ## Measured performance
 

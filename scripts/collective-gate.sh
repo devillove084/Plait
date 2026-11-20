@@ -38,6 +38,14 @@ for op in $ops; do
       echo "Plait failure: $op $size: $plait" >&2
       exit 1
     fi
+    if [ -n "${PLAIT_GATE_MIN_RATIO:-}" ]; then
+      nccl_bw=$(printf '%s' "$nccl" | sed -n 's/.*busbw_GB\/s=\([0-9.]*\).*/\1/p')
+      plait_bw=$(printf '%s' "$plait" | sed -n 's/.*busbw_GB\/s=\([0-9.]*\).*/\1/p')
+      if ! awk -v a="$plait_bw" -v b="$nccl_bw" -v r="$PLAIT_GATE_MIN_RATIO" 'BEGIN { exit !(b > 0 && a / b >= r) }'; then
+        echo "performance gate failure: $op $size plait=${plait_bw} nccl=${nccl_bw} ratio<$PLAIT_GATE_MIN_RATIO" >&2
+        exit 1
+      fi
+    fi
     if [ "$first_size" -eq 1 ]; then first_size=0; else echo "," >> "$artifact"; fi
     printf '{"size":%s,"nccl":"%s","plait":"%s"}' "$size" \
       "${nccl//\"/\\\"}" "${plait//\"/\\\"}" >> "$artifact"
