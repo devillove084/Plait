@@ -335,8 +335,8 @@ fn main() -> AnyResult<()> {
                 received.copy_from_slice(result);
             }
         }
-        region.write_host(&received)?;
     }
+    region.write_host(&received)?;
     let seconds = start.elapsed().as_secs_f64() / iters as f64;
     let output = region.read_host(count)?;
     let expected = (world * (world + 1)) as f32 / 2.0;

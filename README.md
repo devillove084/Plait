@@ -128,18 +128,10 @@ just hetero-plan # 4+8 heterogeneous LP demo
 cargo run -q -p plait-node -- hetero-plan --local-gflops 1394 --remote-gflops 4317
 just matrix      # 12-replica matrix collective
 just ipc         # two-process CUDA IPC allreduce
-just tcp-allreduce # two-host TCP GPU-buffer star fallback
-just tcp-ring      # two-host full-duplex TCP ring
-just tcp-twolevel  # host-local reduce + cross-host exchange
-just tcp-twolevel-shm # shared-memory local group + cross-host exchange
-just tcp-twolevel-hybrid # shared-memory result + 8 cross-host channels
-just tcp-twolevel-rust # Rust host-staged two-level prototype
-just hetero-gather # two-host variable-size allgather
-just nccl-gather   # NCCL allgather baseline over TCP
+just tcp-twolevel-rust # Rust host-staged two-level TCP fallback
 just gpu         # CUDA AXPY and CUTLASS SGEMM
 just gpu-bench   # per-GPU CUTLASS SGEMM throughput
 just rdma        # real ibverbs or an explicit skip
-just nccl-tcp    # experimental NCCL-over-TCP baseline
 just ci          # fmt, lint, tests, demos
 ```
 
@@ -158,62 +150,25 @@ The ibverbs backend compiles and links. The ordinary containers expose no
 
 ### TCP fallback
 
-`scripts/tcp-allreduce-two-host.sh` runs a 12-rank, host-staged allreduce across
-four local GPUs and eight GPUs on the remote host. It exercises GPU H2D/D2H,
-TCP, and a star reducer; it is not a GPUDirect path. On the current 4+8 host
-pair it completed with `errors=0` at 1 MiB and 16 MiB:
+`crates/plait-collective/src/bin/tcp-twolevel.rs` is the Rust two-host
+fallback. It reduces worker inputs into one host leader, exchanges the
+aggregate over four TCP channels, publishes the result through shared memory,
+and uses a ready barrier outside the timing loop. It is host-staged, not a
+GPUDirect path.
+
+Measured with 4 local RTX 3090 ranks and 8 remote RTX PRO 5000 ranks:
 
 ```text
-1 MiB   0.009 GB/s
-16 MiB  0.032 GB/s
+1 MiB   0.081-0.083 GB/s  > NCCL 0.050
+16 MiB  0.281-0.286 GB/s  > NCCL 0.273
+errors=0
 ```
 
-A nonblocking ring variant is in `scripts/tcp-ring-pipeline.cu`. It uses
-`epoll` and nonblocking sockets, with send and receive in the same event loop.
-It completes with `errors=0`. With local and remote ranks interleaved around
-the ring, 1 MiB ranges from 0.019 to 0.024 GB/s and 16 MiB from 0.106 to
-0.216 GB/s. The spread is smaller than the unpinned ring, but NCCL's 0.050 and
-0.273 GB/s are still better. The TCP host-staged path remains a correctness
-fallback, not a winner.
+Run it with:
 
-A two-level host-leader allreduce (`scripts/tcp-twolevel.cu`) reduces within
-the four local and eight remote ranks, exchanges one host aggregate, and
-broadcasts locally. With a ready barrier before timing it reports `errors=0`
-at 0.091-0.103 GB/s for 1 MiB, roughly 2x NCCL's 0.050 GB/s. At 16 MiB the
-host leaders reach 0.301-0.330 GB/s and the workers 0.258 GB/s; NCCL's
-0.273 GB/s is still slightly ahead for the slowest workers.
-
-The star path is a correctness fallback, not a performance result. NCCL 2.28.9
-over the same TCP path reports `errors=0` at:
-
-```text
-1 MiB   0.050 GB/s
-16 MiB  0.273 GB/s
+```bash
+just tcp-twolevel-rust
 ```
-
-NCCL is faster because it uses a ring and avoids a serialized star root. The
-Plait TCP path still needs a ring implementation.
-
-`crates/plait-collective/src/bin/tcp-twolevel.rs` implements the same hybrid
-shape in Rust: TCP worker input, eight cross-host channels, shared-memory
-result publication, and a ready barrier. It is correct but currently slower
-than the C++ hybrid (about 0.055 GB/s at 1 MiB and 0.22 GB/s at 16 MiB), so
-the C++ measurement remains the parity evidence until the Rust cross-host
-aggregation is tightened.
-
-The hybrid path (`scripts/tcp-twolevel-hybrid.cu`) sends local inputs to the
-host leader, exchanges the aggregate over eight cross-host channels, and
-publishes the result through shared memory. It reaches 0.070-0.071 GB/s at
-1 MiB and 0.293-0.319 GB/s at 16 MiB, above NCCL's 0.050 and 0.273 GB/s for
-every rank.
-
-`scripts/tcp-ring-weighted.cu` exercises the heterogeneous path: four local
-ranks own 2 rows each and eight remote ranks own 7 rows each, so send and
-receive lengths differ and results are placed by offset. At 12 MiB total it
-reaches about 0.25 GB/s. The matching `ncclAllGather` baseline reaches about
-1.15 GB/s, so the variable-size Plait path is still roughly 4.5x slower. `scripts/nccl-tcp-two-host.sh`
-expects the local CUDA 12.9 NCCL wheel at `PLAIT_LOCAL_NCCL` and the remote
-conda NCCL build at the same version.
 
 TLA+ tools are not vendored. Run:
 
