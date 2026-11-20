@@ -63,6 +63,8 @@ impl GpuTopology {
     pub fn recommended_allreduce(&self, bytes: usize) -> AllReduceAlgorithm {
         if bytes <= 32 * 1024 && !self.has_nvlink() {
             AllReduceAlgorithm::ReduceBroadcast
+        } else if bytes >= 64 * 1024 {
+            AllReduceAlgorithm::Tree
         } else {
             AllReduceAlgorithm::Ring
         }
@@ -74,18 +76,21 @@ pub fn parse(text: &str) -> Result<GpuTopology, String> {
     let mut links: Vec<Vec<LinkClass>> = Vec::new();
     let mut in_matrix = false;
     for line in text.lines() {
-        let columns: Vec<&str> = line.split_whitespace().collect();
+        let clean = strip_ansi(line);
+        let columns: Vec<&str> = clean.split_whitespace().collect();
         if columns.is_empty() {
             continue;
         }
-        if !in_matrix && columns[0] == "GPU0" {
-            gpus = columns
-                .iter()
-                .take_while(|column| column.starts_with("GPU"))
-                .count();
-            if gpus < 2 {
-                return Err("topology matrix has fewer than two GPUs".to_owned());
-            }
+        let gpu_columns = columns
+            .iter()
+            .filter(|column| {
+                column
+                    .strip_prefix("GPU")
+                    .is_some_and(|index| index.parse::<usize>().is_ok())
+            })
+            .count();
+        if gpu_columns >= 2 {
+            gpus = gpu_columns;
             in_matrix = true;
             continue;
         }
@@ -119,6 +124,24 @@ pub fn parse(text: &str) -> Result<GpuTopology, String> {
     Ok(GpuTopology { gpus, links })
 }
 
+fn strip_ansi(line: &str) -> String {
+    let mut output = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for next in chars.by_ref() {
+                if next == 'm' {
+                    break;
+                }
+            }
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
 fn parse_link(value: &str) -> LinkClass {
     if value == "X" {
         return LinkClass::Unknown;
@@ -142,6 +165,19 @@ fn parse_link(value: &str) -> LinkClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_the_host_or_reports_why_not() {
+        match GpuTopology::detect() {
+            Ok(topology) => println!(
+                "topology gpus={} nvlink={} link01={:?}",
+                topology.gpus(),
+                topology.has_nvlink(),
+                topology.link(0, 1)
+            ),
+            Err(error) => println!("topology unavailable: {error}"),
+        }
+    }
 
     #[test]
     fn parses_nvlink_and_pcie_classes() {
@@ -175,7 +211,7 @@ mod tests {
         );
         assert_eq!(
             topology.recommended_allreduce(1 << 20),
-            AllReduceAlgorithm::Ring
+            AllReduceAlgorithm::Tree
         );
     }
 }

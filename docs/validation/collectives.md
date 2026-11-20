@@ -75,8 +75,11 @@ at this size. This is recorded as a failed performance gate, not hidden.
 uses the conservative `GpuTopology::recommended_allreduce`; an unavailable
 topology falls back to ring.
 
-The binary tree allreduce builds parent `rank & (rank - 1)` and runs a
-bottom-up reduce plus top-down broadcast. 1 MiB, 8 ranks on `pro5000`:
+The binary tree implementations build parent `rank & (rank - 1)`:
+`broadcast_tree`, `reduce_tree`, and tree allreduce. Root-relative indexing is
+used for non-zero roots. `--algorithm auto` selects reduce+broadcast below
+32 KiB on PCIe, tree at 64 KiB or more, and ring otherwise. 1 MiB, 8 ranks on
+`pro5000`:
 
 | Algorithm | Time (ms) | Bus BW (GB/s) |
 |---|---:|---:|

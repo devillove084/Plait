@@ -62,13 +62,15 @@ The channel engine is a structural step, not a performance win.
 ### M4 — Topology-aware algorithms
 
 - [x] Read PCIe/NVLink topology (`nvidia-smi topo -m`); parse NVLink/PIX/PXB/
-  PHB/NODE/SYS.
+  PHB/NODE/SYS, including ANSI-stripped headers.
 - [x] Conservative selection API; `--algorithm auto` falls back to ring when
   topology discovery fails.
-- [x] Binary tree allreduce on the rank tree.
-- [ ] Tree broadcast/reduce and measured size/topology selection.
+- [x] Binary tree allreduce, broadcast, and reduce on the rank tree.
+- [x] Size heuristic: small PCIe messages use reduce+broadcast, larger use tree;
+  ring remains the fallback. The heuristic is recorded, not yet tuned across a
+  full size sweep.
 - [x] Explicit fallback: CollNet/NVLS/PAT are never advertised as available;
-  the selector falls back to ring/reduce+broadcast.
+  the selector falls back to ring/reduce+broadcast/tree.
 - [ ] Timeline records the selected topology class (algorithm is recorded).
 
 Acceptance: on the 8× Blackwell host (two NUMA groups, no NVLink) the selector

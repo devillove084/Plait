@@ -507,6 +507,137 @@ impl PeerGroup {
         Ok(values[..count].to_vec())
     }
 
+    /// Binary tree broadcast rooted at `root`; root 0 uses parent `r & (r-1)`.
+    pub fn broadcast_tree(&self, value: Vec<f32>, root: usize) -> Result<Vec<Vec<f32>>> {
+        if root >= self.world_size() {
+            return Err(CollectiveError::new("broadcast root out of range"));
+        }
+        let started = self.trace_start();
+        let bytes = value.len() * std::mem::size_of::<f32>();
+        let result = self.broadcast_tree_inner(value, root);
+        if result.is_ok() {
+            self.trace_record("broadcast_tree", "collective", bytes, None, 1, started);
+        }
+        result
+    }
+
+    fn broadcast_tree_inner(&self, value: Vec<f32>, root: usize) -> Result<Vec<Vec<f32>>> {
+        let n = self.world_size();
+        let count = value.len();
+        let mut data = Vec::with_capacity(n);
+        let mut receive = Vec::with_capacity(n);
+        for rank in 0..n {
+            let host = if rank == root {
+                value.clone()
+            } else {
+                vec![0.0; count]
+            };
+            data.push(
+                self.ranks[rank]
+                    .stream
+                    .clone_htod(&host)
+                    .map_err(driver("tree broadcast allocation"))?,
+            );
+            receive.push(
+                self.ranks[rank]
+                    .stream
+                    .alloc_zeros::<f32>(count)
+                    .map_err(driver("tree broadcast receive"))?,
+            );
+        }
+        for logical in 1..n {
+            let rank = (root + logical) % n;
+            let parent_logical = logical & (logical - 1);
+            let parent = (root + parent_logical) % n;
+            self.copy(
+                parent,
+                &data[parent],
+                0..count,
+                rank,
+                &mut receive[rank],
+                0..count,
+            )?;
+            self.copy(
+                rank,
+                &receive[rank],
+                0..count,
+                rank,
+                &mut data[rank],
+                0..count,
+            )?;
+            self.ranks[rank]
+                .stream
+                .synchronize()
+                .map_err(driver("tree broadcast sync"))?;
+        }
+        self.collect(&data, count)
+    }
+
+    /// Binary tree reduce rooted at `root`; returns the reduced value on root.
+    pub fn reduce_tree(&self, inputs: &[Vec<f32>], root: usize) -> Result<Vec<f32>> {
+        self.validate(inputs)?;
+        if root >= self.world_size() {
+            return Err(CollectiveError::new("reduce root out of range"));
+        }
+        let started = self.trace_start();
+        let bytes = inputs.first().map_or(0, Vec::len) * std::mem::size_of::<f32>();
+        let result = self.reduce_tree_inner(inputs, root);
+        if result.is_ok() {
+            self.trace_record("reduce_tree", "collective", bytes, None, 1, started);
+        }
+        result
+    }
+
+    fn reduce_tree_inner(&self, inputs: &[Vec<f32>], root: usize) -> Result<Vec<f32>> {
+        let n = self.world_size();
+        let count = inputs[0].len();
+        let mut data = Vec::with_capacity(n);
+        let mut receive = Vec::with_capacity(n);
+        for rank in 0..n {
+            data.push(
+                self.ranks[rank]
+                    .stream
+                    .clone_htod(&inputs[rank])
+                    .map_err(driver("tree reduce allocation"))?,
+            );
+            receive.push(
+                self.ranks[rank]
+                    .stream
+                    .alloc_zeros::<f32>(count)
+                    .map_err(driver("tree reduce receive"))?,
+            );
+        }
+        for logical in (1..n).rev() {
+            let rank = (root + logical) % n;
+            let parent_logical = logical & (logical - 1);
+            let parent = (root + parent_logical) % n;
+            self.copy(
+                rank,
+                &data[rank],
+                0..count,
+                parent,
+                &mut receive[parent],
+                0..count,
+            )?;
+            self.add(
+                parent,
+                &mut data[parent],
+                0..count,
+                &receive[parent],
+                0..count,
+            )?;
+            self.ranks[parent]
+                .stream
+                .synchronize()
+                .map_err(driver("tree reduce sync"))?;
+        }
+        let values = self.ranks[root]
+            .stream
+            .clone_dtoh(&data[root])
+            .map_err(driver("tree reduce copy"))?;
+        Ok(values[..count].to_vec())
+    }
+
     pub fn all_gather(&self, chunks: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
         let started = self.trace_start();
         let bytes =
@@ -1239,6 +1370,20 @@ mod tests {
 
         let reduced = group.reduce(&inputs, 0).expect("reduce");
         assert_eq!(reduced, expected);
+        let tree_reduced = group.reduce_tree(&inputs, 0).expect("tree reduce");
+        assert_eq!(tree_reduced, expected);
+        let tree_broadcast = group
+            .broadcast_tree(expected.clone(), 0)
+            .expect("tree broadcast");
+        for values in tree_broadcast {
+            assert_eq!(values, expected);
+        }
+        let rooted = group
+            .broadcast_tree(expected.clone(), 1)
+            .expect("rooted tree broadcast");
+        for values in rooted {
+            assert_eq!(values, expected);
+        }
 
         let broadcast = group.broadcast(expected.clone(), 0).expect("broadcast");
         for values in broadcast {
