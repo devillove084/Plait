@@ -51,7 +51,7 @@ and eventual progress under weak fairness. This proves the scheduler layer
 conditional on a correct SCC partition.
 
 - [x] Finite TLA+ model of component execution.
-- [ ] TLC model-check `Safety` and `ExecutedOnce` for 3 and 5 nodes.
+- [x] TLC model-check `Safety` and `ExecutedOnce` for 3 and 5 nodes.
 - [ ] Add a reachability model that derives SCCs instead of taking the partition
   as a constant.
 - [ ] Prove no deadlock and eventual completion for every bounded graph.
