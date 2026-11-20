@@ -1,21 +1,37 @@
-# Dependency policy and lock
+# Dependency policy
 
-Plait does not use Git submodules for ordinary upstream dependencies. CMake
-first-class packages and dependency providers remain usable, while the standard
-presets fetch immutable, hash-verified source snapshots.
+Plait is a Rust 2024 workspace. The authoritative lock is the committed
+`Cargo.lock`; CI runs with `--locked`.
 
-| Dependency | Snapshot | SHA-256 | Role |
-| --- | --- | --- | --- |
-| Abseil | `20260526.0` / `5650e9cf76d3be4318d5fa3af38ee483ddfd5e4a` | `bac569e31429f85d7bdd9f90e4767442faf9c8fa1def08a66a7d5d78e0fba204` | Core implementation utilities |
-| GoogleTest | `v1.17.0` / `52eb8108c5bdec04579160ae17225d66034bd723` | `745c55415660044610f7fcd3af7a6420d5de16a7dbb9ebfe2e131275676232be` | Tests and mocks |
-| YalantingLibs | `0.6.1` | `2ef2089a49a08f764c558e9caf46e1d37697b111e04a48e5c5156f57f3afff24` | Internal `struct_pack` wire codec |
-| OpenCL-Headers | `v2026.05.29` | `d9e6c48357de5002da11ce45de600e0c3ffe6ab4f628a3b9fe2b38603161658a` | OpenCL 3.1.1 API surface |
-| OpenCL-ICD-Loader | `v2026.05.29` | `48fd0c5181db7cd046f4f731d5955694892e10998d49d09ee0d997e7e04fd939` | Portable OpenCL dispatch loader |
+| Dependency | Version | Role |
+| --- | --- | --- |
+| `serde` | 1 | Wire, command, snapshot, and region-descriptor derives |
+| `bincode` | 1.3 | Framed TCP payload codec |
+| `sha2` | 0.10 | Stable `NodeId` derivation from human labels |
+| `rand` | 0.8 | Fresh node and client identities when no id is supplied |
 
-The authoritative executable lock is `cmake/Dependencies.cmake`. Updating a
-dependency requires changing both its immutable source location and hash,
-running every build preset, and updating this table in the same change.
+Standard library only is used for threads, sockets, channels, allocation, and
+time. There is no async runtime, C/C++ bridge, build script, or Git submodule.
 
-Git submodules remain reserved for an upstream that Plait must patch long-term,
-or for a separately audited source tree whose exact checkout must be available
-without CMake configuration. Neither case applies to the initial dependencies.
+## Updating a dependency
+
+1. Change the workspace version in `Cargo.toml`.
+2. Run `cargo update -p <crate>` and commit `Cargo.lock`.
+3. Run the full gate from the repository root:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --locked
+cargo run --locked -p plait-node -- demo
+cargo run --locked -p plait-node -- dsa
+```
+
+4. Update this table in the same change.
+
+## Removed foundation
+
+The previous C++26/CMake project, its dependency snapshots (Abseil,
+GoogleTest, YalantingLibs, OpenCL), build presets, clang-format/tidy gates, and
+the C++ CI workflow were removed as part of the Rust rewrite. They remain in
+Git history.

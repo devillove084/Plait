@@ -1,0 +1,12 @@
+[package]
+name = "plait-consensus"
+description = "Leaderless EPaxos state machine for Plait"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+plait-core.workspace = true
+serde.workspace = true

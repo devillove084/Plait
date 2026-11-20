@@ -1,0 +1,14 @@
+[package]
+name = "plait-net"
+description = "Framed TCP transport for Plait"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bincode.workspace = true
+plait-core.workspace = true
+plait-consensus.workspace = true
+serde.workspace = true

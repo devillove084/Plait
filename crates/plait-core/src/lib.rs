@@ -1,0 +1,18 @@
+//! Backend-neutral vocabulary shared by every Plait crate.
+//!
+//! Nothing in this crate knows about sockets, threads, or a particular
+//! accelerator. Nodes are named by stable identities, commands declare the
+//! tensor/operator keys they touch, and membership is a replicated
+//! configuration rather than an array of ranks.
+
+pub mod command;
+pub mod config;
+pub mod identity;
+pub mod tensor;
+
+pub use command::{Access, Command, FuseKind, Key, MembershipChange, Mode, OpId, OpSpec};
+pub use config::{ClusterConfig, ConfigError, QuorumPolicy};
+pub use identity::NodeId;
+pub use tensor::{
+    DType, Placement, Shape, ShardId, TensorId, TensorKey, TensorSpec, TensorVersion, TensorView,
+};

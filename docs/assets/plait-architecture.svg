@@ -1,98 +1,77 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" role="img" aria-labelledby="title description">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 500" role="img" aria-labelledby="title desc">
   <title id="title">Plait architecture</title>
-  <desc id="description">Frontends feed the rankless Plait tensor core, which coordinates peers and schedules work across heterogeneous backend adapters.</desc>
-
+  <desc id="desc">Three equal peers propose into an EPaxos log. Ordered commands drive a fused runtime, which materializes tensors. Bulk bytes move between registered memory regions on a data plane.</desc>
   <defs>
-    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#091426"/>
-      <stop offset="1" stop-color="#12102d"/>
-    </linearGradient>
-    <linearGradient id="core" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#123a66"/>
-      <stop offset="0.55" stop-color="#27245f"/>
-      <stop offset="1" stop-color="#432064"/>
-    </linearGradient>
-    <linearGradient id="flow" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0" stop-color="#22d3ee"/>
-      <stop offset="0.55" stop-color="#8b5cf6"/>
-      <stop offset="1" stop-color="#f59e0b"/>
-    </linearGradient>
-    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
-      <feGaussianBlur stdDeviation="5" result="blur"/>
-      <feMerge>
-        <feMergeNode in="blur"/>
-        <feMergeNode in="SourceGraphic"/>
-      </feMerge>
-    </filter>
-    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M 0 0 L 10 5 L 0 10 z" fill="#67e8f9"/>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--accent)"/>
     </marker>
-    <style>
-      .layer { fill: #7dd3fc; font: 600 14px ui-sans-serif, system-ui, sans-serif; letter-spacing: 2px; }
-      .title { fill: #f8fafc; font: 700 24px ui-sans-serif, system-ui, sans-serif; }
-      .subtitle { fill: #bac8de; font: 400 17px ui-sans-serif, system-ui, sans-serif; }
-      .pill { fill: #e2e8f0; font: 600 16px ui-sans-serif, system-ui, sans-serif; }
-      .adapter { fill: #f8fafc; font: 700 18px ui-sans-serif, system-ui, sans-serif; }
-      .stroke { stroke: #5ee7f7; stroke-opacity: 0.65; stroke-width: 1.5; }
-      .flow { fill: none; stroke: #67e8f9; stroke-width: 3; marker-end: url(#arrow); }
-    </style>
+    <marker id="arrow-muted" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--muted)"/>
+    </marker>
   </defs>
 
-  <rect width="1280" height="720" rx="28" fill="url(#background)"/>
-  <path d="M 80 560 C 310 500, 420 640, 660 570 S 1040 500, 1200 575" fill="none" stroke="url(#flow)" stroke-width="3" opacity="0.2"/>
+  <text x="24" y="28" font-size="16" font-weight="600" fill="var(--fg)">Plait: one fabric, no rank 0</text>
+  <text x="24" y="48" font-size="12" fill="var(--muted)">Every process can propose, recover, join, and serve snapshots.</text>
 
-  <text x="58" y="105" class="layer">CONSUMERS</text>
-  <rect x="200" y="48" width="820" height="104" rx="22" fill="#101f37" class="stroke"/>
-  <text x="610" y="91" text-anchor="middle" class="title">Frontends &amp; runtimes</text>
-  <text x="610" y="124" text-anchor="middle" class="subtitle">Ferrule · training runtime · tensor API</text>
+  <rect x="28" y="72" width="126" height="54" rx="8" fill="var(--surface)" stroke="var(--border)"/>
+  <text x="91" y="96" text-anchor="middle" font-size="14" font-weight="600" fill="var(--fg)">Peer A</text>
+  <text x="91" y="114" text-anchor="middle" font-size="11" fill="var(--muted)">NodeId</text>
 
-  <path d="M 610 152 L 610 198" class="flow"/>
+  <rect x="170" y="72" width="126" height="54" rx="8" fill="var(--surface)" stroke="var(--border)"/>
+  <text x="233" y="96" text-anchor="middle" font-size="14" font-weight="600" fill="var(--fg)">Peer B</text>
+  <text x="233" y="114" text-anchor="middle" font-size="11" fill="var(--muted)">NodeId</text>
 
-  <text x="58" y="285" class="layer">CORE</text>
-  <rect x="160" y="210" width="820" height="168" rx="26" fill="url(#core)" stroke="url(#flow)" stroke-width="2"/>
-  <text x="570" y="253" text-anchor="middle" class="title">Plait rankless tensor fabric</text>
-  <text x="570" y="282" text-anchor="middle" class="subtitle">backend-neutral state and dependency model</text>
+  <rect x="312" y="72" width="126" height="54" rx="8" fill="var(--surface)" stroke="var(--border)"/>
+  <text x="375" y="96" text-anchor="middle" font-size="14" font-weight="600" fill="var(--fg)">Peer C</text>
+  <text x="375" y="114" text-anchor="middle" font-size="11" fill="var(--muted)">NodeId</text>
 
-  <rect x="190" y="311" width="165" height="42" rx="21" fill="#071426" fill-opacity="0.72" stroke="#2dd4bf" stroke-opacity="0.55"/>
-  <text x="272.5" y="338" text-anchor="middle" class="pill">Identity</text>
-  <rect x="375" y="311" width="165" height="42" rx="21" fill="#071426" fill-opacity="0.72" stroke="#38bdf8" stroke-opacity="0.55"/>
-  <text x="457.5" y="338" text-anchor="middle" class="pill">Versions</text>
-  <rect x="560" y="311" width="165" height="42" rx="21" fill="#071426" fill-opacity="0.72" stroke="#a78bfa" stroke-opacity="0.65"/>
-  <text x="642.5" y="338" text-anchor="middle" class="pill">Placement</text>
-  <rect x="745" y="311" width="205" height="42" rx="21" fill="#071426" fill-opacity="0.72" stroke="#f59e0b" stroke-opacity="0.6"/>
-  <text x="847.5" y="338" text-anchor="middle" class="pill">Events &amp; failures</text>
+  <line x1="91" y1="126" x2="150" y2="166" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="233" y1="126" x2="233" y2="166" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="375" y1="126" x2="316" y2="166" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#arrow)"/>
 
-  <path d="M 980 294 L 1022 294" class="flow" marker-start="url(#arrow)"/>
-  <rect x="1034" y="210" width="196" height="168" rx="26" fill="#101f37" stroke="#a78bfa" stroke-opacity="0.7" stroke-width="1.5"/>
-  <text x="1132" y="253" text-anchor="middle" class="title">Peer fabric</text>
-  <text x="1132" y="288" text-anchor="middle" class="subtitle">membership</text>
-  <text x="1132" y="316" text-anchor="middle" class="subtitle">transport</text>
-  <text x="1132" y="344" text-anchor="middle" class="subtitle">coordination</text>
+  <rect x="28" y="170" width="410" height="150" rx="8" fill="var(--surface)" stroke="var(--accent)"/>
+  <text x="46" y="196" font-size="14" font-weight="600" fill="var(--fg)">EPaxos-style log</text>
+  <text x="46" y="218" font-size="11" fill="var(--muted)">InstanceId = proposer + local counter</text>
+  <text x="46" y="238" font-size="11" fill="var(--muted)">PreAccept / Accept / Commit, ballots</text>
+  <text x="46" y="258" font-size="11" fill="var(--muted)">Dependencies + seq, SCC execution</text>
+  <text x="46" y="278" font-size="11" fill="var(--muted)">Any voter may recover a stalled instance</text>
+  <text x="46" y="302" font-size="11" fill="var(--success)">fast path when dependency sets agree</text>
 
-  <path d="M 570 378 L 570 424" class="flow"/>
+  <line x1="438" y1="245" x2="520" y2="245" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="478" y="234" text-anchor="middle" font-size="11" fill="var(--muted)">ordered</text>
 
-  <text x="58" y="485" class="layer">EXECUTION</text>
-  <rect x="160" y="436" width="1070" height="88" rx="24" fill="#10243b" class="stroke"/>
-  <text x="695" y="474" text-anchor="middle" class="title">Asynchronous scheduler &amp; data movement</text>
-  <text x="695" y="503" text-anchor="middle" class="subtitle">capabilities · costs · transfers · conversions · reductions</text>
+  <rect x="520" y="150" width="350" height="190" rx="8" fill="var(--surface)" stroke="var(--border)"/>
+  <text x="538" y="176" font-size="14" font-weight="600" fill="var(--fg)">Fused runtime</text>
+  <text x="538" y="198" font-size="11" fill="var(--muted)">Sum · Max · Gather · TopK · OnlineSoftmax</text>
+  <line x1="538" y1="210" x2="852" y2="210" stroke="var(--border)"/>
+  <text x="538" y="232" font-size="11" fill="var(--fg)">Contribution arrives as a command</text>
+  <text x="538" y="252" font-size="11" fill="var(--muted)">last contributor triggers local fusion</text>
+  <text x="538" y="272" font-size="11" fill="var(--muted)">no separate all-reduce phase</text>
+  <text x="538" y="298" font-size="11" fill="var(--success)">tensor shard materialized on every replica</text>
+  <text x="538" y="322" font-size="11" fill="var(--muted)">membership changes are commands too</text>
 
-  <path d="M 695 524 L 695 570" class="flow"/>
+  <rect x="560" y="52" width="270" height="66" rx="8" fill="var(--surface)" stroke="var(--border)"/>
+  <text x="576" y="76" font-size="13" font-weight="600" fill="var(--fg)">Replicated membership</text>
+  <text x="576" y="96" font-size="11" fill="var(--muted)">staged learner → unanimous promotion</text>
+  <text x="576" y="112" font-size="11" fill="var(--muted)">snapshot catch-up, no rank-zero join</text>
+  <line x1="695" y1="118" x2="695" y2="150" stroke="var(--arrow-muted)" stroke-width="1.2" marker-end="url(#arrow-muted)"/>
 
-  <text x="58" y="635" class="layer">ADAPTERS</text>
-  <g filter="url(#glow)">
-    <circle cx="695" cy="573" r="5" fill="#67e8f9"/>
-  </g>
-  <path d="M 695 573 L 265 598 M 695 573 L 480 598 M 695 573 L 695 598 M 695 573 L 910 598 M 695 573 L 1125 598" fill="none" stroke="url(#flow)" stroke-width="2" opacity="0.75"/>
+  <rect x="28" y="360" width="410" height="96" rx="8" fill="var(--surface)" stroke="var(--border)"/>
+  <text x="46" y="384" font-size="13" font-weight="600" fill="var(--fg)">Registered memory data plane</text>
+  <text x="46" y="404" font-size="11" fill="var(--muted)">aligned buffers · buffer pool · RegionDescriptor</text>
+  <text x="46" y="422" font-size="11" fill="var(--muted)">one-sided read/write · loopback now, ibverbs next</text>
+  <text x="46" y="442" font-size="11" fill="var(--warning)">large bytes stay out of consensus</text>
 
-  <rect x="170" y="598" width="190" height="76" rx="20" fill="#0d2742" stroke="#22d3ee" stroke-opacity="0.75"/>
-  <text x="265" y="644" text-anchor="middle" class="adapter">CUDA</text>
-  <rect x="385" y="598" width="190" height="76" rx="20" fill="#162342" stroke="#38bdf8" stroke-opacity="0.75"/>
-  <text x="480" y="644" text-anchor="middle" class="adapter">HIP</text>
-  <rect x="600" y="598" width="190" height="76" rx="20" fill="#232044" stroke="#8b5cf6" stroke-opacity="0.8"/>
-  <text x="695" y="644" text-anchor="middle" class="adapter">Metal</text>
-  <rect x="815" y="598" width="190" height="76" rx="20" fill="#33203f" stroke="#c084fc" stroke-opacity="0.8"/>
-  <text x="910" y="644" text-anchor="middle" class="adapter">OpenCL</text>
-  <rect x="1030" y="598" width="190" height="76" rx="20" fill="#3a251f" stroke="#f59e0b" stroke-opacity="0.85"/>
-  <text x="1125" y="636" text-anchor="middle" class="adapter">PJRT / vendor</text>
-  <text x="1125" y="660" text-anchor="middle" class="subtitle">adapters</text>
+  <rect x="520" y="372" width="350" height="72" rx="8" fill="var(--surface)" stroke="var(--border)"/>
+  <text x="538" y="396" font-size="13" font-weight="600" fill="var(--fg)">Materialized tensor state</text>
+  <text x="538" y="416" font-size="11" fill="var(--muted)">tensor key + shard + epoch + version</text>
+  <text x="538" y="434" font-size="11" fill="var(--muted)">readable from any replica</text>
+
+  <line x1="695" y1="340" x2="695" y2="372" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <path d="M 520 408 L 438 408" stroke="var(--accent)" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+  <path d="M 438 392 L 520 392" stroke="var(--accent)" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+  <text x="479" y="384" text-anchor="middle" font-size="11" fill="var(--muted)">bulk</text>
+
+  <line x1="28" y1="484" x2="872" y2="484" stroke="var(--border)"/>
+  <text x="28" y="498" font-size="10" fill="var(--muted)">Control: framed TCP or a future RDMA backend · Ordered state: EPaxos instances · Identity: 128-bit NodeId</text>
 </svg>

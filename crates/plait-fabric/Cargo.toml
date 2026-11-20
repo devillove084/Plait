@@ -1,0 +1,12 @@
+[package]
+name = "plait-fabric"
+description = "Fused operator runtime and cluster node for Plait"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+plait-core.workspace = true
+plait-consensus.workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "plait-core"
+description = "Identity, tensor vocabulary, commands, and membership configuration for Plait"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rand.workspace = true
+serde.workspace = true
+sha2.workspace = true

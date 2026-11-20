@@ -1,0 +1,20 @@
+[package]
+name = "plait-node"
+description = "Plait cluster process and 3-node fused-operator demo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "plait-node"
+path = "src/main.rs"
+
+[dependencies]
+plait-core.workspace = true
+plait-consensus.workspace = true
+plait-fabric.workspace = true
+plait-parallel.workspace = true
+plait-net.workspace = true
+rand.workspace = true
