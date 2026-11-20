@@ -34,6 +34,7 @@ struct Sim {
     now: u64,
     accepts: usize,
     recovers: usize,
+    actions: Vec<&'static str>,
     options: Options,
 }
 
@@ -62,6 +63,7 @@ impl Sim {
             now: 1,
             accepts: 0,
             recovers: 0,
+            actions: Vec::new(),
             options,
         }
     }
@@ -77,6 +79,17 @@ impl Sim {
                     if matches!(outbound.message, Message::Recover { .. }) {
                         self.recovers += 1;
                     }
+                    self.actions.push(match &outbound.message {
+                        Message::PreAccept { .. } => "PreAccept",
+                        Message::PreAcceptReply { .. } => "PreAcceptReply",
+                        Message::Accept { .. } => "Accept",
+                        Message::AcceptReply { .. } => "AcceptReply",
+                        Message::Commit { .. } => "Commit",
+                        Message::Recover { .. } => "Recover",
+                        Message::RecoverReply { .. } => "RecoverReply",
+                        Message::TryPreAccept { .. } => "TryPreAccept",
+                        Message::TryPreAcceptReply { .. } => "TryPreAcceptReply",
+                    });
                     self.queue.push_back((from, outbound.to, outbound.message));
                 }
             }
@@ -376,27 +389,45 @@ fn ordering_message_trace_maps_to_tla_actions() {
     let mut sim = Sim::new(&ids);
     sim.propose(ids[0], publish(7));
 
-    let mut actions = Vec::new();
-    while let Some((from, to, message)) = sim.queue.pop_front() {
-        actions.push(match &message {
-            Message::PreAccept { .. } => "PreAccept",
-            Message::PreAcceptReply { .. } => "PreAcceptReply",
-            Message::Accept { .. } => "Accept",
-            Message::AcceptReply { .. } => "AcceptReply",
-            Message::Commit { .. } => "Commit",
-            Message::Recover { .. } => "Recover",
-            Message::RecoverReply { .. } => "RecoverReply",
-            Message::TryPreAccept { .. } => "TryPreAccept",
-            Message::TryPreAcceptReply { .. } => "TryPreAcceptReply",
-        });
-        sim.deliver(from, to, message);
-        sim.drain_outbox();
-    }
-
+    sim.pump();
     sim.assert_consistent(1);
+    let actions = &sim.actions;
     assert!(actions.contains(&"PreAccept"));
     assert!(actions.contains(&"PreAcceptReply"));
     assert!(actions.contains(&"Commit"));
     assert!(!actions.contains(&"Accept"));
     assert!(!actions.contains(&"Recover"));
+}
+#[test]
+fn ordering_slow_path_trace_maps_to_tla_actions() {
+    let ids = [node("slow-a"), node("slow-b"), node("slow-c")];
+    let mut sim = Sim::new(&ids);
+    sim.propose(ids[0], publish(1));
+    sim.propose(ids[1], publish(2));
+    sim.pump();
+    sim.assert_consistent(2);
+    assert!(sim.actions.contains(&"Accept"));
+    assert!(sim.actions.contains(&"AcceptReply"));
+    assert!(sim.actions.contains(&"Commit"));
+}
+
+#[test]
+fn ordering_recovery_trace_maps_to_tla_actions() {
+    let ids = [node("recover-a"), node("recover-b"), node("recover-c")];
+    let mut sim = Sim::new(&ids);
+    sim.propose(ids[0], publish(11));
+    sim.deliver_where(|from, to, message| {
+        *from == ids[0] && *to == ids[1] && matches!(message, Message::PreAccept { .. })
+    });
+    sim.blocked.insert((ids[0], ids[1]));
+    sim.blocked.insert((ids[1], ids[0]));
+    sim.blocked.insert((ids[0], ids[2]));
+    sim.blocked.insert((ids[2], ids[0]));
+    for _ in 0..6 {
+        sim.tick_all(120);
+        sim.pump();
+    }
+    assert!(sim.actions.contains(&"Recover"));
+    assert!(sim.actions.contains(&"RecoverReply"));
+    assert!(sim.actions.contains(&"Commit"));
 }
