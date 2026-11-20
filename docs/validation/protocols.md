@@ -23,7 +23,7 @@ line/flag kernel is not yet resident or multi-block.
 | Protocol | 1 MiB | 16 MiB |
 |---|---:|---:|
 | LL | 0.228 GB/s | 0.438 GB/s |
-| LL128 | 0.049 GB/s | 0.054 GB/s |
+| LL128 | 1.099 GB/s | 2.254 GB/s |
 
 These are worse than the resident device ring (20+ GB/s / 27+ GB/s). They are
 not wired into `--device-ring` defaults. The LL128 kernel is one block per rank

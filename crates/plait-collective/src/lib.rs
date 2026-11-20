@@ -548,7 +548,6 @@ impl PeerGroup {
             })
             .collect();
         let lines = workspace.lines;
-        let blocks = lines.clamp(1, 64);
         for rank in 0..n {
             let next = (rank + 1) % n;
             let (next_data, next_recv, next_flags) = pointers[next];
@@ -561,36 +560,25 @@ impl PeerGroup {
             let n_i = n as i32;
             let width_i = workspace.width as i32;
             let lines_i = lines as i32;
-            for block in 0..blocks {
-                let begin = block * lines / blocks;
-                let end = (block + 1) * lines / blocks;
-                if begin == end {
-                    continue;
-                }
-                let begin_i = begin as i32;
-                let end_i = end as i32;
-                let mut launch = stream.launch_builder(function);
-                launch.arg(&data_ptr);
-                launch.arg(&recv_ptr);
-                launch.arg(&flag_ptr);
-                launch.arg(&next_data);
-                launch.arg(&next_recv);
-                launch.arg(&next_flags);
-                launch.arg(&rank_i);
-                launch.arg(&n_i);
-                launch.arg(&width_i);
-                launch.arg(&lines_i);
-                launch.arg(&begin_i);
-                launch.arg(&end_i);
-                unsafe {
-                    launch.launch(LaunchConfig {
-                        grid_dim: (1, 1, 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
-                    })
-                }
-                .map_err(driver("LL128 launch"))?;
+            let mut launch = stream.launch_builder(function);
+            launch.arg(&data_ptr);
+            launch.arg(&recv_ptr);
+            launch.arg(&flag_ptr);
+            launch.arg(&next_data);
+            launch.arg(&next_recv);
+            launch.arg(&next_flags);
+            launch.arg(&rank_i);
+            launch.arg(&n_i);
+            launch.arg(&width_i);
+            launch.arg(&lines_i);
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (lines.div_ceil(8) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
             }
+            .map_err(driver("LL128 launch"))?;
         }
         Ok(())
     }
