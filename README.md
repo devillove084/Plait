@@ -128,7 +128,8 @@ just hetero-plan # 4+8 heterogeneous LP demo
 cargo run -q -p plait-node -- hetero-plan --local-gflops 1394 --remote-gflops 4317
 just matrix      # 12-replica matrix collective
 just ipc         # two-process CUDA IPC allreduce
-just tcp-allreduce # two-host TCP GPU-buffer fallback
+just tcp-allreduce # two-host TCP GPU-buffer star fallback
+just tcp-ring      # two-host full-duplex TCP ring
 just gpu         # CUDA AXPY and CUTLASS SGEMM
 just gpu-bench   # per-GPU CUTLASS SGEMM throughput
 just rdma        # real ibverbs or an explicit skip
@@ -160,6 +161,13 @@ pair it completed with `errors=0` at 1 MiB and 16 MiB:
 1 MiB   0.009 GB/s
 16 MiB  0.032 GB/s
 ```
+
+A full-duplex ring variant is in `scripts/tcp-ring-pipeline.cu`. It runs
+send and receive in dedicated threads with a two-phase rendezvous, so the
+reducer no longer serializes `send` then `recv`. It completes with `errors=0`;
+1 MiB ranges from 0.008 to 0.074 GB/s and 16 MiB from 0.037 to 0.244 GB/s
+depending on rank. The spread is still large and the path is not yet competitive
+with NCCL on every rank.
 
 The star path is a correctness fallback, not a performance result. NCCL 2.28.9
 over the same TCP path reports `errors=0` at:

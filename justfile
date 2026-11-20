@@ -57,6 +57,9 @@ ipc: setup
 tcp-allreduce: setup
     ./scripts/tcp-allreduce-two-host.sh
 
+tcp-ring: setup
+    ./scripts/tcp-ring-pipeline-two-host.sh
+
 nccl-tcp: setup
     ./scripts/nccl-tcp-two-host.sh
 
