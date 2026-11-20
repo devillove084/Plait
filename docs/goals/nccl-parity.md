@@ -107,7 +107,9 @@ ordinary container exposes an active ibverbs device.
 - [x] Same rank counts, byte sizes, warmup, and iterations for the 1 MiB run.
 - [x] Correctness checks with finite tolerance and per-rank errors.
 - [ ] Full size sweep across 4 KiB–64 MiB.
-- [ ] JSON timeline and benchmark artifact per run in CI.
+- [x] JSON timeline and benchmark artifact per run (`just gate-collectives`).
+- [ ] CI performance threshold (the gate currently records failures, not a
+  speedup threshold).
 - [ ] CI gate on a GPU host; explicit skip only when hardware is absent.
 
 ## Current measured baseline

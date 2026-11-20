@@ -187,6 +187,19 @@ is the M7 artifact generator; JSON trace files are written by the Plait side whe
 `--trace` is supplied. The full size sweep and a CI performance threshold remain
 open. NCCL alltoall is implemented with grouped `ncclSend`/`ncclRecv`.
 
+## Collective gate
+
+`just gate-collectives` runs NCCL and Plait for every supported operation over a
+size list and writes `target/collective-gate.json` plus per-run Chrome traces.
+It fails if NCCL reports an error or Plait fails its own reference check.
+
+```sh
+PLAIT_GATE_SIZES="4096 65536 1048576 16777216" just gate-collectives
+```
+
+The gate currently records performance; it does not yet enforce a performance
+threshold.
+
 ## Measured performance
 
 Eight RTX PRO 5000, 1 MiB, 8 ranks, 5 warmups / 10 timed iterations:

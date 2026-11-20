@@ -63,6 +63,9 @@ nccl-sweep: setup
 nccl-ops: setup
     ./scripts/nccl-ops.sh
 
+gate-collectives: setup
+    ./scripts/collective-gate.sh
+
 profile: setup
     cargo build -q -p plait-node
     nsys profile -o target/plait-profile --force-overwrite true --trace=cuda --stats=true target/debug/plait-node collectives --gpus 8 --bytes 1048576 --iters 2 --op allreduce
