@@ -318,6 +318,7 @@ collectives and remaining gaps are in
 parity plan is in [docs/goals/nccl-parity.md](docs/goals/nccl-parity.md), the
 asymmetric 4+8 design in [docs/design/asymmetric.md](docs/design/asymmetric.md),
 the profile breakdown in [docs/validation/profile.md](docs/validation/profile.md),
+protocol status in [docs/validation/protocols.md](docs/validation/protocols.md),
 and the formal EPaxos workstream in
 [docs/goals/epaxos-formal.md](docs/goals/epaxos-formal.md).
 

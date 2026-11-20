@@ -223,3 +223,69 @@ extern "C" __global__ void plait_scatter_pull(
         local[rank * width + i] = root[rank * width + i];
     }
 }
+
+extern "C" __global__ void plait_ll128_allreduce(
+    float* data,
+    float* recv,
+    unsigned int* flags,
+    unsigned long long next_data,
+    unsigned long long next_recv,
+    unsigned long long next_flags,
+    int rank,
+    int ranks,
+    int width,
+    int lines)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    float* next_data_ptr = reinterpret_cast<float*>(next_data);
+    float* next_recv_ptr = reinterpret_cast<float*>(next_recv);
+    unsigned int* next_flags_ptr = reinterpret_cast<unsigned int*>(next_flags);
+    int prev = (rank + ranks - 1) % ranks;
+    for (int step = 0; step < ranks - 1; ++step) {
+        int send_chunk = (rank + ranks - step) % ranks;
+        int recv_chunk = (rank + ranks - step - 1) % ranks;
+        for (int line = 0; line < lines; ++line) {
+            int start = line * 32;
+            int end = min(width, start + 32);
+            for (int i = start + tid; i < end; i += blockDim.x) {
+                next_recv_ptr[step * width + i] = data[send_chunk * width + i];
+            }
+            __syncthreads();
+            __threadfence_system();
+            if (tid == 0) {
+                next_flags_ptr[step * lines + line] = (unsigned int)(rank + 1);
+                while (*(volatile unsigned int*)(flags + step * lines + line) !=
+                       (unsigned int)(prev + 1)) {
+                }
+            }
+            __syncthreads();
+            __threadfence_system();
+            for (int i = start + tid; i < end; i += blockDim.x) {
+                data[recv_chunk * width + i] += recv[step * width + i];
+            }
+            __syncthreads();
+        }
+    }
+    for (int step = 0; step < ranks - 1; ++step) {
+        int send_chunk = (rank + ranks - step + 1) % ranks;
+        for (int line = 0; line < lines; ++line) {
+            int start = line * 32;
+            int end = min(width, start + 32);
+            for (int i = start + tid; i < end; i += blockDim.x) {
+                next_data_ptr[send_chunk * width + i] = data[send_chunk * width + i];
+            }
+            __syncthreads();
+            __threadfence_system();
+            if (tid == 0) {
+                next_flags_ptr[(ranks - 1) * lines + step * lines + line] =
+                    (unsigned int)(rank + 1);
+                while (*(volatile unsigned int*)(flags + (ranks - 1) * lines +
+                                                 step * lines + line) !=
+                       (unsigned int)(prev + 1)) {
+                }
+            }
+            __syncthreads();
+            __threadfence_system();
+        }
+    }
+}

@@ -1027,6 +1027,7 @@ pub fn run_collectives_demo(
     channels: usize,
     resident: bool,
     device_ring: bool,
+    protocol: &str,
     trace: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use plait_collective::{AllReduceAlgorithm, PeerGroup};
@@ -1085,6 +1086,35 @@ pub fn run_collectives_demo(
         run_collective_op(&group, op, &inputs, &expected, algorithm)?;
     }
     let seconds = start.elapsed().as_secs_f64() / iters as f64;
+    if op == "allreduce" && protocol != "simple" {
+        let checked = match protocol {
+            "ll" => group.all_reduce_device_ring(&inputs)?,
+            "ll128" => group.all_reduce_ll128(&inputs)?,
+            other => return Err(format!("unknown protocol {other}").into()),
+        };
+        validate_device_output("allreduce", &inputs, &expected, &checked)?;
+        let start = Instant::now();
+        for _ in 0..iters {
+            match protocol {
+                "ll" => {
+                    group.all_reduce_device_ring(&inputs)?;
+                }
+                "ll128" => {
+                    group.all_reduce_ll128(&inputs)?;
+                }
+                _ => {}
+            }
+        }
+        let elapsed = start.elapsed().as_secs_f64() / iters as f64;
+        let bw = allreduce_bytes_f64(bytes) / elapsed / 1e9;
+        let busbw = bw * 2.0 * (ranks - 1) as f64 / ranks as f64;
+        println!(
+            "plait collectives: protocol={protocol} allreduce ranks={ranks} bytes={} time_ms={:.6} algbw_GB/s={bw:.3} busbw_GB/s={busbw:.3}",
+            (bytes / std::mem::size_of::<f32>()).max(1) * std::mem::size_of::<f32>(),
+            elapsed * 1e3
+        );
+        return Ok(());
+    }
     if device_ring && op == "alltoall" {
         let checked = group.all_to_all_device(&inputs)?;
         validate_device_output("alltoall", &inputs, &expected, &checked)?;

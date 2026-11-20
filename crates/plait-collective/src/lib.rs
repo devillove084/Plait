@@ -60,6 +60,13 @@ impl std::fmt::Display for RankId {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Protocol {
+    Simple,
+    Ll,
+    Ll128,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AllReduceAlgorithm {
     /// Bandwidth-optimal ring reduce-scatter + all-gather.
     Ring,
@@ -133,6 +140,7 @@ struct GpuRank {
     streams: Box<[Arc<CudaStream>]>,
     function: CudaFunction,
     ring: CudaFunction,
+    ll128: CudaFunction,
     alltoall: CudaFunction,
     scatter: CudaFunction,
     _module: Arc<CudaModule>,
@@ -212,6 +220,9 @@ impl PeerGroup {
             let ring = module
                 .load_function("plait_ring_allreduce")
                 .map_err(|error| CollectiveError::new(format!("load ring kernel: {error}")))?;
+            let ll128 = module
+                .load_function("plait_ll128_allreduce")
+                .map_err(|error| CollectiveError::new(format!("load LL128 kernel: {error}")))?;
             let alltoall = module
                 .load_function("plait_alltoall_push")
                 .map_err(|error| CollectiveError::new(format!("load alltoall kernel: {error}")))?;
@@ -224,6 +235,7 @@ impl PeerGroup {
                 streams: streams.into_boxed_slice(),
                 function,
                 ring,
+                ll128,
                 alltoall,
                 scatter,
                 _module: module,
@@ -433,6 +445,103 @@ impl PeerGroup {
             )));
         }
         Ok(())
+    }
+
+    pub fn recommended_protocol(&self, bytes: usize) -> Protocol {
+        if bytes <= 32 * 1024 {
+            Protocol::Ll
+        } else if bytes >= 64 * 1024 {
+            Protocol::Ll128
+        } else {
+            Protocol::Simple
+        }
+    }
+
+    pub fn all_reduce_protocol(
+        &self,
+        inputs: &[Vec<f32>],
+        protocol: Protocol,
+        algorithm: AllReduceAlgorithm,
+    ) -> Result<Vec<Vec<f32>>> {
+        match protocol {
+            Protocol::Simple => self.all_reduce(inputs, algorithm),
+            Protocol::Ll => self.all_reduce_device_ring(inputs),
+            Protocol::Ll128 => self.all_reduce_ll128(inputs),
+        }
+    }
+
+    pub fn all_reduce_ll128(&self, inputs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
+        use crate::ipc::PeerRegion;
+        self.validate(inputs)?;
+        let n = self.world_size();
+        let count = inputs[0].len();
+        let width = count.div_ceil(n);
+        let lines = width.div_ceil(32);
+        let padded = width * n;
+        let mut data = Vec::with_capacity(n);
+        let mut receive = Vec::with_capacity(n);
+        let mut flags = Vec::with_capacity(n);
+        for (rank, input) in inputs.iter().enumerate() {
+            let mut host = input.clone();
+            host.resize(padded, 0.0);
+            let region = PeerRegion::alloc(rank, padded * std::mem::size_of::<f32>())?;
+            region.write_host(&host)?;
+            data.push(region);
+            receive.push(PeerRegion::alloc(
+                rank,
+                width * (n - 1) * std::mem::size_of::<f32>(),
+            )?);
+            let flag = PeerRegion::alloc(rank, 2 * (n - 1) * lines * 4)?;
+            flag.write_host(&vec![0.0f32; 2 * (n - 1) * lines])?;
+            flags.push(flag);
+        }
+        let pointers: Vec<(u64, u64, u64)> = (0..n)
+            .map(|rank| {
+                (
+                    data[rank].as_ptr() as u64,
+                    receive[rank].as_ptr() as u64,
+                    flags[rank].as_ptr() as u64,
+                )
+            })
+            .collect();
+        for rank in 0..n {
+            let next = (rank + 1) % n;
+            let (next_data, next_recv, next_flags) = pointers[next];
+            let stream = self.ranks[rank].stream.clone();
+            let function = &self.ranks[rank].ll128;
+            let data_ptr = pointers[rank].0;
+            let recv_ptr = pointers[rank].1;
+            let flag_ptr = pointers[rank].2;
+            let rank_i = rank as i32;
+            let n_i = n as i32;
+            let width_i = width as i32;
+            let lines_i = lines as i32;
+            let mut launch = stream.launch_builder(function);
+            launch.arg(&data_ptr);
+            launch.arg(&recv_ptr);
+            launch.arg(&flag_ptr);
+            launch.arg(&next_data);
+            launch.arg(&next_recv);
+            launch.arg(&next_flags);
+            launch.arg(&rank_i);
+            launch.arg(&n_i);
+            launch.arg(&width_i);
+            launch.arg(&lines_i);
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(driver("LL128 launch"))?;
+        }
+        self.sync()?;
+        let mut output = Vec::with_capacity(n);
+        for region in &data {
+            output.push(region.read_host(count)?);
+        }
+        Ok(output)
     }
 
     /// Device-side ring allreduce. One kernel per rank writes directly into
@@ -2072,6 +2181,28 @@ mod tests {
             }
         }
         assert_eq!(reduced, expected);
+    }
+
+    #[test]
+    fn ll128_allreduce_matches_reference_or_skips() {
+        let group = match PeerGroup::new(2) {
+            Ok(group) => group,
+            Err(error) => {
+                eprintln!("LL128 skipped: {error}");
+                return;
+            }
+        };
+        let inputs = vec![
+            (0..321).map(|index| index as f32).collect::<Vec<_>>(),
+            (0..321)
+                .map(|index| (index * 5 + 2) as f32)
+                .collect::<Vec<_>>(),
+        ];
+        let expected = reference_sum(&inputs);
+        let output = group.all_reduce_ll128(&inputs).expect("LL128 allreduce");
+        for values in output {
+            assert_eq!(values, expected);
+        }
     }
 
     #[test]
