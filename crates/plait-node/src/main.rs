@@ -35,6 +35,7 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             let mut channels = 1usize;
             let mut op = "allreduce".to_owned();
             let mut resident = false;
+            let mut device_ring = false;
             let mut trace = None;
             while let Some(arg) = args.next() {
                 match arg.as_str() {
@@ -49,6 +50,7 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     "--op" => op = args.next().ok_or("--op needs a value")?,
                     "--resident" => resident = true,
+                    "--device-ring" => device_ring = true,
                     "--trace" => {
                         trace = Some(args.next().ok_or("--trace needs a path")?);
                     }
@@ -63,6 +65,7 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 &op,
                 channels,
                 resident,
+                device_ring,
                 trace.as_deref(),
             )
         }

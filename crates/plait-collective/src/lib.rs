@@ -90,6 +90,19 @@ impl std::error::Error for CollectiveError {}
 
 type Result<T, E = CollectiveError> = std::result::Result<T, E>;
 
+pub struct DeviceRingWorkspace {
+    data: Vec<crate::ipc::PeerRegion>,
+    receive: Vec<crate::ipc::PeerRegion>,
+    flags: Vec<crate::ipc::PeerRegion>,
+    count: usize,
+    channels: usize,
+    segment: usize,
+    width: usize,
+    data_stride: usize,
+    recv_stride: usize,
+    flag_stride: usize,
+}
+
 struct ChannelBuffers {
     channel: usize,
     start: usize,
@@ -100,10 +113,12 @@ struct ChannelBuffers {
 }
 
 struct GpuRank {
+    ctx: Arc<CudaContext>,
     /// Channel 0 alias, kept for the single-stream path.
     stream: Arc<CudaStream>,
     streams: Box<[Arc<CudaStream>]>,
     function: CudaFunction,
+    ring: CudaFunction,
     _module: Arc<CudaModule>,
 }
 
@@ -178,10 +193,15 @@ impl PeerGroup {
             let function = module
                 .load_function("plait_add_inplace")
                 .map_err(|error| CollectiveError::new(format!("load kernel: {error}")))?;
+            let ring = module
+                .load_function("plait_ring_allreduce")
+                .map_err(|error| CollectiveError::new(format!("load ring kernel: {error}")))?;
             ranks.push(GpuRank {
+                ctx,
                 stream,
                 streams: streams.into_boxed_slice(),
                 function,
+                ring,
                 _module: module,
             });
         }
@@ -190,6 +210,7 @@ impl PeerGroup {
             channels,
             trace: None,
         };
+        group.enable_peer_access()?;
         group.peer_copy_check()?;
         Ok(group)
     }
@@ -315,6 +336,50 @@ impl PeerGroup {
         }
     }
 
+    fn enable_peer_access(&self) -> Result<()> {
+        use cudarc::driver::sys;
+        for rank in &self.ranks {
+            rank.ctx
+                .bind_to_thread()
+                .map_err(|error| CollectiveError::new(format!("bind context: {error}")))?;
+        }
+        for left in 0..self.ranks.len() {
+            for right in 0..self.ranks.len() {
+                if left == right {
+                    continue;
+                }
+                self.ranks[left]
+                    .ctx
+                    .bind_to_thread()
+                    .map_err(|error| CollectiveError::new(format!("bind left: {error}")))?;
+                let mut peer = std::ptr::null_mut();
+                self.ranks[right]
+                    .ctx
+                    .bind_to_thread()
+                    .map_err(|error| CollectiveError::new(format!("bind right: {error}")))?;
+                let current = unsafe { sys::cuCtxGetCurrent(&mut peer) };
+                if current != sys::CUresult::CUDA_SUCCESS {
+                    return Err(CollectiveError::new(format!(
+                        "cuCtxGetCurrent: {current:?}"
+                    )));
+                }
+                self.ranks[left]
+                    .ctx
+                    .bind_to_thread()
+                    .map_err(|error| CollectiveError::new(format!("rebind left: {error}")))?;
+                let result = unsafe { sys::cuCtxEnablePeerAccess(peer, 0) };
+                if result != sys::CUresult::CUDA_SUCCESS
+                    && result != sys::CUresult::CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED
+                {
+                    return Err(CollectiveError::new(format!(
+                        "cuCtxEnablePeerAccess {left}->{right}: {result:?}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Verify that a peer copy works in both directions. This is the first
     /// failure point when IOMMU/PCIe peer access is unavailable.
     pub fn peer_copy_check(&self) -> Result<()> {
@@ -344,6 +409,155 @@ impl PeerGroup {
             )));
         }
         Ok(())
+    }
+
+    /// Device-side ring allreduce. One kernel per rank writes directly into
+    /// peer receive/data buffers and synchronizes with device flags.
+    pub fn all_reduce_device_ring(&self, inputs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
+        let mut workspace = self.prepare_device_ring(inputs)?;
+        self.launch_device_ring(&mut workspace)?;
+        self.sync()?;
+        self.read_device_ring(&workspace)
+    }
+
+    pub fn all_reduce_device_ring_resident(
+        &self,
+        inputs: &[Vec<f32>],
+        iterations: usize,
+    ) -> Result<(std::time::Duration, Vec<Vec<f32>>)> {
+        let mut workspace = self.prepare_device_ring(inputs)?;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            self.launch_device_ring(&mut workspace)?;
+        }
+        self.sync()?;
+        let elapsed = start.elapsed();
+        let output = self.read_device_ring(&workspace)?;
+        Ok((elapsed, output))
+    }
+
+    fn prepare_device_ring(&self, inputs: &[Vec<f32>]) -> Result<DeviceRingWorkspace> {
+        use crate::ipc::PeerRegion;
+        self.validate(inputs)?;
+        let n = self.world_size();
+        let channels = self.channels;
+        let count = inputs[0].len();
+        let segment = count.div_ceil(channels);
+        let width = segment.div_ceil(n);
+        let data_stride = width * n;
+        let recv_stride = width * (n - 1);
+        let flag_stride = 2 * (n - 1);
+        let bytes = channels * data_stride * std::mem::size_of::<f32>();
+        let mut data = Vec::with_capacity(n);
+        let mut receive = Vec::with_capacity(n);
+        let mut flags = Vec::with_capacity(n);
+        for (rank, input) in inputs.iter().enumerate() {
+            let mut host = vec![0.0f32; channels * data_stride];
+            for channel in 0..channels {
+                let start = channel * segment;
+                let end = (start + segment).min(count);
+                if start < end {
+                    let offset = channel * data_stride;
+                    host[offset..offset + (end - start)].copy_from_slice(&input[start..end]);
+                }
+            }
+            let region = PeerRegion::alloc(rank, bytes)?;
+            region.write_host(&host)?;
+            data.push(region);
+            receive.push(PeerRegion::alloc(
+                rank,
+                channels * recv_stride * std::mem::size_of::<f32>(),
+            )?);
+            let flag_region = PeerRegion::alloc(rank, channels * flag_stride * 4)?;
+            flag_region.write_host(&vec![0.0f32; channels * flag_stride])?;
+            flags.push(flag_region);
+        }
+        Ok(DeviceRingWorkspace {
+            data,
+            receive,
+            flags,
+            count,
+            channels,
+            segment,
+            width,
+            data_stride,
+            recv_stride,
+            flag_stride,
+        })
+    }
+
+    fn launch_device_ring(&self, workspace: &mut DeviceRingWorkspace) -> Result<()> {
+        let n = self.world_size();
+        let pointers: Vec<(u64, u64, u64)> = (0..n)
+            .map(|rank| {
+                (
+                    workspace.data[rank].as_ptr() as u64,
+                    workspace.receive[rank].as_ptr() as u64,
+                    workspace.flags[rank].as_ptr() as u64,
+                )
+            })
+            .collect();
+        for rank in 0..n {
+            let next = (rank + 1) % n;
+            let (next_data, next_recv, next_flags) = pointers[next];
+            let stream = self.ranks[rank].stream.clone();
+            let function = &self.ranks[rank].ring;
+            let count_i = workspace.count as i32;
+            let width_i = workspace.width as i32;
+            let n_i = n as i32;
+            let rank_i = rank as i32;
+            let channels_i = workspace.channels as i32;
+            let data_stride_i = workspace.data_stride as i32;
+            let recv_stride_i = workspace.recv_stride as i32;
+            let flag_stride_i = workspace.flag_stride as i32;
+            let data_ptr = pointers[rank].0;
+            let recv_ptr = pointers[rank].1;
+            let flag_ptr = pointers[rank].2;
+            let mut launch = stream.launch_builder(function);
+            launch.arg(&data_ptr);
+            launch.arg(&recv_ptr);
+            launch.arg(&flag_ptr);
+            launch.arg(&next_data);
+            launch.arg(&next_recv);
+            launch.arg(&next_flags);
+            launch.arg(&rank_i);
+            launch.arg(&n_i);
+            launch.arg(&count_i);
+            launch.arg(&width_i);
+            launch.arg(&channels_i);
+            launch.arg(&data_stride_i);
+            launch.arg(&recv_stride_i);
+            launch.arg(&flag_stride_i);
+            // SAFETY: regions live in `workspace`; peer access is enabled.
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (workspace.channels as u32, 1, 1),
+                    block_dim: (1024, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(driver("device ring launch"))?;
+        }
+        Ok(())
+    }
+
+    fn read_device_ring(&self, workspace: &DeviceRingWorkspace) -> Result<Vec<Vec<f32>>> {
+        let n = self.world_size();
+        let mut output = Vec::with_capacity(n);
+        for region in &workspace.data {
+            let host = region.read_host(workspace.channels * workspace.data_stride)?;
+            let mut values = vec![0.0f32; workspace.count];
+            for channel in 0..workspace.channels {
+                let start = channel * workspace.segment;
+                let end = (start + workspace.segment).min(workspace.count);
+                if start < end {
+                    let offset = channel * workspace.data_stride;
+                    values[start..end].copy_from_slice(&host[offset..offset + (end - start)]);
+                }
+            }
+            output.push(values);
+        }
+        Ok(output)
     }
 
     /// Device-resident ring allreduce benchmark path. Inputs are uploaded once;
@@ -1378,6 +1592,30 @@ mod tests {
             }
         }
         output
+    }
+
+    #[test]
+    fn device_ring_allreduce_matches_cpu_or_skips() {
+        let group = match PeerGroup::new(2) {
+            Ok(group) => group,
+            Err(error) => {
+                eprintln!("device ring skipped: {error}");
+                return;
+            }
+        };
+        let inputs = vec![
+            (0..257).map(|index| index as f32).collect::<Vec<_>>(),
+            (0..257)
+                .map(|index| (index * 3 + 1) as f32)
+                .collect::<Vec<_>>(),
+        ];
+        let expected = reference_sum(&inputs);
+        let output = group
+            .all_reduce_device_ring(&inputs)
+            .expect("device ring allreduce");
+        for values in output {
+            assert_eq!(values, expected);
+        }
     }
 
     #[test]

@@ -175,7 +175,7 @@ same `algbw_GB/s` / `busbw_GB/s` fields. On `pro5000` (8 ranks, 1 MiB):
 
 | Op | NCCL Bus BW (GB/s) | Plait Bus BW (GB/s) |
 |---|---:|---:|
-| allreduce | 8.446 | 0.087 |
+| allreduce (device ring, C=4) | 8.025 | 20.944 |
 | broadcast | 6.193 | 0.106 |
 | reduce | 3.219 | 0.704 |
 | allgather | 14.644 | 0.084 |

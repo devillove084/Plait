@@ -118,9 +118,10 @@ ordinary container exposes an active ibverbs device.
 
 | Implementation | Bus BW (GB/s) | Status |
 |---|---:|---|
-| Plait ring | 0.31 | correct, slow |
+| Plait host ring | 0.31 | correct, slow |
+| Plait device-ring (C=4) | 20.93 | faster than NCCL at 1 MiB |
 | Plait recursive doubling | 0.61 | correct, slow |
-| NCCL 2.30.4 | 8.44 | reference |
+| NCCL 2.30.4 | 8.43 | reference |
 
 The baseline is retained as a regression floor. A performance change is not
 accepted without a new measured table and the matching timeline artifact.

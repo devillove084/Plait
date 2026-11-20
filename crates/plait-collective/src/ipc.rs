@@ -131,6 +131,10 @@ impl PeerRegion {
         self.ptr as *mut u8
     }
 
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr as *const u8
+    }
+
     pub fn write_host(&self, values: &[f32]) -> Result<()> {
         let bytes = std::mem::size_of_val(values);
         if bytes > self.bytes {

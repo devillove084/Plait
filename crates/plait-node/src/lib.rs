@@ -1026,6 +1026,7 @@ pub fn run_collectives_demo(
     op: &str,
     channels: usize,
     resident: bool,
+    device_ring: bool,
     trace: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use plait_collective::{AllReduceAlgorithm, PeerGroup};
@@ -1084,6 +1085,28 @@ pub fn run_collectives_demo(
         run_collective_op(&group, op, &inputs, &expected, algorithm)?;
     }
     let seconds = start.elapsed().as_secs_f64() / iters as f64;
+    if device_ring && op == "allreduce" {
+        let checked = group.all_reduce_device_ring(&inputs)?;
+        for values in &checked {
+            if values
+                .iter()
+                .zip(&expected)
+                .any(|(actual, expected)| (*actual - *expected).abs() > 1e-3)
+            {
+                return Err("device-ring allreduce correctness check failed".into());
+            }
+        }
+        let (duration, output) = group.all_reduce_device_ring_resident(&inputs, iters)?;
+        let elapsed = duration.as_secs_f64() / iters as f64;
+        let bw = allreduce_bytes_f64(bytes) / elapsed / 1e9;
+        let busbw = bw * 2.0 * (ranks - 1) as f64 / ranks as f64;
+        println!(
+            "plait collectives: device-ring allreduce ranks={ranks} bytes={} time_ms={:.6} algbw_GB/s={bw:.3} busbw_GB/s={busbw:.3}",
+            (bytes / std::mem::size_of::<f32>()).max(1) * std::mem::size_of::<f32>(),
+            elapsed * 1e3
+        );
+        let _ = output;
+    }
     if resident && op == "allreduce" {
         let (elapsed, output) = group.all_reduce_resident(&inputs, iters)?;
         if output.iter().any(|values| values.len() != inputs[0].len()) {

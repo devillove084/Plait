@@ -71,6 +71,22 @@ So H2D/D2H plus per-call allocation account for roughly 17.6 ms of the 21 ms.
 The remaining 3.4 ms is still dominated by the 112 host-issued peer copies and
 the final stream synchronizations; it is not kernel-bound.
 
+## Device-side ring kernel
+
+The host-driven ring was replaced for allreduce by a device kernel: each rank
+launches one kernel, writes peer buffers, and synchronizes with device flags.
+Resident measurements on `pro5000`, 8 ranks, C=4:
+
+| Size | Plait device-ring | NCCL | Ratio |
+|---:|---:|---:|---:|
+| 1 MiB | 20.944 GB/s | 8.025 GB/s | 2.61× |
+| 16 MiB | 27.401 GB/s | 22.282 GB/s | 1.23× |
+| 64 MiB | 27.349 GB/s | 23.817 GB/s | 1.15× |
+
+This is the first Plait path that beats NCCL on the same host. It is an
+allreduce result; broadcast/reduce/allgather/reducescatter/alltoall still use the
+host-driven path.
+
 ## What would change the result
 
 1. Device-resident input/output API: allocate once, time only the collective.
