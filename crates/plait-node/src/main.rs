@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use plait_core::NodeId;
 use plait_node::{
     NodeConfig, RunningNode, run_demo, run_devices, run_dsa_demo, run_gpu_demo, run_hetero_demo,
-    run_parallel_demo, run_rdma_selftest,
+    run_matrix_node, run_parallel_demo, run_rdma_selftest,
 };
 
 #[tokio::main]
@@ -25,6 +25,25 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         "devices" => run_devices(),
         "hetero" => run_hetero_demo(),
         "gpu-demo" => run_gpu_demo(),
+        "matrix" => {
+            let mut manifest = None;
+            let mut start = 0usize;
+            let mut count = 6usize;
+            let mut driver = false;
+            let mut hold = 40u64;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--manifest" => manifest = Some(args.next().ok_or("--manifest needs a path")?),
+                    "--start" => start = args.next().ok_or("--start needs a number")?.parse()?,
+                    "--count" => count = args.next().ok_or("--count needs a number")?.parse()?,
+                    "--driver" => driver = true,
+                    "--hold" => hold = args.next().ok_or("--hold needs seconds")?.parse()?,
+                    other => return Err(format!("unknown matrix argument {other}").into()),
+                }
+            }
+            let manifest = manifest.ok_or("--manifest is required")?;
+            run_matrix_node(&manifest, start, count, driver, hold).await
+        }
         "id" => {
             println!("{}", NodeId::random());
             Ok(())
@@ -60,6 +79,7 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 peers,
                 join,
                 options: Default::default(),
+                advertise_devices: true,
             };
             let node = RunningNode::start(config).await?;
             println!("plait node {} listening on {}", node.id(), node.addr());

@@ -5,9 +5,12 @@
 //! shipping architecture-specific PTX. This crate is intentionally small: it
 //! proves the compute path; model kernels are adapters above it.
 
+use std::ffi::c_void;
 use std::sync::Arc;
 
-use cudarc::driver::{CudaContext, CudaFunction, CudaModule, LaunchConfig, PushKernelArg};
+use cudarc::driver::{
+    CudaContext, CudaFunction, CudaModule, DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg,
+};
 use cudarc::nvrtc::{Ptx, compile_ptx};
 
 const KERNEL: &str = r#"
@@ -71,7 +74,9 @@ impl GpuExecutor {
         })
     }
 
-    /// Run a CUTLASS SGEMM on this device context.
+    /// Run a CUTLASS SGEMM with device pointers and the cudarc stream. No
+    /// intermediate host buffer is allocated by the CUTLASS shim; only the
+    /// input/output copies at the API boundary remain.
     #[allow(clippy::too_many_arguments)]
     pub fn sgemm(
         &self,
@@ -84,10 +89,67 @@ impl GpuExecutor {
         alpha: f32,
         beta: f32,
     ) -> Result<Vec<f32>, GpuError> {
+        if m == 0 || n == 0 || k == 0 {
+            return Err(GpuError::new("sgemm dimensions must be non-zero"));
+        }
+        if a.len() != m * k || b.len() != k * n || c.len() != m * n {
+            return Err(GpuError::new("sgemm input lengths do not match dimensions"));
+        }
+        if m > i32::MAX as usize || n > i32::MAX as usize || k > i32::MAX as usize {
+            return Err(GpuError::new("sgemm dimensions exceed i32"));
+        }
         self._context
             .bind_to_thread()
             .map_err(|error| GpuError::new(error.to_string()))?;
-        cutlass_sgemm(a, b, c, m, n, k, alpha, beta)
+        let stream = self._context.default_stream();
+        let a_dev = stream
+            .clone_htod(a)
+            .map_err(|error| GpuError::new(error.to_string()))?;
+        let b_dev = stream
+            .clone_htod(b)
+            .map_err(|error| GpuError::new(error.to_string()))?;
+        let mut c_dev = stream
+            .clone_htod(c)
+            .map_err(|error| GpuError::new(error.to_string()))?;
+        #[cfg(plait_cutlass)]
+        {
+            let rc = {
+                let (a_ptr, _a_guard) = a_dev.device_ptr(&stream);
+                let (b_ptr, _b_guard) = b_dev.device_ptr(&stream);
+                let (c_ptr, _c_guard) = c_dev.device_ptr_mut(&stream);
+                unsafe {
+                    plait_cutlass_sgemm_device(
+                        a_ptr as *const c_void,
+                        b_ptr as *const c_void,
+                        c_ptr as *mut c_void,
+                        m as i32,
+                        n as i32,
+                        k as i32,
+                        alpha,
+                        beta,
+                        stream.cu_stream() as *mut c_void,
+                    )
+                }
+            };
+            if rc != 0 {
+                return Err(GpuError::new(format!(
+                    "CUTLASS SGEMM failed with code {rc}"
+                )));
+            }
+            stream
+                .synchronize()
+                .map_err(|error| GpuError::new(error.to_string()))?;
+            stream
+                .clone_dtoh(&c_dev)
+                .map_err(|error| GpuError::new(error.to_string()))
+        }
+        #[cfg(not(plait_cutlass))]
+        {
+            let _ = (a_dev, b_dev, c_dev, alpha, beta);
+            Err(GpuError::new(
+                "CUTLASS is not built: clone NVIDIA/cutlass into target/cutlass and provide nvcc",
+            ))
+        }
     }
 
     /// `out = alpha * x + y` on the device. Returns host-visible results.
@@ -128,6 +190,18 @@ impl GpuExecutor {
 
 #[cfg(plait_cutlass)]
 unsafe extern "C" {
+    fn plait_cutlass_sgemm_device(
+        a: *const c_void,
+        b: *const c_void,
+        c: *mut c_void,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        stream: *mut c_void,
+    ) -> i32;
+
     fn plait_cutlass_sgemm(
         a: *const f32,
         b: *const f32,

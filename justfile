@@ -45,6 +45,9 @@ devices: setup
 hetero: setup
     cargo run -q --locked -p plait-node -- hetero
 
+matrix: setup
+    ./scripts/matrix-local.sh
+
 gpu: setup
     cargo run -q --locked -p plait-node -- gpu-demo
 

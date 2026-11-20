@@ -66,3 +66,42 @@ extern "C" int plait_cutlass_sgemm(
     cudaFree(c);
     return 0;
 }
+
+extern "C" int plait_cutlass_sgemm_device(
+    const void* device_a,
+    const void* device_b,
+    void* device_c,
+    int m,
+    int n,
+    int k,
+    float alpha,
+    float beta,
+    void* stream_ptr)
+{
+    if (m <= 0 || n <= 0 || k <= 0 || device_a == nullptr ||
+        device_b == nullptr || device_c == nullptr) {
+        return 1;
+    }
+    const float* a = static_cast<const float*>(device_a);
+    const float* b = static_cast<const float*>(device_b);
+    float* c = static_cast<float*>(device_c);
+    CutlassSgemm gemm;
+    CutlassSgemm::Arguments args(
+        {m, n, k},
+        {a, k},
+        {b, n},
+        {c, n},
+        {c, n},
+        {alpha, beta});
+    void* workspace = nullptr;
+    const size_t workspace_bytes = CutlassSgemm::get_workspace_size(args);
+    if (workspace_bytes != 0 && cudaMalloc(&workspace, workspace_bytes) != cudaSuccess) {
+        return 2;
+    }
+    const cudaStream_t stream = static_cast<cudaStream_t>(stream_ptr);
+    const cutlass::Status status = gemm(args, workspace, stream);
+    if (workspace != nullptr) {
+        cudaFree(workspace);
+    }
+    return status == cutlass::Status::kSuccess ? 0 : 3;
+}

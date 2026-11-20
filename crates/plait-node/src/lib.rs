@@ -30,6 +30,7 @@ pub struct NodeConfig {
     pub peers: BTreeMap<NodeId, String>,
     pub join: Option<JoinTarget>,
     pub options: Options,
+    pub advertise_devices: bool,
 }
 
 impl NodeConfig {
@@ -44,6 +45,7 @@ impl NodeConfig {
             peers,
             join: None,
             options: Options::default(),
+            advertise_devices: true,
         }
     }
 }
@@ -89,6 +91,7 @@ impl RunningNode {
             replica: Replica::new(id, cluster, Runtime::new(), config.options.clone()),
             options: config.options,
             join: config.join,
+            advertise_devices: config.advertise_devices,
             joined: false,
             staged_proposed: BTreeSet::new(),
             commit_proposed: BTreeSet::new(),
@@ -130,6 +133,7 @@ struct NodeState {
     replica: Replica<Runtime>,
     options: Options,
     join: Option<JoinTarget>,
+    advertise_devices: bool,
     joined: bool,
     staged_proposed: BTreeSet<NodeId>,
     commit_proposed: BTreeSet<NodeId>,
@@ -289,7 +293,8 @@ impl NodeState {
     }
 
     fn maybe_register_devices(&mut self, now: u64) {
-        if self.devices_registered
+        if !self.advertise_devices
+            || self.devices_registered
             || !self.replica.config().is_voter(self.id)
             || (self.join.is_some() && !self.joined)
         {
@@ -388,8 +393,14 @@ pub struct Client {
 
 impl Client {
     pub async fn new() -> io::Result<Self> {
+        Self::new_on("127.0.0.1:0").await
+    }
+
+    /// Bind the client listener to a reachable address. A remote node must be
+    /// able to send the Ack/QueryReply back to this address.
+    pub async fn new_on(listen: &str) -> io::Result<Self> {
         let id = NodeId::random();
-        let transport = TcpTransport::bind(id, "127.0.0.1:0", BTreeMap::new()).await?;
+        let transport = TcpTransport::bind(id, listen, BTreeMap::new()).await?;
         Ok(Self { transport, next: 1 })
     }
 
@@ -529,6 +540,7 @@ pub async fn run_demo() -> Result<(), Box<dyn std::error::Error>> {
             peers: peers.clone(),
             join: None,
             options: Options::default(),
+            advertise_devices: true,
         };
         let cluster = ClusterConfig::new(peers.keys().copied())?;
         nodes.push(RunningNode::start_with_transport(
@@ -975,7 +987,9 @@ pub fn run_gpu_demo() -> Result<(), Box<dyn std::error::Error>> {
         .map(|index| (index % 11) as f32 * 0.25 - 0.5)
         .collect();
     let c = vec![0.0f32; m * n];
-    match plait_gpu::cutlass_sgemm(&a, &b, &c, m, n, k, 1.0, 0.0) {
+    let cutlass_result = plait_gpu::GpuExecutor::new(0)
+        .and_then(|executor| executor.sgemm(&a, &b, &c, m, n, k, 1.0, 0.0));
+    match cutlass_result {
         Ok(output) => {
             for row in 0..m {
                 for col in 0..n {
@@ -989,7 +1003,7 @@ pub fn run_gpu_demo() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             println!(
-                "plait gpu: CUTLASS SGEMM {m}x{n}x{k} ok on {} visible GPU(s)",
+                "plait gpu: CUTLASS device-pointer SGEMM {m}x{n}x{k} ok on {} visible GPU(s)",
                 executed
             );
         }
@@ -998,4 +1012,220 @@ pub fn run_gpu_demo() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// Run one host's share of a two-host 12-replica matrix collective.
+///
+/// Manifest lines are `hex-node-id@listen-address`. The first six entries are
+/// host A, the last six are host B. Only the driver host submits the command;
+/// both hosts keep their nodes alive for `hold_seconds`.
+pub async fn run_matrix_node(
+    manifest: &str,
+    local_start: usize,
+    local_count: usize,
+    driver: bool,
+    hold_seconds: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use plait_parallel::{AxisSizes, Topology};
+
+    let text = std::fs::read_to_string(manifest)?;
+    let mut entries = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (id, addr) = line
+            .split_once('@')
+            .ok_or_else(|| format!("manifest line must be id@addr: {line}"))?;
+        entries.push((NodeId::from_hex(id)?, addr.to_owned()));
+    }
+    if entries.len() != 12 {
+        return Err(format!("matrix manifest needs 12 entries, got {}", entries.len()).into());
+    }
+    let ids: Vec<NodeId> = entries.iter().map(|(id, _)| *id).collect();
+    let peers: BTreeMap<NodeId, String> = entries.iter().cloned().collect();
+    let mut nodes = Vec::new();
+    for (id, addr) in entries.iter().skip(local_start).take(local_count) {
+        let transport = TcpTransport::bind(*id, addr, peers.clone()).await?;
+        let config = NodeConfig {
+            id: *id,
+            listen: String::new(),
+            peers: peers.clone(),
+            join: None,
+            options: Options::default(),
+            advertise_devices: false,
+        };
+        let cluster = ClusterConfig::new(ids.iter().copied())?;
+        nodes.push(RunningNode::start_with_transport(
+            config, transport, cluster,
+        )?);
+    }
+    println!(
+        "plait matrix: host process started {} local replicas ({local_start}..{}), 12 voters",
+        nodes.len(),
+        local_start + nodes.len()
+    );
+
+    if driver {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let advertise = entries
+            .get(local_start)
+            .map(|(_, addr)| {
+                addr.rsplit_once(':')
+                    .map(|(host, _)| host)
+                    .unwrap_or("127.0.0.1")
+            })
+            .unwrap_or("127.0.0.1");
+        let mut client = Client::new_on(&format!("{advertise}:0")).await?;
+        for (id, addr) in &entries {
+            client.add_peer(*id, addr.clone());
+        }
+        let topology = Topology::new(AxisSizes::new(2, 1, 3, 2, 1, 1), ids.clone())?;
+        let (m, n, k) = (8usize, 8usize, 6usize);
+        let (a, b) = matrix_inputs(m, n, k);
+        let expected = matrix_reference(&a, &b, m, n, k);
+        let op = OpId::new(NodeId::derive("matrix-plan"), 1);
+        let spec = OpSpec {
+            id: op,
+            kind: FuseKind::Sum,
+            contributors: ids.iter().copied().collect(),
+            tensor: TensorKey::new(TensorId(40_000), ShardId(0)),
+            epoch: 1,
+        };
+        client.submit(ids[0], Command::DeclareOp(spec)).await?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if client
+                .query(ids[0], op)
+                .await
+                .ok()
+                .is_some_and(|reply| reply.declared)
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err("matrix declaration timed out".into());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let mut contributions = 0usize;
+        for (id, _) in &entries {
+            let coord = topology.coord(*id).ok_or("node missing from topology")?;
+            let values = matrix_partial(
+                &a,
+                &b,
+                m,
+                n,
+                k,
+                coord.data as usize,
+                coord.tensor as usize,
+                coord.expert as usize,
+                2,
+                3,
+                2,
+            );
+            client
+                .submit(
+                    *id,
+                    Command::Contribute {
+                        op,
+                        contributor: *id,
+                        values,
+                    },
+                )
+                .await?;
+            contributions += 1;
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let values = loop {
+            if let Some(values) = client
+                .query(ids[0], op)
+                .await
+                .ok()
+                .and_then(|reply| reply.values)
+            {
+                break values;
+            }
+            if Instant::now() >= deadline {
+                return Err("matrix collective timed out".into());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        if values.len() != expected.len() {
+            return Err("matrix result length mismatch".into());
+        }
+        for (index, (actual, expected)) in values.iter().zip(&expected).enumerate() {
+            if (actual - expected).abs() > 1e-9 {
+                return Err(format!("matrix mismatch at {index}: {actual} vs {expected}").into());
+            }
+        }
+        let checksum: f64 = values.iter().sum();
+        println!(
+            "plait matrix: 12 replicas DP2×TP3×EP2, {m}x{n}x{k}, {contributions} contributions, checksum {checksum}"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    } else {
+        tokio::time::sleep(Duration::from_secs(hold_seconds)).await;
+    }
+    drop(nodes);
+    Ok(())
+}
+
+fn matrix_inputs(m: usize, n: usize, k: usize) -> (Vec<f64>, Vec<f64>) {
+    let a = (0..m * k)
+        .map(|index| ((index * 7 + 3) % 17) as f64 - 8.0)
+        .collect();
+    let b = (0..k * n)
+        .map(|index| ((index * 11 + 5) % 13) as f64 - 6.0)
+        .collect();
+    (a, b)
+}
+
+fn matrix_reference(a: &[f64], b: &[f64], m: usize, n: usize, k: usize) -> Vec<f64> {
+    let mut out = vec![0.0; m * n];
+    for row in 0..m {
+        for col in 0..n {
+            let mut sum = 0.0;
+            for inner in 0..k {
+                sum += a[row * k + inner] * b[inner * n + col];
+            }
+            out[row * n + col] = sum;
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn matrix_partial(
+    a: &[f64],
+    b: &[f64],
+    m: usize,
+    n: usize,
+    k: usize,
+    dp: usize,
+    tp: usize,
+    ep: usize,
+    dp_size: usize,
+    tp_size: usize,
+    ep_size: usize,
+) -> Vec<f64> {
+    let row_start = dp * m / dp_size;
+    let row_end = (dp + 1) * m / dp_size;
+    let col_start = ep * n / ep_size;
+    let col_end = (ep + 1) * n / ep_size;
+    let k_start = tp * k / tp_size;
+    let k_end = (tp + 1) * k / tp_size;
+    let mut out = vec![0.0; m * n];
+    for row in row_start..row_end {
+        for col in col_start..col_end {
+            let mut sum = 0.0;
+            for inner in k_start..k_end {
+                sum += a[row * k + inner] * b[inner * n + col];
+            }
+            out[row * n + col] = sum;
+        }
+    }
+    out
 }

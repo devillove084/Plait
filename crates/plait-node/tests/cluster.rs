@@ -36,6 +36,7 @@ async fn start_bootstrap(ids: &[NodeId]) -> (Vec<RunningNode>, Vec<String>) {
             peers: peers.clone(),
             join: None,
             options: Default::default(),
+            advertise_devices: false,
         };
         let cluster = ClusterConfig::new(ids.iter().copied()).unwrap();
         nodes.push(RunningNode::start_with_transport(config, transport, cluster).unwrap());
@@ -139,6 +140,7 @@ async fn a_joining_node_receives_a_snapshot_and_becomes_a_voter() {
             addr: addrs[0].clone(),
         }),
         options: Default::default(),
+        advertise_devices: false,
     };
     let joining = RunningNode::start(joining_config).await.unwrap();
     client.add_peer(ids[2], joining.addr().to_owned());

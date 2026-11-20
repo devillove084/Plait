@@ -161,10 +161,33 @@ plait hetero: 9 devices, 32 compute tasks, placements {Cpu: 3, Nvidia: 29}
 ```
 
 `hetero` now executes real work per placement: NVIDIA devices run CUTLASS
-SGEMM with CPU-reference verification, and CPU devices run the CPU reference
+device-pointer/stream SGEMM with CPU-reference verification, and CPU devices run the CPU reference
 GEMM. Device registration, eligibility, reservation, compute, and replicated
 placement are all real. AMD/Huawei/PPU adapters are still the next layer;
 they fail explicitly rather than silently using a CPU placeholder.
+
+## 12-replica matrix collective
+
+`just matrix` starts two TCP processes on one host with six replicas each
+(12 voters, topology DP2×TP3×EP2), submits a matrix GEMM as twelve fused-sum
+contributions, and checks the result against a CPU reference:
+
+```text
+plait matrix: 12 replicas DP2×TP3×EP2, 8x8x6, 12 contributions, checksum 103
+```
+
+The same mode crosses hosts. A tested layout puts six replicas on the local
+`11.166.42.141` host and six on `pro5000`; SSH local forwarding exposes the
+remote ports to the driver:
+
+```sh
+ssh -N -L 127.0.0.1:8201:127.0.0.1:8201 ... pro5000
+plait-node matrix --manifest cross.manifest --start 0 --count 6 --driver
+```
+
+The client binds its reply listener to a reachable host address, not
+`127.0.0.1`, so remote replicas can return Ack/QueryReply. The tested cross-host
+result was the same checksum `103`.
 
 ## EP / DP / PP execution
 
@@ -228,8 +251,9 @@ just demo        # three async TCP nodes, fused sum
 just dsa         # TP/CP DSA vs single-node reference
 just parallel    # EP MoE, DP optimizer, PP stages
 just devices     # discovered NVIDIA/AMD/Huawei/PPU/CPU
-just hetero      # capability-aware compute placement
-just gpu         # real CUDA AXPY + CUTLASS SGEMM
+just hetero      # capability-aware compute placement + CUTLASS GEMM
+just matrix      # two-process, 12-replica TCP matrix collective
+just gpu         # real CUDA AXPY + CUTLASS device-pointer SGEMM
 just rdma        # real ibverbs or a clear skip
 just ci          # fmt + lint + tests + demos
 ```
