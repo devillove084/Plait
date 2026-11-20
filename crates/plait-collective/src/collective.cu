@@ -20,6 +20,7 @@ extern "C" __global__ void plait_ring_allreduce(
     int ranks,
     int count,
     int width,
+    int mode,
     int channels,
     int data_stride,
     int recv_stride,
@@ -42,6 +43,7 @@ extern "C" __global__ void plait_ring_allreduce(
         && ((reinterpret_cast<unsigned long long>(data) & 15ull) == 0)
         && ((reinterpret_cast<unsigned long long>(next_recv_ptr) & 15ull) == 0)
         && ((reinterpret_cast<unsigned long long>(recv) & 15ull) == 0);
+    if (mode != 1) {
     for (int step = 0; step < ranks - 1; ++step) {
         int send_chunk = (rank + ranks - step) % ranks;
         int recv_chunk = (rank + ranks - step - 1) % ranks;
@@ -80,8 +82,12 @@ extern "C" __global__ void plait_ring_allreduce(
         }
         __syncthreads();
     }
+    }
+    if (mode != 2) {
     for (int step = 0; step < ranks - 1; ++step) {
-        int send_chunk = (rank + ranks - step + 1) % ranks;
+        int send_chunk = (mode == 1)
+            ? (rank + ranks - step) % ranks
+            : (rank + ranks - step + 1) % ranks;
         if (vector) {
             float4* dst = reinterpret_cast<float4*>(next_data_ptr + send_chunk * width);
             const float4* src = reinterpret_cast<const float4*>(data + send_chunk * width);
@@ -101,6 +107,7 @@ extern "C" __global__ void plait_ring_allreduce(
         }
         __syncthreads();
         __threadfence_system();
+    }
     }
 }
 

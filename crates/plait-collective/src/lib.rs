@@ -109,6 +109,7 @@ pub struct DeviceRingWorkspace {
     data_stride: usize,
     recv_stride: usize,
     flag_stride: usize,
+    mode: i32,
 }
 
 struct ChannelBuffers {
@@ -427,7 +428,7 @@ impl PeerGroup {
     /// Device-side ring allreduce. One kernel per rank writes directly into
     /// peer receive/data buffers and synchronizes with device flags.
     pub fn all_reduce_device_ring(&self, inputs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
-        let mut workspace = self.prepare_device_ring(inputs)?;
+        let mut workspace = self.prepare_device_ring(inputs, 0)?;
         self.launch_device_ring(&mut workspace)?;
         self.sync()?;
         self.read_device_ring(&workspace)
@@ -527,7 +528,7 @@ impl PeerGroup {
         inputs: &[Vec<f32>],
         iterations: usize,
     ) -> Result<(std::time::Duration, Vec<Vec<f32>>)> {
-        let mut workspace = self.prepare_device_ring(inputs)?;
+        let mut workspace = self.prepare_device_ring(inputs, 0)?;
         let start = std::time::Instant::now();
         for _ in 0..iterations {
             self.launch_device_ring(&mut workspace)?;
@@ -538,7 +539,35 @@ impl PeerGroup {
         Ok((elapsed, output))
     }
 
-    fn prepare_device_ring(&self, inputs: &[Vec<f32>]) -> Result<DeviceRingWorkspace> {
+    pub fn all_gather_device(&self, chunks: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
+        if chunks.len() != self.world_size() {
+            return Err(CollectiveError::new("all_gather rank count mismatch"));
+        }
+        let width = chunks[0].len();
+        if chunks.iter().any(|chunk| chunk.len() != width) {
+            return Err(CollectiveError::new("all_gather chunks differ in size"));
+        }
+        let n = self.world_size();
+        let count = width * n;
+        let mut inputs = vec![vec![0.0f32; count]; n];
+        for (rank, chunk) in chunks.iter().enumerate() {
+            inputs[rank][rank * width..(rank + 1) * width].copy_from_slice(chunk);
+        }
+        let mut workspace = self.prepare_device_ring(&inputs, 1)?;
+        self.launch_device_ring(&mut workspace)?;
+        self.sync()?;
+        self.read_device_ring(&workspace)
+    }
+
+    pub fn reduce_scatter_device(&self, inputs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
+        self.validate(inputs)?;
+        let mut workspace = self.prepare_device_ring(inputs, 2)?;
+        self.launch_device_ring(&mut workspace)?;
+        self.sync()?;
+        self.read_device_ring(&workspace)
+    }
+
+    fn prepare_device_ring(&self, inputs: &[Vec<f32>], mode: i32) -> Result<DeviceRingWorkspace> {
         use crate::ipc::PeerRegion;
         self.validate(inputs)?;
         let n = self.world_size();
@@ -585,6 +614,7 @@ impl PeerGroup {
             data_stride,
             recv_stride,
             flag_stride,
+            mode,
         })
     }
 
@@ -609,6 +639,7 @@ impl PeerGroup {
             let n_i = n as i32;
             let rank_i = rank as i32;
             let channels_i = workspace.channels as i32;
+            let mode_i = workspace.mode;
             let data_stride_i = workspace.data_stride as i32;
             let recv_stride_i = workspace.recv_stride as i32;
             let flag_stride_i = workspace.flag_stride as i32;
@@ -626,6 +657,7 @@ impl PeerGroup {
             launch.arg(&n_i);
             launch.arg(&count_i);
             launch.arg(&width_i);
+            launch.arg(&mode_i);
             launch.arg(&channels_i);
             launch.arg(&data_stride_i);
             launch.arg(&recv_stride_i);
