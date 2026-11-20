@@ -7,7 +7,7 @@
 
 use std::process::Command;
 
-use crate::AllReduceAlgorithm;
+use crate::{AllReduceAlgorithm, Protocol};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkClass {
@@ -61,12 +61,32 @@ impl GpuTopology {
     /// Small messages prefer the latency-oriented reduce+broadcast path;
     /// larger messages and NVLink-connected hosts use ring.
     pub fn recommended_allreduce(&self, bytes: usize) -> AllReduceAlgorithm {
-        if bytes <= 32 * 1024 && !self.has_nvlink() {
+        if !self.has_nvlink() {
+            return AllReduceAlgorithm::Ring;
+        }
+        if bytes <= 32 * 1024 {
             AllReduceAlgorithm::ReduceBroadcast
         } else if bytes >= 64 * 1024 {
             AllReduceAlgorithm::Tree
         } else {
             AllReduceAlgorithm::Ring
+        }
+    }
+
+    /// Pick a device protocol from message size and link class.
+    ///
+    /// LL/LL128 are latency protocols for NVLink. On PCIe their per-line flag
+    /// traffic is slower than the simple ring, so PCIe always selects Simple.
+    pub fn recommended_protocol(&self, bytes: usize) -> Protocol {
+        if !self.has_nvlink() {
+            return Protocol::Simple;
+        }
+        if bytes <= 32 * 1024 {
+            Protocol::Ll
+        } else if bytes >= 64 * 1024 {
+            Protocol::Ll128
+        } else {
+            Protocol::Simple
         }
     }
 }
@@ -194,12 +214,14 @@ mod tests {
         assert_eq!(topology.link(1, 2), LinkClass::Node);
         assert_eq!(
             topology.recommended_allreduce(1024),
-            AllReduceAlgorithm::Ring
+            AllReduceAlgorithm::ReduceBroadcast
         );
+        assert_eq!(topology.recommended_protocol(1024), Protocol::Ll);
+        assert_eq!(topology.recommended_protocol(1 << 20), Protocol::Ll128);
     }
 
     #[test]
-    fn small_pcie_message_prefers_reduce_broadcast() {
+    fn pcie_uses_ring_and_simple_protocol() {
         let text = "\
         GPU0 GPU1\n\
         GPU0 X SYS\n\
@@ -207,11 +229,13 @@ mod tests {
         let topology = parse(text).expect("topology");
         assert_eq!(
             topology.recommended_allreduce(1024),
-            AllReduceAlgorithm::ReduceBroadcast
+            AllReduceAlgorithm::Ring
         );
         assert_eq!(
             topology.recommended_allreduce(1 << 20),
-            AllReduceAlgorithm::Tree
+            AllReduceAlgorithm::Ring
         );
+        assert_eq!(topology.recommended_protocol(1024), Protocol::Simple);
+        assert_eq!(topology.recommended_protocol(1 << 20), Protocol::Simple);
     }
 }
