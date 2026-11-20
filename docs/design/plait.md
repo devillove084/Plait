@@ -4,7 +4,7 @@ Status: research prototype. This document is the design of record; the code is
 the reference implementation, not a production training system. Requirements and
 assumptions are in [plait-requirements.md](plait-requirements.md); the rendered
 architecture is [plait-architecture.html](plait-architecture.html). Remote
-validation evidence is in [../validation/pro5000.md](../validation/pro5000.md).
+validation evidence is summarized in the README.
 
 ## 0. Executive summary
 

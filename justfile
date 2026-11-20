@@ -45,6 +45,9 @@ devices: setup
 hetero: setup
     cargo run -q --locked -p plait-node -- hetero
 
+hetero-plan: setup
+    cargo run -q --locked -p plait-node -- hetero-plan
+
 collectives: setup
     cargo run -q --locked -p plait-node -- collectives --channels ${PLAIT_CHANNELS:-1} --resident --trace target/collectives-trace.json
 

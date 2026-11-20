@@ -95,7 +95,7 @@ plait rdma: rxe0 loopback write/read passed (128 bytes)
 
 The normal `pro5000` container still has no `/dev/infiniband`, so `plait-node
 rdma-selftest` reports the expected skip there. See
-[validation/pro5000.md](validation/pro5000.md) for the exact setup.
+the README for the current hardware limitation.
 
 ## Container behavior
 
