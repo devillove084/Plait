@@ -102,6 +102,15 @@ pub struct BroadcastPullWorkspace {
     width: usize,
 }
 
+pub struct Ll128Workspace {
+    data: Vec<crate::ipc::PeerRegion>,
+    receive: Vec<crate::ipc::PeerRegion>,
+    flags: Vec<crate::ipc::PeerRegion>,
+    count: usize,
+    width: usize,
+    lines: usize,
+}
+
 pub struct AllToAllWorkspace {
     _data: Vec<crate::ipc::PeerRegion>,
     output: Vec<crate::ipc::PeerRegion>,
@@ -471,6 +480,28 @@ impl PeerGroup {
     }
 
     pub fn all_reduce_ll128(&self, inputs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
+        let workspace = self.prepare_ll128(inputs)?;
+        self.launch_ll128(&workspace)?;
+        self.sync()?;
+        self.read_ll128(&workspace)
+    }
+
+    pub fn all_reduce_ll128_resident(
+        &self,
+        inputs: &[Vec<f32>],
+        iterations: usize,
+    ) -> Result<(std::time::Duration, Vec<Vec<f32>>)> {
+        let workspace = self.prepare_ll128(inputs)?;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            self.launch_ll128(&workspace)?;
+            self.sync()?;
+        }
+        let elapsed = start.elapsed();
+        Ok((elapsed, self.read_ll128(&workspace)?))
+    }
+
+    fn prepare_ll128(&self, inputs: &[Vec<f32>]) -> Result<Ll128Workspace> {
         use crate::ipc::PeerRegion;
         self.validate(inputs)?;
         let n = self.world_size();
@@ -495,15 +526,29 @@ impl PeerGroup {
             flag.write_host(&vec![0.0f32; 2 * (n - 1) * lines])?;
             flags.push(flag);
         }
+        Ok(Ll128Workspace {
+            data,
+            receive,
+            flags,
+            count,
+            width,
+            lines,
+        })
+    }
+
+    fn launch_ll128(&self, workspace: &Ll128Workspace) -> Result<()> {
+        let n = self.world_size();
         let pointers: Vec<(u64, u64, u64)> = (0..n)
             .map(|rank| {
                 (
-                    data[rank].as_ptr() as u64,
-                    receive[rank].as_ptr() as u64,
-                    flags[rank].as_ptr() as u64,
+                    workspace.data[rank].as_ptr() as u64,
+                    workspace.receive[rank].as_ptr() as u64,
+                    workspace.flags[rank].as_ptr() as u64,
                 )
             })
             .collect();
+        let lines = workspace.lines;
+        let blocks = lines.clamp(1, 64);
         for rank in 0..n {
             let next = (rank + 1) % n;
             let (next_data, next_recv, next_flags) = pointers[next];
@@ -514,9 +559,8 @@ impl PeerGroup {
             let flag_ptr = pointers[rank].2;
             let rank_i = rank as i32;
             let n_i = n as i32;
-            let width_i = width as i32;
+            let width_i = workspace.width as i32;
             let lines_i = lines as i32;
-            let blocks = lines.clamp(1, 64);
             for block in 0..blocks {
                 let begin = block * lines / blocks;
                 let end = (block + 1) * lines / blocks;
@@ -548,10 +592,13 @@ impl PeerGroup {
                 .map_err(driver("LL128 launch"))?;
             }
         }
-        self.sync()?;
-        let mut output = Vec::with_capacity(n);
-        for region in &data {
-            output.push(region.read_host(count)?);
+        Ok(())
+    }
+
+    fn read_ll128(&self, workspace: &Ll128Workspace) -> Result<Vec<Vec<f32>>> {
+        let mut output = Vec::with_capacity(workspace.data.len());
+        for region in &workspace.data {
+            output.push(region.read_host(workspace.count)?);
         }
         Ok(output)
     }

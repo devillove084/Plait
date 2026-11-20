@@ -1094,16 +1094,12 @@ pub fn run_collectives_demo(
         };
         validate_device_output("allreduce", &inputs, &expected, &checked)?;
         let start = Instant::now();
-        for _ in 0..iters {
-            match protocol {
-                "ll" => {
-                    group.all_reduce_device_ring(&inputs)?;
-                }
-                "ll128" => {
-                    group.all_reduce_ll128(&inputs)?;
-                }
-                _ => {}
+        if protocol == "ll" {
+            for _ in 0..iters {
+                group.all_reduce_device_ring(&inputs)?;
             }
+        } else {
+            let _ = group.all_reduce_ll128_resident(&inputs, iters)?;
         }
         let elapsed = start.elapsed().as_secs_f64() / iters as f64;
         let bw = allreduce_bytes_f64(bytes) / elapsed / 1e9;
