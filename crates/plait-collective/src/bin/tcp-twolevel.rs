@@ -8,6 +8,7 @@ use std::env;
 use std::ffi::CString;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 
@@ -125,14 +126,68 @@ fn receive(stream: &mut TcpStream, count: usize) -> AnyResult<Vec<f32>> {
     Ok(values)
 }
 
-fn exchange(stream: TcpStream, send: Vec<f32>, count: usize) -> AnyResult<Vec<f32>> {
-    let mut reader = stream.try_clone()?;
-    let writer = thread::spawn(move || send_values(stream, &send));
-    let received = receive(&mut reader, count)?;
-    writer
-        .join()
-        .map_err(|_| std::io::Error::other("cross writer panicked"))??;
-    Ok(received)
+fn exchange_poll(stream: TcpStream, send: &[f32], count: usize) -> AnyResult<Vec<f32>> {
+    let fd = stream.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let send_bytes =
+        unsafe { std::slice::from_raw_parts(send.as_ptr().cast::<u8>(), send.len() * 4) };
+    let mut recv = vec![0.0f32; count];
+    let recv_bytes =
+        unsafe { std::slice::from_raw_parts_mut(recv.as_mut_ptr().cast::<u8>(), count * 4) };
+    let mut sent = 0usize;
+    let mut received = 0usize;
+    while sent < send_bytes.len() || received < recv_bytes.len() {
+        let mut event = libc::pollfd {
+            fd,
+            events: 0,
+            revents: 0,
+        };
+        if sent < send_bytes.len() {
+            event.events |= libc::POLLOUT;
+        }
+        if received < recv_bytes.len() {
+            event.events |= libc::POLLIN;
+        }
+        if unsafe { libc::poll(&mut event, 1, -1) } < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error.into());
+        }
+        if event.revents & libc::POLLOUT != 0 && sent < send_bytes.len() {
+            let n = unsafe {
+                libc::send(
+                    fd,
+                    send_bytes[sent..].as_ptr().cast(),
+                    send_bytes.len() - sent,
+                    libc::MSG_NOSIGNAL,
+                )
+            };
+            if n > 0 {
+                sent += n as usize;
+            }
+        }
+        if event.revents & libc::POLLIN != 0 && received < recv_bytes.len() {
+            let n = unsafe {
+                libc::recv(
+                    fd,
+                    recv_bytes[received..].as_mut_ptr().cast(),
+                    recv_bytes.len() - received,
+                    0,
+                )
+            };
+            if n > 0 {
+                received += n as usize;
+            } else if n == 0 {
+                return Err(std::io::Error::other("cross peer closed").into());
+            }
+        }
+    }
+    Ok(recv)
 }
 
 fn main() -> AnyResult<()> {
@@ -232,14 +287,14 @@ fn main() -> AnyResult<()> {
             let mut cross_values = vec![vec![0.0f32; count]; 4];
             let (sender, receiver) = std::sync::mpsc::channel();
             thread::scope(|scope| {
-                for channel in 0..4 {
+                for (channel, source) in crosses.iter().enumerate() {
                     let begin = channel * part;
                     let end = if channel == 3 { count } else { begin + part };
                     let payload = sum[begin..end].to_vec();
-                    let stream = crosses[channel].try_clone().expect("cross clone");
+                    let stream = source.try_clone().expect("cross clone");
                     let sender = sender.clone();
                     scope.spawn(move || {
-                        let result = exchange(stream, payload, end - begin)
+                        let result = exchange_poll(stream, &payload, end - begin)
                             .map(|values| (channel, begin, values));
                         let _ = sender.send(result);
                     });
