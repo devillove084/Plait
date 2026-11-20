@@ -1018,10 +1018,11 @@ pub fn run_gpu_demo() -> Result<(), Box<dyn std::error::Error>> {
 /// the NCCL `all_reduce_perf` harness. This is intentionally separate from the
 /// consensus matrix runner: it measures the GPU data plane, not agreement.
 pub fn run_collectives_demo(
-    gpus: usize,
+    ranks: usize,
     bytes: usize,
     iters: usize,
     algorithm: &str,
+    trace: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use plait_collective::{AllReduceAlgorithm, PeerGroup};
     use std::time::Instant;
@@ -1034,13 +1035,13 @@ pub fn run_collectives_demo(
     };
 
     let available = cudarc_device_count();
-    let gpus = if gpus == 0 { available } else { gpus };
-    if gpus < 2 {
-        return Err(format!("collectives need at least 2 GPUs, found {available}").into());
+    let ranks = if ranks == 0 { available } else { ranks };
+    if ranks < 2 {
+        return Err(format!("collectives need at least 2 ranks, found {available}").into());
     }
-    let group = PeerGroup::new(gpus)?;
+    let mut group = PeerGroup::new(ranks)?;
     let count = (bytes / std::mem::size_of::<f32>()).max(1);
-    let inputs: Vec<Vec<f32>> = (0..gpus)
+    let inputs: Vec<Vec<f32>> = (0..ranks)
         .map(|rank| {
             (0..count)
                 .map(|index| (rank + 1) as f32 + (index % 17) as f32 * 0.001)
@@ -1049,8 +1050,8 @@ pub fn run_collectives_demo(
         .collect();
     let expected: Vec<f32> = (0..count)
         .map(|index| {
-            let sum = (1..=gpus).sum::<usize>() as f32;
-            sum + (index % 17) as f32 * 0.001 * gpus as f32
+            let sum = (1..=ranks).sum::<usize>() as f32;
+            sum + (index % 17) as f32 * 0.001 * ranks as f32
         })
         .collect();
     for _ in 0..5 {
@@ -1065,17 +1066,28 @@ pub fn run_collectives_demo(
         }
     }
     let start = Instant::now();
+    if trace.is_some() {
+        group.enable_trace(iters.saturating_mul(group.world_size()).max(1));
+    }
     for _ in 0..iters {
         group.all_reduce(&inputs, algorithm)?;
     }
     let seconds = start.elapsed().as_secs_f64() / iters as f64;
     let allreduce_bytes = count * std::mem::size_of::<f32>();
     let algbw = allreduce_bytes as f64 / seconds / 1e9;
-    let busbw = algbw * 2.0 * (gpus - 1) as f64 / gpus as f64;
+    let busbw = algbw * 2.0 * (ranks - 1) as f64 / ranks as f64;
     println!(
-        "plait collectives: {algorithm:?} allreduce gpus={gpus} bytes={allreduce_bytes} time_ms={:.6} algbw_GB/s={algbw:.3} busbw_GB/s={busbw:.3}",
+        "plait collectives: {algorithm:?} allreduce ranks={} bytes={allreduce_bytes} time_ms={:.6} algbw_GB/s={algbw:.3} busbw_GB/s={busbw:.3}",
+        group.world_size(),
         seconds * 1e3
     );
+    if let Some(path) = trace {
+        group.write_trace(path)?;
+        println!(
+            "plait collectives: chrome trace {} events at {path}",
+            group.trace_events().len()
+        );
+    }
     Ok(())
 }
 

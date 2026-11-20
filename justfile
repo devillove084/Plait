@@ -46,7 +46,7 @@ hetero: setup
     cargo run -q --locked -p plait-node -- hetero
 
 collectives: setup
-    cargo run -q --locked -p plait-node -- collectives
+    cargo run -q --locked -p plait-node -- collectives --trace target/collectives-trace.json
 
 matrix: setup
     ./scripts/matrix-local.sh

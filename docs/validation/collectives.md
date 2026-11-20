@@ -24,7 +24,26 @@ yet.
   host.
 
 The API lives in `crates/plait-collective/src/lib.rs`. `just collectives` runs
-the one-megabyte all-reduce benchmark.
+the one-megabyte all-reduce benchmark and writes a Chrome trace.
+
+## Rank model and Chrome timeline
+
+The public API uses `RankId` and `PeerGroup::world_size()` / `rank()`. This
+initial implementation assigns one rank per visible GPU. The bench prints
+`ranks=...`, not `gpus=...`.
+
+`PeerGroup::enable_trace(capacity)` records one `X` event per rank for every
+collective, with `tid = rank`. `PeerGroup::write_trace(path)` emits the Chrome
+Trace Event JSON format. Load it in `chrome://tracing` or Perfetto:
+
+```sh
+just collectives
+# produces target/collectives-trace.json
+```
+
+The trace is opt-in: when disabled there is no mutex on the collective hot
+path. The buffer is preallocated, event names are static strings, and no
+per-event `String` is allocated.
 
 ## Measured performance
 
