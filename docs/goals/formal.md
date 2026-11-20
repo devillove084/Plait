@@ -67,8 +67,8 @@ conditional on a correct SCC partition.
 - [ ] Model message loss, duplication, and reordering.
 - [x] Check liveness for the single-instance ordering model
   (`PlaitOrderingTiny`).
-- [ ] Check liveness for the full multi-instance recovery model; the current
-  state space is too large for a quick TLC pass.
+- [x] Check liveness for the two-instance recovery model
+  (`PlaitOrderingLive`).
 
 ### F3 — Modified protocol
 

@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use plait_core::NodeId;
 use plait_node::{
     NodeConfig, RunningNode, run_collectives_demo, run_demo, run_devices, run_dsa_demo,
-    run_gpu_demo, run_gpu_rdma_probe, run_hetero_demo, run_matrix_node, run_parallel_demo,
-    run_rdma_selftest,
+    run_gpu_demo, run_gpu_rdma_probe, run_hetero_demo, run_hetero_plan, run_matrix_node,
+    run_parallel_demo, run_rdma_selftest,
 };
 
 #[tokio::main]
@@ -25,6 +25,7 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         "rdma-selftest" => run_rdma_selftest().await,
         "devices" => run_devices(),
         "hetero" => run_hetero_demo(),
+        "hetero-plan" => run_hetero_plan(),
         "gpu-demo" => run_gpu_demo(),
         "gpu-rdma" => run_gpu_rdma_probe(),
         "collectives" => {

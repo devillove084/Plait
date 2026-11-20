@@ -1515,6 +1515,76 @@ pub fn run_gpu_rdma_probe() -> Result<(), Box<dyn std::error::Error>> {
 /// Manifest lines are `hex-node-id@listen-address`. The first six entries are
 /// host A, the last six are host B. Only the driver host submits the command;
 /// both hosts keep their nodes alive for `hold_seconds`.
+/// Demonstrate the heterogeneous max-min planner on the real 4+8 mix.
+pub fn run_hetero_plan() -> Result<(), Box<dyn std::error::Error>> {
+    use plait_parallel::{
+        AsymmetricLayout, HeterogeneousLayout, LinkKind, RankProfile, RankWeight,
+    };
+
+    let mut profiles = Vec::new();
+    for index in 0..4 {
+        profiles.push(RankProfile {
+            node: NodeId::derive(&format!("3090-{index}")),
+            gpus: 1,
+            compute_units: 1.0,
+            link: LinkKind::Pcie,
+            bandwidth_gbps: Some(25.0),
+            latency_us: Some(5.0),
+        });
+    }
+    for index in 0..8 {
+        profiles.push(RankProfile {
+            node: NodeId::derive(&format!("pro5000-{index}")),
+            gpus: 1,
+            compute_units: 4.0,
+            link: LinkKind::Ub,
+            bandwidth_gbps: Some(200.0),
+            latency_us: Some(2.0),
+        });
+    }
+
+    let message_bytes = 64 * 1024 * 1024;
+    let plan = HeterogeneousLayout::plan_detailed(&profiles, message_bytes)?;
+    println!(
+        "plait hetero-plan: ranks=12 message_mib=64 local_share={:.3} remote_share={:.3}",
+        plan.shares[..4].iter().map(|(_, share)| share).sum::<f64>(),
+        plan.shares[4..].iter().map(|(_, share)| share).sum::<f64>()
+    );
+    for rows in [8usize, 64, 256] {
+        let ranges = plan.layout.row_ranges(rows);
+        let local: usize = ranges[..4].iter().map(|range| range.range.len()).sum();
+        let remote: usize = ranges[4..].iter().map(|range| range.range.len()).sum();
+        println!(
+            "plait hetero-plan: rows={rows} local_rows={local} remote_rows={remote} predicted_makespan_ms={:.3}",
+            plan.makespan * 1e3
+        );
+    }
+
+    let equal = AsymmetricLayout::new(
+        profiles
+            .iter()
+            .map(|profile| RankWeight {
+                node: profile.node,
+                gpus: profile.gpus,
+                weight: 1,
+            })
+            .collect(),
+    )?;
+    let equal_ranges = equal.row_ranges(64);
+    let local_equal: usize = equal_ranges[..4]
+        .iter()
+        .map(|range| range.range.len())
+        .sum();
+    let remote_equal: usize = equal_ranges[4..]
+        .iter()
+        .map(|range| range.range.len())
+        .sum();
+    println!(
+        "plait hetero-plan: rows=64 equal_split_local={local_equal} equal_split_remote={remote_equal}"
+    );
+    Ok(())
+}
+
 pub async fn run_matrix_node(
     manifest: &str,
     local_start: usize,

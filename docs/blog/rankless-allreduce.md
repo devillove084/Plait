@@ -1,6 +1,18 @@
 # GPU 不排队，把 AllReduce 塞进共识日志
 
-先说结果。8 张 RTX PRO 5000 在同一台机器上，PCIe 拓扑，没有 NVLink。Plait 的 device ring allreduce 和 NCCL 2.30.4 跑同一组尺寸，结果是这样。
+我想做的东西，和“再写一个 NCCL”不太一样。
+
+未来几年里，一个训练集群很可能混着不同代的卡，NVLink、PCIe、UB 都在，节点会重启，会临时退出，也会重新加入。传统的 communicator 先固定一组 rank，再在这组 rank 上选 ring 或 tree。只要成员变了，group、rank 映射和通信计划都要重建。
+
+Plait 的起点是另一套东西。节点有稳定身份，没有 rank 0。每条 tensor 计算和它的通信贡献都是一条可排序命令。命令进入无主日志，日志给出全序。一个 operator 的所有 contributor 都提交完，副本在本地把结果合出来。
+
+![Plait 的控制面与数据面](assets/plait-architecture.png)
+
+这套结构的目标不是把每个 collective 都做成日志消息。控制信息和小 partial 走日志，大 tensor 走注册内存和单向 descriptor。日志负责“谁在什么时候贡献了什么”，数据面负责把字节搬过去。
+
+## 为什么值得折腾
+
+先看结果。8 张 RTX PRO 5000 在同一台机器上，PCIe 拓扑，没有 NVLink。Plait 的 device ring allreduce 和 NCCL 2.30.4 跑同一组尺寸。
 
 | 消息大小 | Plait | NCCL |
 |---:|---:|---:|
@@ -8,17 +20,15 @@
 | 16 MiB | 16.3 GB/s | 12.72 GB/s |
 | 64 MiB | 15.7 GB/s | 13.60 GB/s |
 
-这不是把 NCCL 包一层。Plait 里没有固定进程组，没有 rank 0，没有“所有 GPU 先到齐再开始”的全局 barrier。集合通信被拆成一条条可排序的命令，命令本身就是状态转移。
+这组数字来自同一台机器、同一批 GPU、同一组 warmup 和迭代次数。它只覆盖单机 allreduce，不是完整训练吞吐，也不代表 Plait 已经全面替代 NCCL。
 
-这篇文章讲三件事。这个结构怎么跑起来，4×3090 加 8×Pro 5000 这种不对等集群怎么分活，哪些地方还没有做完。
-
-![Plait 的控制面与数据面](assets/plait-architecture.png)
+Plait 想解决的是结构问题。NCCL 的 communicator 仍然围绕固定 rank 组工作。Plait 把成员、依赖和状态转移都放进日志。4+8 的异构分片、TP/EP/DP 的 contributor 集合、节点重加入，都可以是一条命令，不需要重建整个 communicator。
 
 ## 一条命令如何变成一次 AllReduce
 
-传统 collective 先约定一个 group，再按 rank 编号决定每个进程读写哪一段。进程组里通常有一个根，或者一条固定环。成员变化、节点重启、异构卡混插，都要改 group 和 rank 映射。
+传统 collective 先约定 group，再按 rank 编号决定每个进程读写哪一段。进程组里通常有一个根，或者一条固定环。成员变化、节点重启、异构卡混插，都要改 group 和 rank 映射。
 
-Plait 换了一个起点。每个节点有稳定的 128 位 `NodeId`，它从不等于数组下标，也不因为成员变化而改号。节点把一条命令提案到无主日志，日志给出全序。命令可以是声明一个 fused operator，也可以是提交某个 contributor 的局部结果。
+Plait 里，每个节点有稳定的 128 位 `NodeId`。它从不等于数组下标，也不因为成员变化而改号。节点把命令提案到无主日志，日志给出全序。命令可以是声明一个 fused operator，也可以是提交某个 contributor 的局部结果。
 
 一个 operator 长这样。
 
@@ -36,7 +46,7 @@ OpSpec {
 
 这套路径的快慢，取决于两件事。日志只承载控制信息和小的 partial，大 tensor 走注册内存和单向 descriptor。互相冲突的命令按依赖排序，互不冲突的 SCC 可以并行执行。
 
-我在 `ExecutionGraph` 里把 ready frontier 做成在线 SCC 凝聚图。一个新依赖边如果闭合环，就把环上的组件合并。执行时整个组件一起出队，冲突边不拆开。这样做的直接结果是，独立 operator 不会被一条无关的全局 barrier 拦住。
+`ExecutionGraph` 把 ready frontier 做成在线 SCC 凝聚图。一个新依赖边如果闭合环，就把环上的组件合并。执行时整个组件一起出队，冲突边不拆开。这样做的直接结果是，独立 operator 不会被一条无关的全局 barrier 拦住。
 
 ## 4×3090 和 8×Pro 5000 怎么分
 
@@ -62,7 +72,23 @@ b_i = latency_i
 8 × RTX PRO 5000 UB,   compute 4.0, 200 Gbps
 ```
 
-解出来是 `local_share=0.111`，`remote_share=0.889`。64 行的矩阵里，4 张 3090 合计拿约 7 行，8 张 Pro 5000 拿其余 57 行。8 行的 demo 会出现整数量化把 local 抹成 0 的情况，这个边界我在文档里写清楚了，调度器应该优先看分数份额，不要只看行数。
+仓库里有一个可以直接跑的 demo。
+
+```bash
+cargo run -q -p plait-node -- hetero-plan
+```
+
+输出是
+
+```text
+plait hetero-plan: ranks=12 message_mib=64 local_share=0.111 remote_share=0.889
+plait hetero-plan: rows=8 local_rows=0 remote_rows=8 predicted_makespan_ms=27.822
+plait hetero-plan: rows=64 local_rows=7 remote_rows=57 predicted_makespan_ms=27.822
+plait hetero-plan: rows=256 local_rows=28 remote_rows=228 predicted_makespan_ms=27.822
+plait hetero-plan: rows=64 equal_split_local=21 equal_split_remote=43
+```
+
+64 行的时候，平均分会给 4 张 3090 共 21 行，LP 只给 7 行。8 行的 demo 会出现整数量化把 local 抹成 0 的情况，这个边界在文档里写清楚了。调度器应该优先看分数份额，不要只看行数。
 
 ![4+8 异构行份额](assets/hetero-4plus8.png)
 
@@ -78,9 +104,27 @@ Plait 在 1 MiB 到 64 MiB 的 allreduce 上领先，原因不神秘。小消息
 
 边界同样明确。上面的数字只覆盖单机 allreduce，不是完整训练吞吐。矩阵校验用 12 个逻辑 contributor 跑 `DP2×TP3×EP2`，8×8×6 和 64×64×64 的 checksum 都是 103 和 197，和 NCCL 的 float allreduce 对得上。但矩阵路径包含日志协议、12 次提案和 CPU f64 参考，不适合拿来吹带宽。
 
-## 参考了哪些论文
+## TLA 证明到什么程度
 
-这套东西不是凭空想出来的。下面几篇对我的设计影响最大。
+我们在 `specs/` 下留了有限 TLA 模型，统一用 TLC 跑。
+
+```text
+PlaitExecutionGraphSmall   3 节点调度器
+PlaitExecutionGraphFive    5 节点调度器
+PlaitOrderingSmall         ballot / preaccept / accept / commit / recovery
+PlaitOrderingLive          两 instance recovery liveness
+PlaitOrderingTiny          单实例 liveness
+PlaitUnified               容量 / 计算 / 融合 / 提交 / 执行
+PlaitUnifiedTiny           统一模型 liveness
+```
+
+检查的性质包括 `Agreement`、`CommittedStable`、`CommittedDepsStable`、`CapacityBound`、`FusionSound`、`CommitAfterFusion`、`DependencyClosure`。
+
+ordering safety 和 liveness 的 TLC 跑过 1,986,053 个状态，271,441 个不同状态，没有报错。统一设计的 TLC 跑过 738,227 个不同状态。模型里包含了异构容量、贡献完整性、融合前置条件、dependency 顺序和最终执行。
+
+这些结果证明的是有限抽象下的不变量。它不证明 Rust 代码和 TLA 每一步等价。我们后来把“严格 recovery”改成按成本选路，重算、snapshot replay、recovery ballot 三者取最小。这个选择只对确定性的 shard 成立，已经提交的命令仍然走共识。
+
+## 参考了哪些论文
 
 HeteCCL 把异构 GPU 集群的 collective 调度写成 MILP，用 DSL 描述硬件和传输约束，再合成近似最优 schedule。我的 4+8 线性规划比它小得多，但问题形状一致。
 
@@ -107,23 +151,6 @@ https://proceedings.mlsys.org/paper_files/paper/2020/file/cd3a9a55f7f3723133fa4a
 华为 UB 的 multicast 工作也值得看。它把“复制”和“归约”往网络里推，和 Plait 把 partial 放进日志是两种不同的融合方向。
 
 https://arxiv.org/pdf/2605.22428v1
-
-## TLA 证明到什么程度
-
-我们在 `specs/` 下留了五组有限模型，统一用 `tlc` 跑。
-
-```text
-PlaitExecutionGraphSmall   3 节点调度器
-PlaitExecutionGraphFive    5 节点调度器
-PlaitOrderingSmall         ballot / preaccept / accept / commit / recovery
-PlaitOrderingTiny          单实例 liveness
-PlaitUnified               容量 / 计算 / 融合 / 提交 / 执行
-PlaitUnifiedTiny           统一模型 liveness
-```
-
-检查的性质包括 `Agreement`、`CommittedStable`、`CommittedDepsStable`、`CapacityBound`、`FusionSound`、`CommitAfterFusion`、`DependencyClosure`。ordering safety 的 TLC 跑过 271,441 个不同状态，统一设计的 TLC 跑过 738,227 个不同状态，没有报错。
-
-这些结果证明的是有限抽象下的不变量。它不证明 Rust 代码和 TLA 每一步等价，也不覆盖消息丢失、重复、重排和完整 recovery liveness。我们后来把“严格 recovery”改成按成本选路，重算、snapshot replay、recovery ballot 三者取最小。这个选择只对确定性的 shard 成立，已经提交的命令仍然走共识。
 
 ## 还没做完的
 
