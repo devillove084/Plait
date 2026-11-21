@@ -11,6 +11,11 @@
 *.profdata
 perf.data*
 
+# Python build products
+__pycache__/
+*.py[cod]
+*.so
+
 # Editor state
 .idea/
 .vscode/

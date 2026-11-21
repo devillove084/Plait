@@ -1,0 +1,16 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "plait-nccl"
+version = "0.2.0"
+description = "Plait NCCL-compatible collective backend for PyTorch/vLLM"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+[tool.maturin]
+manifest-path = "crates/plait-nccl/Cargo.toml"
+module-name = "plait_nccl._plait_nccl"
+features = ["python"]
+python-source = "python"

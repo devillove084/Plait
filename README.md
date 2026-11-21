@@ -164,6 +164,10 @@ Measured with 4 local RTX 3090 ranks and 8 remote RTX PRO 5000 ranks:
 errors=0
 ```
 
+`crates/plait-nccl` provides a PyO3 NCCL-compatible communicator for vLLM.
+`PLAIT_NCCL_SHM=1` enables the host-mapped local path and
+`PLAIT_NCCL_KERNEL=1` enables the single-stream GPU-kernel allreduce path.
+
 Run it with:
 
 ```bash
@@ -193,6 +197,7 @@ The script expects `tlc` on `PATH`.
 | `plait-device` | device discovery and capability scheduling |
 | `plait-gpu` | CUDA AXPY and CUTLASS SGEMM execution |
 | `plait-node` | cluster process, client, benchmarks, demos |
+| `plait-nccl` | PyO3 NCCL-compatible communicator for PyTorch/vLLM |
 
 Design documents:
 
@@ -203,13 +208,15 @@ Design documents:
 - [docs/parallelism.md](docs/parallelism.md) — parallelism-axis mapping
 - [docs/rdma.md](docs/rdma.md) — verbs backend and setup
 - [docs/goals/tcp-parity.md](docs/goals/tcp-parity.md) — TCP/NCCL acceptance goal
+- [docs/nccl-python.md](docs/nccl-python.md) — vLLM/Python NCCL compatibility backend
+- [docs/rankless-nccl.md](docs/rankless-nccl.md) — rankless groups and vendor backends
 - [specs/](specs/) — TLA+ models and TLC configurations
 
 ## Limitations
 
 - No authentication or encryption. The transport trusts the network.
 - No durable state. Restart with the same identity is not handled.
-- No verified cross-host GPU-buffer collective.
+- No verified cross-host GPU-buffer collective outside the host-staged `plait-nccl` TCP path.
 - Only NVIDIA has a real kernel adapter. AMD, Huawei, and PPU profiles are
   discovered and scheduled, but their kernel adapters are not implemented.
 - LL/LL128 remain opt-in and are slower on the tested PCIe host.

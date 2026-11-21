@@ -11,6 +11,7 @@ members = [
     "crates/plait-rdma",
     "crates/plait-net",
     "crates/plait-node",
+    "crates/plait-nccl",
 ]
 resolver = "2"
 
@@ -39,6 +40,7 @@ plait-mem = { path = "crates/plait-mem" }
 plait-parallel = { path = "crates/plait-parallel" }
 plait-rdma = { path = "crates/plait-rdma" }
 plait-net = { path = "crates/plait-net" }
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "fallback-dynamic-loading", "cuda-13020"] }
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"

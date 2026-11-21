@@ -54,3 +54,9 @@ collectives: setup
 ipc: setup
     ./scripts/ipc-peer.sh
 
+
+python-wheel:
+    maturin build --release
+
+python-test:
+    cargo test -p plait-nccl --features python

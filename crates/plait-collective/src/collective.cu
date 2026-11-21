@@ -1,3 +1,6 @@
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
 extern "C" __global__ void plait_add_inplace(
     float* dst,
     const float* src,
@@ -287,5 +290,27 @@ extern "C" __global__ void plait_ll128_allreduce(
         }
         __syncwarp();
         __threadfence_system();
+    }
+}
+
+extern "C" __global__ void plait_add_bf16(
+    __nv_bfloat16* dst,
+    const __nv_bfloat16* src,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = __hadd(dst[i], src[i]);
+    }
+}
+
+extern "C" __global__ void plait_add_f16(
+    __half* dst,
+    const __half* src,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = __hadd(dst[i], src[i]);
     }
 }

@@ -177,6 +177,32 @@ impl PeerRegion {
     }
 
     /// Copy bytes from this region into a peer region without host staging.
+    pub fn copy_from_device(&self, source: u64, bytes: usize) -> Result<()> {
+        if bytes > self.bytes {
+            return Err(CollectiveError::new("device copy exceeds region"));
+        }
+        self.bind()?;
+        check(
+            unsafe { sys::cuMemcpyDtoDAsync_v2(self.ptr, source, bytes, std::ptr::null_mut()) },
+            "cuMemcpyDtoDAsync",
+        )?;
+        self.sync()
+    }
+
+    pub fn copy_to_device(&self, destination: u64, bytes: usize) -> Result<()> {
+        if bytes > self.bytes {
+            return Err(CollectiveError::new("device copy exceeds region"));
+        }
+        self.bind()?;
+        check(
+            unsafe {
+                sys::cuMemcpyDtoDAsync_v2(destination, self.ptr, bytes, std::ptr::null_mut())
+            },
+            "cuMemcpyDtoDAsync",
+        )?;
+        self.sync()
+    }
+
     pub fn copy_to(&self, destination: &PeerRegion, bytes: usize) -> Result<()> {
         if bytes > self.bytes || bytes > destination.bytes {
             return Err(CollectiveError::new("peer copy exceeds region"));
@@ -266,8 +292,13 @@ impl AddKernel {
         ))
     }
 
-    /// `destination += source` over `count` f32 values.
-    pub fn add(&self, destination: &PeerRegion, source: &PeerRegion, count: usize) -> Result<()> {
+    fn add_with(
+        &self,
+        function: sys::CUfunction,
+        destination: &PeerRegion,
+        source: &PeerRegion,
+        count: usize,
+    ) -> Result<()> {
         if count == 0 {
             return Ok(());
         }
@@ -286,7 +317,7 @@ impl AddKernel {
         check(
             unsafe {
                 sys::cuLaunchKernel(
-                    self.function,
+                    function,
                     blocks,
                     1,
                     1,
@@ -302,6 +333,41 @@ impl AddKernel {
             "cuLaunchKernel",
         )?;
         check(unsafe { sys::cuCtxSynchronize() }, "cuCtxSynchronize")
+    }
+
+    /// `destination += source` over `count` f32 values.
+    pub fn add(&self, destination: &PeerRegion, source: &PeerRegion, count: usize) -> Result<()> {
+        self.add_with(self.function, destination, source, count)
+    }
+
+    pub fn add_bf16(
+        &self,
+        destination: &PeerRegion,
+        source: &PeerRegion,
+        count: usize,
+    ) -> Result<()> {
+        let name = CString::new("plait_add_bf16").expect("kernel name");
+        let mut function = std::ptr::null_mut();
+        check(
+            unsafe { sys::cuModuleGetFunction(&mut function, self.module, name.as_ptr()) },
+            "cuModuleGetFunction bf16",
+        )?;
+        self.add_with(function, destination, source, count)
+    }
+
+    pub fn add_f16(
+        &self,
+        destination: &PeerRegion,
+        source: &PeerRegion,
+        count: usize,
+    ) -> Result<()> {
+        let name = CString::new("plait_add_f16").expect("kernel name");
+        let mut function = std::ptr::null_mut();
+        check(
+            unsafe { sys::cuModuleGetFunction(&mut function, self.module, name.as_ptr()) },
+            "cuModuleGetFunction f16",
+        )?;
+        self.add_with(function, destination, source, count)
     }
 }
 
