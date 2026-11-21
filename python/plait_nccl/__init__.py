@@ -226,6 +226,41 @@ def patch_vllm(disable_custom_allreduce: bool = True) -> None:
         parallel_state.set_custom_all_reduce(False)
 
 
+
+
+def preferred_linear_backend(device: int | None = None, quantization: str | None = None) -> str:
+    """Pick a vLLM quantized-linear backend for this GPU and checkpoint.
+
+    SM120 (RTX PRO 5000 Blackwell) gets Humming, including NVFP4. Ampere keeps
+    Marlin for W4A16 checkpoints and Cutlass for FP8, so a heterogeneous
+    deployment can use the same checkpoint on both host groups.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return "auto"
+    major, minor = torch.cuda.get_device_capability(device)
+    if (major, minor) >= (12, 0):
+        return "humming"
+    if quantization in {"awq", "gptq", "awq_marlin", "gptq_marlin"}:
+        return "marlin"
+    if (major, minor) >= (8, 9):
+        return "cutlass"
+    return "cutlass"
+
+
+def kernel_config(device: int | None = None, quantization: str | None = None):
+    """Return a vLLM ``KernelConfig`` tuned for this GPU.
+
+    Pass it as ``LLM(..., kernel_config=kernel_config(...))``. The allreduce
+    path is unchanged: quantized weights still produce bf16/fp16 activations,
+    which Plait's NCCL kernel already handles.
+    """
+    from vllm.config import KernelConfig
+
+    backend = preferred_linear_backend(device, quantization)
+    return KernelConfig(linear_backend=backend, moe_backend=backend)
+
 __all__ = [
     "NCCLLibrary",
     "CommHandle",
@@ -234,6 +269,8 @@ __all__ = [
     "ncclUniqueId",
     "patch_vllm",
     "patch_vllm_control",
+    "preferred_linear_backend",
+    "kernel_config",
 ]
 
 
