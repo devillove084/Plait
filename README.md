@@ -167,6 +167,9 @@ errors=0
 `crates/plait-nccl` provides a PyO3 NCCL-compatible communicator for vLLM.
 `PLAIT_NCCL_SHM=1` enables the host-mapped local path and
 `PLAIT_NCCL_KERNEL=1` enables the single-stream GPU-kernel allreduce path.
+`plait_nccl.kernel_config(device, quantization)` returns a vLLM `KernelConfig`
+using Humming on SM120 and Marlin/Cutlass on Ampere; the collective itself
+stays bf16/fp16.
 
 Run it with:
 
