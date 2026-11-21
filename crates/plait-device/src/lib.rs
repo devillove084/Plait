@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::process::Command;
 
+use cudarc::driver::{CudaContext, sys};
 use plait_core::{AcceleratorKind, ComputeRequirement, DeviceId, DeviceProfile, NodeId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,6 +121,42 @@ pub fn discover(node: NodeId) -> Vec<DeviceProfile> {
     profiles
 }
 
+/// Quantization GEMM kernels that are both present in vLLM and useful for a
+/// device. `marlin` is the W4A16 path that works on Ampere; `humming` and
+/// `b12x` are the Blackwell mixed-precision/NVFP4 paths. Capability is read
+/// from the `[cc X.Y, N SM]` suffix emitted by discovery, so this remains a
+/// pure profile query with no driver call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KernelCaps {
+    pub marlin: bool,
+    pub humming: bool,
+    pub b12x: bool,
+    pub fp8: bool,
+    pub nvfp4: bool,
+}
+
+pub fn compute_capability(profile: &DeviceProfile) -> Option<(u8, u8)> {
+    let start = profile.name.find("[cc ")? + 4;
+    let rest = &profile.name[start..];
+    let version = rest.split(',').next()?.trim();
+    let (major, minor) = version.split_once('.')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
+pub fn kernel_caps(profile: &DeviceProfile) -> KernelCaps {
+    let (major, minor) = compute_capability(profile).unwrap_or((0, 0));
+    let sm = major * 10 + minor;
+    KernelCaps {
+        marlin: sm >= 75,
+        // vLLM's Humming mixed-precision path targets Blackwell; Ampere and
+        // Ada keep Marlin so the same checkpoint can run on every rank.
+        humming: sm >= 100,
+        b12x: sm >= 120,
+        fp8: sm >= 89,
+        nvfp4: sm >= 100,
+    }
+}
+
 fn cpu_profile(node: NodeId) -> Option<DeviceProfile> {
     let memory = fs::read_to_string("/proc/meminfo")
         .ok()
@@ -166,6 +203,14 @@ fn discover_nvidia(node: NodeId) -> Vec<DeviceProfile> {
     parse_nvidia(&String::from_utf8_lossy(&output.stdout), node)
 }
 
+fn nvidia_sm_count(index: u32) -> Option<u32> {
+    let context = CudaContext::new(index as usize).ok()?;
+    context
+        .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+        .ok()
+        .and_then(|value| u32::try_from(value).ok())
+}
+
 fn parse_nvidia(text: &str, node: NodeId) -> Vec<DeviceProfile> {
     let mut profiles = Vec::new();
     for line in text.lines() {
@@ -181,14 +226,26 @@ fn parse_nvidia(text: &str, node: NodeId) -> Vec<DeviceProfile> {
         };
         let clock_mhz = fields[3].parse::<u64>().unwrap_or(0);
         let name = fields[1];
-        let flops = clock_mhz.saturating_mul(1_000_000).saturating_mul(128);
+        let capability = fields[4].trim();
+        let sm_count = nvidia_sm_count(index).unwrap_or(1);
+        let tensor_ops_per_sm = match capability {
+            "12.0" => 256,
+            "9.0" => 256,
+            "8.9" => 128,
+            "8.6" => 128,
+            _ => 128,
+        };
+        let flops = (sm_count as u64)
+            .saturating_mul(clock_mhz)
+            .saturating_mul(1_000_000)
+            .saturating_mul(tensor_ops_per_sm);
         profiles.push(DeviceProfile {
             id: DeviceId::new(node, index),
-            name: format!("{name} [{}]", fields[4]),
+            name: format!("{name} [cc {capability}, {sm_count} SM]"),
             arch: AcceleratorKind::Nvidia,
             memory_bytes: memory_mib.saturating_mul(1024 * 1024),
             flops,
-            compute_units: 1,
+            compute_units: sm_count,
             supports_fp16: true,
             supports_bf16: true,
             supports_fp64: true,
@@ -453,5 +510,41 @@ mod tests {
             registry.select(&any, SchedulingPolicy::LeastLoaded),
             Some(first)
         );
+    }
+
+    fn profile_with_name(name: &str) -> DeviceProfile {
+        DeviceProfile {
+            id: DeviceId::new(NodeId::derive(name), 0),
+            name: name.to_owned(),
+            arch: AcceleratorKind::Nvidia,
+            memory_bytes: 24 << 30,
+            flops: 1,
+            compute_units: 82,
+            supports_fp16: true,
+            supports_bf16: true,
+            supports_fp64: true,
+            rdma_capable: false,
+            numa_node: None,
+        }
+    }
+
+    #[test]
+    fn kernel_caps_split_ampere_from_blackwell() {
+        let ampere = profile_with_name("NVIDIA GeForce RTX 3090 [cc 8.6, 82 SM]");
+        assert_eq!(compute_capability(&ampere), Some((8, 6)));
+        let caps = kernel_caps(&ampere);
+        assert!(caps.marlin);
+        assert!(!caps.humming);
+        assert!(!caps.fp8);
+        assert!(!caps.nvfp4);
+
+        let blackwell = profile_with_name("NVIDIA RTX PRO 5000 72GB Blackwell [cc 12.0, 110 SM]");
+        assert_eq!(compute_capability(&blackwell), Some((12, 0)));
+        let caps = kernel_caps(&blackwell);
+        assert!(caps.marlin);
+        assert!(caps.humming);
+        assert!(caps.b12x);
+        assert!(caps.fp8);
+        assert!(caps.nvfp4);
     }
 }

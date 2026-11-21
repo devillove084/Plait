@@ -9,4 +9,5 @@ repository.workspace = true
 
 [dependencies]
 plait-core.workspace = true
+cudarc.workspace = true
 serde.workspace = true

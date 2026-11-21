@@ -400,6 +400,7 @@ dependencies = [
 name = "plait-device"
 version = "0.2.0"
 dependencies = [
+ "cudarc",
  "plait-core",
  "serde",
 ]
