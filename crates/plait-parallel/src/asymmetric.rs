@@ -7,7 +7,7 @@
 
 use std::ops::Range;
 
-use plait_core::NodeId;
+use plait_core::{DeviceProfile, NodeId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RankWeight {
@@ -115,6 +115,28 @@ pub struct RankProfile {
     pub bandwidth_gbps: Option<f64>,
     /// Measured collective latency; falls back to the link class nominal value.
     pub latency_us: Option<f64>,
+}
+
+impl RankProfile {
+    /// Build a scheduling profile from a discovered device. The advertised
+    /// FLOP rate includes SM count and per-architecture tensor throughput, so
+    /// a 110-SM SM120 rank receives a larger share than an 82-SM Ampere rank
+    /// even when both are one GPU.
+    pub fn from_device(
+        profile: &DeviceProfile,
+        link: LinkKind,
+        bandwidth_gbps: Option<f64>,
+        latency_us: Option<f64>,
+    ) -> Self {
+        Self {
+            node: profile.id.node,
+            gpus: 1,
+            compute_units: (profile.flops.max(1) as f64) / 1e12,
+            link,
+            bandwidth_gbps,
+            latency_us,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
