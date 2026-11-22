@@ -170,6 +170,9 @@ errors=0
 `plait_nccl.kernel_config(device, quantization)` returns a vLLM `KernelConfig`
 using Humming on SM120 and Marlin/Cutlass on Ampere; the collective itself
 stays bf16/fp16.
+`plait_parallel::choose_codesign` picks the smallest fitting
+`(quant format, TP group)`; eight SM120 cards therefore run 122B NVFP4 as four
+TP2 replicas, while a 4B model runs as twelve TP1 replicas.
 
 Run it with:
 
