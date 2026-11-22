@@ -88,7 +88,6 @@ def main() -> int:
                 "--gpu-memory-utilization",
                 str(args.gpu_memory_utilization),
                 "--trust-remote-code",
-                "--disable-log-requests",
             ]
             if not args.no_enforce_eager:
                 command.append("--enforce-eager")
