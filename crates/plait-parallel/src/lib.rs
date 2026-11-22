@@ -7,6 +7,7 @@
 
 pub mod asymmetric;
 pub mod cluster;
+pub mod codesign;
 pub mod dp;
 pub mod dsa;
 pub mod moe;
@@ -20,6 +21,9 @@ pub use asymmetric::{
     AsymmetricLayout, HeterogeneousLayout, LinkKind, RankProfile, RankWeight, WeightedRowRange,
 };
 pub use cluster::LocalCluster;
+pub use codesign::{
+    CodesignPlan, DeviceQuantPlan, KernelBackend, ParallelMode, QuantFormat, choose_codesign,
+};
 pub use dp::{DpConfig, DpError, DpOutput, DpRunner, GlobalDp};
 pub use dsa::{DsaConfig, DsaError, DsaOutput, DsaRunner, GlobalDsa};
 pub use moe::{GlobalMoe, MoeConfig, MoeError, MoeOutput, MoeRunner};

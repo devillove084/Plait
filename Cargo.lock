@@ -477,6 +477,7 @@ version = "0.2.0"
 dependencies = [
  "plait-consensus",
  "plait-core",
+ "plait-device",
  "plait-fabric",
  "plait-mem",
  "serde",

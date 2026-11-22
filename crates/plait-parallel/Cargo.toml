@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 plait-core.workspace = true
+plait-device.workspace = true
 plait-consensus.workspace = true
 plait-fabric.workspace = true
 plait-mem.workspace = true
