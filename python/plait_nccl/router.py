@@ -4,7 +4,7 @@ The router is deliberately model-agnostic: a tier advertises its context,
 quality class, quantization format, and an OpenAI-compatible endpoint. The
 default tiers match the measured 4-local/8-remote layout:
 
-* local 4x3090: Qwen3.5-4B BF16, cheap short prompts
+* local 4x3090: Qwen3.5-9B W4A16 (Marlin), cheap short prompts
 * remote 8xPRO: Qwen3.5-35B-A3B-FP8, long prompts
 * remote 8xPRO: Qwen3.5-122B-A10B-NVFP4, high-quality/long-context requests
 
@@ -100,12 +100,12 @@ class CapabilityRouter:
 def default_tiers(local_endpoint: str, remote_endpoint: str) -> list[Tier]:
     return [
         Tier(
-            name="local-4b",
+            name="local-9b-w4a16",
             endpoint=local_endpoint,
-            model="/mnt/nas1/hf/Qwen3.5-4B",
+            model="/mnt/nas1/hf/Qwen3.5-9B-W4A16",
             max_context=4096,
             quality=1,
-            quant="bf16",
+            quant="w4a16",
             throughput=1.0,
         ),
         Tier(
