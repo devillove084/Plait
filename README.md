@@ -173,8 +173,9 @@ stays bf16/fp16.
 `plait_parallel::choose_codesign` picks the smallest fitting
 `(quant format, TP group)`; eight SM120 cards therefore run 122B NVFP4 as four
 TP2 replicas, while a 4B model runs as twelve TP1 replicas.
-`plait_nccl.CapabilityRouter` routes local 9B-W4A16 and remote 35B-FP8 tiers; the 122B-NVFP4
-tier is disabled until the upstream vLLM Qwen3.5 TP path is validated. FP8 communication is opt-in
+`plait_nccl.CapabilityRouter` routes local 9B-W4A16, remote 35B-FP8, and remote 122B-NVFP4 tiers.
+The 122B tier requires native vLLM multiprocessing TP2; external-launcher TP
+produced degenerate Qwen3.5 output even in BF16. FP8 communication is opt-in
 (`plait_nccl.comm_quant.all_reduce_fp8`) and its accuracy/bandwidth gate
 defaults off; it is only for cross-host TP.
 

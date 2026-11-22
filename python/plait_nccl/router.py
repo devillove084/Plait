@@ -127,8 +127,9 @@ def default_tiers(local_endpoint: str, remote_endpoint: str) -> list[Tier]:
             quality=3,
             quant="nvfp4",
             throughput=0.25,
-            # Upstream vLLM 0.28 Qwen3.5 TP produces degenerate output; keep
-            # the tier out of routing until a validated TP path lands.
-            enabled=False,
+            # Must be served by native vLLM multiprocessing TP2. The
+            # external_launcher TP path produces degenerate output even at
+            # BF16; use four independent TP2 servers behind this endpoint.
+            enabled=True,
         ),
     ]
