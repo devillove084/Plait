@@ -28,10 +28,12 @@ class Tier:
     quality: int
     quant: str
     throughput: float = 1.0
+    enabled: bool = True
 
     def can_serve(self, prompt_tokens: int, max_tokens: int, quality: int) -> bool:
         return (
-            self.quality >= quality
+            self.enabled
+            and self.quality >= quality
             and prompt_tokens + max_tokens <= self.max_context
         )
 
@@ -125,5 +127,8 @@ def default_tiers(local_endpoint: str, remote_endpoint: str) -> list[Tier]:
             quality=3,
             quant="nvfp4",
             throughput=0.25,
+            # Upstream vLLM 0.28 Qwen3.5 TP produces degenerate output; keep
+            # the tier out of routing until a validated TP path lands.
+            enabled=False,
         ),
     ]
