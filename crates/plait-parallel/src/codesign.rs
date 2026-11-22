@@ -116,55 +116,48 @@ pub fn choose_codesign(
         return Err("codesign needs a non-zero weight footprint".to_owned());
     }
     let n = profiles.len() as u64;
-    for format in [
-        QuantFormat::Bf16,
-        QuantFormat::Fp8,
-        QuantFormat::NvFp4,
-        QuantFormat::W4A16,
-    ] {
-        let mut backends = Vec::with_capacity(profiles.len());
-        for profile in profiles {
-            let Some(backend) = backend(profile, format) else {
-                backends.clear();
-                break;
-            };
-            backends.push(backend);
-        }
-        if backends.is_empty() {
+    // Smallest TP group first; within a group, prefer precision over
+    // compression, with NVFP4 ahead of FP8 on Blackwell because it halves
+    // both weight traffic and shard count.
+    for tp_size in 1..=n {
+        if n % tp_size != 0 {
             continue;
         }
-        let full_bytes = (input.weight_bytes_bf16 as f64 * format.bytes_ratio()) as u64;
-        if profiles
-            .iter()
-            .all(|profile| fits(profile, input, full_bytes))
-        {
+        for format in [
+            QuantFormat::Bf16,
+            QuantFormat::NvFp4,
+            QuantFormat::Fp8,
+            QuantFormat::W4A16,
+        ] {
+            let mut backends = Vec::with_capacity(profiles.len());
+            for profile in profiles {
+                let Some(backend) = backend(profile, format) else {
+                    backends.clear();
+                    break;
+                };
+                backends.push(backend);
+            }
+            if backends.is_empty() {
+                continue;
+            }
+            let full_bytes = (input.weight_bytes_bf16 as f64 * format.bytes_ratio()) as u64;
+            let shard_bytes = full_bytes / tp_size;
+            if !profiles
+                .iter()
+                .all(|profile| fits(profile, input, shard_bytes))
+            {
+                continue;
+            }
             return Ok(CodesignPlan {
-                mode: ParallelMode::DataParallel,
+                mode: if tp_size == 1 {
+                    ParallelMode::DataParallel
+                } else {
+                    ParallelMode::TensorParallel
+                },
                 format,
                 backend: backends[0],
-                tp_size: 1,
-                replicas: profiles.len() as u32,
-                per_device: backends
-                    .iter()
-                    .map(|backend| DeviceQuantPlan {
-                        format,
-                        backend: *backend,
-                        weight_bytes: full_bytes,
-                    })
-                    .collect(),
-            });
-        }
-        let shard_bytes = full_bytes / n;
-        if profiles
-            .iter()
-            .all(|profile| fits(profile, input, shard_bytes))
-        {
-            return Ok(CodesignPlan {
-                mode: ParallelMode::TensorParallel,
-                format,
-                backend: backends[0],
-                tp_size: profiles.len() as u32,
-                replicas: 1,
+                tp_size: tp_size as u32,
+                replicas: (n / tp_size) as u32,
                 per_device: backends
                     .iter()
                     .map(|backend| DeviceQuantPlan {
@@ -257,5 +250,30 @@ mod tests {
         assert_eq!(plan.format, QuantFormat::NvFp4);
         assert_eq!(plan.backend, KernelBackend::Humming);
         assert_eq!(plan.tp_size, 2);
+    }
+
+    #[test]
+    fn eight_sm120_cards_use_four_tp2_replicas() {
+        let devices: Vec<_> = (0..8)
+            .map(|index| {
+                device(
+                    &format!("NVIDIA RTX PRO 5000 72GB Blackwell #{index} [cc 12.0, 110 SM]"),
+                    72,
+                )
+            })
+            .collect();
+        let plan = choose_codesign(
+            &devices,
+            &CodesignInput {
+                weight_bytes_bf16: 244 << 30,
+                kv_bytes: 4 << 30,
+                memory_fraction: 0.85,
+            },
+        )
+        .expect("plan");
+        assert_eq!(plan.mode, ParallelMode::TensorParallel);
+        assert_eq!(plan.format, QuantFormat::NvFp4);
+        assert_eq!(plan.tp_size, 2);
+        assert_eq!(plan.replicas, 4);
     }
 }
