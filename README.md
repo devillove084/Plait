@@ -179,6 +179,17 @@ produced degenerate Qwen3.5 output even in BF16. FP8 communication is opt-in
 (`plait_nccl.comm_quant.all_reduce_fp8`) and its accuracy/bandwidth gate
 defaults off; it is only for cross-host TP.
 
+Native TP startup (Qwen3.5 must not use `external_launcher`):
+
+```bash
+# local 4x3090 W4A16 TP1
+python scripts/serve-tiered.py --model /mnt/nas1/hf/Qwen3.5-9B-W4A16 \
+  --replicas 4 --tp 1 --port-base 8000
+# remote 8xPRO 122B-NVFP4, four independent native TP2 replicas
+python scripts/serve-tiered.py --model /mnt/nas1/hf/Qwen3.5-122B-A10B-NVFP4 \
+  --replicas 4 --tp 2 --port-base 8100 --max-model-len 1024
+```
+
 Run it with:
 
 ```bash
