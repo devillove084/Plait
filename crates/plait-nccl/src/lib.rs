@@ -426,9 +426,102 @@ fn device_to_host(
         .map_err(|_| NCCL_UNHANDLED_CUDA_ERROR)
 }
 
+/// E4M3 finite value, used by the optional quantized-communication path.
+pub(crate) fn fp8_e4m3_to_f32(bits: u8) -> f32 {
+    let sign = if bits & 0x80 == 0 { 1.0 } else { -1.0 };
+    let exponent = ((bits >> 3) & 0x0f) as i32;
+    let mantissa = (bits & 0x07) as f32;
+    if exponent == 0x0f {
+        // E4M3FN uses the last mantissa code for NaN; 0x7e is the finite
+        // maximum 448.
+        return if mantissa == 7.0 {
+            f32::NAN
+        } else {
+            sign * (1.0 + mantissa / 8.0) * 256.0
+        };
+    }
+    if exponent == 0 {
+        return sign * (mantissa / 8.0) * 2f32.powi(-6);
+    }
+    sign * (1.0 + mantissa / 8.0) * 2f32.powi(exponent - 7)
+}
+
+pub(crate) fn f32_to_fp8_e4m3(value: f32) -> u8 {
+    if value.is_nan() {
+        return 0x7f;
+    }
+    let sign = if value.is_sign_negative() { 0x80 } else { 0 };
+    let magnitude = value.abs().min(448.0);
+    if magnitude == 0.0 {
+        return sign;
+    }
+    let exponent = magnitude.log2().floor() as i32;
+    if exponent < -6 {
+        let mantissa = (magnitude / 2f32.powi(-9)).round().clamp(0.0, 7.0) as u8;
+        return sign | mantissa;
+    }
+    let mut exponent = exponent.clamp(-6, 8);
+    let mut mantissa = ((magnitude / 2f32.powi(exponent) - 1.0) * 8.0).round() as i32;
+    if mantissa == 8 {
+        exponent += 1;
+        mantissa = 0;
+    }
+    if exponent > 8 {
+        return sign | 0x7e;
+    }
+    sign | (((exponent + 7) as u8) << 3) | mantissa.clamp(0, 7) as u8
+}
+
 pub(crate) fn reduce_bytes(op: ReduceOp, dtype: DataType, buffers: &[Vec<u8>]) -> Vec<u8> {
     let slices: Vec<&[u8]> = buffers.iter().map(Vec::as_slice).collect();
     reduce_slices(op, dtype, &slices)
+}
+
+/// Reduce FP8 E4M3 payloads in FP32 and return an FP32 byte buffer. The
+/// vLLM-facing allreduce API has a single dtype, so the quantized path needs
+/// this explicit mixed-input/mixed-output helper to avoid quantizing the sum
+/// a second time.
+pub(crate) fn reduce_fp8_to_f32(buffers: &[Vec<u8>]) -> Vec<u8> {
+    let Some(first) = buffers.first() else {
+        return Vec::new();
+    };
+    let mut values = vec![0.0f32; first.len()];
+    for buffer in buffers {
+        for (index, byte) in buffer.iter().enumerate() {
+            values[index] += fp8_e4m3_to_f32(*byte);
+        }
+    }
+    values
+        .into_iter()
+        .flat_map(|value| value.to_ne_bytes())
+        .collect()
+}
+
+fn all_reduce_fp8_host(comm: &Comm, send: &[u8]) -> Result<Vec<u8>, NcclResult> {
+    let mut network = comm.network.lock().unwrap();
+    if comm.world == 1 {
+        return Ok(reduce_fp8_to_f32(&[send.to_vec()]));
+    }
+    if comm.rank == 0 {
+        let mut buffers = Vec::with_capacity(comm.world);
+        buffers.push(send.to_vec());
+        for peer in &mut network.peers {
+            let mut buffer = vec![0u8; send.len()];
+            recv_exact(peer, &mut buffer).map_err(|_| NCCL_UNHANDLED_CUDA_ERROR)?;
+            buffers.push(buffer);
+        }
+        let result = reduce_fp8_to_f32(&buffers);
+        for peer in &mut network.peers {
+            send_all(peer, &result).map_err(|_| NCCL_UNHANDLED_CUDA_ERROR)?;
+        }
+        Ok(result)
+    } else {
+        let root = network.root.as_mut().unwrap();
+        send_all(root, send).map_err(|_| NCCL_UNHANDLED_CUDA_ERROR)?;
+        let mut result = vec![0u8; send.len() * 4];
+        recv_exact(root, &mut result).map_err(|_| NCCL_UNHANDLED_CUDA_ERROR)?;
+        Ok(result)
+    }
 }
 
 pub(crate) fn reduce_slices(op: ReduceOp, dtype: DataType, buffers: &[&[u8]]) -> Vec<u8> {
@@ -520,6 +613,30 @@ pub(crate) fn reduce_slices(op: ReduceOp, dtype: DataType, buffers: &[&[u8]]) ->
                 output.extend_from_slice(&bf16::from_f32(value).to_bits().to_ne_bytes());
             }
             output
+        }
+        DataType::Float8e4m3 => {
+            let mut values = vec![0.0f32; bytes];
+            for (index, byte) in buffers[0].iter().enumerate() {
+                values[index] = fp8_e4m3_to_f32(*byte);
+            }
+            for buffer in &buffers[1..] {
+                for (index, byte) in buffer.iter().enumerate() {
+                    let value = fp8_e4m3_to_f32(*byte);
+                    values[index] = match op {
+                        ReduceOp::Sum | ReduceOp::Avg => values[index] + value,
+                        ReduceOp::Prod => values[index] * value,
+                        ReduceOp::Max => values[index].max(value),
+                        ReduceOp::Min => values[index].min(value),
+                    };
+                }
+            }
+            if matches!(op, ReduceOp::Avg) {
+                let n = buffers.len() as f32;
+                for value in &mut values {
+                    *value /= n;
+                }
+            }
+            values.into_iter().map(f32_to_fp8_e4m3).collect::<Vec<u8>>()
         }
         _ => {
             // Integer sums are byte-width preserving and sufficient for the
@@ -1820,6 +1937,25 @@ impl CommHandle {
         )
     }
 
+    fn all_reduce_fp8_to_f32(&self, send: u64, recv: u64, count: usize) -> i32 {
+        let comm = unsafe { &*self.ptr };
+        if count == 0 {
+            return NCCL_SUCCESS;
+        }
+        let mut host = vec![0u8; count];
+        if device_to_host(comm.runtime.as_ref(), send, &mut host).is_err() {
+            return NCCL_UNHANDLED_CUDA_ERROR;
+        }
+        let result = match all_reduce_fp8_host(comm, &host) {
+            Ok(result) => result,
+            Err(error) => return error,
+        };
+        if host_to_device(comm.runtime.as_ref(), recv, &result).is_err() {
+            return NCCL_UNHANDLED_CUDA_ERROR;
+        }
+        NCCL_SUCCESS
+    }
+
     fn all_gather(&self, send: u64, recv: u64, count: usize, dtype: i32) -> i32 {
         ncclAllGather(
             send as *const std::ffi::c_void,
@@ -1998,6 +2134,31 @@ mod tests {
             .flat_map(|value| bf16::from_f32(*value).to_bits().to_ne_bytes())
             .collect();
         assert_eq!(sum, expected);
+    }
+
+    #[test]
+    fn fp8_e4m3_roundtrips_within_quantization_error() {
+        for value in [0.0f32, 1.0, -1.0, 0.1, -0.1, 448.0, -448.0] {
+            let bits = f32_to_fp8_e4m3(value);
+            let decoded = fp8_e4m3_to_f32(bits);
+            let tolerance = value.abs().max(1.0) * 0.07;
+            assert!(
+                (decoded - value).abs() <= tolerance,
+                "{value} -> {bits:#04x} -> {decoded}"
+            );
+        }
+        assert!(fp8_e4m3_to_f32(f32_to_fp8_e4m3(448.0)).is_finite());
+        assert!(fp8_e4m3_to_f32(0x7f).is_nan());
+    }
+
+    #[test]
+    fn reduces_fp8_e4m3_in_float32_accumulator() {
+        let left: Vec<u8> = [1.0f32, 2.0].iter().map(|v| f32_to_fp8_e4m3(*v)).collect();
+        let right: Vec<u8> = [3.0f32, 4.0].iter().map(|v| f32_to_fp8_e4m3(*v)).collect();
+        let sum = reduce_bytes(ReduceOp::Sum, DataType::Float8e4m3, &[left, right]);
+        let decoded: Vec<f32> = sum.iter().map(|bits| fp8_e4m3_to_f32(*bits)).collect();
+        assert!((decoded[0] - 4.0).abs() < 0.3);
+        assert!((decoded[1] - 6.0).abs() < 0.4);
     }
 
     #[test]

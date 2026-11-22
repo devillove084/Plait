@@ -20,6 +20,7 @@ import time
 from typing import Any
 
 from . import _plait_nccl
+from .router import CapabilityRouter, Tier, default_tiers
 
 SUCCESS = 0
 VERSION = 23004
@@ -61,6 +62,11 @@ class CommHandle:
         self, send: int, recv: int, count: int, dtype: int, op: int, stream: int
     ) -> int:
         return self._handle.all_reduce_stream(send, recv, count, dtype, op, stream)
+
+    def all_reduce_fp8_to_f32(
+        self, send: int, recv: int, count: int
+    ) -> int:
+        return self._handle.all_reduce_fp8_to_f32(send, recv, count)
 
     def all_gather(self, send: int, recv: int, count: int, dtype: int) -> int:
         return self._handle.all_gather(send, recv, count, dtype)
@@ -271,6 +277,9 @@ __all__ = [
     "patch_vllm_control",
     "preferred_linear_backend",
     "kernel_config",
+    "CapabilityRouter",
+    "Tier",
+    "default_tiers",
 ]
 
 
