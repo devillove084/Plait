@@ -5,7 +5,7 @@
 \* and Complete models the ordered commit authorizing delivery after reduction.
 EXTENDS Naturals, FiniteSets
 
-CONSTANTS StopOldShard, AllowRevoke, AllowExpire, AllowFailure, SharedEpoch
+CONSTANTS StopOldShard, HoldOldPull, AllowRevoke, AllowExpire, AllowFailure, SharedEpoch
 VARIABLES active, revoked, admitted, pending, published, pulled, prefix, committed, delivered, failed
 
 Ops == {1, 2}
@@ -33,6 +33,7 @@ LiveGrant(o) == o \in pending /\ (admitted[o] # Old \/ ~revoked)
 Admit(o) ==
     /\ active = (IF SharedEpoch THEN Old ELSE o)
     /\ admitted[o] = 0
+    /\ (HoldOldPull /\ o = New) => 2 \in published[Old]
     /\ admitted' = [admitted EXCEPT ![o] = active]
     /\ pending' = pending \cup {o}
     /\ UNCHANGED <<active, revoked, published, pulled, prefix, committed, delivered, failed>>
@@ -69,6 +70,10 @@ CloseFailedAdmission ==
 
 Collecting(o) == ~(o = Old /\ failed)
 
+\* A producer has already published the first operation's shard. Only that
+\* transfer is stalled, so the same producer can serve another operation.
+PullHeld(o, k) == HoldOldPull /\ o = Old /\ k = 2
+
 Publish(o, k) ==
     /\ LiveGrant(o)
     /\ ~(StopOldShard /\ o = Old /\ k = 2)
@@ -80,6 +85,7 @@ Pull(o, source, epoch, k) ==
     /\ Collecting(o)
     /\ o = source /\ epoch = admitted[o] /\ epoch # 0
     /\ k \in published[source] \ pulled[o]
+    /\ ~PullHeld(o, k)
     /\ pulled' = [pulled EXCEPT ![o] = @ \cup {k}]
     /\ UNCHANGED <<active, revoked, admitted, pending, published, prefix, committed, delivered, failed>>
 
@@ -133,7 +139,8 @@ ForeignPayloadRejected ==
 
 EarlyPullEnabled ==
     \A o \in Ops :
-        \A k \in published[o] \ pulled[o] : Collecting(o) => ENABLED Pull(o, o, admitted[o], k)
+        \A k \in published[o] \ pulled[o] :
+            Collecting(o) /\ ~PullHeld(o, k) => ENABLED Pull(o, o, admitted[o], k)
 
 IncrementalFoldEnabled ==
     \A o \in Ops : Collecting(o) /\ prefix[o] + 1 \in pulled[o] => ENABLED Reduce(o)
@@ -143,8 +150,15 @@ SharedWorkerCanPublish ==
         SharedEpoch /\ LiveGrant(o) /\ k \notin published[o] => ENABLED Publish(o, k)
 
 StalledOldNeverDelivers == StopOldShard => delivered[Old].count = 0
+HeldPullNeverDelivers ==
+    HoldOldPull => /\ 2 \notin pulled[Old]
+                   /\ delivered[Old] = EmptyReceipt
+                   /\ delivered[New] # EmptyReceipt =>
+                       Old \in pending /\ admitted[Old] = admitted[New] /\ 2 \in published[Old]
 FailureReportEnabled == AllowFailure /\ Old \in pending /\ ~failed => ENABLED ReportOldFailure
 FailedOldCloses == <> (failed /\ Old \notin pending)
 NewCompletes == <> (delivered[New].count # 0)
-OldDrains == (~StopOldShard /\ ~AllowRevoke /\ ~AllowExpire /\ ~AllowFailure) => <> (delivered[Old].count # 0)
+OldDrains ==
+    (~StopOldShard /\ ~HoldOldPull /\ ~AllowRevoke /\ ~AllowExpire /\ ~AllowFailure)
+        => <> (delivered[Old].count # 0)
 ====

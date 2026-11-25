@@ -1759,7 +1759,7 @@ mod tests {
                 .worker_ready_at(grant, [4; 32], address, layout.shard(grant.device))
                 .unwrap();
         }
-        for (counter, deadline) in [(2, 20), (3, 30), (4, 30)] {
+        for (counter, deadline) in [(2, 20), (3, 30), (4, 30), (5, 30)] {
             assert_eq!(
                 state.admit_w4(group, id(counter), 10, deadline),
                 Ok(ServingOutcome::W4Admitted {
@@ -1780,29 +1780,33 @@ mod tests {
             },
         };
         assert_eq!(
-            state.apply(&complete(5, 2, grants.to_vec())),
+            state.apply(&complete(6, 2, grants.to_vec())),
             Err(ServingError::W4NotAdmitted)
         );
         let mut stale = grants;
         stale[1].fence += 1;
         assert_eq!(
-            state.apply(&complete(6, 3, stale.to_vec())),
+            state.apply(&complete(7, 3, stale.to_vec())),
             Err(ServingError::GrantMismatch)
         );
+        assert_eq!(state.w4_drain(version).unwrap().pending, 3);
+
+        // A later admission on the same workers can commit while earlier work is pending.
+        let receipt = Ok(group_outcome(version, GroupPhase::Draining));
+        assert_eq!(state.apply(&complete(8, 5, grants.to_vec())), receipt);
         assert_eq!(state.w4_drain(version).unwrap().pending, 2);
 
-        let committed = complete(7, 3, grants.to_vec());
-        let receipt = Ok(group_outcome(version, GroupPhase::Draining));
+        let committed = complete(9, 3, grants.to_vec());
         assert_eq!(state.apply(&committed), receipt);
         assert_eq!(state.w4_drain(version).unwrap().pending, 1);
         assert_eq!(
-            state.apply(&complete(8, 3, grants.to_vec())),
+            state.apply(&complete(10, 3, grants.to_vec())),
             Err(ServingError::W4NotAdmitted)
         );
 
         state.quiesce(version, GroupPhase::Revoked).unwrap();
         assert_eq!(
-            state.apply(&complete(9, 4, grants.to_vec())),
+            state.apply(&complete(11, 4, grants.to_vec())),
             Err(ServingError::GrantMismatch)
         );
         assert_eq!(state.apply(&committed), receipt);
