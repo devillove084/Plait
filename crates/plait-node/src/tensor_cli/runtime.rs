@@ -282,7 +282,7 @@ async fn run_device(
         tokio::select! {
             next = inbox.recv() => {
                 let Some(invocation) = next else { return Ok(()) };
-                if invocation.response.is_closed() {
+                if invocation.response.is_closed() && matches!(invocation.request, Request::Execute(_)) {
                     continue;
                 }
                 let reply = match &mut state {
@@ -714,15 +714,7 @@ async fn serve(
                 )
                 .await;
             };
-            return match submit::execute(server, *operator).await {
-                Ok((plan, output)) => {
-                    write_frame(&mut stream, &json!({ "plan": plan })).await?;
-                    write_payload(&mut stream, &output).await
-                }
-                Err(error) => {
-                    write_frame(&mut stream, &json!({ "error": error.to_string() })).await
-                }
-            };
+            return submit::serve(&mut stream, server, *operator).await;
         }
     };
     write_frame(&mut stream, &route_local(&server.routes, request).await).await

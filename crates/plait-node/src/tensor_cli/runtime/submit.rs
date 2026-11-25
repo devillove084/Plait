@@ -15,11 +15,11 @@ use plait_parallel::precision::{
     W4Decision, W4PlacementRequest, W4Profile, W4Scope, W4Selection, plan_w4,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::net::TcpStream;
 use tokio::task::JoinSet;
 
-use super::{CALL_TIMEOUT, DispatchServer, read_frame, read_payload, write_frame};
+use super::{CALL_TIMEOUT, DispatchServer, read_frame, read_payload, write_frame, write_payload};
 use crate::tensor_cli::control::GroupControl;
 use crate::tensor_cli::w4::{self, worker::Request};
 use crate::tensor_cli::{Source, pull_contribution, reduce_transfers};
@@ -27,6 +27,7 @@ use crate::tensor_cli::{Source, pull_contribution, reduce_transfers};
 const SHARD_TIMEOUT: Duration = Duration::from_secs(40);
 const PULL_TIMEOUT: Duration = Duration::from_secs(5);
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(3);
+const CLOSE_ADMISSION_TIMEOUT: Duration = Duration::from_secs(2);
 const RESULT_RETENTION_MS: u64 = 90_000;
 
 #[derive(Deserialize, Serialize)]
@@ -48,10 +49,66 @@ struct Shard {
     decision: W4Decision,
 }
 
-pub(super) async fn execute(
+pub(super) async fn serve(
+    stream: &mut TcpStream,
     server: &Arc<DispatchServer>,
-    operator: Operator,
-) -> io::Result<(W4Selection, Vec<u8>)> {
+    mut operator: Operator,
+) -> io::Result<()> {
+    let (mut control, work, version, tracked) = match admit(server, &operator).await {
+        Ok(admission) => admission,
+        Err(error) => return write_frame(stream, &json!({ "error": error.to_string() })).await,
+    };
+    let (result, shards) = match plan_admitted(&mut control, version, work, &mut operator).await {
+        Ok((selection, plan, shards)) => {
+            let result = async {
+                let output = dispatch_and_reduce(
+                    server,
+                    &plan,
+                    &shards,
+                    operator.k as usize,
+                    &operator.activations_f16,
+                )
+                .await?;
+                complete(&mut control, version, work, &shards).await?;
+                Ok((selection, output))
+            }
+            .await;
+            (result, shards)
+        }
+        Err(error) => (Err(error), Vec::new()),
+    };
+    drop(operator);
+    let close_admission = tracked && result.is_err();
+    let reply = async {
+        match result {
+            Ok((plan, output)) => {
+                write_frame(stream, &json!({ "plan": plan })).await?;
+                write_payload(stream, &output).await
+            }
+            Err(error) => write_frame(stream, &json!({ "error": error.to_string() })).await,
+        }
+    };
+    let cleanup = async {
+        if close_admission {
+            // Fence any late dispatch before sending exact releases. Admission
+            // expiry and publication retention cover unreachable peers.
+            let finish = ServingOperation {
+                id: OpId::new(NodeId::random(), 1),
+                action: ServingAction::FinishW4 { version, work },
+            };
+            let _ = tokio::time::timeout(CLOSE_ADMISSION_TIMEOUT, control.apply(&finish)).await;
+        }
+        release(server, &shards).await;
+    };
+    // The submission slot accounts for cleanup until both futures finish.
+    let (written, ()) = tokio::join!(reply, cleanup);
+    written
+}
+
+async fn admit(
+    server: &DispatchServer,
+    operator: &Operator,
+) -> io::Result<(GroupControl, OpId, GroupVersion, bool)> {
     let [rows, _] = operator.output_shape;
     if operator.k == 0
         || rows == 0
@@ -80,29 +137,23 @@ pub(super) async fn execute(
     else {
         return Err(io::Error::other("expected W4 admission receipt"));
     };
-    let (selection, output) =
-        match execute_admitted(server, &mut control, version, work, operator).await {
-            Ok(result) => result,
-            Err(error) => {
-                if tracked {
-                    let finish = ServingOperation {
-                        id: OpId::new(NodeId::random(), 1),
-                        action: ServingAction::FinishW4 { version, work },
-                    };
-                    let _ = control.apply(&finish).await;
-                }
-                return Err(error);
-            }
-        };
+    Ok((control, work, version, tracked))
+}
+
+async fn complete(
+    control: &mut GroupControl,
+    version: GroupVersion,
+    work: OpId,
+    shards: &[Shard],
+) -> io::Result<()> {
     let completion = ServingOperation {
         id: OpId::new(NodeId::random(), 1),
         action: ServingAction::CompleteW4 {
             version,
             work,
-            grants: selection
-                .decisions
+            grants: shards
                 .iter()
-                .map(|decision| decision.shard.partial.grant)
+                .map(|shard| shard.decision.shard.partial.grant)
                 .collect(),
         },
     };
@@ -110,16 +161,15 @@ pub(super) async fn execute(
         .apply(&completion)
         .await?
         .map_err(|error| io::Error::other(format!("W4 completion rejected: {error:?}")))?;
-    Ok((selection, output))
+    Ok(())
 }
 
-async fn execute_admitted(
-    server: &Arc<DispatchServer>,
+async fn plan_admitted(
     control: &mut GroupControl,
     version: GroupVersion,
     work: OpId,
-    operator: Operator,
-) -> io::Result<(W4Selection, Vec<u8>)> {
+    operator: &mut Operator,
+) -> io::Result<(W4Selection, KSum, Vec<Shard>)> {
     let view = control.version(version).await?;
     if !matches!(view.phase, GroupPhase::Active | GroupPhase::Draining) {
         return Err(io::Error::other("the admitted W4 version lost its grants"));
@@ -150,8 +200,8 @@ async fn execute_admitted(
             .filter(|grant| endpoints.contains_key(&grant.device))
             .copied()
             .collect(),
-        scopes: operator.scopes,
-        profiles: operator.profiles,
+        scopes: std::mem::take(&mut operator.scopes),
+        profiles: std::mem::take(&mut operator.profiles),
     };
     let selection = plan_w4(&request).map_err(io::Error::other)?;
     let shards: Vec<_> = selection
@@ -175,16 +225,7 @@ async fn execute_admitted(
         partial_size(shard.decision.shard.partial)?;
     }
     plan.check_grants(&view).map_err(io::Error::other)?;
-    let result = dispatch_and_reduce(
-        server,
-        &plan,
-        &shards,
-        operator.k as usize,
-        &operator.activations_f16,
-    )
-    .await;
-    release(server, &shards).await;
-    Ok((selection, result?))
+    Ok((selection, plan, shards))
 }
 
 async fn dispatch_and_reduce(
@@ -223,11 +264,8 @@ async fn dispatch_and_reduce(
             pull_contribution(source, PULL_TIMEOUT).await
         });
     }
-    // Each shard pulls as soon as its worker publishes. Drain the tasks before
-    // releasing their immutable results, including when a sibling failed.
-    let result = reduce_transfers(plan, &mut calls).await;
-    while calls.join_next().await.is_some() {}
-    result
+    // Dropping the JoinSet on the first failure cancels sibling client tasks.
+    reduce_transfers(plan, &mut calls).await
 }
 
 async fn release(server: &Arc<DispatchServer>, shards: &[Shard]) {
@@ -284,8 +322,7 @@ mod tests {
     use super::super::Invocation;
     use super::*;
 
-    #[tokio::test]
-    async fn pulls_a_ready_shard_before_the_last_worker_finishes() {
+    fn test_shards() -> [Shard; 2] {
         let host = NodeId::derive("async-reduction-test");
         let addr = "127.0.0.1:0".parse().unwrap();
         let shard = |index| {
@@ -332,7 +369,13 @@ mod tests {
                 },
             }
         };
-        let shards = [shard(0), shard(1)];
+        [shard(0), shard(1)]
+    }
+
+    #[tokio::test]
+    async fn pulls_a_ready_shard_before_the_last_worker_finishes() {
+        let shards = test_shards();
+        let addr = shards[0].addr;
         let [slow, fast] = shards.map(|shard| shard.decision.shard.partial);
         let slow_data = PartialSource::bind(addr, slow, 2.0f32.to_le_bytes().to_vec())
             .await
@@ -383,5 +426,44 @@ mod tests {
         assert_eq!(output, 5.0f32.to_le_bytes());
         fast_worker.await.unwrap();
         slow_worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_shard_cancels_a_sibling_waiting_for_its_worker() {
+        let shards = test_shards();
+        let addr = shards[0].addr;
+        let [failed, stalled] = shards.map(|shard| shard.decision.shard.partial);
+        let (send_failed, mut failed_worker) = mpsc::channel::<Invocation>(1);
+        let (send_stalled, mut stalled_worker) = mpsc::channel::<Invocation>(1);
+        let workers = tokio::spawn(async move {
+            let mut waiting = stalled_worker.recv().await.unwrap().response;
+            failed_worker
+                .recv()
+                .await
+                .unwrap()
+                .response
+                .send(json!({ "error": "fixture rejected the shard" }))
+                .unwrap();
+            waiting.closed().await;
+        });
+        let server = Arc::new(DispatchServer {
+            addr,
+            control: crate::tensor_cli::ControlPeers::new(Vec::new(), Vec::new(), addr.to_string()),
+            routes: BTreeMap::from([
+                (failed.grant.device, send_failed),
+                (stalled.grant.device, send_stalled),
+            ]),
+            submissions: Arc::new(Semaphore::new(1)),
+        });
+        let plan = KSum::new(2, 1, vec![failed, stalled]).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let error = dispatch_and_reduce(&server, &plan, &shards, 2, &[0, 0])
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), "shard 0: fixture rejected the shard");
+            workers.await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 }

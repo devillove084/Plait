@@ -270,8 +270,16 @@ result to the caller after receiving the applied receipt. A revocation or
 admission expiry ordered first prevents delivery even if all bytes arrived.
 The receipt survives a retry of the same completion operation.
 
+A terminal shard error cancels the submitter's outstanding dispatch and pull
+tasks. The submitter reports the error while it closes the admission and
+releases partials. In-flight device calls may finish under the worker
+supervisor. Admission closure fences late work, and release matches the exact
+descriptor. Retention expiry reclaims partials when release cannot reach a
+worker. The request retains its submission slot through bounded cleanup.
+
 The current group can admit new work while an earlier epoch drains. A
 straggler in the earlier epoch holds up its own result. The TLA+ model covers
 independent publication and pull, two operations sharing workers in one epoch,
-and admission expiry between the final fold and completion.
+admission expiry between the final fold and completion, and a terminal shard
+error while another shard remains stalled.
 [Async reduction model](../specs/PlaitAsyncReduction.tla)
