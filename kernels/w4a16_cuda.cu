@@ -354,13 +354,20 @@ int humming_repack(void *handle, const void *canonical, void *packed) {
     return submitted == cudaSuccess ? cudaStreamSynchronize(session->stream) : submitted;
 }
 
-int device_launch_humming(void *handle, const plait_w4a16_shape *shape,
-                         const void *activation, const void *weight, const void *scale,
-                         const void *zero, void *output, void **completion) {
+int submit_humming(void *handle, const plait_w4a16_shape *shape,
+                   const void *activation, const void *weight, const void *scale,
+                   const void *zero, void *output, void **completion) {
     auto session = static_cast<Session *>(handle);
     return record_submission(session, completion, [&] {
         return plait_humming_launch(shape, activation, weight, scale, zero, output, session->stream);
     });
+}
+
+int device_launch_humming(void *handle, const plait_w4a16_shape *shape,
+                         const void *activation, const void *weight, const void *scale,
+                         const void *zero, void *output, void **completion) {
+    if (!shape || shape->output_bits != 16) return cudaErrorInvalidValue;
+    return submit_humming(handle, shape, activation, weight, scale, zero, output, completion);
 }
 
 const plait_w4a16_humming_api humming_api = {humming_probe, humming_repack, device_launch_humming};
@@ -390,6 +397,16 @@ const plait_w4a16_device_api api = {
 extern "C" const plait_w4a16_device_api *plait_w4a16_device_api_v1(void) {
     return &api;
 }
+
+#if defined(PLAIT_W4A16_HUMMING) && defined(PLAIT_W4_HUMMING_SHARDS)
+extern "C" int plait_w4a16_humming_f32_launch_v1(
+    void *handle, const plait_w4a16_shape *shape, const void *activation,
+    const void *weight, const void *scale, const void *zero, void *output, void **completion) {
+    if (!shape || shape->output_bits != 32 || !handle || !activation || !weight ||
+        !scale || !zero || !output || !completion) return cudaErrorInvalidValue;
+    return submit_humming(handle, shape, activation, weight, scale, zero, output, completion);
+}
+#endif
 
 extern "C" int plait_w4_completion_query_v1(void *handle, void *completion, uint32_t *ready) {
     if (!handle || !completion || !ready) return PLAIT_GPU(ErrorInvalidValue);

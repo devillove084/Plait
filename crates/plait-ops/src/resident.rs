@@ -42,6 +42,16 @@ type QuantizeF16 = unsafe extern "C" fn(
     *mut *mut c_void,
 ) -> i32;
 type CompletionQuery = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u32) -> i32;
+type HummingLaunch = unsafe extern "C" fn(
+    *mut c_void,
+    *const Shape,
+    *const c_void,
+    *const c_void,
+    *const c_void,
+    *const c_void,
+    *mut c_void,
+    *mut *mut c_void,
+) -> i32;
 
 #[repr(C)]
 struct DeviceApi {
@@ -72,6 +82,7 @@ struct Session<'lib> {
     quantized_launch: Option<QuantizedLaunch>,
     quantize_f16: Option<QuantizeF16>,
     completion_query: Option<CompletionQuery>,
+    humming_launch_f32: Option<HummingLaunch>,
 }
 
 #[repr(C)]
@@ -93,16 +104,7 @@ struct MarlinApi {
 struct HummingApi {
     probe: unsafe extern "C" fn(*mut c_void, u32, u32, u32) -> i32,
     repack: unsafe extern "C" fn(*mut c_void, *const c_void, *mut c_void) -> i32,
-    launch: unsafe extern "C" fn(
-        *mut c_void,
-        *const Shape,
-        *const c_void,
-        *const c_void,
-        *const c_void,
-        *const c_void,
-        *mut c_void,
-        *mut *mut c_void,
-    ) -> i32,
+    launch: HummingLaunch,
 }
 
 impl Drop for Session<'_> {
@@ -285,6 +287,9 @@ impl<'lib> DeviceSession<'lib> {
             completion_query: unsafe { library.get(b"plait_w4_completion_query_v1") }
                 .ok()
                 .map(|symbol| *symbol),
+            humming_launch_f32: unsafe { library.get(b"plait_w4a16_humming_f32_launch_v1") }
+                .ok()
+                .map(|symbol| *symbol),
         })))
     }
 
@@ -349,6 +354,14 @@ impl<'lib> DeviceSession<'lib> {
         &self,
         weights: W4Weights<'_>,
     ) -> Result<PreparedW4A16<'lib>, OperatorError> {
+        self.prepare_humming_kernel(weights, None)
+    }
+
+    fn prepare_humming_kernel(
+        &self,
+        weights: W4Weights<'_>,
+        launch_f32: Option<HummingLaunch>,
+    ) -> Result<PreparedW4A16<'lib>, OperatorError> {
         let session = &self.0;
         type Entry = unsafe extern "C" fn() -> *const HummingApi;
         let entry = unsafe { session.library.get::<Entry>(b"plait_w4a16_humming_api_v1") }
@@ -384,8 +397,30 @@ impl<'lib> DeviceSession<'lib> {
             kernel: Kernel::Humming {
                 api,
                 zero: Buffer::upload(session, &zeros)?,
+                launch_f32,
             },
         })
+    }
+
+    /// Prepare Humming for FP32 output on a matching weight shape.
+    pub fn prepare_humming_f32(
+        &self,
+        weights: W4Weights<'_>,
+    ) -> Result<PreparedW4A16<'lib>, OperatorError> {
+        let launch = self.0.humming_launch_f32.ok_or(OperatorError::Unsupported(
+            "library has no FP32 Humming output",
+        ))?;
+        // The tensor-core path decodes the INT4 weights in FP16 before MMA.
+        let scale_limit = half::f16::MAX.to_f32() / 15.0;
+        if weights.scales.iter().any(|&bits| {
+            let scale = half::f16::from_bits(bits).to_f32();
+            !scale.is_finite() || scale.abs() > scale_limit
+        }) {
+            return Err(OperatorError::Unsupported(
+                "Humming shard weight scales exceed the FP16 dequantization range",
+            ));
+        }
+        self.prepare_humming_kernel(weights, Some(launch))
     }
 
     /// Upload a row-major FP16 tensor. The host slice may be reused on return.
@@ -560,6 +595,7 @@ enum Kernel<'lib> {
     Humming {
         api: &'lib HummingApi,
         zero: Buffer<'lib>,
+        launch_f32: Option<HummingLaunch>,
     },
 }
 
@@ -676,13 +712,20 @@ impl<'lib> PreparedW4A16<'lib> {
                 ));
             }
         }
-        if matches!(self.kernel, Kernel::Humming { .. })
-            && (bias.is_some() || output != OutputType::F16)
-        {
+        if matches!(self.kernel, Kernel::Humming { .. }) && bias.is_some() {
             return Err(OperatorError::Unsupported(
-                "Humming requires an FP16 output without fused bias",
+                "Humming does not support fused bias",
             ));
         }
+        let humming_launch = match &self.kernel {
+            Kernel::Humming { launch_f32, .. } if output == OutputType::F32 => {
+                Some(launch_f32.ok_or(OperatorError::Unsupported(
+                    "Humming weights were not prepared for FP32 output",
+                ))?)
+            }
+            Kernel::Humming { api, .. } => Some(api.launch),
+            _ => None,
+        };
         let kernel_buffer = match &self.kernel {
             Kernel::Reference { zero } | Kernel::Humming { zero, .. } => zero,
             Kernel::Marlin { workspace, .. } => workspace,
@@ -722,7 +765,8 @@ impl<'lib> PreparedW4A16<'lib> {
                         buffer,
                         event,
                     ),
-                    Kernel::Humming { api, zero } => (api.launch)(
+                    Kernel::Humming { zero, .. } => humming_launch
+                        .expect("Humming output validated")(
                         session.handle.as_ptr(),
                         shape,
                         input.buffer.ptr(),

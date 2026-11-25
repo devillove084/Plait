@@ -15,9 +15,8 @@ use serde_json::{Value, json};
 use tokio::task::JoinSet;
 
 use super::{
-    ControlPeers, DeviceSession, Digest, GroupControl, NativeW4A16, PreparedW4A16, Sha256,
-    W4Decision, W4Device, W4Scope, W4WeightInput, activation_format, check_expiry,
-    validate_decision,
+    ControlPeers, DeviceSession, Digest, GroupControl, NativeW4A16, Sha256, W4Decision, W4Device,
+    W4Partition, W4Scope, W4WeightInput, activation_format, check_expiry, validate_decision,
 };
 const MAX_PUBLISHED: usize = 8;
 const MAX_PULLS: usize = 8;
@@ -151,7 +150,7 @@ struct ResidentWorker<'lib> {
     grant: WorkerGrant,
     scope: W4Scope,
     device: DeviceSession<'lib>,
-    linear: PreparedW4A16<'lib>,
+    linear: W4Partition<'lib>,
     control: GroupControl,
     published: Arc<Mutex<Publications>>,
     addr: SocketAddr,
@@ -200,7 +199,14 @@ pub(in crate::tensor_cli) async fn run(
     // The local deployment configuration chooses a trusted native device library.
     let backend = unsafe { NativeW4A16::load(&command.device.library) }?;
     let device = backend.open_device(command.device.ordinal)?;
-    let linear = device.prepare(weights)?;
+    let linear = W4Partition::prepare(&device, weights)?;
+    if linear.humming.is_some() {
+        eprintln!(
+            "resident W4 using Humming FP32 output for A16, N={} K={}",
+            command.output_columns,
+            end - start
+        );
+    }
     drop(input);
 
     let listener = PartialListener::bind(command.listen).await?;
@@ -270,11 +276,12 @@ impl ResidentWorker<'_> {
         let rows = partial.output_shape[0];
         let mut scope = self.scope;
         scope.output_shape[0] = rows;
-        if !scope.matches(partial, self.linear.group_size()) {
+        if !scope.matches(partial, self.linear.canonical.group_size()) {
             return Err("W4 decision is outside the resident worker scope".into());
         }
         validate_decision(decision, partial, scope)?;
-        if u64::from(rows) * u64::from(self.linear.input_columns()) != activations_f16.len() as u64
+        if u64::from(rows) * u64::from(self.linear.canonical.input_columns())
+            != activations_f16.len() as u64
         {
             return Err("activation shape does not match the resident W4 invocation".into());
         }
@@ -299,9 +306,9 @@ impl ResidentWorker<'_> {
                 decision.profile.quantization,
                 self.device.supports_f16_quantization(),
             )?;
-            let values =
-                self.device
-                    .project_w4_f32(&self.linear, &activations_f16, None, activation)?;
+            let values = self
+                .linear
+                .project(&self.device, &activations_f16, activation)?;
             self.control
                 .check_worker(self.grant, Some(partial.op))
                 .await?;

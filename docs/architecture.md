@@ -281,6 +281,13 @@ The reducer accumulates the contiguous K prefix and holds later shards until
 their predecessors arrive. This preserves FP32 summation order across network
 schedules.
 
+Libraries built with `PLAIT_W4_HUMMING_SHARDS` can write the dense Humming A16
+accumulators directly to an FP32 shard. Profiling and execution select that
+path for matching compiled shapes and finite in-range weight scales. The
+worker keeps canonical and repacked weights so A4 and A8 can use their
+integer kernels. The device library and weight digests bind the resulting
+profiles to their execution path.
+
 Each resident worker can keep partials from up to eight operations, with a
 64 MiB total retention limit. A new publication at capacity returns an error.
 An exact retry can reuse its retained payload. A release or expiration frees

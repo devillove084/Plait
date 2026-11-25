@@ -386,6 +386,63 @@ fn native_chains_reference_and_marlin_on_one_queue() {
 }
 
 #[cfg(feature = "native")]
+#[test]
+fn native_humming_writes_fp32_accumulators_for_shards() {
+    use plait_ops::native::{NativeW4A16, W4Activation};
+    use std::path::Path;
+
+    let Some(library) = std::env::var_os("PLAIT_HUMMING_F32_TEST_LIBRARY") else {
+        return;
+    };
+    let dims = std::env::var("PLAIT_HUMMING_TEST_NK").unwrap_or_else(|_| "256,512".into());
+    let (n, k) = dims.split_once(',').expect("shape is N,K");
+    let (n, k) = (n.parse::<u32>().unwrap(), k.parse::<u32>().unwrap());
+    let groups = k / 128;
+    let backend = unsafe { NativeW4A16::load(Path::new(&library)) }.unwrap();
+    let device = backend.open_device(0).unwrap();
+    let packed: Vec<_> = (0..n * k / 2).map(|i| (i * 47 + i / 17) as u8).collect();
+    let scales: Vec<_> = (0..n * groups)
+        .map(|i| half((1 + (i % 4)) as f32 / 256.0))
+        .collect();
+    let zeros: Vec<_> = (0..n * groups).map(|i| ((i * 5) % 16) as u8).collect();
+    let weights = W4Weights::new(k, n, 128, &packed, &scales, Some(&zeros)).unwrap();
+    let mut overflow_scales = scales.clone();
+    overflow_scales[0] = f16::MAX.to_bits();
+    let overflow = W4Weights::new(k, n, 128, &packed, &overflow_scales, Some(&zeros)).unwrap();
+    assert!(matches!(
+        device.prepare_humming_f32(overflow),
+        Err(plait_ops::OperatorError::Unsupported(_))
+    ));
+    let linear = device.prepare_humming_f32(weights).unwrap();
+    let mut would_round = 0;
+    for rows in [1, 33, 65] {
+        let activations: Vec<_> = (0..rows * k)
+            .map(|i| half(((i * 53 % 193) as i32 - 96) as f32 / 128.0))
+            .collect();
+        let expected = W4A16::new(weights, &activations, None, OutputType::F32)
+            .unwrap()
+            .run_cpu();
+        let pending = device
+            .submit_w4_f32(&linear, &activations, None, W4Activation::F16)
+            .unwrap();
+        if device.supports_completion_query() {
+            poll_producer(&pending);
+        }
+        let actual = pending.read().unwrap();
+        assert_eq!(actual, expected, "M={rows}");
+        let LinearOutput::F32(values) = actual else {
+            panic!("expected FP32 output");
+        };
+        would_round += values
+            .iter()
+            .filter(|&&value| f16::from_f32(value).to_f32() != value)
+            .count();
+    }
+    assert!(would_round > 0);
+    println!("FP32 Humming preserves {would_round} values that FP16 would round for N={n}, K={k}");
+}
+
+#[cfg(feature = "native")]
 fn select_weights(width: u32, columns: impl IntoIterator<Item = u32>) -> Vec<u8> {
     let mut weights = Vec::new();
     for column in columns {

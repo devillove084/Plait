@@ -169,6 +169,39 @@ impl W4WeightInput {
     }
 }
 
+struct W4Partition<'lib> {
+    canonical: PreparedW4A16<'lib>,
+    humming: Option<PreparedW4A16<'lib>>,
+}
+
+impl<'lib> W4Partition<'lib> {
+    fn prepare(
+        device: &DeviceSession<'lib>,
+        weights: W4Weights<'_>,
+    ) -> Result<Self, OperatorError> {
+        let canonical = device.prepare(weights)?;
+        let humming = match device.prepare_humming_f32(weights) {
+            Ok(weights) => Some(weights),
+            Err(OperatorError::Unsupported(_)) => None,
+            Err(error) => return Err(error),
+        };
+        Ok(Self { canonical, humming })
+    }
+
+    fn project(
+        &self,
+        device: &DeviceSession<'lib>,
+        activations: &[u16],
+        activation: W4Activation,
+    ) -> Result<Vec<f32>, OperatorError> {
+        let weights = match activation {
+            W4Activation::F16 => self.humming.as_ref().unwrap_or(&self.canonical),
+            _ => &self.canonical,
+        };
+        device.project_w4_f32(weights, activations, None, activation)
+    }
+}
+
 pub(super) async fn publish(command: PublishW4) -> Result<(), Box<dyn std::error::Error>> {
     let partial = command.source.partial;
     command.device.check_partial(partial)?;
@@ -204,8 +237,8 @@ pub(super) async fn publish(command: PublishW4) -> Result<(), Box<dyn std::error
         let backend = unsafe { NativeW4A16::load(&command.device.library) }?;
         let device = backend.open_device(command.device.ordinal)?;
         let activation = activation_format(bits, quantization, device.supports_f16_quantization())?;
-        let linear = device.prepare(weights)?;
-        device.project_w4_f32(&linear, &input.activations_f16, None, activation)?
+        let linear = W4Partition::prepare(&device, weights)?;
+        linear.project(&device, &input.activations_f16, activation)?
     };
     if let Some(control) = &mut control {
         control.check_worker(partial.grant, None).await?;
@@ -272,7 +305,7 @@ pub(super) fn profile(command: ProfileW4) -> Result<(), Box<dyn std::error::Erro
     // The local deployment configuration selects a trusted Plait device library.
     let backend = unsafe { NativeW4A16::load(&command.device.library) }?;
     let device = backend.open_device(command.device.ordinal)?;
-    let linear = device.prepare(weights)?;
+    let linear = W4Partition::prepare(&device, weights)?;
     let mut profiles = Vec::new();
     let mut references: Vec<Vec<f32>> = Vec::with_capacity(cases.len());
     let device_quantization = device.supports_f16_quantization();
@@ -290,7 +323,7 @@ pub(super) fn profile(command: ProfileW4) -> Result<(), Box<dyn std::error::Erro
         let mut latency_ns = 0;
         let mut error_ppm = 0;
         for (index, &(activations, layer_norm)) in cases.iter().enumerate() {
-            let run = || device.project_w4_f32(&linear, activations, None, activation);
+            let run = || linear.project(&device, activations, activation);
             match run() {
                 Ok(_) => {}
                 Err(OperatorError::Unsupported(_)) if bits != 16 => continue 'modes,

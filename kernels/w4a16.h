@@ -113,6 +113,13 @@ typedef struct {
 
 const plait_w4a16_humming_api *plait_w4a16_humming_api_v1(void);
 
+/* Optional FP32 output on the same prepared Humming buffers and queue.
+ * Available when Humming is built with PLAIT_W4_HUMMING_SHARDS.
+ */
+int plait_w4a16_humming_f32_launch_v1(
+    void *session, const plait_w4a16_shape *shape, const void *activation,
+    const void *weight, const void *scale, const void *zero, void *output, void **completion);
+
 #ifdef __cplusplus
 }
 #endif
