@@ -1,22 +1,27 @@
+use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use plait_core::OpId;
 use plait_core::serving::{GroupPhase, WorkerGrant};
 use plait_core::tensor::KPartial;
-use plait_net::tensor::{PartialListener, partial_size};
+use plait_net::tensor::{MAX_PARTIAL_BYTES, PartialListener, partial_size};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::watch;
+use tokio::task::JoinSet;
 
 use super::{
     ControlPeers, DeviceSession, Digest, GroupControl, NativeW4A16, PreparedW4A16, Sha256,
     W4Decision, W4Device, W4Scope, W4WeightInput, activation_format, check_expiry,
     validate_decision,
 };
-use crate::tensor_cli::retryable_pull_error;
+const MAX_PUBLISHED: usize = 8;
+const MAX_PULLS: usize = 8;
+const PULL_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Deserialize)]
 pub(in crate::tensor_cli) struct WorkerW4 {
@@ -74,9 +79,71 @@ struct Published {
 }
 
 impl Published {
-    fn expired(&self) -> bool {
-        self.expires_at
-            .is_some_and(|deadline| deadline <= Instant::now())
+    fn expired(&self, now: Instant) -> bool {
+        self.expires_at.is_some_and(|deadline| deadline <= now)
+    }
+}
+
+#[derive(Default)]
+struct Publications {
+    entries: BTreeMap<OpId, Published>,
+}
+
+impl Publications {
+    fn check(
+        &mut self,
+        decision: W4Decision,
+        activation_digest: [u8; 32],
+        payload_bytes: usize,
+        now: Instant,
+    ) -> io::Result<bool> {
+        self.expire(now);
+        if let Some(entry) = self.entries.get(&decision.shard.partial.op) {
+            if entry.decision != decision || entry.activation_digest != activation_digest {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "operation already published a different resident W4 contribution",
+                ));
+            }
+            return Ok(true);
+        }
+        let retained: usize = self.entries.values().map(|entry| entry.payload.len()).sum();
+        if self.entries.len() >= MAX_PUBLISHED || payload_bytes > MAX_PARTIAL_BYTES - retained {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "resident W4 publication capacity exhausted",
+            ));
+        }
+        Ok(false)
+    }
+
+    fn publish(&mut self, entry: Published) {
+        // The worker serializes invocations. Other tasks only read or expire entries.
+        let prior = self.entries.insert(entry.decision.shard.partial.op, entry);
+        assert!(prior.is_none(), "publication was already present");
+    }
+
+    fn release(&mut self, partial: KPartial) -> bool {
+        let std::collections::btree_map::Entry::Occupied(entry) = self.entries.entry(partial.op)
+        else {
+            return false;
+        };
+        if entry.get().decision.shard.partial != partial {
+            return false;
+        }
+        entry.remove();
+        true
+    }
+
+    fn fetch(&self, partial: KPartial, now: Instant) -> Option<Bytes> {
+        self.entries
+            .get(&partial.op)
+            .filter(|entry| entry.decision.shard.partial == partial && !entry.expired(now))
+            .map(|entry| entry.payload.clone())
+    }
+
+    fn expire(&mut self, now: Instant) {
+        self.entries.retain(|_, entry| !entry.expired(now));
     }
 }
 
@@ -86,7 +153,7 @@ struct ResidentWorker<'lib> {
     device: DeviceSession<'lib>,
     linear: PreparedW4A16<'lib>,
     control: GroupControl,
-    published: watch::Sender<Option<Published>>,
+    published: Arc<Mutex<Publications>>,
     addr: SocketAddr,
 }
 
@@ -138,17 +205,17 @@ pub(in crate::tensor_cli) async fn run(
 
     let listener = PartialListener::bind(command.listen).await?;
     let addr = command.advertise.unwrap_or(listener.local_addr()?);
-    let (published, reader) = watch::channel(None);
+    let published = Arc::new(Mutex::new(Publications::default()));
     let mut worker = ResidentWorker {
         grant: command.grant,
         scope,
         device,
         linear,
         control,
-        published,
+        published: published.clone(),
         addr,
     };
-    let server = tokio::spawn(serve(listener, reader));
+    let server = tokio::spawn(serve(listener, published));
     let outcome = async {
         respond(&json!({ "ready": addr }))?;
         for line in lines {
@@ -177,17 +244,7 @@ impl ResidentWorker<'_> {
         match request {
             Request::Execute(invocation) => self.invoke(*invocation).await,
             Request::Release { partial } => {
-                let released = self.published.send_if_modified(|slot| {
-                    if slot
-                        .as_ref()
-                        .is_some_and(|item| item.decision.shard.partial == partial)
-                    {
-                        *slot = None;
-                        true
-                    } else {
-                        false
-                    }
-                });
+                let released = self.published.lock().unwrap().release(partial);
                 Ok(json!({ "released": released }))
             }
         }
@@ -206,7 +263,7 @@ impl ResidentWorker<'_> {
             return Err("result retention must be between 1 and 120000 ms".into());
         }
         let partial = decision.shard.partial;
-        partial_size(partial)?;
+        let payload_bytes = partial_size(partial)?;
         if partial.grant != self.grant {
             return Err("W4 decision has a different worker grant".into());
         }
@@ -226,28 +283,16 @@ impl ResidentWorker<'_> {
             digest.update(value.to_le_bytes());
         }
         let activation_digest = digest.finalize().into();
-        self.published.send_if_modified(|slot| {
-            if slot.as_ref().is_some_and(Published::expired) {
-                *slot = None;
-                true
-            } else {
-                false
-            }
-        });
-        let replay = if let Some(item) = self.published.borrow().as_ref() {
-            if item.decision != decision || item.activation_digest != activation_digest {
-                return Err(
-                    "release the current resident W4 contribution before submitting another".into(),
-                );
-            }
-            true
-        } else {
-            false
-        };
         self.control
             .check_worker(self.grant, Some(partial.op))
             .await?;
         check_expiry(decision)?;
+        let replay = self.published.lock().unwrap().check(
+            decision,
+            activation_digest,
+            payload_bytes,
+            Instant::now(),
+        )?;
         if !replay {
             let activation = activation_format(
                 decision.profile.activation_bits,
@@ -260,7 +305,7 @@ impl ResidentWorker<'_> {
             self.control
                 .check_worker(self.grant, Some(partial.op))
                 .await?;
-            self.published.send_replace(Some(Published {
+            self.published.lock().unwrap().publish(Published {
                 decision,
                 activation_digest,
                 payload: values
@@ -269,31 +314,35 @@ impl ResidentWorker<'_> {
                     .collect::<Vec<_>>()
                     .into(),
                 expires_at: retention_ms.map(|ms| Instant::now() + Duration::from_millis(ms)),
-            }));
+            });
         }
         Ok(json!({ "addr": self.addr, "partial": partial }))
     }
 }
 
-async fn serve(
-    listener: PartialListener,
-    reader: watch::Receiver<Option<Published>>,
-) -> io::Result<()> {
+async fn serve(listener: PartialListener, published: Arc<Mutex<Publications>>) -> io::Result<()> {
+    let mut pulls = JoinSet::new();
+    let mut expiry = tokio::time::interval(Duration::from_secs(1));
+    expiry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        let result = listener
-            .serve_next(Duration::from_secs(3), |request| {
-                reader
-                    .borrow()
-                    .as_ref()
-                    .filter(|item| item.decision.shard.partial == request && !item.expired())
-                    .map(|item| item.payload.clone())
-            })
-            .await;
-        if let Err(error) = result {
-            if !retryable_pull_error(&error) {
-                return Err(error);
+        tokio::select! {
+            connection = listener.accept(), if pulls.len() < MAX_PULLS => {
+                let connection = connection?;
+                let published = published.clone();
+                pulls.spawn(async move {
+                    connection.serve(PULL_TIMEOUT, |request| {
+                        published.lock().unwrap().fetch(request, Instant::now())
+                    }).await
+                });
             }
-            eprintln!("tensor source request failed: {error}");
+            Some(result) = pulls.join_next(), if !pulls.is_empty() => {
+                if let Err(error) = result? {
+                    eprintln!("tensor source request failed: {error}");
+                }
+            }
+            _ = expiry.tick() => {
+                published.lock().unwrap().expire(Instant::now());
+            }
         }
     }
 }
@@ -303,4 +352,146 @@ fn respond(value: &Value) -> io::Result<()> {
     serde_json::to_writer(&mut stdout, value)?;
     writeln!(stdout)?;
     stdout.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use plait_core::serving::{GroupId, GroupVersion};
+    use plait_core::{DeviceId, NodeId, ShardId};
+    use plait_net::tensor::fetch_partial;
+    use plait_parallel::precision::{W4Profile, W4Shard};
+    use tokio::net::TcpStream;
+
+    use super::*;
+
+    fn publication(counter: u64, expires_at: Option<Instant>) -> Published {
+        let node = NodeId::derive("resident-publications");
+        let device = DeviceId::new(node, 0);
+        let partial = KPartial {
+            grant: WorkerGrant {
+                version: GroupVersion {
+                    group: GroupId(node),
+                    epoch: 1,
+                },
+                device,
+                incarnation: 1,
+                fence: 2,
+            },
+            op: OpId::new(node, counter),
+            shard: ShardId(1),
+            k_start: 0,
+            k_end: 2,
+            output_shape: [1, 1],
+        };
+        let scope = W4Scope {
+            device,
+            incarnation: 1,
+            ordinal: 0,
+            library_sha256: [0; 32],
+            weights_sha256: [0; 32],
+            k_range: [0, 2],
+            output_shape: [1, 1],
+            group_size: 1,
+        };
+        Published {
+            decision: W4Decision {
+                shard: W4Shard { partial, scope },
+                profile: W4Profile {
+                    scope,
+                    calibration_id: [0; 32],
+                    activation_bits: 16,
+                    quantization: None,
+                    latency_ns: 1,
+                    error_ppm: 0,
+                    valid_until_ms: u64::MAX,
+                },
+            },
+            activation_digest: [0; 32],
+            payload: Bytes::copy_from_slice(&(counter as f32).to_le_bytes()),
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn retries_and_capacity_preserve_unreleased_publications() {
+        let mut retained = Publications::default();
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(1);
+        let first = publication(0, Some(deadline));
+        let decision = first.decision;
+        let partial = decision.shard.partial;
+        retained.publish(first);
+        let next = publication(1, None).decision;
+        assert_eq!(
+            retained
+                .check(next, [0; 32], MAX_PARTIAL_BYTES, now)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        for counter in 1..MAX_PUBLISHED as u64 {
+            let entry = publication(counter, None);
+            assert!(!retained.check(entry.decision, [0; 32], 4, now).unwrap());
+            retained.publish(entry);
+        }
+        let another = publication(MAX_PUBLISHED as u64, None).decision;
+        assert_eq!(
+            retained.check(another, [0; 32], 4, now).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(retained.check(decision, [0; 32], 4, now).unwrap());
+        assert_eq!(
+            retained
+                .check(decision, [1; 32], 4, now)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        let mut stale = partial;
+        stale.grant.fence -= 1;
+        assert!(!retained.release(stale));
+        assert!(retained.fetch(partial, now).is_some());
+        assert!(retained.fetch(partial, deadline).is_none());
+        assert!(!retained.check(another, [0; 32], 4, deadline).unwrap());
+    }
+
+    #[tokio::test]
+    async fn multiple_publications_serve_pulls_while_another_connection_stalls() {
+        let mut retained = Publications::default();
+        let first = publication(1, None);
+        let second = publication(2, None);
+        let (first_partial, second_partial) =
+            (first.decision.shard.partial, second.decision.shard.partial);
+        retained.publish(first);
+        retained.publish(second);
+        let retained = Arc::new(Mutex::new(retained));
+        let listener = PartialListener::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve(listener, retained.clone()));
+        let stalled = TcpStream::connect(addr).await.unwrap();
+        let timeout = Duration::from_secs(1);
+        for (partial, expected) in [(second_partial, 2.0f32), (first_partial, 1.0f32)] {
+            assert_eq!(
+                fetch_partial(addr, partial, timeout)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                expected.to_le_bytes()
+            );
+        }
+        assert!(retained.lock().unwrap().release(second_partial));
+        assert_eq!(
+            fetch_partial(addr, second_partial, timeout)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(fetch_partial(addr, first_partial, timeout).await.is_ok());
+        drop(stalled);
+        server.abort();
+        let _ = server.await;
+    }
 }

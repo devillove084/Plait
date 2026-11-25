@@ -13,10 +13,12 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 use super::{MAX_FRAME, codec, send_frame};
 
+pub const MAX_PARTIAL_BYTES: usize = MAX_FRAME;
+
 pub fn partial_size(partial: KPartial) -> io::Result<usize> {
     partial
         .payload_bytes()
-        .filter(|size| *size <= MAX_FRAME)
+        .filter(|size| *size <= MAX_PARTIAL_BYTES)
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "invalid partial tensor size"))
 }
 
@@ -58,6 +60,7 @@ impl PartialSource {
 
 /// An endpoint that serves contributions supplied by a local producer.
 pub struct PartialListener(TcpListener);
+pub struct PartialConnection(TcpStream);
 
 impl PartialListener {
     pub async fn bind(addr: SocketAddr) -> io::Result<Self> {
@@ -68,14 +71,29 @@ impl PartialListener {
         self.0.local_addr()
     }
 
-    /// Look up the full descriptor after reading it from the consumer.
+    /// Accept separately from service so a slow connection need not hold up another.
+    pub async fn accept(&self) -> io::Result<PartialConnection> {
+        let (stream, _) = self.0.accept().await?;
+        Ok(PartialConnection(stream))
+    }
+
     pub async fn serve_next(
         &self,
         deadline: Duration,
         lookup: impl FnOnce(KPartial) -> Option<Bytes>,
     ) -> io::Result<()> {
-        let (stream, _) = self.0.accept().await?;
-        let mut framed = Framed::new(stream, request_codec());
+        self.accept().await?.serve(deadline, lookup).await
+    }
+}
+
+impl PartialConnection {
+    /// Look up the full descriptor after reading it from the consumer.
+    pub async fn serve(
+        self,
+        deadline: Duration,
+        lookup: impl FnOnce(KPartial) -> Option<Bytes>,
+    ) -> io::Result<()> {
+        let mut framed = Framed::new(self.0, request_codec());
         let exchange = async {
             let request = framed.next().await.transpose()?.ok_or_else(closed)?;
             let payload = bincode::options()

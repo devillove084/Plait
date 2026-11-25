@@ -1,11 +1,11 @@
 ---- MODULE PlaitAsyncReduction ----
-\* Two admitted operations overlap across two epochs. Each operation uses
-\* two immutable K shards; its consumers need only this operation's plan.
+\* Two admitted operations overlap across two epochs or use the same two workers
+\* in one epoch. Each operation uses two immutable K shards.
 \* Publish and Pull model dispatch_and_reduce, Reduce models KReduction,
 \* and Deliver models the ordered grant check after reduction.
 EXTENDS Naturals, FiniteSets
 
-CONSTANTS StopOldShard, AllowRevoke
+CONSTANTS StopOldShard, AllowRevoke, SharedEpoch
 VARIABLES active, revoked, admitted, published, pulled, prefix, delivered
 
 Ops == {1, 2}
@@ -27,13 +27,13 @@ Init ==
 LiveGrant(o) == admitted[o] # 0 /\ (admitted[o] # Old \/ ~revoked)
 
 Admit(o) ==
-    /\ o = active
+    /\ active = (IF SharedEpoch THEN Old ELSE o)
     /\ admitted[o] = 0
     /\ admitted' = [admitted EXCEPT ![o] = active]
     /\ UNCHANGED <<active, revoked, published, pulled, prefix, delivered>>
 
 Activate ==
-    /\ active = Old
+    /\ ~SharedEpoch /\ active = Old
     /\ admitted[Old] = Old
     /\ active' = New
     /\ UNCHANGED <<revoked, admitted, published, pulled, prefix, delivered>>
@@ -96,6 +96,10 @@ EarlyPullEnabled ==
 
 IncrementalFoldEnabled ==
     \A o \in Ops : prefix[o] + 1 \in pulled[o] => ENABLED Reduce(o)
+
+SharedWorkerCanPublish ==
+    \A o \in Ops, k \in Shards :
+        SharedEpoch /\ LiveGrant(o) /\ k \notin published[o] => ENABLED Publish(o, k)
 
 StalledOldNeverDelivers == StopOldShard => delivered[Old].count = 0
 NewCompletes == <> (delivered[New].count # 0)
