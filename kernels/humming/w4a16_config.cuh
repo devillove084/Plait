@@ -82,11 +82,12 @@ public:
   };
 };
 
+template<uint32_t N, uint32_t K>
 class LayerConfig {
 public:
   static constexpr auto kSmVersion = PLAIT_HUMMING_SM;
-  static constexpr auto kShapeN = PLAIT_HUMMING_N;
-  static constexpr auto kShapeK = PLAIT_HUMMING_K;
+  static constexpr auto kShapeN = N;
+  static constexpr auto kShapeK = K;
   static constexpr auto kPadShapeN = 0u;
   static constexpr auto kPadShapeK = 0u;
   static constexpr auto kNumExperts = 0u;
@@ -123,8 +124,8 @@ public:
   static constexpr auto kUseNativeDequant = false;
   static constexpr auto kUseBlockScaledMma = false;
   static constexpr auto kMmaScaleGroupSize = 128u;
-  static constexpr auto kWeightShapeN = PLAIT_HUMMING_N;
-  static constexpr auto kWeightShapeK = PLAIT_HUMMING_K;
+  static constexpr auto kWeightShapeN = N;
+  static constexpr auto kWeightShapeK = K;
 };
 
 class ComputeConfig {
@@ -178,14 +179,3 @@ public:
   static constexpr auto kNumLoadThreads = 128u;
   static constexpr auto kSmemReuseModeId = 2u;
 };
-
-using SharedStorageType = SharedStorage<
-    MmaOpClass,
-    Shape<32, 128, 64>,
-    Shape<16, 64, 64>,
-    FloatingPointType<16, 5, 10>,
-    IntegerType<false, 4>,
-    FloatingPointType<16, 5, 10>,
-    LayerConfig,
-    ComputeConfig,
-    TuningConfig>;

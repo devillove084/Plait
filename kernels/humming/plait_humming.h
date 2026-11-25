@@ -7,10 +7,17 @@ extern "C" {
 #endif
 
 int plait_humming_probe(int ordinal, uint32_t n, uint32_t k, uint32_t group_size);
+int plait_humming_probe_shape(int ordinal, uint32_t n, uint32_t k, uint32_t group_size,
+                             uint32_t output_bits);
 int plait_humming_repack(const void *canonical, void *packed, void *stream);
+int plait_humming_repack_shape(uint32_t n, uint32_t k, uint32_t group_size,
+                              const void *canonical, void *packed, void *stream);
 int plait_humming_launch(const plait_w4a16_shape *shape, const void *activation,
                          const void *weight, const void *scale, const void *zero,
                          void *output, void *stream);
+int plait_humming_launch_shape(const plait_w4a16_shape *shape, const void *activation,
+                               const void *weight, const void *scale, const void *zero,
+                               void *output, void *stream);
 
 #ifdef __cplusplus
 }

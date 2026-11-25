@@ -638,6 +638,104 @@ fn check_tiled_marlin(path: &std::path::Path) {
 
 #[cfg(feature = "native")]
 #[test]
+fn native_humming_catalog_interleaves_shapes_on_one_queue() {
+    use plait_ops::OperatorError;
+    use plait_ops::native::NativeW4A16;
+    use std::path::Path;
+
+    let Some(path) = std::env::var_os("PLAIT_HUMMING_CATALOG_TEST_LIBRARY") else {
+        return;
+    };
+    let backend = unsafe { NativeW4A16::load(Path::new(&path)) }.unwrap();
+    let session = backend.open_device(0).unwrap();
+    let mut kernels = Vec::new();
+    let mut prepared = Vec::new();
+    for (index, (n, k)) in [(256, 512), (256, 256), (256, 768), (512, 1024)]
+        .into_iter()
+        .enumerate()
+    {
+        let group_size = 128;
+        let seed = index as u32;
+        let packed: Vec<_> = (0..n * k / 2)
+            .map(|i| (i * 59 + i / 21 + seed * 31) as u8)
+            .collect();
+        let scales: Vec<_> = (0..n * (k / group_size))
+            .map(|i| half((1 + (i + seed) % 4) as f32 / 256.0))
+            .collect();
+        let zeros: Vec<_> = (0..n * (k / group_size))
+            .map(|i| ((i * 11 + i / 7 + seed) % 16) as u8)
+            .collect();
+        let weights = W4Weights::new(k, n, group_size, &packed, &scales, Some(&zeros)).unwrap();
+        let f16 = session.prepare_humming(weights).unwrap();
+        let f32 = session.prepare_humming_f32(weights).unwrap();
+        kernels.push((f16, f32));
+        for (rows, output) in [
+            (1, OutputType::F32),
+            (33, OutputType::F16),
+            (65, OutputType::F32),
+        ] {
+            let activations: Vec<_> = (0..rows * k)
+                .map(|i| half(((i * 43 + seed * 11) % 95) as f32 / 128.0 - 0.25))
+                .collect();
+            let input = session.upload_f16(rows, k, &activations).unwrap();
+            let expected = W4A16::new(weights, &activations, None, output)
+                .unwrap()
+                .run_cpu();
+            prepared.push((index, n, k, rows, output, input, expected));
+        }
+    }
+
+    let missing_weights = vec![0x99; 256 * 384 / 2];
+    let missing_scales = vec![half(1.0); 256 * 3];
+    let missing = W4Weights::new(384, 256, 128, &missing_weights, &missing_scales, None).unwrap();
+    assert!(matches!(
+        session.prepare_humming(missing),
+        Err(OperatorError::Unsupported(_))
+    ));
+    assert!(matches!(
+        session.prepare_humming_f32(missing),
+        Err(OperatorError::Unsupported(_))
+    ));
+
+    let mut pending = Vec::new();
+    for (index, n, k, rows, output, input, expected) in prepared.into_iter().rev() {
+        let (f16, f32) = &kernels[index];
+        let linear = if output == OutputType::F32 { f32 } else { f16 };
+        let result = linear.submit(&input, None, output).unwrap();
+        pending.push((n, k, rows, output, result, expected));
+    }
+    drop(kernels);
+    for (n, k, rows, output, result, expected) in pending {
+        assert_eq!(
+            result.read().unwrap(),
+            expected,
+            "M={rows} N={n} K={k} output={output:?}"
+        );
+    }
+
+    if let Some(fp16_only) = std::env::var_os("PLAIT_HUMMING_FP16_CATALOG_TEST_LIBRARY") {
+        let backend = unsafe { NativeW4A16::load(Path::new(&fp16_only)) }.unwrap();
+        let device = backend.open_device(0).unwrap();
+        let packed = vec![0x99; 256 * 256 / 2];
+        let scales = vec![half(1.0); 256 * 2];
+        let weights = W4Weights::new(256, 256, 128, &packed, &scales, None).unwrap();
+        let linear = device.prepare_humming(weights).unwrap();
+        let activations = vec![half(0.5); 256];
+        let input = device.upload_f16(1, 256, &activations).unwrap();
+        let output = linear.submit(&input, None, OutputType::F16).unwrap();
+        assert_eq!(
+            output.read().unwrap(),
+            LinearOutput::F16(vec![half(128.0); 256])
+        );
+        assert!(matches!(
+            device.prepare_humming_f32(weights),
+            Err(OperatorError::Unsupported(_))
+        ));
+    }
+}
+
+#[cfg(feature = "native")]
+#[test]
 fn native_humming_writes_fp32_accumulators_for_shards() {
     use plait_ops::native::{NativeW4A16, W4Activation};
     use std::path::Path;

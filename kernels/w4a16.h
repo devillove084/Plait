@@ -149,6 +149,22 @@ int plait_w4a16_humming_f32_launch_v1(
     void *session, const plait_w4a16_shape *shape, const void *activation,
     const void *weight, const void *scale, const void *zero, void *output, void **completion);
 
+/* Shape-aware Humming extension. Probe returns -1 if the device, shape,
+ * weight group size, or output type is unavailable. Repack uses the supplied
+ * shape and requires n*k/2 bytes in both buffers. It does not retain probe
+ * state. Launch selects the compiled kernel for that same shape and output.
+ */
+typedef struct {
+    int (*probe)(void *session, uint32_t n, uint32_t k, uint32_t group_size, uint32_t output_bits);
+    int (*repack)(void *session, uint32_t n, uint32_t k, uint32_t group_size,
+                  const void *canonical, void *packed);
+    int (*launch)(void *session, const plait_w4a16_shape *shape,
+                  const void *activation, const void *weight, const void *scale,
+                  const void *zero, void *output, void **completion);
+} plait_w4a16_humming_api_v2_table;
+
+const plait_w4a16_humming_api_v2_table *plait_w4a16_humming_api_v2(void);
+
 #ifdef __cplusplus
 }
 #endif

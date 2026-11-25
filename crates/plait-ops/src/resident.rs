@@ -64,6 +64,9 @@ type HummingLaunch = unsafe extern "C" fn(
     *mut c_void,
     *mut *mut c_void,
 ) -> i32;
+type HummingRepackV1 = unsafe extern "C" fn(*mut c_void, *const c_void, *mut c_void) -> i32;
+type HummingRepackV2 =
+    unsafe extern "C" fn(*mut c_void, u32, u32, u32, *const c_void, *mut c_void) -> i32;
 
 #[repr(C)]
 struct DeviceApi {
@@ -126,8 +129,20 @@ struct MarlinTiledApi {
 #[repr(C)]
 struct HummingApi {
     probe: unsafe extern "C" fn(*mut c_void, u32, u32, u32) -> i32,
-    repack: unsafe extern "C" fn(*mut c_void, *const c_void, *mut c_void) -> i32,
+    repack: HummingRepackV1,
     launch: HummingLaunch,
+}
+
+#[repr(C)]
+struct HummingApiV2 {
+    probe: unsafe extern "C" fn(*mut c_void, u32, u32, u32, u32) -> i32,
+    repack: HummingRepackV2,
+    launch: HummingLaunch,
+}
+
+enum HummingRepack {
+    Legacy(HummingRepackV1),
+    Shaped(HummingRepackV2),
 }
 
 impl Drop for Session<'_> {
@@ -458,31 +473,64 @@ impl<'lib> DeviceSession<'lib> {
         &self,
         weights: W4Weights<'_>,
     ) -> Result<PreparedW4A16<'lib>, OperatorError> {
-        self.prepare_humming_kernel(weights, None)
+        self.prepare_humming_kernel(weights, OutputType::F16)
     }
 
     fn prepare_humming_kernel(
         &self,
         weights: W4Weights<'_>,
-        launch_f32: Option<HummingLaunch>,
+        output: OutputType,
     ) -> Result<PreparedW4A16<'lib>, OperatorError> {
         let session = &self.0;
-        type Entry = unsafe extern "C" fn() -> *const HummingApi;
-        let entry = unsafe { session.library.get::<Entry>(b"plait_w4a16_humming_api_v1") }
-            .map_err(|_| OperatorError::Unsupported("library has no resident Humming kernel"))?;
-        let api = unsafe { entry().as_ref() }
-            .ok_or_else(|| OperatorError::Backend("resident Humming API is null".to_owned()))?;
-        let probe = unsafe {
-            (api.probe)(
-                session.handle.as_ptr(),
-                weights.n,
-                weights.k,
-                weights.group_size,
+        let handle = session.handle.as_ptr();
+        let (n, k, group_size) = (weights.n, weights.k, weights.group_size);
+        type EntryV2 = unsafe extern "C" fn() -> *const HummingApiV2;
+        let shaped = unsafe {
+            session
+                .library
+                .get::<EntryV2>(b"plait_w4a16_humming_api_v2")
+        };
+        let (probe, repack, launch, launch_f32) = if let Ok(entry) = shaped {
+            let api = unsafe { entry().as_ref() }
+                .ok_or_else(|| OperatorError::Backend("Humming v2 API is null".to_owned()))?;
+            let bits = if output == OutputType::F32 { 32 } else { 16 };
+            let probe = unsafe { (api.probe)(handle, n, k, group_size, bits) };
+            (
+                probe,
+                HummingRepack::Shaped(api.repack),
+                api.launch,
+                (output == OutputType::F32).then_some(api.launch),
+            )
+        } else {
+            type Entry = unsafe extern "C" fn() -> *const HummingApi;
+            let entry = unsafe { session.library.get::<Entry>(b"plait_w4a16_humming_api_v1") }
+                .map_err(|_| {
+                    OperatorError::Unsupported("library has no resident Humming kernel")
+                })?;
+            let api = unsafe { entry().as_ref() }
+                .ok_or_else(|| OperatorError::Backend("Humming v1 API is null".to_owned()))?;
+            let launch_f32 = if output == OutputType::F32 {
+                Some(
+                    session
+                        .humming_launch_f32
+                        .ok_or(OperatorError::Unsupported(
+                            "library has no FP32 Humming output",
+                        ))?,
+                )
+            } else {
+                None
+            };
+            let probe = unsafe { (api.probe)(handle, n, k, group_size) };
+            (
+                probe,
+                HummingRepack::Legacy(api.repack),
+                api.launch,
+                launch_f32,
             )
         };
         if probe == -1 {
             return Err(OperatorError::Unsupported(
-                "Humming library has no kernel for this device and weight shape",
+                "Humming library has no kernel for this device, weight shape, and output type",
             ));
         }
         status("probe Humming device", probe)?;
@@ -490,7 +538,12 @@ impl<'lib> DeviceSession<'lib> {
         let canonical = Buffer::upload(session, weights.packed)?;
         let packed = Buffer::new(session, ptr::null(), weights.packed.len())?;
         status("repack Humming weights", unsafe {
-            (api.repack)(session.handle.as_ptr(), canonical.ptr(), packed.ptr())
+            match repack {
+                HummingRepack::Legacy(repack) => repack(handle, canonical.ptr(), packed.ptr()),
+                HummingRepack::Shaped(repack) => {
+                    repack(handle, n, k, group_size, canonical.ptr(), packed.ptr())
+                }
+            }
         })?;
         Ok(PreparedW4A16 {
             k: weights.k,
@@ -499,7 +552,7 @@ impl<'lib> DeviceSession<'lib> {
             packed,
             scale: Buffer::upload(session, &scales)?,
             kernel: Kernel::Humming {
-                api,
+                launch,
                 zero: Buffer::upload(session, &zeros)?,
                 launch_f32,
             },
@@ -511,9 +564,6 @@ impl<'lib> DeviceSession<'lib> {
         &self,
         weights: W4Weights<'_>,
     ) -> Result<PreparedW4A16<'lib>, OperatorError> {
-        let launch = self.0.humming_launch_f32.ok_or(OperatorError::Unsupported(
-            "library has no FP32 Humming output",
-        ))?;
         // The tensor-core path decodes the INT4 weights in FP16 before MMA.
         let scale_limit = half::f16::MAX.to_f32() / 15.0;
         if weights.scales.iter().any(|&bits| {
@@ -524,7 +574,7 @@ impl<'lib> DeviceSession<'lib> {
                 "Humming shard weight scales exceed the FP16 dequantization range",
             ));
         }
-        self.prepare_humming_kernel(weights, Some(launch))
+        self.prepare_humming_kernel(weights, OutputType::F32)
     }
 
     /// Upload a row-major FP16 tensor. The host slice may be reused on return.
@@ -698,7 +748,7 @@ enum Kernel<'lib> {
         workspace: MarlinWorkspace<'lib>,
     },
     Humming {
-        api: &'lib HummingApi,
+        launch: HummingLaunch,
         zero: Buffer<'lib>,
         launch_f32: Option<HummingLaunch>,
     },
@@ -844,7 +894,7 @@ impl<'lib> PreparedW4A16<'lib> {
                     "Humming weights were not prepared for FP32 output",
                 ))?)
             }
-            Kernel::Humming { api, .. } => Some(api.launch),
+            Kernel::Humming { launch, .. } => Some(*launch),
             _ => None,
         };
         let scratch_bytes = match &self.kernel {
