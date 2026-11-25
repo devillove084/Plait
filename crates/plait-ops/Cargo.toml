@@ -1,0 +1,18 @@
+[package]
+name = "plait-ops"
+description = "Quantized linear operators and native execution for Plait"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT AND Apache-2.0"
+repository.workspace = true
+
+[features]
+default = []
+native = ["dep:libloading"]
+cuda-marlin = ["native", "dep:cudarc"]
+
+[dependencies]
+cudarc = { workspace = true, optional = true }
+half = "2"
+libloading = { version = "0.8", optional = true }

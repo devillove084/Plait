@@ -178,6 +178,15 @@ pub struct Snapshot {
     pub executed_order: Vec<InstanceId>,
 }
 
+/// Changes since the last durable snapshot or flush of a local replica.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReplicaDelta {
+    pub config: ClusterConfig,
+    pub counters: BTreeMap<NodeId, u64>,
+    pub records: Vec<(InstanceId, Record)>,
+    pub executed_tail: Vec<InstanceId>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Options {
     /// Time to wait for the fast quorum before retrying preaccept.

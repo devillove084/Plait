@@ -95,7 +95,7 @@ rule and records the same placement.
   benchmark.
 - **A4 — hardware.** No RDMA device in the local or remote container; the backend
   compiles and links, and its two-QP path runs only on a host with an RNIC or
-  Soft-RoCE. The remote host does expose 8 NVIDIA RTX PRO 5000 72GB GPUs.
+  Soft-RoCE. The remote host does expose 8 NVIDIA Blackwell GPUs.
 - **A5 — vendor kernels are adapters.** Discovery, capability matching, compute
   conflicts, scheduling, and placement are implemented; CUDA/ROCm/CANN/PPU
   kernel execution is the next adapter layer.
@@ -439,7 +439,7 @@ meaning of a contribution.
 | Interfaces / data model | 4/5 | Concrete command, descriptor, endpoint, record schemas |
 
 **Total: 34/40. Weakest dimension: multi-host/vendor performance evidence.** The
-local 4× RTX 3090 and remote 8× RTX PRO 5000 hosts both executed real AXPY and
+local 4× NVIDIA Ampere and remote 8× NVIDIA Blackwell hosts both executed real AXPY and
 CUTLASS SGEMM; the async TCP control plane and a real Soft-RoCE two-QP transfer
 were validated. Still unmeasured: multi-host RDMA traffic, AMD/Huawei/PPU
 kernels, and 3/5/8-voter commit p99 under load.

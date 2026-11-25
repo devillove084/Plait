@@ -7,11 +7,17 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["rdma"]
+rdma = ["dep:plait-rdma"]
+
 [[bin]]
 name = "plait-node"
 path = "src/main.rs"
 
 [dependencies]
+bincode.workspace = true
+bytes.workspace = true
 plait-core.workspace = true
 plait-consensus.workspace = true
 plait-device.workspace = true
@@ -19,7 +25,16 @@ plait-fabric.workspace = true
 plait-gpu.workspace = true
 plait-collective.workspace = true
 plait-parallel.workspace = true
-plait-rdma.workspace = true
 plait-net.workspace = true
+plait-ops = { path = "../plait-ops", features = ["native"] }
 rand.workspace = true
-tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["fs", "process"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+plait-rdma = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

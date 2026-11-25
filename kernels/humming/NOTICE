@@ -1,0 +1,13 @@
+The Rust word packing in crates/plait-ops/src/packing.rs is adapted from
+common_pack_weight in the Humming device header
+humming/include/humming/kernel/pack_weight.cuh.
+
+Upstream: https://github.com/vllm-project/humming
+Revision: 8c787fb9702fec8e533274903959ec253199c69e
+License: Apache License, Version 2.0 (see LICENSE).
+
+The headers in include/humming are the unmodified transitive includes of the
+upstream humming.cuh GEMM and process.cuh weight repacker at the same revision.
+w4a16_config.cuh adapts the upstream Humming JIT configuration for dense
+groupwise W4A16, and plait-ops adapts the scale and zero point permutations
+from humming/transform.py.

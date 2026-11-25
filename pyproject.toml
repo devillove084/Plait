@@ -9,8 +9,12 @@ description = "Plait NCCL-compatible collective backend for PyTorch/vLLM"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 
+[project.entry-points."vllm.general_plugins"]
+plait_w4a16 = "plait_ops:register_vllm"
+
 [tool.maturin]
 manifest-path = "crates/plait-nccl/Cargo.toml"
 module-name = "plait_nccl._plait_nccl"
 features = ["python"]
 python-source = "python"
+python-packages = ["plait_nccl", "plait_ops"]

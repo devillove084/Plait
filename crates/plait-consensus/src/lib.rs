@@ -11,6 +11,6 @@ pub mod types;
 pub use execution::{EdgeKinds, ExecutionGraph};
 pub use replica::{Replica, StateMachine};
 pub use types::{
-    Attrs, Ballot, InstanceId, Message, Options, Outbound, Phase, ProposeError, Record, Snapshot,
-    Value, ValueState,
+    Attrs, Ballot, InstanceId, Message, Options, Outbound, Phase, ProposeError, Record,
+    ReplicaDelta, Snapshot, Value, ValueState,
 };

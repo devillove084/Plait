@@ -213,6 +213,43 @@ fn concurrent_conflicting_proposals_converge() {
 }
 
 #[test]
+fn a_restarted_voter_orders_a_lagging_proposal_after_an_applied_conflict() {
+    let first_voter = node("applied-first");
+    let recovered_voter = node("applied-recovered");
+    let lagging_voter = node("applied-lagging");
+    let mut sim = Sim::new(&[first_voter, recovered_voter, lagging_voter]);
+    let first = sim.propose(first_voter, publish(1));
+    sim.deliver_where(|_, to, _| *to != lagging_voter);
+    assert_eq!(sim.book(first_voter).order, [first]);
+    assert_eq!(sim.book(recovered_voter).order, [first]);
+    assert!(sim.book(lagging_voter).order.is_empty());
+
+    let snapshot = sim.nodes[&recovered_voter].snapshot();
+    sim.nodes.insert(
+        recovered_voter,
+        Replica::from_snapshot(recovered_voter, snapshot, sim.options.clone()),
+    );
+    let second = sim.propose(lagging_voter, publish(2));
+    sim.deliver_where(|from, to, message| {
+        *from != first_voter
+            && *to != first_voter
+            && !matches!(message, Message::Commit { id, .. } | Message::PreAccept { id, .. } if *id == first)
+    });
+    assert_eq!(sim.book(recovered_voter).order, [first, second]);
+    assert!(sim.book(lagging_voter).order.is_empty());
+
+    // Drop the original delivery. The lagging voter must fetch the decision.
+    sim.queue.retain(|(_, to, message)| {
+        *to != lagging_voter
+            || !matches!(message, Message::Commit { id, .. } | Message::PreAccept { id, .. } if *id == first)
+    });
+    sim.tick_all(10);
+    sim.pump();
+    sim.assert_consistent(2);
+    assert_eq!(sim.book(lagging_voter).order, [first, second]);
+}
+
+#[test]
 fn minority_cannot_commit_but_majority_can() {
     let ids = [node("a"), node("b"), node("c"), node("d"), node("e")];
     let mut sim = Sim::new(&ids);

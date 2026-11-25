@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::device::{ComputeRequirement, DeviceId, DeviceProfile};
 use crate::identity::NodeId;
+use crate::serving::{GroupId, RouteSetId, ServingOperation};
 use crate::tensor::{ShardId, TensorId, TensorKey};
 
 /// A command's replication identity. Operator ids are minted by a node, not by
@@ -85,6 +86,10 @@ pub enum Key {
     /// A physical accelerator. Compute tasks that reserve the same device
     /// conflict; tasks on different devices can execute concurrently.
     Device(DeviceId),
+    ServingGroup(GroupId),
+    HostMemory(NodeId),
+    ServingOperation(OpId),
+    ServingRoutes(RouteSetId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +163,7 @@ pub enum Command {
     /// and result; Plait ordering orders it by input/output tensors and device key.
     Compute(ComputeTask),
     Membership(MembershipChange),
+    Serving(Box<ServingOperation>),
 }
 
 impl Key {
@@ -167,7 +173,10 @@ impl Key {
     pub const fn class(self) -> KeyClass {
         match self {
             Self::Tensor(_) | Self::Op(_) => KeyClass::Data,
-            Self::Device(_) => KeyClass::Device,
+            Self::Device(_) | Self::HostMemory(_) => KeyClass::Device,
+            Self::ServingGroup(_) | Self::ServingOperation(_) | Self::ServingRoutes(_) => {
+                KeyClass::Control
+            }
             Self::Config => KeyClass::Config,
         }
     }
@@ -178,6 +187,7 @@ pub enum KeyClass {
     Data,
     Device,
     Config,
+    Control,
 }
 
 impl Command {
@@ -254,6 +264,11 @@ impl Command {
                 key: Key::Config,
                 mode: Mode::Write,
             }],
+            Self::Serving(operation) => {
+                let mut accesses = vec![read_config];
+                accesses.extend(operation.accesses());
+                accesses
+            }
         }
     }
 
@@ -326,6 +341,7 @@ impl Command {
                 task.values.len()
             ),
             Self::Membership(change) => format!("membership {change:?}"),
+            Self::Serving(operation) => format!("serving {:?}", operation.id),
         }
     }
 }

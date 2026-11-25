@@ -1,10 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use plait_consensus::{InstanceId, StateMachine};
+use plait_core::serving::{
+    DecoderCheckpoint, DecoderClaim, DecoderDirectory, DecoderDrainStatus, DecoderFailover,
+    DecoderReplayPage, DecoderRouteWork, DecoderSwitch, ExecutionHostLiveness, GroupVersion,
+    GroupView, ResidentOwner, RouteDirectory, RouteSetId, ServingOperation, ServingReceipt,
+    ServingResources, ServingResult, W4DrainStatus, WorkerDispatch, WorkerGrant,
+};
 use plait_core::{
     AcceleratorKind, Command, ComputeTask, DeviceId, DeviceProfile, FuseKind, MembershipChange,
     NodeId, OpId, OpSpec, TensorKey, TensorVersion, TensorView,
 };
+
+use crate::serving::ServingState;
 
 /// A deterministic event emitted while applying replicated commands. Nodes use
 /// these to wake local consumers without polling the whole runtime.
@@ -41,6 +49,10 @@ pub enum Event {
         device: DeviceId,
         output: TensorKey,
     },
+    ServingApplied {
+        operation: OpId,
+        result: ServingResult,
+    },
     Error(String),
 }
 
@@ -61,6 +73,8 @@ pub struct Runtime {
     members: BTreeMap<NodeId, String>,
     devices: BTreeMap<DeviceId, DeviceProfile>,
     placements: BTreeMap<OpId, DeviceId>,
+    serving: ServingState,
+    deferred_serving: Option<Vec<ServingOperation>>,
     applied: BTreeSet<InstanceId>,
     events: Vec<Event>,
 }
@@ -92,6 +106,98 @@ impl Runtime {
 
     pub fn placement(&self, task: OpId) -> Option<DeviceId> {
         self.placements.get(&task).copied()
+    }
+
+    pub fn serving_group(&self, version: GroupVersion) -> Option<&GroupView> {
+        self.serving.group(version)
+    }
+
+    pub fn serving_receipt(&self, operation: OpId) -> Option<&ServingReceipt> {
+        self.serving.receipt(operation)
+    }
+
+    pub fn serving_resources(&self) -> ServingResources {
+        self.serving.resources()
+    }
+
+    pub fn serving_dispatch(&self, version: GroupVersion) -> Vec<WorkerDispatch> {
+        self.serving.dispatch(version)
+    }
+
+    pub fn serving_w4_drain(&self, version: GroupVersion) -> Option<W4DrainStatus> {
+        self.serving.w4_drain(version)
+    }
+
+    pub fn serving_routes(&self, id: RouteSetId) -> Option<RouteDirectory> {
+        self.serving.routes(id)
+    }
+
+    pub fn serving_decoder_routes(&self, id: RouteSetId) -> Option<DecoderDirectory> {
+        self.serving.decoder_routes(id)
+    }
+
+    pub fn serving_decoder_drain(&self, version: GroupVersion) -> Option<DecoderDrainStatus> {
+        self.serving.decoder_drain(version)
+    }
+
+    pub fn serving_decoder_claims(&self, version: GroupVersion) -> Vec<DecoderClaim> {
+        self.serving.decoder_claims(version)
+    }
+
+    pub fn serving_decoder_checkpoints(
+        &self,
+        model: RouteSetId,
+        work: OpId,
+        transfer: NodeId,
+    ) -> Vec<DecoderCheckpoint> {
+        self.serving.decoder_checkpoints(model, work, transfer)
+    }
+
+    pub fn serving_decoder_replay(
+        &self,
+        model: RouteSetId,
+        work: OpId,
+        offset: u32,
+        now: u64,
+    ) -> Option<DecoderReplayPage> {
+        self.serving.decoder_replay(model, work, offset, now)
+    }
+
+    pub fn serving_decoder_failover(&self, id: RouteSetId) -> Option<DecoderFailover> {
+        self.serving.decoder_failover(id)
+    }
+
+    pub fn serving_decoder_switch(&self, id: RouteSetId) -> Option<DecoderSwitch> {
+        self.serving.decoder_switch(id)
+    }
+
+    pub fn serving_decoder_admission_routes(
+        &self,
+        id: RouteSetId,
+    ) -> plait_core::serving::DecoderAdmissionRoutes {
+        self.serving.decoder_admission_routes(id)
+    }
+
+    pub fn serving_decoder_route_work(&self, id: RouteSetId) -> Option<DecoderRouteWork> {
+        self.serving.decoder_route_work(id)
+    }
+
+    pub fn serving_execution_host(&self, host: NodeId) -> Option<ExecutionHostLiveness> {
+        self.serving.execution_host(host)
+    }
+
+    pub fn serving_execution_hosts(
+        &self,
+    ) -> impl Iterator<Item = (NodeId, ExecutionHostLiveness)> + '_ {
+        self.serving.execution_hosts()
+    }
+
+    pub fn serving_resident_versions_on(&self, host: NodeId) -> BTreeSet<GroupVersion> {
+        self.serving.resident_versions_on(host)
+    }
+
+    pub fn serving_resident_owner(&self, grant: WorkerGrant) -> Option<ResidentOwner> {
+        self.serving.resident_owner(grant)
     }
 
     pub fn events(&self) -> &[Event] {
@@ -190,6 +296,16 @@ impl Runtime {
                 }
                 Ok(())
             }
+            Command::Serving(operation) => {
+                if self
+                    .serving
+                    .receipt(operation.id)
+                    .is_some_and(|receipt| receipt.operation != **operation)
+                {
+                    return Err("serving operation id already used for another action".to_owned());
+                }
+                Ok(())
+            }
             Command::Nop | Command::Membership(_) => Ok(()),
         }
     }
@@ -221,7 +337,22 @@ impl Runtime {
             Command::RegisterDevice(profile) => self.register_device(profile.clone()),
             Command::Compute(task) => self.compute(task.clone()),
             Command::Membership(change) => self.membership(change),
+            Command::Serving(operation) => {
+                if let Some(changes) = &mut self.deferred_serving {
+                    changes.push((**operation).clone());
+                } else {
+                    self.apply_serving(operation);
+                }
+            }
         }
+    }
+
+    fn apply_serving(&mut self, operation: &ServingOperation) {
+        let result = self.serving.apply(operation);
+        self.events.push(Event::ServingApplied {
+            operation: operation.id,
+            result,
+        });
     }
 
     fn register_device(&mut self, profile: DeviceProfile) {
@@ -545,9 +676,20 @@ impl StateMachine for Runtime {
     /// same replicated state and applies one complete SCC; the parent then
     /// merges the resulting maps in deterministic batch order.
     fn fork_batch(&self) -> Option<Self> {
-        let mut fork = self.clone();
-        fork.events.clear();
-        Some(fork)
+        // Replay only this batch's serving commands at merge time. A cloned
+        // reservation table would overwrite decisions made by earlier batches.
+        Some(Self {
+            ops: self.ops.clone(),
+            pending: self.pending.clone(),
+            results: self.results.clone(),
+            shards: self.shards.clone(),
+            members: self.members.clone(),
+            devices: self.devices.clone(),
+            placements: self.placements.clone(),
+            applied: self.applied.clone(),
+            deferred_serving: Some(Vec::new()),
+            ..Self::default()
+        })
     }
 
     fn merge_batch(&mut self, mut other: Self) {
@@ -559,6 +701,9 @@ impl StateMachine for Runtime {
         self.members.extend(other.members);
         self.devices.extend(other.devices);
         self.placements.extend(other.placements);
+        for operation in other.deferred_serving.take().unwrap_or_default() {
+            self.apply_serving(&operation);
+        }
         self.events.append(&mut other.events);
     }
 }

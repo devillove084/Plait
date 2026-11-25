@@ -196,8 +196,8 @@ mod tests {
     #[test]
     fn small_model_uses_data_parallel_everywhere() {
         let devices = vec![
-            device("NVIDIA GeForce RTX 3090 [cc 8.6, 82 SM]", 24),
-            device("NVIDIA RTX PRO 5000 72GB Blackwell [cc 12.0, 110 SM]", 72),
+            device("NVIDIA Ampere [cc 8.6, 82 SM]", 24),
+            device("NVIDIA Blackwell [cc 12.0, 110 SM]", 72),
         ];
         let plan = choose_codesign(
             &devices,
@@ -216,7 +216,7 @@ mod tests {
 
     #[test]
     fn ampere_drops_to_w4a16_for_a_9b_model() {
-        let devices = vec![device("NVIDIA GeForce RTX 3090 [cc 8.6, 82 SM]", 24)];
+        let devices = vec![device("NVIDIA Ampere [cc 8.6, 82 SM]", 24)];
         let plan = choose_codesign(
             &devices,
             &CodesignInput {
@@ -234,8 +234,8 @@ mod tests {
     #[test]
     fn two_sm120_cards_shard_122b_nvfp4() {
         let devices = vec![
-            device("NVIDIA RTX PRO 5000 72GB Blackwell [cc 12.0, 110 SM]", 72),
-            device("NVIDIA RTX PRO 5000 72GB Blackwell [cc 12.0, 110 SM]", 72),
+            device("NVIDIA Blackwell [cc 12.0, 110 SM]", 72),
+            device("NVIDIA Blackwell [cc 12.0, 110 SM]", 72),
         ];
         let plan = choose_codesign(
             &devices,
@@ -255,12 +255,7 @@ mod tests {
     #[test]
     fn eight_sm120_cards_use_four_tp2_replicas() {
         let devices: Vec<_> = (0..8)
-            .map(|index| {
-                device(
-                    &format!("NVIDIA RTX PRO 5000 72GB Blackwell #{index} [cc 12.0, 110 SM]"),
-                    72,
-                )
-            })
+            .map(|index| device(&format!("NVIDIA Blackwell #{index} [cc 12.0, 110 SM]"), 72))
             .collect();
         let plan = choose_codesign(
             &devices,
