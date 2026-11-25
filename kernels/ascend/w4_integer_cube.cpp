@@ -5,25 +5,21 @@ namespace {
 
 constexpr uint32_t tile_m = PLAIT_ASCEND_TILE_M;
 constexpr uint32_t tile_n = PLAIT_ASCEND_TILE_N;
-constexpr uint32_t cube_k = PLAIT_ASCEND_CUBE_K;
-constexpr uint32_t max_group_k = PLAIT_ASCEND_MAX_GROUP_K;
 
-}  // namespace
-
-extern "C" __global__ __aicore__ void plait_ascend_w4_cube(
+template<typename Input, typename Acc, uint32_t cube_k, uint32_t max_group_k>
+__aicore__ void project(
     GM_ADDR packed_a, GM_ADDR packed_b, GM_ADDR scratch,
     uint32_t m, uint32_t n, uint32_t k, uint32_t groups) {
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY);
     AscendC::InitSocState();
     AscendC::LocalMemAllocator<AscendC::Hardware::L1> l1;
     AscendC::LocalMemAllocator<AscendC::Hardware::L0A> l0a;
     AscendC::LocalMemAllocator<AscendC::Hardware::L0B> l0b;
     AscendC::LocalMemAllocator<AscendC::Hardware::L0C> l0c;
-    const auto a1 = l1.Alloc<AscendC::TPosition::A1, int8_t>(tile_m * max_group_k);
-    const auto b1 = l1.Alloc<AscendC::TPosition::B1, int8_t>(tile_n * max_group_k);
-    const auto a2 = l0a.Alloc<AscendC::TPosition::A2, int8_t>(tile_m * max_group_k);
-    const auto b2 = l0b.Alloc<AscendC::TPosition::B2, int8_t>(tile_n * max_group_k);
-    const auto c = l0c.Alloc<AscendC::TPosition::CO1, int32_t>(tile_m * tile_n);
+    const auto a1 = l1.Alloc<AscendC::TPosition::A1, Input>(tile_m * max_group_k);
+    const auto b1 = l1.Alloc<AscendC::TPosition::B1, Input>(tile_n * max_group_k);
+    const auto a2 = l0a.Alloc<AscendC::TPosition::A2, Input>(tile_m * max_group_k);
+    const auto b2 = l0b.Alloc<AscendC::TPosition::B2, Input>(tile_n * max_group_k);
+    const auto c = l0c.Alloc<AscendC::TPosition::CO1, Acc>(tile_m * tile_n);
 
     const uint32_t n_tiles = n / tile_n;
     const uint32_t tiles_per_group = (m / tile_m) * n_tiles;
@@ -35,16 +31,16 @@ extern "C" __global__ __aicore__ void plait_ascend_w4_cube(
     const AscendC::MmadParams dot(tile_m, tile_n, k, 0, false, true);
     const AscendC::FixpipeParamsV220 store(tile_n, tile_m, tile_m, tile_n, false);
 
-    const auto a = reinterpret_cast<__gm__ int8_t *>(packed_a);
-    const auto b = reinterpret_cast<__gm__ int8_t *>(packed_b);
-    const auto out = reinterpret_cast<__gm__ int32_t *>(scratch);
+    const auto a = reinterpret_cast<__gm__ Input *>(packed_a);
+    const auto b = reinterpret_cast<__gm__ Input *>(packed_b);
+    const auto out = reinterpret_cast<__gm__ Acc *>(scratch);
     for (uint32_t task = AscendC::GetBlockIdx(); task < tiles; task += AscendC::GetBlockNum()) {
         const uint32_t group = task / tiles_per_group;
         const uint32_t tile = task % tiles_per_group;
         const uint32_t row = tile / n_tiles * tile_m;
         const uint32_t col = tile % n_tiles * tile_n;
-        AscendC::GlobalTensor<int8_t> ar, br;
-        AscendC::GlobalTensor<int32_t> cr;
+        AscendC::GlobalTensor<Input> ar, br;
+        AscendC::GlobalTensor<Acc> cr;
         ar.SetGlobalBuffer(a + (uint64_t(group) * m + row) * k, tile_m * k);
         br.SetGlobalBuffer(b + (uint64_t(group) * n + col) * k, tile_n * k);
         cr.SetGlobalBuffer(out + uint64_t(task) * tile_m * tile_n, tile_m * tile_n);
@@ -63,4 +59,21 @@ extern "C" __global__ __aicore__ void plait_ascend_w4_cube(
         AscendC::Fixpipe(cr, c, store);
         AscendC::PipeBarrier<PIPE_ALL>();
     }
+}
+
+}  // namespace
+
+extern "C" __global__ __aicore__ void plait_ascend_w4_cube(
+    GM_ADDR packed_a, GM_ADDR packed_b, GM_ADDR scratch,
+    uint32_t m, uint32_t n, uint32_t k, uint32_t groups) {
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY);
+    project<int8_t, int32_t, PLAIT_ASCEND_CUBE_K, PLAIT_ASCEND_MAX_GROUP_K>(
+        packed_a, packed_b, scratch, m, n, k, groups);
+}
+
+extern "C" __global__ __aicore__ void plait_ascend_marlin_cube(
+    GM_ADDR packed_a, GM_ADDR packed_b, GM_ADDR scratch,
+    uint32_t m, uint32_t n, uint32_t k, uint32_t groups) {
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY);
+    project<half, float, 16, PLAIT_ASCEND_MARLIN_K_UNIT>(packed_a, packed_b, scratch, m, n, k, groups);
 }

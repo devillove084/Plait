@@ -371,6 +371,11 @@ impl<'lib> DeviceSession<'lib> {
             session
                 .library
                 .get::<TiledEntry>(b"plait_w4a16_marlin_metal_api_v1")
+                .or_else(|_| {
+                    session
+                        .library
+                        .get::<TiledEntry>(b"plait_w4a16_marlin_ascend_api_v1")
+                })
                 .map(|entry| (entry, false))
                 .or_else(|_| {
                     session

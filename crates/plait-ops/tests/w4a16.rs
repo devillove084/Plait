@@ -482,7 +482,6 @@ fn native_marlin_mfma_handles_asymmetric_weights_and_tail_groups() {
 #[cfg(feature = "native")]
 #[test]
 fn native_marlin_metal_handles_asymmetric_weights_and_tail_groups() {
-    use plait_ops::native::{NativeW4A16, W4Activation};
     use std::path::Path;
 
     let Some(path) = std::env::var_os("PLAIT_MARLIN_METAL_TEST_LIBRARY") else {
@@ -490,6 +489,72 @@ fn native_marlin_metal_handles_asymmetric_weights_and_tail_groups() {
     };
     let path = Path::new(&path);
     check_tiled_marlin(path);
+    check_marlin_wide_dequantization(path);
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn native_marlin_ascend_bounds_workspace_across_k_waves_and_column_bands() {
+    use plait_ops::native::NativeW4A16;
+    use std::path::Path;
+
+    let Some(path) = std::env::var_os("PLAIT_MARLIN_ASCEND_TEST_LIBRARY") else {
+        return;
+    };
+    let path = Path::new(&path);
+    check_tiled_marlin(path);
+    check_marlin_wide_dequantization(path);
+
+    let backend = unsafe { NativeW4A16::load(path) }.unwrap();
+    let session = backend.open_device(0).unwrap();
+    let (n, k, group_size) = (4112u32, 8192u32, 128u32);
+    let groups = k / group_size;
+    let packed = vec![0x66; (n * k / 2) as usize];
+    let zeros: Vec<_> = (0..n * groups)
+        .map(|i| ((i * 3 + i / 19) % 16) as u8)
+        .collect();
+    let scale = |index| [0.25, 0.5, 1.0, 2.0][index % 4];
+    let scales: Vec<_> = (0..n as usize * groups as usize)
+        .map(|index| half(scale(index)))
+        .collect();
+    let x: Vec<_> = (0..k)
+        .map(|i| half(if i % 128 == 0 { 1.0 + 1.0 / 256.0 } else { 1.0 }))
+        .collect();
+    let reference: Vec<_> = (0..n as usize)
+        .map(|col| {
+            (0..groups as usize)
+                .map(|group| {
+                    let index = col * groups as usize + group;
+                    (128.0 + 1.0 / 256.0) * (6.0 - f32::from(zeros[index])) * scale(index)
+                })
+                .sum::<f32>()
+        })
+        .collect();
+    let weights = W4Weights::new(k, n, group_size, &packed, &scales, Some(&zeros)).unwrap();
+    let input = session.upload_f16(1, k, &x).unwrap();
+    for output in [OutputType::F32, OutputType::F16] {
+        let (prepared, expected) = match output {
+            OutputType::F32 => (
+                session.prepare_marlin_f32(weights).unwrap(),
+                LinearOutput::F32(reference.clone()),
+            ),
+            OutputType::F16 => (
+                session.prepare_marlin(weights).unwrap(),
+                LinearOutput::F16(reference.iter().copied().map(half).collect()),
+            ),
+        };
+        let result = prepared.submit(&input, None, output).unwrap();
+        drop(prepared);
+        if session.supports_completion_query() {
+            poll_producer(&result);
+        }
+        assert_eq!(result.read().unwrap(), expected);
+    }
+}
+
+#[cfg(feature = "native")]
+fn check_marlin_wide_dequantization(path: &std::path::Path) {
+    use plait_ops::native::{NativeW4A16, W4Activation};
 
     // Both the grouped weight and the full result exceed the FP16 range.
     let backend = unsafe { NativeW4A16::load(path) }.unwrap();

@@ -98,7 +98,7 @@ typedef struct {
 
 const plait_w4a16_marlin_api *plait_w4a16_marlin_api_v1(void);
 
-/* Optional tiled Marlin extension for AMD CDNA3 or Apple Silicon.
+/* Optional tiled Marlin extension for AMD CDNA3, Apple Silicon, or Ascend 950.
  * The same launch supports FP16 and FP32 results. Each 16-by-16 weight tile
  * packs four consecutive K codes per uint16_t, ordered first by K group of four
  * and then by output column. Tiles are ordered by output tile, then input tile.
@@ -114,6 +114,7 @@ typedef struct {
 typedef plait_w4a16_marlin_tiled_api plait_w4a16_marlin_mfma_api;
 const plait_w4a16_marlin_mfma_api *plait_w4a16_marlin_mfma_api_v1(void);
 const plait_w4a16_marlin_tiled_api *plait_w4a16_marlin_metal_api_v1(void);
+const plait_w4a16_marlin_tiled_api *plait_w4a16_marlin_ascend_api_v1(void);
 
 /* Optional FP32 split-K accumulation and final output with Marlin-packed weights.
  * Available when Marlin is built with PLAIT_W4_MARLIN_SHARDS.
