@@ -1,0 +1,9 @@
+marlin_cuda_kernel.cu is from IST-DASLab/marlin, revision
+1f25790bdd49fba53106164a24666dade68d7c90
+https://github.com/IST-DASLab/marlin
+
+Copyright (C) Marlin.2024 Elias Frantar.
+The upstream kernel is distributed under the Apache License, Version 2.0.
+The original copyright and license header are retained.
+The Rust repacking in crates/plait-ops/src/marlin_layout.rs implements the same
+permutations as the upstream marlin/__init__.py under that license.

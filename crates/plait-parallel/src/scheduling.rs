@@ -168,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn four_3090_and_eight_pro5000_choose_one_leader_per_host() {
+    fn four_ampere_and_eight_blackwell_choose_one_leader_per_host() {
         let mut profiles = Vec::new();
         for index in 0..4 {
             profiles.push(profile(

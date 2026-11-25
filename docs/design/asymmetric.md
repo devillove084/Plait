@@ -24,11 +24,11 @@ rank weights, then `row_ranges` covers `0..M` exactly once.
 For the 4+8 demo:
 
 ```text
-4 local ranks:  RTX 3090, PCIe, compute 1.0, 25 Gbps
-8 remote ranks: RTX PRO 5000, UB, compute 4.0, 200 Gbps
+4 local ranks:  NVIDIA Ampere, PCIe, compute 1.0, 25 Gbps
+8 remote ranks: NVIDIA Blackwell, UB, compute 4.0, 200 Gbps
 ```
 
-the LP gives `local_share=0.111`, `remote_share=0.889`, so the eight Pro 5000
+the LP gives `local_share=0.111`, `remote_share=0.889`, so the eight NVIDIA Blackwell devices
 ranks own the large majority of rows. With only 8 matrix rows the local group
 can quantize to zero rows; at 64 rows it receives about 7. The planner also
 exposes the fractional shares so a scheduler need not rely on row counts for

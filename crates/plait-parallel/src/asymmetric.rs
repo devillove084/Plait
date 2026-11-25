@@ -14,7 +14,7 @@ pub struct RankWeight {
     pub node: NodeId,
     /// Advertised accelerator count for this rank. Used only for work share.
     pub gpus: u32,
-    /// Relative capacity; a Blackwell rank may be heavier than a 3090 rank.
+    /// Relative capacity; a Blackwell rank may be heavier than a NVIDIA Ampere rank.
     pub weight: u32,
 }
 
@@ -327,11 +327,11 @@ mod tests {
         assert_eq!(remote, 80);
     }
     #[test]
-    fn four_3090s_get_less_than_eight_pro5000s() {
+    fn four_ampere_devices_get_less_than_eight_blackwell_devices() {
         let mut profiles = Vec::new();
         for index in 0..4 {
             profiles.push(RankProfile {
-                node: NodeId::derive(&format!("3090-{index}")),
+                node: NodeId::derive(&format!("ampere-{index}")),
                 gpus: 1,
                 compute_units: 1.0,
                 link: LinkKind::Pcie,
@@ -341,7 +341,7 @@ mod tests {
         }
         for index in 0..8 {
             profiles.push(RankProfile {
-                node: NodeId::derive(&format!("pro5000-{index}")),
+                node: NodeId::derive(&format!("blackwell-{index}")),
                 gpus: 1,
                 compute_units: 4.0,
                 link: LinkKind::Ub,
@@ -356,7 +356,7 @@ mod tests {
         assert_eq!(local + remote, 120);
         assert!(
             remote > local,
-            "eight Pro5000s must own more rows than four 3090s"
+            "eight NVIDIA Blackwell devices must own more rows than four NVIDIA Ampere devices"
         );
         assert!(ranges[4].range.len() > ranges[0].range.len());
         let local_share: f64 = plan.shares[..4].iter().map(|(_, share)| share).sum();

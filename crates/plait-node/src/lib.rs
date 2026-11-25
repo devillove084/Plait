@@ -10,14 +10,27 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use plait_consensus::{Options, Replica};
+use plait_core::serving::{ServingAction, ServingLookup, ServingOperation, ServingView};
 use plait_core::{
     AcceleratorKind, ClusterConfig, Command, ComputeRequirement, ComputeTask, DeviceId, FuseKind,
     NodeId, OpId, OpSpec, ShardId, TensorId, TensorKey,
 };
 use plait_fabric::Runtime;
 use plait_net::{TcpTransport, Wire};
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug)]
+mod client;
+mod discovery;
+mod execution_host;
+mod observation;
+mod storage;
+pub use client::{Client, QueryResult};
+pub use discovery::discover_voters;
+use observation::PendingObservation;
+pub use storage::StorageMode;
+use storage::{Image, Journal};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JoinTarget {
     pub node: NodeId,
     pub addr: String,
@@ -54,26 +67,80 @@ pub struct RunningNode {
     id: NodeId,
     addr: String,
     stop: Arc<Notify>,
-    handle: Option<JoinHandle<()>>,
+    handle: Option<JoinHandle<io::Result<()>>>,
 }
 
 impl RunningNode {
     pub async fn start(config: NodeConfig) -> io::Result<Self> {
-        let mut transport_peers = config.peers.clone();
-        if let Some(join) = &config.join {
-            transport_peers.insert(join.node, join.addr.clone());
-        }
-        let transport = TcpTransport::bind(config.id, &config.listen, transport_peers).await?;
-        let voters = if config.join.is_some() {
-            vec![config.id]
+        Self::start_configured(config, None).await
+    }
+
+    pub async fn start_durable(config: NodeConfig, storage: StorageMode) -> io::Result<Self> {
+        Self::start_configured(config, Some(storage)).await
+    }
+
+    async fn start_configured(
+        mut config: NodeConfig,
+        storage: Option<StorageMode>,
+    ) -> io::Result<Self> {
+        let journal = storage
+            .map(|mode| Journal::open(mode, config.id))
+            .transpose()?;
+        let (replica, journal) = if let Some((mut journal, saved)) = journal {
+            let mut replica = if let Some(image) = saved {
+                config.join = image.pending_join;
+                for (id, address) in image.peers {
+                    config.peers.entry(id).or_insert(address);
+                }
+                let replica = Replica::<Runtime>::from_snapshot(
+                    config.id,
+                    image.snapshot,
+                    config.options.clone(),
+                );
+                if !replica.violations().is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "replica journal cannot be replayed",
+                    ));
+                }
+                replica
+            } else {
+                let replica = Self::bootstrap_replica(&config)?;
+                journal.install(Image {
+                    id: config.id,
+                    snapshot: replica.snapshot(),
+                    peers: config.peers.clone(),
+                    pending_join: config.join.clone(),
+                })?;
+                replica
+            };
+            replica.track_deltas();
+            (replica, Some(journal))
         } else {
-            let mut voters: Vec<NodeId> = config.peers.keys().copied().collect();
-            voters.push(config.id);
-            voters
+            (Self::bootstrap_replica(&config)?, None)
         };
-        let cluster = ClusterConfig::new(voters)
+        let mut peers = config.peers.clone();
+        if let Some(join) = &config.join {
+            peers.insert(join.node, join.addr.clone());
+        }
+        let transport = TcpTransport::bind(config.id, &config.listen, peers).await?;
+        Ok(Self::spawn(config, transport, replica, journal))
+    }
+
+    fn bootstrap_replica(config: &NodeConfig) -> io::Result<Replica<Runtime>> {
+        let peers = config
+            .peers
+            .keys()
+            .copied()
+            .filter(|_| config.join.is_none());
+        let cluster = ClusterConfig::new(std::iter::once(config.id).chain(peers))
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        Self::start_with_transport(config, transport, cluster)
+        Ok(Replica::new(
+            config.id,
+            cluster,
+            Runtime::new(),
+            config.options.clone(),
+        ))
     }
 
     pub fn start_with_transport(
@@ -81,32 +148,46 @@ impl RunningNode {
         transport: TcpTransport,
         cluster: ClusterConfig,
     ) -> io::Result<Self> {
+        let replica = Replica::new(config.id, cluster, Runtime::new(), config.options.clone());
+        Ok(Self::spawn(config, transport, replica, None))
+    }
+
+    fn spawn(
+        config: NodeConfig,
+        transport: TcpTransport,
+        replica: Replica<Runtime>,
+        journal: Option<Journal>,
+    ) -> Self {
         let id = config.id;
         let addr = transport.local_addr().to_owned();
+        transport.advertise_voter(config.join.is_none() && replica.config().is_voter(id));
         let stop = Arc::new(Notify::new());
         let task_stop = stop.clone();
         let state = NodeState {
             id,
             transport,
-            replica: Replica::new(id, cluster, Runtime::new(), config.options.clone()),
+            replica,
+            journal,
             options: config.options,
+            joined: config.join.is_none(),
             join: config.join,
             advertise_devices: config.advertise_devices,
-            joined: false,
             staged_proposed: BTreeSet::new(),
             commit_proposed: BTreeSet::new(),
             devices_registered: false,
             last_join_poll: 0,
             last_ready: 0,
             started: Instant::now(),
+            observations: BTreeMap::new(),
+            execution_hosts: execution_host::HostWatch::default(),
         };
         let handle = tokio::spawn(state.run(task_stop));
-        Ok(Self {
+        Self {
             id,
             addr,
             stop,
             handle: Some(handle),
-        })
+        }
     }
 
     pub fn id(&self) -> NodeId {
@@ -115,6 +196,15 @@ impl RunningNode {
 
     pub fn addr(&self) -> &str {
         &self.addr
+    }
+
+    pub async fn wait(&mut self) -> io::Result<()> {
+        let Some(handle) = &mut self.handle else {
+            return Ok(());
+        };
+        let result = handle.await;
+        self.handle = None;
+        result.map_err(io::Error::other)?
     }
 }
 
@@ -131,6 +221,7 @@ struct NodeState {
     id: NodeId,
     transport: TcpTransport,
     replica: Replica<Runtime>,
+    journal: Option<Journal>,
     options: Options,
     join: Option<JoinTarget>,
     advertise_devices: bool,
@@ -141,6 +232,8 @@ struct NodeState {
     last_join_poll: u64,
     last_ready: u64,
     started: Instant,
+    observations: BTreeMap<(NodeId, u64), PendingObservation>,
+    execution_hosts: execution_host::HostWatch,
 }
 
 impl NodeState {
@@ -148,7 +241,7 @@ impl NodeState {
         self.started.elapsed().as_millis() as u64
     }
 
-    async fn run(mut self, stop: Arc<Notify>) {
+    async fn run(mut self, stop: Arc<Notify>) -> io::Result<()> {
         let mut ticker = tokio::time::interval(Duration::from_millis(10));
         loop {
             #[allow(clippy::large_enum_variant)]
@@ -167,31 +260,47 @@ impl NodeState {
                 Event::Incoming(None) => break,
                 Event::Incoming(Some((from, wire))) => {
                     let now = self.now();
-                    self.handle(from, wire, now).await;
+                    self.handle(from, wire, now).await?;
+                    self.persist()?;
+                    self.advertise_voter();
+                    self.reply_to_observations().await;
+                    self.flush().await;
                 }
                 Event::Tick => {
                     let now = self.now();
                     self.replica.tick(now);
+                    if self.joined && self.replica.config().is_voter(self.id) {
+                        for operation in self
+                            .execution_hosts
+                            .expirations(self.replica.machine(), now)
+                        {
+                            self.propose(Command::Serving(Box::new(operation)), now);
+                        }
+                    }
                     self.maybe_register_devices(now);
+                    self.persist()?;
+                    self.advertise_voter();
+                    self.reply_to_observations().await;
                     self.drive_join(now).await;
                     self.refresh_peers();
                     self.flush().await;
                 }
             }
         }
+        Ok(())
     }
 
-    async fn handle(&mut self, from: NodeId, wire: Wire, now: u64) {
+    async fn handle(&mut self, from: NodeId, wire: Wire, now: u64) -> io::Result<()> {
         match wire {
             Wire::Consensus(message) => {
-                if self.joined || self.join.is_none() {
+                if self.joined {
                     self.replica.handle(from, message, now);
                 }
             }
             Wire::JoinRequest { node, addr } => {
                 self.transport.set_peer(node, addr.clone());
-                if node == self.id {
-                    return;
+                if !self.joined || node == self.id {
+                    return Ok(());
                 }
                 if self.replica.config().is_member(node) {
                     self.send_snapshot(node).await;
@@ -205,25 +314,49 @@ impl NodeState {
                 }
             }
             Wire::SnapshotRequest { node } => {
-                if self.replica.config().is_member(node) {
+                if self.joined && self.replica.config().is_member(node) {
                     self.send_snapshot(node).await;
                 }
             }
-            Wire::Snapshot { snapshot, peers } => {
+            Wire::Snapshot {
+                snapshot,
+                mut peers,
+            } => {
                 if self.joined {
-                    return;
+                    return Ok(());
                 }
-                if !snapshot.config.is_member(self.id) && !snapshot.config.is_voter(self.id) {
-                    return;
+                if !snapshot.config.is_member(self.id) {
+                    return Ok(());
                 }
-                self.replica = Replica::from_snapshot(self.id, snapshot, self.options.clone());
+                // The sender's peer table may omit its own address. Keep the
+                // joining node's known addresses for the installed membership.
+                for (node, address) in self.transport.peers().await {
+                    peers.entry(node).or_insert(address);
+                }
+                peers.retain(|node, _| *node != self.id && snapshot.config.is_member(*node));
+                let mut replica = Replica::from_snapshot(self.id, snapshot, self.options.clone());
+                if !replica.violations().is_empty() {
+                    return Ok(());
+                }
+                if let Some(journal) = &mut self.journal {
+                    journal.install(Image {
+                        id: self.id,
+                        snapshot: replica.snapshot(),
+                        peers: peers.clone(),
+                        pending_join: None,
+                    })?;
+                    replica.track_deltas();
+                }
+                self.replica = replica;
+                self.execution_hosts = execution_host::HostWatch::default();
                 self.transport.set_peers(peers);
                 self.joined = true;
                 self.refresh_peers();
                 self.send_ready(now).await;
             }
             Wire::Ready { node } => {
-                if self.replica.config().is_voter(self.id)
+                if self.joined
+                    && self.replica.config().is_voter(self.id)
                     && self.replica.config().staged_add().contains(&node)
                     && self.commit_proposed.insert(node)
                 {
@@ -239,7 +372,7 @@ impl NodeState {
                 reply_to,
             } => {
                 self.transport.set_peer(from, reply_to);
-                let can_propose = self.replica.config().is_voter(self.id);
+                let can_propose = self.joined && self.replica.config().is_voter(self.id);
                 let result = if !can_propose {
                     Err("this node is not a voter".to_owned())
                 } else {
@@ -256,6 +389,7 @@ impl NodeState {
                     Ok(message) => (true, message),
                     Err(message) => (false, message),
                 };
+                self.persist()?;
                 let _ = self
                     .transport
                     .send(
@@ -288,8 +422,128 @@ impl NodeState {
             Wire::Ping => {
                 let _ = self.transport.send(from, Wire::Pong).await;
             }
-            Wire::Hello { .. } | Wire::Pong | Wire::Ack { .. } | Wire::QueryReply { .. } => {}
+            Wire::ServingQuery {
+                request,
+                lookup,
+                reply_to,
+            } => {
+                self.transport.set_peer(from, reply_to);
+                let runtime = self.replica.machine();
+                let view = match lookup {
+                    ServingLookup::Group(version) => {
+                        ServingView::Group(runtime.serving_group(version).cloned())
+                    }
+                    ServingLookup::Operation(operation) => {
+                        ServingView::Operation(runtime.serving_receipt(operation).cloned())
+                    }
+                    ServingLookup::Resources => ServingView::Resources(runtime.serving_resources()),
+                    ServingLookup::Routes(id) => ServingView::Routes(runtime.serving_routes(id)),
+                    ServingLookup::Dispatch(version) => {
+                        ServingView::Dispatch(runtime.serving_dispatch(version))
+                    }
+                    ServingLookup::W4Drain(version) => {
+                        ServingView::W4Drain(runtime.serving_w4_drain(version))
+                    }
+                    ServingLookup::DecoderRoutes(id) => {
+                        ServingView::DecoderRoutes(runtime.serving_decoder_routes(id))
+                    }
+                    ServingLookup::DecoderDrain(version) => {
+                        ServingView::DecoderDrain(runtime.serving_decoder_drain(version))
+                    }
+                    ServingLookup::ResidentOwner(grant) => {
+                        ServingView::ResidentOwner(runtime.serving_resident_owner(grant))
+                    }
+                    ServingLookup::DecoderFailover(id) => {
+                        ServingView::DecoderFailover(runtime.serving_decoder_failover(id))
+                    }
+                    ServingLookup::DecoderSwitch(id) => {
+                        ServingView::DecoderSwitch(runtime.serving_decoder_switch(id))
+                    }
+                    ServingLookup::DecoderRouteWork(id) => {
+                        ServingView::DecoderRouteWork(runtime.serving_decoder_route_work(id))
+                    }
+                    ServingLookup::DecoderAdmissionRoutes(id) => {
+                        ServingView::DecoderAdmissionRoutes(
+                            runtime.serving_decoder_admission_routes(id),
+                        )
+                    }
+                    ServingLookup::ExecutionHostLiveness(host) => {
+                        ServingView::ExecutionHostLiveness(runtime.serving_execution_host(host))
+                    }
+                    ServingLookup::DecoderClaims(version) => {
+                        ServingView::DecoderClaims(runtime.serving_decoder_claims(version))
+                    }
+                    ServingLookup::DecoderCheckpoints {
+                        model,
+                        work,
+                        transfer,
+                    } => ServingView::DecoderCheckpoints(
+                        runtime.serving_decoder_checkpoints(model, work, transfer),
+                    ),
+                    ServingLookup::DecoderReplay {
+                        model,
+                        work,
+                        offset,
+                    } => {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .ok()
+                            .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok());
+                        ServingView::DecoderReplay(now.and_then(|now| {
+                            runtime.serving_decoder_replay(model, work, offset, now)
+                        }))
+                    }
+                };
+                let _ = self
+                    .transport
+                    .send(
+                        from,
+                        Wire::ServingQueryReply {
+                            request,
+                            lookup,
+                            view: Box::new(view),
+                        },
+                    )
+                    .await;
+            }
+            Wire::ObserveServingGroup {
+                request,
+                operation,
+                group,
+                epoch,
+                reply_to,
+            } => {
+                self.transport.set_peer(from, reply_to);
+                let operation = ServingOperation {
+                    id: operation,
+                    action: ServingAction::ObserveGroup { group, epoch },
+                };
+                self.start_observation(from, request, operation, now).await;
+            }
+            Wire::Hello { .. }
+            | Wire::Pong
+            | Wire::DiscoverVoter
+            | Wire::VoterIdentity(_)
+            | Wire::Ack { .. }
+            | Wire::QueryReply { .. }
+            | Wire::ServingQueryReply { .. }
+            | Wire::ServingGroupObserved { .. } => {}
         }
+        Ok(())
+    }
+
+    fn advertise_voter(&self) {
+        self.transport
+            .advertise_voter(self.joined && self.replica.config().is_voter(self.id));
+    }
+
+    fn persist(&mut self) -> io::Result<()> {
+        if let Some(journal) = &mut self.journal
+            && let Some(delta) = self.replica.take_delta()
+        {
+            journal.record(delta)?;
+        }
+        Ok(())
     }
 
     fn maybe_register_devices(&mut self, now: u64) {
@@ -384,129 +638,6 @@ impl NodeState {
             }
         }
     }
-}
-
-pub struct Client {
-    transport: TcpTransport,
-    next: u64,
-}
-
-impl Client {
-    pub async fn new() -> io::Result<Self> {
-        Self::new_on("127.0.0.1:0").await
-    }
-
-    /// Bind the client listener to a reachable address. A remote node must be
-    /// able to send the Ack/QueryReply back to this address.
-    pub async fn new_on(listen: &str) -> io::Result<Self> {
-        let id = NodeId::random();
-        let transport = TcpTransport::bind(id, listen, BTreeMap::new()).await?;
-        Ok(Self { transport, next: 1 })
-    }
-
-    pub fn add_peer(&self, node: NodeId, addr: impl Into<String>) {
-        self.transport.set_peer(node, addr);
-    }
-
-    pub async fn submit(&mut self, node: NodeId, command: Command) -> io::Result<String> {
-        let request = self.next;
-        self.next += 1;
-        let reply_to = self.transport.local_addr().to_owned();
-        self.transport
-            .send(
-                node,
-                Wire::Submit {
-                    request,
-                    command,
-                    reply_to,
-                },
-            )
-            .await?;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let next = tokio::time::timeout(
-                remaining.min(Duration::from_millis(100)),
-                self.transport.recv(),
-            )
-            .await;
-            if let Ok(Some((
-                _,
-                Wire::Ack {
-                    request: answer,
-                    ok,
-                    message,
-                },
-            ))) = next
-            {
-                if answer == request {
-                    if ok {
-                        return Ok(message);
-                    }
-                    return Err(io::Error::other(message));
-                }
-            }
-        }
-        Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "submit acknowledgement timed out",
-        ))
-    }
-
-    pub async fn query(&mut self, node: NodeId, op: OpId) -> io::Result<QueryResult> {
-        let request = self.next;
-        self.next += 1;
-        let reply_to = self.transport.local_addr().to_owned();
-        self.transport
-            .send(
-                node,
-                Wire::Query {
-                    request,
-                    op,
-                    reply_to,
-                },
-            )
-            .await?;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let next = tokio::time::timeout(
-                remaining.min(Duration::from_millis(100)),
-                self.transport.recv(),
-            )
-            .await;
-            if let Ok(Some((
-                _,
-                Wire::QueryReply {
-                    request: answer,
-                    op: answer_op,
-                    declared,
-                    values,
-                    executed,
-                    voters,
-                },
-            ))) = next
-            {
-                if answer == request && answer_op == op {
-                    return Ok(QueryResult {
-                        declared,
-                        values,
-                        executed,
-                        voters,
-                    });
-                }
-            }
-        }
-        Err(io::Error::new(io::ErrorKind::TimedOut, "query timed out"))
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct QueryResult {
-    pub declared: bool,
-    pub values: Option<Vec<f64>>,
-    pub executed: usize,
-    pub voters: Vec<NodeId>,
 }
 
 /// Start three TCP nodes, propose a fused sum through different nodes, and
@@ -761,6 +892,7 @@ fn max_error(actual: &[Vec<f64>], expected: &[Vec<f64>]) -> f64 {
 
 /// Run the real ibverbs self-test. Returns a skip message when no device is
 /// configured; this is expected on hosts without an RNIC or Soft-RoCE.
+#[cfg(all(target_os = "linux", feature = "rdma"))]
 pub async fn run_rdma_selftest() -> Result<(), Box<dyn std::error::Error>> {
     let result = tokio::task::spawn_blocking(plait_rdma::selftest)
         .await
@@ -776,6 +908,12 @@ pub async fn run_rdma_selftest() -> Result<(), Box<dyn std::error::Error>> {
             println!("plait rdma: {device} loopback write/read passed ({bytes} bytes)");
         }
     }
+    Ok(())
+}
+
+#[cfg(not(all(target_os = "linux", feature = "rdma")))]
+pub async fn run_rdma_selftest() -> Result<(), Box<dyn std::error::Error>> {
+    println!("plait rdma: skipped (requires Linux and the rdma feature)");
     Ok(())
 }
 
@@ -1537,6 +1675,7 @@ fn cudarc_device_count() -> usize {
 /// Probe GPUDirect registration: a VMM device allocation registered with the
 /// first verbs device. A skip means the host lacks an RDMA device, not that the
 /// path is fast.
+#[cfg(all(target_os = "linux", feature = "rdma"))]
 pub fn run_gpu_rdma_probe() -> Result<(), Box<dyn std::error::Error>> {
     use plait_collective::ipc::VmmRegion;
     use plait_rdma::RdmaDevice;
@@ -1562,6 +1701,12 @@ pub fn run_gpu_rdma_probe() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[cfg(not(all(target_os = "linux", feature = "rdma")))]
+pub fn run_gpu_rdma_probe() -> Result<(), Box<dyn std::error::Error>> {
+    println!("plait gpu-rdma: skipped (requires Linux and the rdma feature)");
+    Ok(())
+}
+
 /// Run one host's share of a two-host 12-replica matrix collective.
 ///
 /// Manifest lines are `hex-node-id@listen-address`. The first six entries are
@@ -1579,7 +1724,7 @@ pub fn run_hetero_plan(
     let mut profiles = Vec::new();
     for index in 0..4 {
         profiles.push(RankProfile {
-            node: NodeId::derive(&format!("3090-{index}")),
+            node: NodeId::derive(&format!("ampere-{index}")),
             gpus: 1,
             compute_units: local_gflops / 1000.0,
             link: LinkKind::Pcie,
@@ -1589,7 +1734,7 @@ pub fn run_hetero_plan(
     }
     for index in 0..8 {
         profiles.push(RankProfile {
-            node: NodeId::derive(&format!("pro5000-{index}")),
+            node: NodeId::derive(&format!("blackwell-{index}")),
             gpus: 1,
             compute_units: remote_gflops / 1000.0,
             link: LinkKind::Ub,

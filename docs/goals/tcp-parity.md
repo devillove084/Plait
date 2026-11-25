@@ -5,7 +5,7 @@ replace the GPUDirect/RDMA gate.
 
 ## Acceptance
 
-For 1 MiB, 16 MiB, and 64 MiB allreduce over the 4×3090 + 8×Pro5000 TCP path:
+For 1 MiB, 16 MiB, and 64 MiB allreduce over the 4×NVIDIA Ampere + 8×NVIDIA Blackwell TCP path:
 
 1. every rank reports `errors=0`;
 2. every rank's `algbw_GB/s` is at least the matching NCCL 2.28.9 TCP result;

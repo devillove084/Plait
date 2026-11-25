@@ -3,10 +3,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 bytes=${PLAIT_TCP_BYTES:-1048576}
 iters=${PLAIT_TCP_ITERS:-5}
-local_ip=${PLAIT_LOCAL_IP:-11.166.42.141}
-remote_ip=${PLAIT_REMOTE_IP:-215.193.188.234}
+local_ip=${PLAIT_LOCAL_IP:?set the local data-plane address}
+remote_ip=${PLAIT_REMOTE_IP:?set the remote data-plane address}
 port=${PLAIT_TCP_PORT:-32700}
-remote=${PLAIT_REMOTE:-pro5000}
+remote=${PLAIT_REMOTE:?set the SSH host for the remote peer}
 remote_dir=${PLAIT_REMOTE_DIR:-/root/plait-src}
 
 cargo build --release -q -p plait-collective --bin tcp-twolevel

@@ -215,7 +215,7 @@ are length-delimited bincode.
 `plait-gpu` executes the real CUDA path: an embedded cubin for AXPY and a
 CUTLASS 4.8.1 C++ FFI shim for SGEMM. The build detects the local compute
 capability and chooses an ABI-compatible compiler (CUDA 12.9 for the Ampere
-3090, 13.2 for Blackwell). `just setup` clones CUTLASS into `target/cutlass` on
+NVIDIA Ampere, 13.2 for Blackwell). `just setup` clones CUTLASS into `target/cutlass` on
 demand.
 
 `plait-device` discovers CPU/NVIDIA/AMD/Huawei/PPU profiles and provides a
@@ -239,20 +239,63 @@ remote key, so the same descriptor is usable by loopback and verbs transports.
 - Minority partition: no commit; ballots may rise, but no state is applied.
 - Membership change: requires all relevant voters; a failure during the change
   stalls it. This is a deliberate safety/availability tradeoff.
-- Restart: not supported yet. Identities and counters must be persisted before
-  this prototype is used for durable deployments.
+- Durable control replicas restore their identity, accepted state, and
+  execution order from the replica journal.
 
-## 7. Why this avoids the old collective bottleneck
+In a native execution group, an unusable W4 worker response pipe initiates
+worker termination and revokes its group version. A sibling whose device lease
+can be verified can rejoin a new epoch immediately. The failed device retains
+its reservation until the original lock is available and its backend release
+check succeeds. `ReclaimResident` orders each device release against new grants.
+The final release retires the old version and returns its shared host-memory
+budget. Retirement preserves grants issued to already reclaimed devices.
+[Resident reclaim model](../specs/PlaitResidentReclaim.tla)
 
-The old model couples three things: a fixed process group, a rank-ordered
-collective, and a central control point. Plait decouples them:
+## 7. Asynchronous versioned reduction
 
-- the process group is membership state, changeable without a special node;
-- the collective is a normal command with conflict keys, so unrelated shards
-  make progress independently;
-- large payloads move through the data plane while the log carries only order
-  and descriptors.
+With NCCL, each rank issues the matching operation on its communicator.
+Execution is ordered on CUDA streams, and NCCL provides asynchronous enqueue
+and nonblocking group calls. [NCCL collective operations](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html) · [NCCL group calls](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/groups.html)
 
-That does not make coordination free. It makes coordination **sparse**: only
-operations that actually conflict pay for ordering, and only the shards that
-participate enter the quorum.
+In the native W4 path, any execution host can submit an operation. The control
+plane admits it against one group epoch. A plan lists the complete K partition
+and exact worker grants. The submitter dispatches all shards concurrently and
+pulls each immutable result as soon as its worker reports the descriptor.
+The reducer accumulates the contiguous K prefix and holds later shards until
+their predecessors arrive. This preserves FP32 summation order across network
+schedules.
+
+Each resident worker can keep partials from up to eight operations, with a
+64 MiB total retention limit. A new publication at capacity returns an error.
+An exact retry can reuse its retained payload. A release or expiration frees
+that operation's entry. Up to eight TCP pulls run independently, each with
+its own deadline, so a consumer that stalls one connection leaves slots for
+other pulls.
+
+After reducing the whole partition, the submitter commits `CompleteW4` on the
+serving group. That command checks every contributing grant and closes the
+tracked admission in one ordered transition. The submitter releases the
+result to the caller after receiving the applied receipt. A revocation or
+admission expiry ordered first prevents delivery even if all bytes arrived.
+The receipt survives a retry of the same completion operation.
+
+A terminal shard error cancels the submitter's outstanding dispatch and pull
+tasks. The submitter reports the error while it closes the admission and
+releases partials. In-flight device calls may finish under the worker
+supervisor. Admission closure fences late work, and release matches the exact
+descriptor. Retention expiry reclaims partials when release cannot reach a
+worker. The request retains its submission slot through bounded cleanup.
+
+The native W4 submitter enforces one host-wide limit and a separate limit for
+each admitted `(group, epoch)`. The execution config defaults to
+`"w4_submissions": {"host": 16, "per_epoch": 8}`. Set the epoch limit below the
+host limit so one draining version leaves space for the active version. The
+host limit still applies when several versions are busy. Both limits count
+requests until reply and cleanup complete. [Epoch admission model](../specs/PlaitEpochAdmission.tla)
+
+The current group can admit new work while an earlier epoch drains. A
+straggler in the earlier epoch holds up its own result. The TLA+ model covers
+independent publication and pull, two operations sharing workers in one epoch,
+admission expiry between the final fold and completion, and a terminal shard
+error while another shard remains stalled.
+[Async reduction model](../specs/PlaitAsyncReduction.tla)

@@ -98,7 +98,7 @@ fn select_nvcc(arch: &str) -> Option<PathBuf> {
     if let Ok(path) = env::var("PLAIT_NVCC") {
         return Some(PathBuf::from(path));
     }
-    // Local RTX 3090 driver predates CUDA 13.2; use the installed 12.9 nvcc
+    // Local NVIDIA Ampere driver predates CUDA 13.2; use the installed 12.9 nvcc
     // when targeting Ampere. Blackwell needs the 13.x toolkit.
     if arch.starts_with("sm_8") {
         let old = Path::new("/opt/cuda129/bin/nvcc");

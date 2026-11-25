@@ -1,11 +1,16 @@
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use plait_core::NodeId;
 use plait_node::{
-    NodeConfig, RunningNode, run_collectives_demo, run_demo, run_devices, run_dsa_demo,
-    run_gpu_bench, run_gpu_demo, run_gpu_rdma_probe, run_hetero_demo, run_hetero_plan,
-    run_matrix_node, run_parallel_demo, run_rdma_selftest,
+    NodeConfig, RunningNode, StorageMode, run_collectives_demo, run_demo, run_devices,
+    run_dsa_demo, run_gpu_bench, run_gpu_demo, run_gpu_rdma_probe, run_hetero_demo,
+    run_hetero_plan, run_matrix_node, run_parallel_demo, run_rdma_selftest,
 };
+
+mod serving_cli;
+mod tensor_cli;
 
 #[tokio::main]
 async fn main() {
@@ -120,11 +125,19 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", NodeId::random());
             Ok(())
         }
+        "serving" => serving_cli::run(args).await,
+        "tensor" => tensor_cli::run(args).await,
         "run" => {
             let mut listen = "127.0.0.1:7001".to_owned();
             let mut id: Option<NodeId> = None;
             let mut peers = BTreeMap::new();
+            let mut seeds = Vec::new();
             let mut join = None;
+            let mut state_dir = None;
+            let mut initialize = false;
+            let mut advertise_devices = true;
+            let mut execution = None;
+            let mut compute_only = false;
             while let Some(arg) = args.next() {
                 match arg.as_str() {
                     "--listen" => listen = args.next().ok_or("--listen needs a value")?,
@@ -136,31 +149,87 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         let (node, addr) = parse_peer(&value)?;
                         peers.insert(node, addr);
                     }
+                    "--seed" => {
+                        seeds.push(parse_seed(&args.next().ok_or("--seed needs an IP:port")?)?);
+                    }
                     "--join" => {
                         let value = args.next().ok_or("--join needs id@addr")?;
                         let (node, addr) = parse_peer(&value)?;
                         join = Some(plait_node::JoinTarget { node, addr });
                     }
+                    "--state-dir" => state_dir = Some(PathBuf::from(args.next().ok_or("--state-dir needs a path")?)),
+                    "--init-state" => initialize = true,
+                    "--no-advertise-devices" => advertise_devices = false,
+                    "--w4-execution" => {
+                        let path = args.next().ok_or("--w4-execution needs a path")?;
+                        execution = Some(serde_json::from_reader::<_, tensor_cli::runtime::Config>(
+                            std::fs::File::open(path)?,
+                        )?);
+                    }
+                    "--compute-only" => compute_only = true,
                     other => return Err(format!("unknown argument {other}").into()),
                 }
             }
+            if initialize && state_dir.is_none() {
+                return Err("--init-state requires --state-dir".into());
+            }
+            if state_dir.is_some() && id.is_none() {
+                return Err("durable replicas require an explicit --id".into());
+            }
+            if execution.is_some() && id.is_none() {
+                return Err("--w4-execution requires a stable --id".into());
+            }
             let id = id.unwrap_or_else(NodeId::random);
+            if compute_only {
+                if join.is_some() || state_dir.is_some() || peers.is_empty() == seeds.is_empty() {
+                    return Err("--compute-only requires either --peer or --seed and no voting membership or journal flags".into());
+                }
+                let config = execution.ok_or("--compute-only requires --w4-execution")?;
+                tokio::select! {
+                    result = tokio::signal::ctrl_c() => result?,
+                    result = tensor_cli::runtime::run(id, config, peers, seeds) => result?,
+                }
+                return Ok(());
+            }
+            if !seeds.is_empty() {
+                return Err("run --seed requires --compute-only".into());
+            }
+            let mut execution_peers = peers.clone();
+            if let Some(target) = &join {
+                execution_peers.insert(target.node, target.addr.clone());
+            }
             let config = NodeConfig {
                 id,
                 listen: listen.clone(),
                 peers,
                 join,
                 options: Default::default(),
-                advertise_devices: true,
+                advertise_devices,
             };
-            let node = RunningNode::start(config).await?;
+            let mut node = match state_dir {
+                Some(path) if initialize => RunningNode::start_durable(config, StorageMode::Initialize(path)).await?,
+                Some(path) => RunningNode::start_durable(config, StorageMode::Resume(path)).await?,
+                None => RunningNode::start(config).await?,
+            };
             println!("plait node {} listening on {}", node.id(), node.addr());
-            tokio::signal::ctrl_c().await?;
+            execution_peers.insert(id, node.addr().to_owned());
+            let execute = async {
+                if let Some(config) = execution {
+                    tensor_cli::runtime::run(id, config, execution_peers, Vec::new()).await
+                } else {
+                    std::future::pending::<std::io::Result<()>>().await
+                }
+            };
+            tokio::select! {
+                result = tokio::signal::ctrl_c() => result?,
+                result = node.wait() => result?,
+                result = execute => result?,
+            }
             drop(node);
             Ok(())
         }
         other => Err(format!(
-            "unknown command {other}; expected run, demo, dsa, parallel, rdma-selftest, devices, hetero, gpu-demo, gpu-bench, gpu-rdma, or id"
+            "unknown command {other}; expected run, serving, tensor, demo, dsa, parallel, rdma-selftest, devices, hetero, gpu-demo, gpu-bench, gpu-rdma, or id"
         )
         .into()),
     }
@@ -171,4 +240,12 @@ fn parse_peer(value: &str) -> Result<(NodeId, String), Box<dyn std::error::Error
         .split_once('@')
         .ok_or("peer must be <hex-id>@<host:port>")?;
     Ok((NodeId::from_hex(id)?, addr.to_owned()))
+}
+
+fn parse_seed(value: &str) -> Result<SocketAddr, Box<dyn std::error::Error>> {
+    let addr = value.parse::<SocketAddr>()?;
+    if addr.ip().is_unspecified() || addr.port() == 0 {
+        return Err("control seed requires a concrete IP and nonzero port".into());
+    }
+    Ok(addr)
 }

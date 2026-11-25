@@ -6,8 +6,8 @@ use plait_core::{Access, ClusterConfig, Command, Key, Mode, NodeId, QuorumPolicy
 
 use crate::execution::ExecutionGraph;
 use crate::types::{
-    Attrs, Ballot, InstanceId, Message, Options, Outbound, Phase, ProposeError, Record, Snapshot,
-    Value, ValueState,
+    Attrs, Ballot, InstanceId, Message, Options, Outbound, Phase, ProposeError, Record,
+    ReplicaDelta, Snapshot, Value, ValueState,
 };
 
 /// The replicated state machine. The consensus layer is generic over it so the
@@ -68,6 +68,17 @@ enum ActivePhase {
     },
 }
 
+struct DeltaCursor {
+    records: BTreeSet<InstanceId>,
+    executed: usize,
+}
+
+#[derive(Default)]
+struct AppliedAccesses {
+    last_write: Option<InstanceId>,
+    subsequent_reads: BTreeSet<InstanceId>,
+}
+
 /// One Plait ordering replica. There is no distinguished replica: [`propose`] works on
 /// every voter, and every replica runs the same recovery watchdog.
 pub struct Replica<S: StateMachine> {
@@ -77,6 +88,7 @@ pub struct Replica<S: StateMachine> {
     options: Options,
     records: BTreeMap<InstanceId, Record>,
     record_index: BTreeMap<Key, BTreeSet<InstanceId>>,
+    applied_accesses: BTreeMap<Key, AppliedAccesses>,
     indexed: BTreeSet<InstanceId>,
     executed: BTreeSet<InstanceId>,
     execution: ExecutionGraph,
@@ -86,6 +98,8 @@ pub struct Replica<S: StateMachine> {
     outbox: Vec<Outbound>,
     violations: Vec<String>,
     clock_ms: u64,
+    next_dependency_fetch_ms: u64,
+    delta: Option<DeltaCursor>,
 }
 
 impl<S: StateMachine> Replica<S> {
@@ -97,6 +111,7 @@ impl<S: StateMachine> Replica<S> {
             options,
             records: BTreeMap::new(),
             record_index: BTreeMap::new(),
+            applied_accesses: BTreeMap::new(),
             indexed: BTreeSet::new(),
             executed: BTreeSet::new(),
             execution: ExecutionGraph::new(),
@@ -106,6 +121,8 @@ impl<S: StateMachine> Replica<S> {
             outbox: Vec::new(),
             violations: Vec::new(),
             clock_ms: 0,
+            next_dependency_fetch_ms: 0,
+            delta: None,
         }
     }
 
@@ -342,6 +359,37 @@ impl<S: StateMachine> Replica<S> {
         for id in stale {
             self.start_recovery(id, now_ms);
         }
+        self.fetch_missing_dependencies(now_ms);
+    }
+
+    fn fetch_missing_dependencies(&mut self, now_ms: u64) {
+        if now_ms < self.next_dependency_fetch_ms {
+            return;
+        }
+        let missing: BTreeSet<_> = self
+            .execution
+            .unresolved_dependencies()
+            .filter(|id| !self.records.contains_key(id))
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        self.next_dependency_fetch_ms = now_ms.saturating_add(self.options.retry_ms);
+        let voters = self.config.voters().clone();
+        for id in missing {
+            for &voter in &voters {
+                if voter != self.id {
+                    self.send(
+                        voter,
+                        Message::Recover {
+                            id,
+                            ballot: Ballot::zero(self.id),
+                            config_version: self.config.version(),
+                        },
+                    );
+                }
+            }
+        }
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -355,6 +403,35 @@ impl<S: StateMachine> Replica<S> {
                 .collect(),
             executed_order: self.executed_order.clone(),
         }
+    }
+
+    /// Track mutations after the caller has durably installed this replica image.
+    pub fn track_deltas(&mut self) {
+        self.delta = Some(DeltaCursor {
+            records: BTreeSet::new(),
+            executed: self.executed_order.len(),
+        });
+    }
+
+    /// Consume the pending changes. If writing them fails, the caller must stop
+    /// serving the replica before replying or sending any consensus messages.
+    pub fn take_delta(&mut self) -> Option<ReplicaDelta> {
+        let cursor = self.delta.as_mut()?;
+        if cursor.records.is_empty() && cursor.executed == self.executed_order.len() {
+            return None;
+        }
+        let records = std::mem::take(&mut cursor.records)
+            .into_iter()
+            .map(|id| (id, self.records[&id].clone()))
+            .collect();
+        let executed_tail = self.executed_order[cursor.executed..].to_vec();
+        cursor.executed = self.executed_order.len();
+        Some(ReplicaDelta {
+            config: self.config.clone(),
+            counters: self.counters.clone(),
+            records,
+            executed_tail,
+        })
     }
 
     fn recovery_jitter(&self, id: InstanceId) -> u64 {
@@ -475,6 +552,9 @@ impl<S: StateMachine> Replica<S> {
             .map(|access| access.key)
             .collect();
         self.records.insert(id, record);
+        if let Some(cursor) = &mut self.delta {
+            cursor.records.insert(id);
+        }
         if self.indexed.insert(id) {
             for key in keys {
                 self.record_index.entry(key).or_default().insert(id);
@@ -482,12 +562,25 @@ impl<S: StateMachine> Replica<S> {
         }
     }
 
-    /// Merge the dependencies visible to this replica into an incoming
-    /// attribute set. Adding the newest instance per proposer is standard
-    /// Plait ordering conflict tracking; it is transitively sufficient.
+    fn record_mut(&mut self, id: InstanceId) -> Option<&mut Record> {
+        let record = self.records.get_mut(&id)?;
+        if let Some(cursor) = &mut self.delta {
+            cursor.records.insert(id);
+        }
+        Some(record)
+    }
+
+    /// Merge conflicts from pending records and the applied frontier on each key.
+    /// An applied conflict still orders work proposed by a replica missing its commit.
     fn merge_attrs(&self, mut base: Attrs, command: &Command, exclude: InstanceId) -> Attrs {
         let mut candidates: BTreeSet<InstanceId> = BTreeSet::new();
         for access in command.accesses() {
+            if let Some(applied) = self.applied_accesses.get(&access.key) {
+                candidates.extend(applied.last_write);
+                if access.mode != Mode::Read {
+                    candidates.extend(&applied.subsequent_reads);
+                }
+            }
             let Some(ids) = self.record_index.get(&access.key) else {
                 continue;
             };
@@ -504,24 +597,34 @@ impl<S: StateMachine> Replica<S> {
             }
         }
 
-        let mut latest: BTreeMap<NodeId, InstanceId> = BTreeMap::new();
+        candidates.remove(&exclude);
         for candidate in candidates {
-            latest
-                .entry(candidate.proposer)
-                .and_modify(|current| {
-                    if current.counter < candidate.counter {
-                        *current = candidate;
-                    }
-                })
-                .or_insert(candidate);
-        }
-        for candidate in latest.values() {
-            base.deps.insert(*candidate);
-            if let Some(record) = self.records.get(candidate) {
+            base.deps.insert(candidate);
+            if let Some(record) = self.records.get(&candidate) {
                 base.seq = base.seq.max(record.value.attrs.seq.saturating_add(1));
             }
         }
         base
+    }
+
+    fn index_applied_accesses(&mut self, id: InstanceId, command: &Command) {
+        for access in command.accesses() {
+            if let std::collections::btree_map::Entry::Occupied(mut pending) =
+                self.record_index.entry(access.key)
+            {
+                pending.get_mut().remove(&id);
+                if pending.get().is_empty() {
+                    pending.remove();
+                }
+            }
+            let applied = self.applied_accesses.entry(access.key).or_default();
+            if access.mode == Mode::Read {
+                applied.subsequent_reads.insert(id);
+            } else {
+                applied.last_write = Some(id);
+                applied.subsequent_reads.clear();
+            }
+        }
     }
 
     fn conflicts_on(command: &Command, access: &Access) -> bool {
@@ -612,7 +715,7 @@ impl<S: StateMachine> Replica<S> {
                     let mut base = record.value.attrs.clone();
                     base.merge(&attrs);
                     let merged = self.merge_attrs(base, &command, id);
-                    if let Some(record) = self.records.get_mut(&id) {
+                    if let Some(record) = self.record_mut(id) {
                         record.value.attrs = merged.clone();
                         record.value.ballot = record.value.ballot.max(ballot);
                         record.phase = Phase::PreAccepted;
@@ -805,7 +908,7 @@ impl<S: StateMachine> Replica<S> {
                 record.quorum = quorum;
                 record.config_version = config_version;
                 record.updated_ms = now_ms;
-                self.records.insert(id, record);
+                *self.record_mut(id).expect("known acceptor record") = record;
                 Message::AcceptReply {
                     id,
                     accepted: true,
@@ -864,7 +967,7 @@ impl<S: StateMachine> Replica<S> {
             attrs,
             ballot,
         };
-        if let Some(record) = self.records.get_mut(&id) {
+        if let Some(record) = self.record_mut(id) {
             if !matches!(record.phase, Phase::Committed | Phase::Executed) {
                 record.value = value.clone();
                 record.phase = Phase::Accepted;
@@ -1009,7 +1112,7 @@ impl<S: StateMachine> Replica<S> {
                 let mut base = record.value.attrs.clone();
                 base.merge(&attrs);
                 let merged = self.merge_attrs(base, &command, id);
-                if let Some(record) = self.records.get_mut(&id) {
+                if let Some(record) = self.record_mut(id) {
                     record.value.attrs = merged.clone();
                     record.value.ballot = record.value.ballot.max(ballot);
                     record.phase = Phase::PreAccepted;
@@ -1065,7 +1168,7 @@ impl<S: StateMachine> Replica<S> {
             attrs: attrs.clone(),
             ballot,
         };
-        if let Some(record) = self.records.get_mut(&id) {
+        if let Some(record) = self.record_mut(id) {
             if !matches!(record.phase, Phase::Committed | Phase::Executed) {
                 record.value = value.clone();
                 record.phase = Phase::PreAccepted;
@@ -1191,19 +1294,17 @@ impl<S: StateMachine> Replica<S> {
     }
 
     fn commit_value(&mut self, id: InstanceId, value: Value, now_ms: u64) {
-        let newly_committed = match self.records.get(&id) {
-            None => true,
-            Some(record) => !matches!(record.phase, Phase::Committed | Phase::Executed),
-        };
-        if let Some(record) = self.records.get_mut(&id) {
-            if matches!(record.phase, Phase::Committed | Phase::Executed) {
-                if record.value.command != value.command {
-                    self.violations
-                        .push(format!("{id:?}: conflicting committed commands"));
-                }
-                self.execute_ready(now_ms);
-                return;
+        if let Some(record) = self.records.get(&id)
+            && matches!(record.phase, Phase::Committed | Phase::Executed)
+        {
+            if record.value.command != value.command {
+                self.violations
+                    .push(format!("{id:?}: conflicting committed commands"));
             }
+            self.execute_ready(now_ms);
+            return;
+        }
+        if let Some(record) = self.record_mut(id) {
             record.value = value.clone();
             record.phase = Phase::Committed;
             record.updated_ms = now_ms;
@@ -1224,9 +1325,7 @@ impl<S: StateMachine> Replica<S> {
             value.attrs.seq,
             &value.attrs.deps,
         );
-        if newly_committed {
-            self.broadcast_commit(id, &value);
-        }
+        self.broadcast_commit(id, &value);
         self.execute_ready(now_ms);
     }
 
@@ -1314,6 +1413,14 @@ impl<S: StateMachine> Replica<S> {
             return;
         }
         let Some(active) = self.active.get(&id).cloned() else {
+            // A dependency fetch can learn a decision without proposing a value.
+            if self.config.is_voter(from)
+                && self.execution.is_unresolved(id)
+                && let Some(state) = state
+                && matches!(state.phase, Phase::Committed | Phase::Executed)
+            {
+                self.commit_value(id, state.value, now_ms);
+            }
             return;
         };
         if !active.quorum.is_voter(from) {
@@ -1574,6 +1681,7 @@ impl<S: StateMachine> Replica<S> {
         let command = record.value.command.clone();
         self.apply_membership(id, &command);
         self.machine.apply(id, &command);
+        self.index_applied_accesses(id, &command);
         self.mark_instance_executed(id, now_ms);
     }
 
@@ -1586,6 +1694,7 @@ impl<S: StateMachine> Replica<S> {
         };
         let command = record.value.command.clone();
         self.apply_membership(id, &command);
+        self.index_applied_accesses(id, &command);
         self.mark_instance_executed(id, now_ms);
     }
 
@@ -1605,7 +1714,7 @@ impl<S: StateMachine> Replica<S> {
     }
 
     fn mark_instance_executed(&mut self, id: InstanceId, now_ms: u64) {
-        if let Some(record) = self.records.get_mut(&id) {
+        if let Some(record) = self.record_mut(id) {
             record.phase = Phase::Executed;
             record.updated_ms = now_ms;
         }
@@ -1620,7 +1729,13 @@ impl<S: StateMachine + Default> Replica<S> {
     pub fn from_snapshot(id: NodeId, snapshot: Snapshot, options: Options) -> Self {
         let mut replica = Self::new(id, snapshot.config, S::default(), options);
         replica.counters = snapshot.counters;
-        for (instance, record) in snapshot.records {
+        for (instance, mut record) in snapshot.records {
+            // Recovery timers use this process's monotonic clock.
+            record.updated_ms = 0;
+            if instance.proposer == id {
+                let counter = replica.counters.entry(id).or_default();
+                *counter = (*counter).max(instance.counter);
+            }
             replica.insert_record(instance, record);
         }
         replica.executed = snapshot.executed_order.iter().copied().collect();
@@ -1645,6 +1760,7 @@ impl<S: StateMachine + Default> Replica<S> {
             };
             let command = record.value.command.clone();
             replica.machine.apply(instance, &command);
+            replica.index_applied_accesses(instance, &command);
             if let Some(record) = replica.records.get_mut(&instance) {
                 record.phase = Phase::Executed;
             }

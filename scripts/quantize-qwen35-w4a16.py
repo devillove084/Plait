@@ -1,4 +1,4 @@
-"""Reproduce the Qwen3.5-9B W4A16 checkpoint used by the 3090 tier.
+"""Reproduce the Qwen3.5-9B W4A16 checkpoint used by the NVIDIA Ampere tier.
 
 Run in a transformers 5.17 / llmcompressor 0.14 environment, not in the vLLM
 runtime environment. GPTQ is calibration-based; replace the local README
