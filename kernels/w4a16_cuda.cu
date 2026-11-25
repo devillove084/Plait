@@ -391,6 +391,17 @@ extern "C" const plait_w4a16_device_api *plait_w4a16_device_api_v1(void) {
     return &api;
 }
 
+extern "C" int plait_w4_completion_query_v1(void *handle, void *completion, uint32_t *ready) {
+    if (!handle || !completion || !ready) return PLAIT_GPU(ErrorInvalidValue);
+    auto session = static_cast<Session *>(handle);
+    auto status = session->bind();
+    if (status != PLAIT_GPU(Success)) return status;
+    status = PLAIT_GPU(EventQuery)(static_cast<PLAIT_GPU(Event_t)>(completion));
+    if (status != PLAIT_GPU(Success) && status != PLAIT_GPU(ErrorNotReady)) return status;
+    *ready = status == PLAIT_GPU(Success);
+    return PLAIT_GPU(Success);
+}
+
 #if defined(PLAIT_W4_INTEGER_ACTIVATION)
 extern "C" int plait_w4_quantize_f16_v1(
     void *handle, uint32_t rows, uint32_t columns, uint32_t group_size, uint32_t bits,

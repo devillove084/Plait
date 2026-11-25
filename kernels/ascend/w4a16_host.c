@@ -321,6 +321,19 @@ const plait_w4a16_device_api *plait_w4a16_device_api_v1(void) {
     return &api;
 }
 
+int plait_w4_completion_query_v1(void *handle, void *value, uint32_t *ready) {
+    if (!handle || !value || !ready) return ACL_ERROR_INVALID_PARAM;
+    ascend_session *session = handle;
+    ascend_completion *completion = value;
+    aclError status = aclrtSetCurrentContext(session->context);
+    if (status != ACL_SUCCESS) return status;
+    aclrtEventRecordedStatus recorded;
+    status = aclrtQueryEventStatus(completion->event, &recorded);
+    if (status != ACL_SUCCESS) return status;
+    *ready = recorded == ACL_EVENT_RECORDED_STATUS_COMPLETE;
+    return ACL_SUCCESS;
+}
+
 int plait_w4a16_run_host(const plait_w4a16_shape *s, int ordinal,
                          const uint16_t *a, const uint8_t *w, const uint16_t *scale,
                          const uint8_t *zero, const uint16_t *bias, void *out) {

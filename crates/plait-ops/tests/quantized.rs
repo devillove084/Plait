@@ -155,6 +155,9 @@ fn check_device_quantization_chain(device: &plait_ops::native::DeviceSession<'_>
         let quantized = device
             .quantize_f16(&computed, ActivationBits::I4, 8)
             .unwrap();
+        if device.supports_completion_query() {
+            let _ = quantized.is_ready().unwrap();
+        }
         let output = identity
             .submit_quantized(&quantized, None, OutputType::F32)
             .unwrap();
@@ -166,6 +169,9 @@ fn check_device_quantization_chain(device: &plait_ops::native::DeviceSession<'_>
                 "quantized activations must be finite"
             ))
         ));
+        if device.supports_completion_query() {
+            assert!(output.is_ready().unwrap());
+        }
     }
     println!("device quantization chain: round-to-even, subnormal and non-finite inputs verified");
 }

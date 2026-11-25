@@ -376,13 +376,18 @@ done:
     return status;
 }
 
+static const metal_index command_completed = 4;  /* MTLCommandBufferStatusCompleted */
+
+static metal_index command_status(id command) {
+    return MESSAGE(metal_index (*)(id, SEL))(command, SELECTOR("status"));
+}
+
 static int device_wait(void *handle, void *completion) {
     (void)handle;
     id pool = autorelease_pool();
     id command = (id)completion;
     invoke(command, "waitUntilCompleted");
-    const metal_index completed = 4;  /* MTLCommandBufferStatusCompleted */
-    const bool succeeded = MESSAGE(metal_index (*)(id, SEL))(command, SELECTOR("status")) == completed;
+    const bool succeeded = command_status(command) == command_completed;
     if (!succeeded) show_error(object(command, "error"));
     invoke(pool, "drain");
     return succeeded ? 0 : 4;
@@ -400,6 +405,14 @@ static const plait_w4a16_device_api api = {
 
 const plait_w4a16_device_api *plait_w4a16_device_api_v1(void) {
     return &api;
+}
+
+int plait_w4_completion_query_v1(void *handle, void *completion, uint32_t *ready) {
+    if (!handle || !completion || !ready) return 1;
+    const metal_index status = command_status((id)completion);
+    if (status > command_completed) return 4;
+    *ready = status == command_completed;
+    return 0;
 }
 
 int plait_w4a16_run_host(const plait_w4a16_shape *s, int ordinal,

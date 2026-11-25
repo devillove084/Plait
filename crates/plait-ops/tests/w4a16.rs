@@ -199,6 +199,7 @@ fn native_chains_device_tensors_and_owns_the_queue() {
         let a = device.prepare(weights_a).unwrap();
         let b = device.prepare(weights_b).unwrap();
         let input = device.upload_f16(2, 3, &activation).unwrap();
+        assert!(input.is_ready().unwrap());
         let bias = device.upload_f16(1, 3, &bias).unwrap();
 
         let other = backend.open_device(ordinal).unwrap();
@@ -226,6 +227,15 @@ fn native_chains_device_tensors_and_owns_the_queue() {
         ));
         let first_again = a.submit(&input, Some(&bias), OutputType::F16).unwrap();
         let second_again = b.submit(&first_again, None, OutputType::F32).unwrap();
+        if device.supports_completion_query() {
+            poll_producer(&second_again);
+            assert!(first_again.is_ready().unwrap());
+        } else {
+            assert!(matches!(
+                second_again.is_ready(),
+                Err(OperatorError::Unsupported(_))
+            ));
+        }
 
         // The two outputs outlive their inputs, weights and original session.
         drop((device, a, b, input, bias, first, first_again, empty));
@@ -233,6 +243,18 @@ fn native_chains_device_tensors_and_owns_the_queue() {
         assert_eq!(second_again.read().unwrap(), expected);
         assert_eq!(second.read().unwrap(), expected);
         println!("resident W4A16 device {ordinal}: two chained submissions match Rust CPU");
+    }
+}
+
+#[cfg(feature = "native")]
+fn poll_producer(output: &plait_ops::native::DeviceTensor<'_>) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !output.is_ready().unwrap() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "producer never completed"
+        );
+        std::thread::yield_now();
     }
 }
 
@@ -325,6 +347,10 @@ fn native_chains_reference_and_marlin_on_one_queue() {
                 let second = linear.submit(&upstream, None, OutputType::F16).unwrap();
                 let second_final = after.submit(&second, None, OutputType::F32).unwrap();
                 drop((input, upstream));
+
+                if session.supports_completion_query() {
+                    poll_producer(&first);
+                }
 
                 let LinearOutput::F16(actual) = first.read().unwrap() else {
                     panic!("expected FP16 Marlin result");
@@ -452,6 +478,9 @@ fn native_humming_runs_groupwise_w4a16_and_chains_on_device() {
                 let input = session.upload_f16(rows, k, &activation).unwrap();
                 let result = linear.submit(&input, None, OutputType::F16).unwrap();
                 let downstream = next.submit(&result, None, OutputType::F32).unwrap();
+                if session.supports_completion_query() {
+                    poll_producer(&result);
+                }
                 let LinearOutput::F16(actual) = result.read().unwrap() else {
                     panic!("expected FP16 Humming result");
                 };

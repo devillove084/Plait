@@ -57,6 +57,13 @@ typedef struct {
 
 const plait_w4a16_device_api *plait_w4a16_device_api_v1(void);
 
+/* Optional completion query for a handle returned by submission on this session.
+ * Returns 0 with ready set to 0 (pending) or 1 (finished). A nonzero result is
+ * the backend error status. The query does not wait, copy results, or release
+ * the completion. Read a quantizer's invalid flag separately after completion.
+ */
+int plait_w4_completion_query_v1(void *session, void *completion, uint32_t *ready);
+
 /* Optional integer activation GEMM on an existing session queue. Activations
  * are signed INT4 (low nibble first) or INT8. Each row and K group has an FP32
  * activation scale. The dot is accumulated in INT32 for each group, then

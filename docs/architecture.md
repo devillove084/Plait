@@ -253,6 +253,14 @@ budget. Retirement preserves grants issued to already reclaimed devices.
 
 ## 7. Asynchronous versioned reduction
 
+Resident W4 submissions return an event on their device session. Libraries can
+export `plait_w4_completion_query_v1` to query that event without waiting or
+copying the result. Rust exposes the capability on `DeviceSession` and the
+query on resident tensors and quantized activations. Waiting or reading still
+checks upstream operations and the device quantizer's invalid-input flag.
+Libraries implementing the original device API can keep using `wait`.
+[Resident W4 C header](../kernels/w4a16.h)
+
 With NCCL, each rank issues the matching operation on its communicator.
 Execution is ordered on CUDA streams, and NCCL provides asynchronous enqueue
 and nonblocking group calls. [NCCL collective operations](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html) · [NCCL group calls](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/groups.html)

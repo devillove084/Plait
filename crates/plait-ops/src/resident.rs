@@ -41,6 +41,7 @@ type QuantizeF16 = unsafe extern "C" fn(
     *mut c_void,
     *mut *mut c_void,
 ) -> i32;
+type CompletionQuery = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u32) -> i32;
 
 #[repr(C)]
 struct DeviceApi {
@@ -70,6 +71,7 @@ struct Session<'lib> {
     handle: NonNull<c_void>,
     quantized_launch: Option<QuantizedLaunch>,
     quantize_f16: Option<QuantizeF16>,
+    completion_query: Option<CompletionQuery>,
 }
 
 #[repr(C)]
@@ -272,6 +274,9 @@ impl<'lib> DeviceSession<'lib> {
             quantize_f16: unsafe { library.get(b"plait_w4_quantize_f16_v1") }
                 .ok()
                 .map(|symbol| *symbol),
+            completion_query: unsafe { library.get(b"plait_w4_completion_query_v1") }
+                .ok()
+                .map(|symbol| *symbol),
         })))
     }
 
@@ -417,6 +422,10 @@ impl<'lib> DeviceSession<'lib> {
         self.0.quantized_launch.is_some() && self.0.quantize_f16.is_some()
     }
 
+    pub fn supports_completion_query(&self) -> bool {
+        self.0.completion_query.is_some()
+    }
+
     /// Quantize an existing FP16 allocation without moving its data to the host.
     /// A non-finite input is reported on a downstream wait or read.
     pub fn quantize_f16(
@@ -507,6 +516,16 @@ pub struct DeviceQuantizedActivations<'lib> {
     codes: Buffer<'lib>,
     scale: Buffer<'lib>,
     completion: Option<Rc<Completion<'lib>>>,
+}
+
+impl DeviceQuantizedActivations<'_> {
+    /// Query the producer event without waiting or reading device memory.
+    /// Input finiteness is checked when a downstream result is waited on or read.
+    pub fn is_ready(&self) -> Result<bool, OperatorError> {
+        self.completion
+            .as_ref()
+            .map_or(Ok(true), |event| event.is_ready())
+    }
 }
 
 /// One resident packed weight matrix. Reuse it across submissions.
@@ -750,6 +769,14 @@ pub struct DeviceTensor<'lib> {
 }
 
 impl DeviceTensor<'_> {
+    /// Query the producer event without waiting or copying the result.
+    /// Use `wait` or `read` to check upstream errors and quantizer flags.
+    pub fn is_ready(&self) -> Result<bool, OperatorError> {
+        self.completion
+            .as_ref()
+            .map_or(Ok(true), |event| event.is_ready())
+    }
+
     /// Wait for this tensor and propagate any failed upstream GPU operation.
     pub fn wait(&self) -> Result<(), OperatorError> {
         self.completion
@@ -839,6 +866,28 @@ struct Completion<'lib> {
 }
 
 impl Completion<'_> {
+    fn is_ready(&self) -> Result<bool, OperatorError> {
+        let query = self
+            .session
+            .completion_query
+            .ok_or(OperatorError::Unsupported(
+                "device library has no W4 completion query",
+            ))?;
+        let mut ready = u32::MAX;
+        status("query W4 completion", unsafe {
+            query(
+                self.session.handle.as_ptr(),
+                self.handle.as_ptr(),
+                &mut ready,
+            )
+        })?;
+        match ready {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(OperatorError::Backend("invalid W4 completion state".into())),
+        }
+    }
+
     fn wait(&self) -> Result<(), OperatorError> {
         self.result
             .get_or_init(|| {
