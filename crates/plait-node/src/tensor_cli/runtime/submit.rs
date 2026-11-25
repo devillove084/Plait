@@ -80,19 +80,37 @@ pub(super) async fn execute(
     else {
         return Err(io::Error::other("expected W4 admission receipt"));
     };
-    let result = execute_admitted(server, &mut control, version, work, operator).await;
-    if tracked {
-        let completion = ServingOperation {
-            id: OpId::new(NodeId::random(), 1),
-            action: ServingAction::FinishW4 { version, work },
+    let (selection, output) =
+        match execute_admitted(server, &mut control, version, work, operator).await {
+            Ok(result) => result,
+            Err(error) => {
+                if tracked {
+                    let finish = ServingOperation {
+                        id: OpId::new(NodeId::random(), 1),
+                        action: ServingAction::FinishW4 { version, work },
+                    };
+                    let _ = control.apply(&finish).await;
+                }
+                return Err(error);
+            }
         };
-        let finished = control.apply(&completion).await;
-        if result.is_ok() {
-            finished?
-                .map_err(|error| io::Error::other(format!("W4 completion rejected: {error:?}")))?;
-        }
-    }
-    result
+    let completion = ServingOperation {
+        id: OpId::new(NodeId::random(), 1),
+        action: ServingAction::CompleteW4 {
+            version,
+            work,
+            grants: selection
+                .decisions
+                .iter()
+                .map(|decision| decision.shard.partial.grant)
+                .collect(),
+        },
+    };
+    control
+        .apply(&completion)
+        .await?
+        .map_err(|error| io::Error::other(format!("W4 completion rejected: {error:?}")))?;
+    Ok((selection, output))
 }
 
 async fn execute_admitted(
@@ -166,10 +184,7 @@ async fn execute_admitted(
     )
     .await;
     release(server, &shards).await;
-    let output = result?;
-    let current = control.version(plan.version()).await?;
-    plan.check_grants(&current).map_err(io::Error::other)?;
-    Ok((selection, output))
+    Ok((selection, result?))
 }
 
 async fn dispatch_and_reduce(

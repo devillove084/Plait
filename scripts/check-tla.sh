@@ -13,3 +13,4 @@ tlc -deadlock -config specs/PlaitAsyncReduction.cfg specs/PlaitAsyncReduction.tl
 tlc -deadlock -config specs/PlaitAsyncReductionStalled.cfg specs/PlaitAsyncReduction.tla
 tlc -deadlock -config specs/PlaitAsyncReductionRevoked.cfg specs/PlaitAsyncReduction.tla
 tlc -deadlock -config specs/PlaitAsyncReductionSharedWorker.cfg specs/PlaitAsyncReduction.tla
+tlc -deadlock -config specs/PlaitAsyncReductionExpired.cfg specs/PlaitAsyncReduction.tla

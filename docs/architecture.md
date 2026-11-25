@@ -263,10 +263,15 @@ that operation's entry. Up to eight TCP pulls run independently, each with
 its own deadline, so a consumer that stalls one connection leaves slots for
 other pulls.
 
-Result delivery requires the whole partition and a final ordered grant check.
+After reducing the whole partition, the submitter commits `CompleteW4` on the
+serving group. That command checks every contributing grant and closes the
+tracked admission in one ordered transition. The submitter releases the
+result to the caller after receiving the applied receipt. A revocation or
+admission expiry ordered first prevents delivery even if all bytes arrived.
+The receipt survives a retry of the same completion operation.
+
 The current group can admit new work while an earlier epoch drains. A
-straggler in the earlier epoch holds up its own result. A revocation ordered
-before the delivery check rejects output even when shard bytes have arrived.
-The TLA+ model covers independent publication and pull, out-of-order arrival,
-stale descriptors, and two operations sharing the same workers in one epoch.
+straggler in the earlier epoch holds up its own result. The TLA+ model covers
+independent publication and pull, two operations sharing workers in one epoch,
+and admission expiry between the final fold and completion.
 [Async reduction model](../specs/PlaitAsyncReduction.tla)
