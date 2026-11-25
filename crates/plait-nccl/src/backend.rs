@@ -1,14 +1,14 @@
 //! Device backends used by the NCCL compatibility layer.
 //!
-//! CUDA is the only backend exercised on this host. Huawei and PPU are loaded
-//! dynamically so the same Rust/Python wheel runs on NVIDIA machines without
-//! requiring CANN or a PPU runtime at build time. The vendor methods are the
-//! only place where platform-specific copies happen; collectives stay in the
-//! shared transport.
+//! Vendor libraries supply device copies and stream ordering. Collective
+//! transport and tensor representation are shared across backends.
 
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::sync::Arc;
+
+mod hip;
+pub use hip::HipRuntime;
 
 thread_local! {
     static BOUND_CUDA_DEVICE: Cell<Option<usize>> = const { Cell::new(None) };
@@ -30,6 +30,10 @@ impl std::error::Error for BackendError {}
 pub trait DeviceRuntime: Send + Sync {
     fn copy_host_to_device(&self, target: u64, source: &[u8]) -> Result<(), BackendError>;
     fn copy_device_to_host(&self, source: u64, target: &mut [u8]) -> Result<(), BackendError>;
+
+    fn synchronize_stream(&self, _stream: u64) -> Result<(), BackendError> {
+        Ok(())
+    }
     fn pin_host(&self, _pointer: u64, _bytes: usize) -> Result<(), BackendError> {
         Ok(())
     }
@@ -79,6 +83,16 @@ impl CudaRuntime {
 }
 
 impl DeviceRuntime for CudaRuntime {
+    fn synchronize_stream(&self, stream: u64) -> Result<(), BackendError> {
+        self.bind()?;
+        let status = unsafe { sys::cuStreamSynchronize(stream as sys::CUstream) };
+        if status == sys::CUresult::CUDA_SUCCESS {
+            Ok(())
+        } else {
+            Err(BackendError(format!("cuStreamSynchronize: {status:?}")))
+        }
+    }
+
     fn copy_host_to_device(&self, target: u64, source: &[u8]) -> Result<(), BackendError> {
         self.bind()?;
         let status = unsafe { sys::cuMemcpyHtoD_v2(target, source.as_ptr().cast(), source.len()) };

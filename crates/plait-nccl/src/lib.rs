@@ -1,8 +1,8 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 //! NCCL-compatible C ABI for Plait.
 //!
-//! This is a compatibility layer, not a byte-for-byte NCCL clone. It exposes
-//! the subset vLLM's `pynccl_wrapper` loads. Cuda, Huawei CANN, and PPU
+//! This exposes the collective surface used by vLLM's `pynccl_wrapper`.
+//! CUDA, ROCm, Huawei CANN, and PPU
 //! adapters are selected at runtime; group and point-to-point transport is
 //! shared. Host-staged TCP is the fallback, with shared-memory two-level
 //! allreduce when the host layout is declared.
@@ -24,7 +24,7 @@ mod kernel;
 mod p2p;
 mod shm;
 
-use backend::{CudaRuntime, DeviceRuntime, HuaweiRuntime, PpuRuntime};
+use backend::{CudaRuntime, DeviceRuntime, HipRuntime, HuaweiRuntime, PpuRuntime};
 
 pub type NcclResult = i32;
 pub const NCCL_SUCCESS: NcclResult = 0;
@@ -130,6 +130,7 @@ struct Network {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendKind {
     Cuda,
+    Rocm,
     Huawei,
     Ppu,
 }
@@ -278,6 +279,9 @@ fn create_runtime(backend: BackendKind, device: usize) -> Result<Box<dyn DeviceR
         BackendKind::Cuda => CudaRuntime::new(device)
             .map(|runtime| Box::new(runtime) as Box<dyn DeviceRuntime>)
             .map_err(|error| error.0),
+        BackendKind::Rocm => HipRuntime::new(device)
+            .map(|runtime| Box::new(runtime) as Box<dyn DeviceRuntime>)
+            .map_err(|error| error.0),
         BackendKind::Huawei => HuaweiRuntime::new(device)
             .map(|runtime| Box::new(runtime) as Box<dyn DeviceRuntime>)
             .map_err(|error| error.0),
@@ -290,6 +294,7 @@ fn create_runtime(backend: BackendKind, device: usize) -> Result<Box<dyn DeviceR
 fn backend_from_env() -> Result<BackendKind, String> {
     match std::env::var("PLAIT_NCCL_BACKEND").as_deref() {
         Ok("cuda") | Err(_) => Ok(BackendKind::Cuda),
+        Ok("rocm") => Ok(BackendKind::Rocm),
         Ok("huawei") => Ok(BackendKind::Huawei),
         Ok("ppu") => Ok(BackendKind::Ppu),
         Ok(other) => Err(format!("unknown PLAIT_NCCL_BACKEND={other}")),
@@ -424,6 +429,12 @@ fn device_to_host(
     runtime
         .copy_device_to_host(device_ptr, host)
         .map_err(|_| NCCL_UNHANDLED_CUDA_ERROR)
+}
+
+fn synchronize_stream(comm: &Comm, stream: *mut std::ffi::c_void) -> Result<(), NcclResult> {
+    comm.runtime
+        .synchronize_stream(stream as u64)
+        .map_err(|error| set_error(error.0))
 }
 
 /// E4M3 finite value, used by the optional quantized-communication path.
@@ -1393,6 +1404,9 @@ pub extern "C" fn ncclAllReduce(
             }
         }
     }
+    if let Err(error) = synchronize_stream(comm, stream) {
+        return error;
+    }
     if let (Some(ipc), Some(shm)) = (&comm.ipc, &comm.shm) {
         let mut ipc = ipc.lock().unwrap();
         if bytes <= ipc.capacity() {
@@ -1461,7 +1475,7 @@ pub extern "C" fn ncclAllGather(
     count: usize,
     datatype: i32,
     comm: *mut Comm,
-    _stream: *mut std::ffi::c_void,
+    stream: *mut std::ffi::c_void,
 ) -> NcclResult {
     if sendbuff.is_null() || recvbuff.is_null() || comm.is_null() {
         return NCCL_INVALID_ARGUMENT;
@@ -1471,6 +1485,9 @@ pub extern "C" fn ncclAllGather(
     };
     let bytes = count * dtype.bytes();
     let comm = unsafe { &*comm };
+    if let Err(error) = synchronize_stream(comm, stream) {
+        return error;
+    }
     if let (Some(shm), Some(layout)) = (&comm.shm, &comm.layout) {
         let mut shm = shm.lock().unwrap();
         if layout.groups.len() > 1 && bytes * comm.world <= shm.slot_bytes() {
@@ -1533,7 +1550,7 @@ pub extern "C" fn ncclBroadcast(
     datatype: i32,
     root_rank: i32,
     comm: *mut Comm,
-    _stream: *mut std::ffi::c_void,
+    stream: *mut std::ffi::c_void,
 ) -> NcclResult {
     if recvbuff.is_null() || comm.is_null() {
         return NCCL_INVALID_ARGUMENT;
@@ -1546,6 +1563,9 @@ pub extern "C" fn ncclBroadcast(
     }
     let bytes = count * dtype.bytes();
     let comm = unsafe { &*comm };
+    if let Err(error) = synchronize_stream(comm, stream) {
+        return error;
+    }
     if let (Some(shm), Some(layout)) = (&comm.shm, &comm.layout) {
         let mut shm = shm.lock().unwrap();
         if layout.groups.len() > 1 && root_rank == 0 && bytes <= shm.slot_bytes() {
@@ -1661,7 +1681,7 @@ pub extern "C" fn ncclReduceScatter(
     datatype: i32,
     op: i32,
     comm: *mut Comm,
-    _stream: *mut std::ffi::c_void,
+    stream: *mut std::ffi::c_void,
 ) -> NcclResult {
     if sendbuff.is_null() || recvbuff.is_null() || comm.is_null() {
         return NCCL_INVALID_ARGUMENT;
@@ -1675,6 +1695,9 @@ pub extern "C" fn ncclReduceScatter(
     // NCCL's reduce-scatter count is per rank: the send buffer holds
     // count * world elements and each rank receives count elements.
     let comm = unsafe { &*comm };
+    if let Err(error) = synchronize_stream(comm, stream) {
+        return error;
+    }
     let width = count * dtype.bytes();
     let bytes = width * comm.world;
     if let Some(shm) = &comm.shm {
@@ -1744,7 +1767,7 @@ pub extern "C" fn ncclReduce(
     op: i32,
     root_rank: i32,
     comm: *mut Comm,
-    _stream: *mut std::ffi::c_void,
+    stream: *mut std::ffi::c_void,
 ) -> NcclResult {
     if sendbuff.is_null() || recvbuff.is_null() || comm.is_null() {
         return NCCL_INVALID_ARGUMENT;
@@ -1757,6 +1780,9 @@ pub extern "C" fn ncclReduce(
     };
     let bytes = count * dtype.bytes();
     let comm = unsafe { &*comm };
+    if let Err(error) = synchronize_stream(comm, stream) {
+        return error;
+    }
     let mut host = vec![0u8; bytes];
     if device_to_host(comm.runtime.as_ref(), sendbuff as u64, &mut host).is_err() {
         return NCCL_UNHANDLED_CUDA_ERROR;
@@ -1807,7 +1833,7 @@ pub extern "C" fn ncclSend(
     datatype: i32,
     dest: i32,
     comm: *mut Comm,
-    _stream: *mut std::ffi::c_void,
+    stream: *mut std::ffi::c_void,
 ) -> NcclResult {
     if sendbuff.is_null() || comm.is_null() {
         return NCCL_INVALID_ARGUMENT;
@@ -1818,6 +1844,9 @@ pub extern "C" fn ncclSend(
     let comm = unsafe { &*comm };
     if dest < 0 || dest as usize >= comm.world || dest as usize == comm.rank {
         return NCCL_INVALID_ARGUMENT;
+    }
+    if let Err(error) = synchronize_stream(comm, stream) {
+        return error;
     }
     let bytes = count * dtype.bytes();
     let mut host = vec![0u8; bytes];
@@ -1837,7 +1866,7 @@ pub extern "C" fn ncclRecv(
     datatype: i32,
     src: i32,
     comm: *mut Comm,
-    _stream: *mut std::ffi::c_void,
+    stream: *mut std::ffi::c_void,
 ) -> NcclResult {
     if recvbuff.is_null() || comm.is_null() {
         return NCCL_INVALID_ARGUMENT;
@@ -1848,6 +1877,9 @@ pub extern "C" fn ncclRecv(
     let comm = unsafe { &*comm };
     if src < 0 || src as usize >= comm.world || src as usize == comm.rank {
         return NCCL_INVALID_ARGUMENT;
+    }
+    if let Err(error) = synchronize_stream(comm, stream) {
+        return error;
     }
     let bytes = count * dtype.bytes();
     let result = match comm.p2p.lock().unwrap().recv(src as u32, bytes) {
@@ -1956,18 +1988,28 @@ impl CommHandle {
         NCCL_SUCCESS
     }
 
-    fn all_gather(&self, send: u64, recv: u64, count: usize, dtype: i32) -> i32 {
+    #[pyo3(signature = (send, recv, count, dtype, stream=0))]
+    fn all_gather(&self, send: u64, recv: u64, count: usize, dtype: i32, stream: u64) -> i32 {
         ncclAllGather(
             send as *const std::ffi::c_void,
             recv as *mut std::ffi::c_void,
             count,
             dtype,
             self.ptr,
-            std::ptr::null_mut(),
+            stream as *mut std::ffi::c_void,
         )
     }
 
-    fn broadcast(&self, send: u64, recv: u64, count: usize, dtype: i32, root: i32) -> i32 {
+    #[pyo3(signature = (send, recv, count, dtype, root, stream=0))]
+    fn broadcast(
+        &self,
+        send: u64,
+        recv: u64,
+        count: usize,
+        dtype: i32,
+        root: i32,
+        stream: u64,
+    ) -> i32 {
         ncclBroadcast(
             send as *const std::ffi::c_void,
             recv as *mut std::ffi::c_void,
@@ -1975,11 +2017,20 @@ impl CommHandle {
             dtype,
             root,
             self.ptr,
-            std::ptr::null_mut(),
+            stream as *mut std::ffi::c_void,
         )
     }
 
-    fn reduce_scatter(&self, send: u64, recv: u64, count: usize, dtype: i32, op: i32) -> i32 {
+    #[pyo3(signature = (send, recv, count, dtype, op, stream=0))]
+    fn reduce_scatter(
+        &self,
+        send: u64,
+        recv: u64,
+        count: usize,
+        dtype: i32,
+        op: i32,
+        stream: u64,
+    ) -> i32 {
         ncclReduceScatter(
             send as *const std::ffi::c_void,
             recv as *mut std::ffi::c_void,
@@ -1987,11 +2038,21 @@ impl CommHandle {
             dtype,
             op,
             self.ptr,
-            std::ptr::null_mut(),
+            stream as *mut std::ffi::c_void,
         )
     }
 
-    fn reduce(&self, send: u64, recv: u64, count: usize, dtype: i32, op: i32, root: i32) -> i32 {
+    #[pyo3(signature = (send, recv, count, dtype, op, root, stream=0))]
+    fn reduce(
+        &self,
+        send: u64,
+        recv: u64,
+        count: usize,
+        dtype: i32,
+        op: i32,
+        root: i32,
+        stream: u64,
+    ) -> i32 {
         ncclReduce(
             send as *const std::ffi::c_void,
             recv as *mut std::ffi::c_void,
@@ -2000,29 +2061,31 @@ impl CommHandle {
             op,
             root,
             self.ptr,
-            std::ptr::null_mut(),
+            stream as *mut std::ffi::c_void,
         )
     }
 
-    fn send(&self, ptr: u64, count: usize, dtype: i32, dest: i32) -> i32 {
+    #[pyo3(signature = (ptr, count, dtype, dest, stream=0))]
+    fn send(&self, ptr: u64, count: usize, dtype: i32, dest: i32, stream: u64) -> i32 {
         ncclSend(
             ptr as *const std::ffi::c_void,
             count,
             dtype,
             dest,
             self.ptr,
-            std::ptr::null_mut(),
+            stream as *mut std::ffi::c_void,
         )
     }
 
-    fn recv(&self, ptr: u64, count: usize, dtype: i32, src: i32) -> i32 {
+    #[pyo3(signature = (ptr, count, dtype, src, stream=0))]
+    fn recv(&self, ptr: u64, count: usize, dtype: i32, src: i32, stream: u64) -> i32 {
         ncclRecv(
             ptr as *mut std::ffi::c_void,
             count,
             dtype,
             src,
             self.ptr,
-            std::ptr::null_mut(),
+            stream as *mut std::ffi::c_void,
         )
     }
 }
