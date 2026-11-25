@@ -38,6 +38,11 @@ size_t marlin_f32_workspace_bytes(uint32_t m, uint32_t n);
 #include "humming/plait_humming.h"
 #endif
 
+#if defined(__HIP__) && defined(PLAIT_W4_HIP_MARLIN_MFMA)
+#include <string.h>
+#include "marlin/plait_marlin_hip.cuh"
+#endif
+
 #if defined(PLAIT_W4_CUDA_INTEGER_MMA) || defined(PLAIT_W4_PPU_INTEGER_MMA)
 #include "w4_integer_mma.cuh"
 #endif
@@ -367,6 +372,37 @@ int device_launch_marlin(void *handle, const plait_w4a16_shape *shape,
 const plait_w4a16_marlin_api marlin_api = {marlin_probe, device_launch_marlin};
 #endif
 
+#if defined(__HIP__) && defined(PLAIT_W4_HIP_MARLIN_MFMA)
+int marlin_mfma_probe(void *handle) {
+    const auto session = static_cast<Session *>(handle);
+    hipDeviceProp_t properties;
+    const auto status = hipGetDeviceProperties(&properties, session->ordinal);
+    if (status != hipSuccess) return status;
+    const auto *arch = properties.gcnArchName;
+    return strncmp(arch, "gfx942", 6) == 0 && (arch[6] == 0 || arch[6] == ':') ? 0 : -1;
+}
+
+int device_launch_marlin_mfma(void *handle, const plait_w4a16_shape *shape,
+                              const void *activation, const void *weight, const void *params,
+                              void *workspace, void *output, void **completion) {
+    if (!plait_w4a16_valid_shape(shape) || shape->k % 16 != 0 || shape->n % 16 != 0 ||
+        uint64_t(shape->k) * shape->n > INT32_MAX ||
+        (shape->group_size != 128 && shape->group_size != shape->k) ||
+        !activation || !weight || !params || !output || !completion) {
+        return hipErrorInvalidValue;
+    }
+    auto session = static_cast<Session *>(handle);
+    return record_submission(session, completion, [&] {
+        return plait_marlin_mfma::launch(session->stream, *shape, activation, weight, params,
+                                         workspace, output);
+    });
+}
+
+const plait_w4a16_marlin_mfma_api marlin_mfma_api = {
+    {marlin_mfma_probe, device_launch_marlin_mfma}, plait_marlin_mfma::workspace,
+};
+#endif
+
 #if defined(PLAIT_W4A16_HUMMING)
 int humming_probe(void *handle, uint32_t n, uint32_t k, uint32_t group_size) {
     const auto session = static_cast<Session *>(handle);
@@ -424,6 +460,12 @@ const plait_w4a16_device_api api = {
 extern "C" const plait_w4a16_device_api *plait_w4a16_device_api_v1(void) {
     return &api;
 }
+
+#if defined(__HIP__) && defined(PLAIT_W4_HIP_MARLIN_MFMA)
+extern "C" const plait_w4a16_marlin_mfma_api *plait_w4a16_marlin_mfma_api_v1(void) {
+    return &marlin_mfma_api;
+}
+#endif
 
 #if defined(PLAIT_W4A16_MARLIN) && defined(PLAIT_W4_MARLIN_SHARDS)
 #if defined(PLAIT_W4_PPU_INTEGER_MMA)

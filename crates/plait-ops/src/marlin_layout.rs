@@ -67,3 +67,53 @@ pub(crate) fn pack(weights: W4Weights<'_>) -> Result<(Vec<u32>, Vec<u16>, i32), 
     }
     Ok((packed, scales, if grouped { 128 } else { -1 }))
 }
+
+pub(crate) fn pack_mfma(weights: W4Weights<'_>) -> Result<(Vec<u16>, Vec<u32>), OperatorError> {
+    let (k, n) = (weights.k as usize, weights.n as usize);
+    if k % 16 != 0 || n % 16 != 0 || (k as u64) * (n as u64) > i32::MAX as u64 {
+        return Err(OperatorError::Unsupported(
+            "Marlin MFMA requires K and N aligned to 16",
+        ));
+    }
+    let grouped = weights.group_size != weights.k;
+    if grouped && weights.group_size != 128 {
+        return Err(OperatorError::Unsupported(
+            "Marlin MFMA supports channelwise scales or groups of 128",
+        ));
+    }
+
+    let groups = weights.groups();
+    let mut parameters = Vec::with_capacity(weights.scales.len());
+    for group in 0..groups {
+        for channel in 0..n {
+            let index = channel * groups + group;
+            let scale_bits = weights.scales[index];
+            let scale = half::f16::from_bits(scale_bits).to_f32();
+            let zero = weights.zero_points.map_or(8, |zeros| zeros[index]);
+            let max_code = f32::from(zero.max(15 - zero));
+            if !scale.is_finite() || (grouped && scale.abs() * max_code > half::f16::MAX.to_f32()) {
+                return Err(OperatorError::Unsupported(
+                    "Marlin MFMA weight scales exceed the supported range",
+                ));
+            }
+            parameters.push(u32::from(scale_bits) | (u32::from(zero) << 16));
+        }
+    }
+
+    let mut packed = Vec::with_capacity(k * n / 4);
+    for column_tile in (0..n).step_by(16) {
+        for input_tile in (0..k).step_by(16) {
+            for input in (input_tile..input_tile + 16).step_by(4) {
+                for channel in column_tile..column_tile + 16 {
+                    // A wave lane reads four contiguous canonical INT4 codes.
+                    let offset = (channel * k + input) / 2;
+                    packed.push(u16::from_le_bytes([
+                        weights.packed[offset],
+                        weights.packed[offset + 1],
+                    ]));
+                }
+            }
+        }
+    }
+    Ok((packed, parameters))
+}

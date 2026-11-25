@@ -42,7 +42,8 @@ type QuantizeF16 = unsafe extern "C" fn(
     *mut *mut c_void,
 ) -> i32;
 type CompletionQuery = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u32) -> i32;
-type MarlinWorkspace = unsafe extern "C" fn(u32, u32) -> usize;
+type MarlinWorkspaceQuery = unsafe extern "C" fn(u32, u32) -> usize;
+type MfmaWorkspaceQuery = unsafe extern "C" fn(u32, u32, u32) -> usize;
 type MarlinLaunch = unsafe extern "C" fn(
     *mut c_void,
     *const Shape,
@@ -94,7 +95,7 @@ struct Session<'lib> {
     quantize_f16: Option<QuantizeF16>,
     completion_query: Option<CompletionQuery>,
     marlin_launch_f32: Option<MarlinLaunch>,
-    marlin_workspace_f32: Option<MarlinWorkspace>,
+    marlin_workspace_f32: Option<MarlinWorkspaceQuery>,
     humming_launch_f32: Option<HummingLaunch>,
 }
 
@@ -102,6 +103,24 @@ struct Session<'lib> {
 struct MarlinApi {
     probe: unsafe extern "C" fn(*mut c_void) -> i32,
     launch: MarlinLaunch,
+}
+
+impl MarlinApi {
+    fn check_device(&self, session: &Session<'_>) -> Result<(), OperatorError> {
+        let probe = unsafe { (self.probe)(session.handle.as_ptr()) };
+        if probe == -1 {
+            return Err(OperatorError::Unsupported(
+                "the Marlin library was built for a different device architecture",
+            ));
+        }
+        status("probe Marlin device", probe)
+    }
+}
+
+#[repr(C)]
+struct MarlinMfmaApi {
+    kernel: MarlinApi,
+    workspace: MfmaWorkspaceQuery,
 }
 
 #[repr(C)]
@@ -330,7 +349,7 @@ impl<'lib> DeviceSession<'lib> {
         &self,
         weights: W4Weights<'_>,
     ) -> Result<PreparedW4A16<'lib>, OperatorError> {
-        self.prepare_marlin_kernel(weights, None)
+        self.prepare_marlin_kernel(weights, OutputType::F16)
     }
 
     /// Prepare Marlin to retain FP32 across device split-K and write FP32 shards.
@@ -338,57 +357,81 @@ impl<'lib> DeviceSession<'lib> {
         &self,
         weights: W4Weights<'_>,
     ) -> Result<PreparedW4A16<'lib>, OperatorError> {
-        let launch = self.0.marlin_launch_f32.ok_or(OperatorError::Unsupported(
-            "library has no FP32 Marlin output",
-        ))?;
-        // Grouped scales multiply the signed INT4 weights before MMA in FP16.
-        // Channelwise scales are applied to the final FP32 sum instead.
-        let scale_limit = half::f16::MAX.to_f32() / 8.0;
-        if weights.scales.iter().any(|&bits| {
-            let scale = half::f16::from_bits(bits).to_f32();
-            !scale.is_finite() || (weights.group_size != weights.k && scale.abs() > scale_limit)
-        }) {
-            return Err(OperatorError::Unsupported(
-                "Marlin shard weight scales exceed the supported range",
-            ));
-        }
-        self.prepare_marlin_kernel(weights, Some(launch))
+        self.prepare_marlin_kernel(weights, OutputType::F32)
     }
 
     fn prepare_marlin_kernel(
         &self,
         weights: W4Weights<'_>,
-        launch_f32: Option<MarlinLaunch>,
+        output: OutputType,
     ) -> Result<PreparedW4A16<'lib>, OperatorError> {
         let session = &self.0;
-        type Entry = unsafe extern "C" fn() -> *const MarlinApi;
-        let entry = unsafe { session.library.get::<Entry>(b"plait_w4a16_marlin_api_v1") }
-            .map_err(|_| OperatorError::Unsupported("library has no resident Marlin kernel"))?;
-        let api = unsafe { entry().as_ref() }
-            .ok_or_else(|| OperatorError::Backend("resident Marlin API is null".to_owned()))?;
-        let probe = unsafe { (api.probe)(session.handle.as_ptr()) };
-        if probe == -1 {
-            return Err(OperatorError::Unsupported(
-                "the Marlin library was built for a different device architecture",
-            ));
-        }
-        status("probe Marlin device", probe)?;
-        let (packed, scales, _) = marlin_layout::pack(weights)?;
-        let workspace_bytes = weights.n as usize / 128 * 16 * size_of::<i32>();
-        let (launch, output) = launch_f32.map_or((api.launch, OutputType::F16), |launch| {
-            (launch, OutputType::F32)
-        });
-        let workspace = if output == OutputType::F32 && session.marlin_workspace_f32.is_some() {
-            None
+        type MfmaEntry = unsafe extern "C" fn() -> *const MarlinMfmaApi;
+        let mfma = unsafe {
+            session
+                .library
+                .get::<MfmaEntry>(b"plait_w4a16_marlin_mfma_api_v1")
+        };
+        let (packed, scale, launch, workspace) = if let Ok(entry) = mfma {
+            let api = unsafe { entry().as_ref() }.ok_or_else(|| {
+                OperatorError::Backend("resident Marlin MFMA API is null".to_owned())
+            })?;
+            api.kernel.check_device(session)?;
+            let (packed, parameters) = marlin_layout::pack_mfma(weights)?;
+            (
+                Buffer::upload(session, &packed)?,
+                Buffer::upload(session, &parameters)?,
+                api.kernel.launch,
+                MarlinWorkspace::Mfma(api.workspace),
+            )
         } else {
-            Some(Buffer::new(session, ptr::null(), workspace_bytes)?)
+            type Entry = unsafe extern "C" fn() -> *const MarlinApi;
+            let entry = unsafe { session.library.get::<Entry>(b"plait_w4a16_marlin_api_v1") }
+                .map_err(|_| OperatorError::Unsupported("library has no resident Marlin kernel"))?;
+            let api = unsafe { entry().as_ref() }
+                .ok_or_else(|| OperatorError::Backend("resident Marlin API is null".to_owned()))?;
+            api.check_device(session)?;
+            let launch = match output {
+                OutputType::F16 => api.launch,
+                OutputType::F32 => {
+                    let launch = session.marlin_launch_f32.ok_or(OperatorError::Unsupported(
+                        "library has no FP32 Marlin output",
+                    ))?;
+                    // Grouped scales are applied before MMA, with signed codes in [-8, 7].
+                    let limit = half::f16::MAX.to_f32() / 8.0;
+                    if weights.scales.iter().any(|&bits| {
+                        let scale = half::f16::from_bits(bits).to_f32();
+                        !scale.is_finite()
+                            || (weights.group_size != weights.k && scale.abs() > limit)
+                    }) {
+                        return Err(OperatorError::Unsupported(
+                            "Marlin shard weight scales exceed the supported range",
+                        ));
+                    }
+                    launch
+                }
+            };
+            let (packed, scales, _) = marlin_layout::pack(weights)?;
+            let workspace = match (output, session.marlin_workspace_f32) {
+                (OutputType::F32, Some(query)) => MarlinWorkspace::Shaped(query),
+                _ => {
+                    let bytes = weights.n as usize / 128 * 16 * size_of::<i32>();
+                    MarlinWorkspace::Resident(Buffer::new(session, ptr::null(), bytes)?)
+                }
+            };
+            (
+                Buffer::upload(session, &packed)?,
+                Buffer::upload(session, &scales)?,
+                launch,
+                workspace,
+            )
         };
         Ok(PreparedW4A16 {
             k: weights.k,
             n: weights.n,
             group_size: weights.group_size,
-            packed: Buffer::upload(session, &packed)?,
-            scale: Buffer::upload(session, &scales)?,
+            packed,
+            scale,
             kernel: Kernel::Marlin {
                 launch,
                 output,
@@ -640,13 +683,29 @@ enum Kernel<'lib> {
     Marlin {
         launch: MarlinLaunch,
         output: OutputType,
-        workspace: Option<Buffer<'lib>>,
+        workspace: MarlinWorkspace<'lib>,
     },
     Humming {
         api: &'lib HummingApi,
         zero: Buffer<'lib>,
         launch_f32: Option<HummingLaunch>,
     },
+}
+
+enum MarlinWorkspace<'lib> {
+    Resident(Buffer<'lib>),
+    Shaped(MarlinWorkspaceQuery),
+    Mfma(MfmaWorkspaceQuery),
+}
+
+impl MarlinWorkspace<'_> {
+    fn scratch_bytes(&self, rows: u32, n: u32, k: u32) -> usize {
+        match self {
+            Self::Resident(_) => 0,
+            Self::Shaped(query) => unsafe { query(rows, n) },
+            Self::Mfma(query) => unsafe { query(rows, n, k) },
+        }
+    }
 }
 
 impl<'lib> PreparedW4A16<'lib> {
@@ -776,24 +835,25 @@ impl<'lib> PreparedW4A16<'lib> {
             Kernel::Humming { api, .. } => Some(api.launch),
             _ => None,
         };
-        let marlin_scratch = match &self.kernel {
-            Kernel::Marlin {
-                workspace: None, ..
-            } if input.rows != 0 => {
-                let query = session
-                    .marlin_workspace_f32
-                    .expect("Marlin workspace query");
-                let bytes = unsafe { query(input.rows, self.n) };
-                if bytes == 0 || bytes > isize::MAX as usize {
-                    return Err(OperatorError::Shape("invalid Marlin scratch size"));
-                }
-                Some(Buffer::new(session, ptr::null(), bytes)?)
+        let scratch_bytes = match &self.kernel {
+            Kernel::Marlin { workspace, .. } if input.rows != 0 => {
+                workspace.scratch_bytes(input.rows, self.n, self.k)
             }
-            _ => None,
+            _ => 0,
         };
+        if scratch_bytes > isize::MAX as usize {
+            return Err(OperatorError::Shape("invalid Marlin scratch size"));
+        }
+        let marlin_scratch = (scratch_bytes != 0)
+            .then(|| Buffer::new(session, ptr::null(), scratch_bytes))
+            .transpose()?;
         let kernel_buffer = match &self.kernel {
             Kernel::Reference { zero } | Kernel::Humming { zero, .. } => Some(zero),
-            Kernel::Marlin { workspace, .. } => workspace.as_ref().or(marlin_scratch.as_ref()),
+            Kernel::Marlin {
+                workspace: MarlinWorkspace::Resident(locks),
+                ..
+            } => Some(locks),
+            Kernel::Marlin { .. } => marlin_scratch.as_ref(),
         };
         self.submit_output(
             input.rows,
@@ -826,7 +886,7 @@ impl<'lib> PreparedW4A16<'lib> {
                         input.buffer.ptr(),
                         self.packed.ptr(),
                         self.scale.ptr(),
-                        kernel_buffer.expect("Marlin workspace allocated").ptr(),
+                        kernel_buffer.map_or(ptr::null_mut(), Buffer::ptr),
                         buffer,
                         event,
                     ),

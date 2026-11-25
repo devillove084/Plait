@@ -451,16 +451,89 @@ fn native_marlin_preserves_fp32_through_split_k() {
                     .all(|&v| f16::from_bits(half(v)).to_f32() != v)
             );
             let input = session.upload_f16(rows, k, &input).unwrap();
-            let output = linear.submit(&input, None, OutputType::F32).unwrap();
-            let LinearOutput::F32(actual) = output.read().unwrap() else {
-                panic!("expected FP32 Marlin result");
-            };
-            assert_eq!(actual.len(), expected.len());
-            for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
-                assert_eq!(actual, expected, "M={rows} G={group_size} index={index}");
+            // Repeat each layout to exercise shared-memory reuse under different scheduling.
+            for replay in 0..4 {
+                let output = linear.submit(&input, None, OutputType::F32).unwrap();
+                let LinearOutput::F32(actual) = output.read().unwrap() else {
+                    panic!("expected FP32 Marlin result");
+                };
+                assert_eq!(actual.len(), expected.len());
+                for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        actual, expected,
+                        "M={rows} G={group_size} replay={replay} index={index}"
+                    );
+                }
             }
             println!("Marlin FP32 split-K matches reference: M={rows} N={n} K={k} G={group_size}");
         }
+    }
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn native_marlin_mfma_handles_asymmetric_weights_and_tail_groups() {
+    use plait_ops::native::NativeW4A16;
+    use std::path::Path;
+
+    let Some(path) = std::env::var_os("PLAIT_MARLIN_MFMA_TEST_LIBRARY") else {
+        return;
+    };
+    let backend = unsafe { NativeW4A16::load(Path::new(&path)) }.unwrap();
+    let session = backend.open_device(0).unwrap();
+    for (n, k, group_size) in [(16u32, 16u32, 16), (80, 272, 128), (96, 272, 272)] {
+        let packed: Vec<_> = (0..n * k / 2)
+            .map(|i| (i * 59 + i / 23 + 47) as u8)
+            .collect();
+        let parameters = n * k.div_ceil(group_size);
+        let scales: Vec<_> = (0..parameters)
+            .map(|i| half((1 + i * 5 % 7) as f32 / 64.0))
+            .collect();
+        let zeros: Vec<_> = (0..parameters)
+            .map(|i| ((i * 11 + i / 9) % 16) as u8)
+            .collect();
+        let weights = W4Weights::new(k, n, group_size, &packed, &scales, Some(&zeros)).unwrap();
+        for rows in [1, 19, 33] {
+            let input: Vec<_> = (0..rows * k)
+                .map(|i| half(((i * 31 % 81) as i32 - 40) as f32 / 128.0))
+                .collect();
+            let activation = session.upload_f16(rows, k, &input).unwrap();
+            let prepared_f16 = session.prepare_marlin(weights).unwrap();
+            let prepared_f32 = session.prepare_marlin_f32(weights).unwrap();
+            let local = prepared_f16
+                .submit(&activation, None, OutputType::F16)
+                .unwrap();
+            let shard = prepared_f32
+                .submit(&activation, None, OutputType::F32)
+                .unwrap();
+            drop((activation, prepared_f16, prepared_f32));
+
+            for (output, result) in [(OutputType::F16, local), (OutputType::F32, shard)] {
+                let expected = W4A16::new(weights, &input, None, output).unwrap().run_cpu();
+                if session.supports_completion_query() {
+                    poll_producer(&result);
+                }
+                let actual = result.read().unwrap();
+                match (actual, expected) {
+                    (LinearOutput::F16(actual), LinearOutput::F16(expected)) => {
+                        assert_eq!(actual, expected, "M={rows} N={n} K={k} G={group_size}");
+                    }
+                    (LinearOutput::F32(actual), LinearOutput::F32(expected)) => {
+                        assert_eq!(actual.len(), expected.len());
+                        for (index, (&actual, &expected)) in
+                            actual.iter().zip(&expected).enumerate()
+                        {
+                            assert_eq!(
+                                actual, expected,
+                                "M={rows} N={n} K={k} G={group_size} index={index}"
+                            );
+                        }
+                    }
+                    _ => panic!("unexpected Marlin MFMA output format"),
+                }
+            }
+        }
+        println!("Marlin MFMA asymmetric FP16 and FP32 matched: N={n} K={k} G={group_size}");
     }
 }
 

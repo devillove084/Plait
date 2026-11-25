@@ -718,6 +718,8 @@ __global__ void Marlin(
     // readable, other ways of writing the loop seemed to noticeably worse performance after compliation.
     if (slice_iters == 0) {
       cp_async_wait<0>();
+      if constexpr (parallel_k)
+        __syncthreads(); // All lanes finish staging before reusing shared memory.
       bool last = slice_idx == slice_count - 1;
       // For per-column scales, we only fetch them here in the final step before write-out
       if (group_blocks == -1 && !parallel_k && last) {
@@ -736,6 +738,7 @@ __global__ void Marlin(
       }
       if constexpr (parallel_k) {
         write_result();
+        __syncthreads(); // Another stripe can immediately start staging in this buffer.
       } else {
         if (slice_count > 1) {
           barrier_acquire(&locks[slice_col], slice_idx);
