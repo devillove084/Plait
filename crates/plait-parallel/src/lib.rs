@@ -13,8 +13,10 @@ pub mod dsa;
 pub mod moe;
 pub mod plan;
 pub mod pp;
+pub mod precision;
 mod recovery;
 pub mod scheduling;
+pub mod serving;
 pub mod topology;
 
 pub use asymmetric::{

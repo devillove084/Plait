@@ -446,10 +446,7 @@ mod tests {
     #[test]
     fn nvidia_csv_parses_into_a_profile() {
         let node = NodeId::derive("dev-parse");
-        let profiles = parse_nvidia(
-            "0, NVIDIA RTX PRO 5000 72GB Blackwell, 73415, 2600, 12.0\n",
-            node,
-        );
+        let profiles = parse_nvidia("0, NVIDIA Blackwell, 73415, 2600, 12.0\n", node);
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0].arch, AcceleratorKind::Nvidia);
         assert_eq!(profiles[0].memory_bytes, 73415 * 1024 * 1024);
@@ -530,7 +527,7 @@ mod tests {
 
     #[test]
     fn kernel_caps_split_ampere_from_blackwell() {
-        let ampere = profile_with_name("NVIDIA GeForce RTX 3090 [cc 8.6, 82 SM]");
+        let ampere = profile_with_name("NVIDIA Ampere [cc 8.6, 82 SM]");
         assert_eq!(compute_capability(&ampere), Some((8, 6)));
         let caps = kernel_caps(&ampere);
         assert!(caps.marlin);
@@ -538,7 +535,7 @@ mod tests {
         assert!(!caps.fp8);
         assert!(!caps.nvfp4);
 
-        let blackwell = profile_with_name("NVIDIA RTX PRO 5000 72GB Blackwell [cc 12.0, 110 SM]");
+        let blackwell = profile_with_name("NVIDIA Blackwell [cc 12.0, 110 SM]");
         assert_eq!(compute_capability(&blackwell), Some((12, 0)));
         let caps = kernel_caps(&blackwell);
         assert!(caps.marlin);

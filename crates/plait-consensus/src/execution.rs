@@ -129,6 +129,22 @@ impl ExecutionGraph {
         self.executed.contains(&id)
     }
 
+    pub(crate) fn unresolved_dependencies(&self) -> impl Iterator<Item = InstanceId> + '_ {
+        self.nodes
+            .values()
+            .flat_map(|node| node.unresolved.iter().copied())
+    }
+
+    pub(crate) fn is_unresolved(&self, id: InstanceId) -> bool {
+        self.dependents.get(&id).is_some_and(|dependents| {
+            dependents.iter().any(|dependent| {
+                self.nodes
+                    .get(dependent)
+                    .is_some_and(|node| node.unresolved.contains(&id))
+            })
+        })
+    }
+
     /// Add a committed instance and wire all edges whose dependencies are
     /// already present. If a dependency commits later, the edge is added then.
     pub fn commit(
@@ -534,6 +550,7 @@ fn edge_kinds(left: &NodeMeta, right: &NodeMeta) -> EdgeKinds {
                     KeyClass::Data => EdgeKinds::DATA,
                     KeyClass::Device => EdgeKinds::DEVICE,
                     KeyClass::Config => EdgeKinds::CONFIG,
+                    KeyClass::Control => EdgeKinds::CONTROL,
                 });
             }
         }

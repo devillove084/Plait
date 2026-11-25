@@ -69,7 +69,7 @@ registered memory and move through peer pointers or one-sided descriptors.
 
 ## Measured baseline
 
-On one host with eight RTX PRO 5000 GPUs, PCIe topology, no NVLink, Plait's
+On one host with eight NVIDIA Blackwell GPUs, PCIe topology, no NVLink, Plait's
 device-ring allreduce measured:
 
 | Size | Plait | NCCL 2.30.4 |
@@ -88,11 +88,11 @@ plus `Simple`.
 
 ## Heterogeneous 4+8 example
 
-The planner models four RTX 3090 ranks and eight RTX PRO 5000 ranks:
+The planner models four NVIDIA Ampere ranks and eight NVIDIA Blackwell ranks:
 
 ```text
-4 × RTX 3090     PCIe, compute 1.0, 25 Gbps
-8 × RTX PRO 5000 UB,   compute 4.0, 200 Gbps
+4 × NVIDIA Ampere     PCIe, compute 1.0, 25 Gbps
+8 × NVIDIA Blackwell UB,   compute 4.0, 200 Gbps
 ```
 
 Run:
@@ -140,9 +140,9 @@ selects the local architecture; no generated CUTLASS tree is committed.
 
 ## Commands and hardware
 
-The GPU data plane requires peer-capable CUDA devices. Local RTX 3090 machines
+The GPU data plane requires peer-capable CUDA devices. Local NVIDIA Ampere machines
 may refuse cross-GPU peer access; tests report the skip instead of hiding it.
-The `pro5000` host passes cross-GPU IPC.
+The NVIDIA Blackwell host passes cross-GPU IPC.
 
 The ibverbs backend compiles and links. The ordinary containers expose no
 `/dev/infiniband`, no active verbs device, and no `CAP_NET_ADMIN`, so
@@ -156,7 +156,7 @@ aggregate over four TCP channels, publishes the result through shared memory,
 and uses a ready barrier outside the timing loop. It is host-staged, not a
 GPUDirect path.
 
-Measured with 4 local RTX 3090 ranks and 8 remote RTX PRO 5000 ranks:
+Measured with 4 local NVIDIA Ampere ranks and 8 remote NVIDIA Blackwell ranks:
 
 ```text
 1 MiB   0.081-0.083 GB/s  > NCCL 0.050

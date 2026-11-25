@@ -237,7 +237,7 @@ def patch_vllm(disable_custom_allreduce: bool = True) -> None:
 def preferred_linear_backend(device: int | None = None, quantization: str | None = None) -> str:
     """Pick a vLLM quantized-linear backend for this GPU and checkpoint.
 
-    SM120 (RTX PRO 5000 Blackwell) gets Humming, including NVFP4. Ampere keeps
+    SM120 (NVIDIA Blackwell) gets Humming, including NVFP4. Ampere keeps
     Marlin for W4A16 checkpoints and Cutlass for FP8, so a heterogeneous
     deployment can use the same checkpoint on both host groups.
     """

@@ -215,7 +215,7 @@ are length-delimited bincode.
 `plait-gpu` executes the real CUDA path: an embedded cubin for AXPY and a
 CUTLASS 4.8.1 C++ FFI shim for SGEMM. The build detects the local compute
 capability and chooses an ABI-compatible compiler (CUDA 12.9 for the Ampere
-3090, 13.2 for Blackwell). `just setup` clones CUTLASS into `target/cutlass` on
+NVIDIA Ampere, 13.2 for Blackwell). `just setup` clones CUTLASS into `target/cutlass` on
 demand.
 
 `plait-device` discovers CPU/NVIDIA/AMD/Huawei/PPU profiles and provides a
@@ -239,20 +239,26 @@ remote key, so the same descriptor is usable by loopback and verbs transports.
 - Minority partition: no commit; ballots may rise, but no state is applied.
 - Membership change: requires all relevant voters; a failure during the change
   stalls it. This is a deliberate safety/availability tradeoff.
-- Restart: not supported yet. Identities and counters must be persisted before
-  this prototype is used for durable deployments.
+- Durable control replicas restore their identity, accepted state, and
+  execution order from the replica journal.
 
-## 7. Why this avoids the old collective bottleneck
+## 7. Asynchronous versioned reduction
 
-The old model couples three things: a fixed process group, a rank-ordered
-collective, and a central control point. Plait decouples them:
+With NCCL, each rank issues the matching operation on its communicator.
+Execution is ordered on CUDA streams, and NCCL provides asynchronous enqueue
+and nonblocking group calls. [NCCL collective operations](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html) · [NCCL group calls](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/groups.html)
 
-- the process group is membership state, changeable without a special node;
-- the collective is a normal command with conflict keys, so unrelated shards
-  make progress independently;
-- large payloads move through the data plane while the log carries only order
-  and descriptors.
+In the native W4 path, any execution host can submit an operation. The control
+plane admits it against one group epoch. A plan lists the complete K partition
+and exact worker grants. The submitter dispatches all shards concurrently and
+pulls each immutable result as soon as its worker reports the descriptor.
+The reducer accumulates the contiguous K prefix and holds later shards until
+their predecessors arrive. This preserves FP32 summation order across network
+schedules.
 
-That does not make coordination free. It makes coordination **sparse**: only
-operations that actually conflict pay for ordering, and only the shards that
-participate enter the quorum.
+Result delivery requires the whole partition and a final ordered grant check.
+The current group can admit new work while an earlier epoch drains. A
+straggler in the earlier epoch holds up its own result. A revocation ordered
+before the delivery check rejects output even when shard bytes have arrived. The TLA+ model covers both
+epochs, independent publication and pull, out-of-order arrival, and stale
+descriptors. [Async reduction model](../specs/PlaitAsyncReduction.tla)

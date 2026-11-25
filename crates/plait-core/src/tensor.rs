@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::{OpId, serving::WorkerGrant};
+
 /// Identifies a logical tensor, independent of where its shards live.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TensorId(pub u128);
@@ -12,7 +14,7 @@ impl std::fmt::Debug for TensorId {
 
 /// Identifies a shard of a tensor. Shard ids are opaque and chosen by the
 /// producer; they are not ranks.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ShardId(pub u32);
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -143,6 +145,30 @@ pub struct TensorView {
     pub key: TensorKey,
     pub version: TensorVersion,
     pub values: Vec<f64>,
+}
+
+/// A planned contribution to a K-split linear operator. Its row-major payload
+/// is little-endian FP32 with the full output shape on every contributing device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KPartial {
+    pub grant: WorkerGrant,
+    pub op: OpId,
+    pub shard: ShardId,
+    pub k_start: u32,
+    pub k_end: u32,
+    pub output_shape: [u32; 2],
+}
+
+impl KPartial {
+    pub fn payload_bytes(self) -> Option<usize> {
+        let [rows, columns] = self.output_shape;
+        if rows == 0 || columns == 0 || self.k_start >= self.k_end {
+            return None;
+        }
+        (rows as usize)
+            .checked_mul(columns as usize)?
+            .checked_mul(DType::F32.size_bytes())
+    }
 }
 
 #[cfg(test)]

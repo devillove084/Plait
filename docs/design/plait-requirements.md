@@ -48,7 +48,7 @@ move bulk bytes through registered memory instead of through the log.
 | Device heterogeneity | CPU + NVIDIA + AMD + Huawei + PPU profiles in one plan | Scheduling cannot assume one vendor or one backend |
 | Compute conflict | Same device serialized; different devices concurrent | A device is a scarce execution resource, not just data |
 | Control concurrency | Tokio actor, channels, `select!`; no locks | Async runtime dependency; one manager task owns sockets |
-| GPU execution | Real CUDA AXPY + CUTLASS SGEMM on 3090 and Blackwell | Vendor-specific FFI; only NVIDIA adapter today |
+| GPU execution | Real CUDA AXPY + CUTLASS SGEMM on NVIDIA Ampere and Blackwell | Vendor-specific FFI; only NVIDIA adapter today |
 
 ## Out of scope (explicit)
 
@@ -98,7 +98,7 @@ move bulk bytes through registered memory instead of through the log.
 | RDMA bulk Q per node/layer | ~14 MB | 64k seq × 16 heads × 128 dim × 2 B / shard |
 | KV cache per 64k sequence | ~262 GB | 2 × 61 × 64k × 128 × 128 × 2 B; sharded |
 | Same-rack commit budget | ≤2 ms p99 | One fast-path RTT + local apply |
-| Remote GPU discovery | 8× RTX PRO 5000 72GB + CPU | `pro5000` test run |
+| Remote GPU discovery | 8× NVIDIA Blackwell + CPU | the Blackwell host test run |
 | Hetero demo tasks | 32 planned ops | placements `{Nvidia: 29, Cpu: 3}` |
 
 ## Validation gate

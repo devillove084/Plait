@@ -1,7 +1,7 @@
 //! Real CUDA execution for Plait compute tasks.
 //!
 //! The kernel is compiled with NVRTC at runtime, so the same source runs on the
-//! local RTX 3090 (sm_86) and the remote RTX PRO 5000 Blackwell (sm_120) without
+//! local NVIDIA Ampere (sm_86) and the remote NVIDIA Blackwell (sm_120) without
 //! shipping architecture-specific PTX. This crate is intentionally small: it
 //! proves the compute path; model kernels are adapters above it.
 

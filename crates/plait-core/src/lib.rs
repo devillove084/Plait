@@ -9,6 +9,7 @@ pub mod command;
 pub mod config;
 pub mod device;
 pub mod identity;
+pub mod serving;
 pub mod tensor;
 
 pub use command::{

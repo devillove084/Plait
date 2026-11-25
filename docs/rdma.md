@@ -86,14 +86,14 @@ alternative software provider if the host supports it.
 
 ## Validation status
 
-A real Soft-RoCE two-QP test passed on `pro5000` through a privileged helper
+A real Soft-RoCE two-QP test passed on the Blackwell host through a privileged helper
 container:
 
 ```text
 plait rdma: rxe0 loopback write/read passed (128 bytes)
 ```
 
-The normal `pro5000` container still has no `/dev/infiniband`, so `plait-node
+The normal Blackwell host container still has no `/dev/infiniband`, so `plait-node
 rdma-selftest` reports the expected skip there. See
 the README for the current hardware limitation.
 
@@ -105,8 +105,8 @@ The **local development container** cannot execute the hardware path:
 - the running 4.19 kernel has no `rdma_rxe.ko`;
 - `CAP_NET_ADMIN` and `CAP_SYS_MODULE` are not in the effective/bounding set.
 
-The **pro5000 host kernel does support `rdma_rxe`** (dmesg shows it), but the
-ordinary `pro5000` container still does not expose `/dev/infiniband` and lacks
+The **NVIDIA Blackwell host kernel supports `rdma_rxe`**, but the
+ordinary Blackwell host container still does not expose `/dev/infiniband` and lacks
 the capabilities to create the link. A privileged helper container with host
 `/sys`, `/dev`, `/lib/modules`, and the repository mounted can create `rxe0` and
 run the test; the ordinary container then still reports:
