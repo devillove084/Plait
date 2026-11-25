@@ -7,8 +7,8 @@ use std::cell::Cell;
 use std::ffi::c_void;
 use std::sync::Arc;
 
-mod hip;
-pub use hip::HipRuntime;
+mod host_copy;
+pub use host_copy::HostCopyRuntime;
 
 thread_local! {
     static BOUND_CUDA_DEVICE: Cell<Option<usize>> = const { Cell::new(None) };

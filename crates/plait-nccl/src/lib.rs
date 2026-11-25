@@ -24,7 +24,7 @@ mod kernel;
 mod p2p;
 mod shm;
 
-use backend::{CudaRuntime, DeviceRuntime, HipRuntime, HuaweiRuntime, PpuRuntime};
+use backend::{CudaRuntime, DeviceRuntime, HostCopyRuntime, HuaweiRuntime, PpuRuntime};
 
 pub type NcclResult = i32;
 pub const NCCL_SUCCESS: NcclResult = 0;
@@ -279,15 +279,26 @@ fn create_runtime(backend: BackendKind, device: usize) -> Result<Box<dyn DeviceR
         BackendKind::Cuda => CudaRuntime::new(device)
             .map(|runtime| Box::new(runtime) as Box<dyn DeviceRuntime>)
             .map_err(|error| error.0),
-        BackendKind::Rocm => HipRuntime::new(device)
+        BackendKind::Rocm => HostCopyRuntime::hip(device)
             .map(|runtime| Box::new(runtime) as Box<dyn DeviceRuntime>)
             .map_err(|error| error.0),
         BackendKind::Huawei => HuaweiRuntime::new(device)
             .map(|runtime| Box::new(runtime) as Box<dyn DeviceRuntime>)
             .map_err(|error| error.0),
-        BackendKind::Ppu => PpuRuntime::new(device)
-            .map(|runtime| Box::new(runtime) as Box<dyn DeviceRuntime>)
-            .map_err(|error| error.0),
+        BackendKind::Ppu => {
+            if std::env::var_os("PLAIT_PPU_LIB").is_some() {
+                return PpuRuntime::new(device)
+                    .map(|runtime| Box::new(runtime) as Box<dyn DeviceRuntime>)
+                    .map_err(|error| error.0);
+            }
+            match HostCopyRuntime::hggc(device) {
+                Ok(runtime) => Ok(Box::new(runtime)),
+                Err(error) if std::env::var_os("PLAIT_PPU_HGGCRT_LIB").is_some() => Err(error.0),
+                Err(native) => PpuRuntime::new(device)
+                    .map(|runtime| Box::new(runtime) as Box<dyn DeviceRuntime>)
+                    .map_err(|adapter| format!("{}; {}", native.0, adapter.0)),
+            }
+        }
     }
 }
 
