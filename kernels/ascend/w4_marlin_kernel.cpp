@@ -9,25 +9,6 @@ constexpr uint32_t k_unit = PLAIT_ASCEND_MARLIN_K_UNIT;
 constexpr uint32_t tile_m = PLAIT_ASCEND_TILE_M;
 constexpr uint32_t tile_n = PLAIT_ASCEND_TILE_N;
 
-__aicore__ void pack_activation(GM_ADDR activation, GM_ADDR packed, uint32_t rows,
-    uint32_t k, uint32_t padded_rows, uint32_t depth, uint32_t first, uint32_t groups) {
-    const auto source = reinterpret_cast<__gm__ const uint64_t *>(activation);
-    const auto out = reinterpret_cast<__gm__ uint64_t *>(packed);
-    const uint64_t group_stride = uint64_t(padded_rows) * (depth / 4);
-    const WriteSlices slices(packed, group_stride * groups, sizeof(uint64_t));
-    for (uint64_t slice = AscendC::GetBlockIdx(); slices.start(slice) < slices.length;
-         slice += AscendC::GetBlockNum()) {
-        const uint64_t end = slices.end(slice);
-        for (uint64_t pos = slices.start(slice); pos < end; ++pos) {
-            const uint32_t group = first + pos / group_stride;
-            const uint32_t row = (pos % group_stride) / (depth / 4);
-            const uint32_t inner = group * (k_unit / 4) + pos % (depth / 4);
-            out[pos] = row < rows && inner < k / 4 ? source[uint64_t(row) * (k / 4) + inner] : 0;
-        }
-    }
-    flush(packed);
-}
-
 __aicore__ void pack_weights(GM_ADDR weight, GM_ADDR params, GM_ADDR packed, uint32_t cols,
     uint32_t n, uint32_t k, uint32_t group_size, uint32_t col_start, uint32_t padded_cols,
     uint32_t depth, uint32_t first, uint32_t groups) {
@@ -68,7 +49,8 @@ extern "C" __global__ __aicore__ void plait_ascend_marlin_pack(
     uint32_t rows, uint32_t cols, uint32_t n, uint32_t k, uint32_t group_size, uint32_t col_start,
     uint32_t padded_rows, uint32_t padded_cols, uint32_t depth, uint32_t first, uint32_t groups) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    pack_activation(activation, packed_a, rows, k, padded_rows, depth, first, groups);
+    plait_ascend::pack_projection_activation(
+        activation, packed_a, rows, k, padded_rows, depth, k_unit, first, groups);
     pack_weights(weight, params, packed_b, cols, n, k, group_size, col_start,
                  padded_cols, depth, first, groups);
 }

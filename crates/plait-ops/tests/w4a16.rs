@@ -787,6 +787,64 @@ fn native_humming_metal_runs_staged_shapes_and_rejects_misalignment() {
 
 #[cfg(feature = "native")]
 #[test]
+fn native_humming_ascend_runs_staged_shapes_and_bounded_waves() {
+    use plait_ops::native::NativeW4A16;
+    use std::path::Path;
+
+    let Some(path) = std::env::var_os("PLAIT_HUMMING_ASCEND_TEST_LIBRARY") else {
+        return;
+    };
+    check_dynamic_humming_shapes(Path::new(&path));
+    let backend = unsafe { NativeW4A16::load(Path::new(&path)) }.unwrap();
+    let device = backend.open_device(0).unwrap();
+    // Force another K wave and another column band in a single submission.
+    let (n, k, group) = (4160, 8192, 128);
+    let groups = k / group;
+    let packed = vec![0xaa; (n * k / 2) as usize];
+    let scale = |col: u32, g: u32| (1 + (col / 64 + g) % 4) as f32 / 8.0;
+    let zero = |col: u32, g: u32| (8 + (col + g) % 2) as u8;
+    let scales: Vec<_> = (0..n)
+        .flat_map(|col| (0..groups).map(move |g| half(scale(col, g))))
+        .collect();
+    let zeros: Vec<_> = (0..n)
+        .flat_map(|col| (0..groups).map(move |g| zero(col, g)))
+        .collect();
+    let weights = W4Weights::new(k, n, group, &packed, &scales, Some(&zeros)).unwrap();
+    let activation: Vec<_> = (0..k)
+        .map(|i| {
+            half(if i % group == 0 {
+                1.0 + 1.0 / 256.0
+            } else {
+                1.0
+            })
+        })
+        .collect();
+    let input = device.upload_f16(1, k, &activation).unwrap();
+    let expected: Vec<f32> = (0..n)
+        .map(|col| {
+            (0..groups)
+                .map(|g| {
+                    (group as f32 + 1.0 / 256.0) * f32::from(10 - zero(col, g)) * scale(col, g)
+                })
+                .sum()
+        })
+        .collect();
+    let f16 = device.prepare_humming(weights).unwrap();
+    let f32 = device.prepare_humming_f32(weights).unwrap();
+    let narrow = f16.submit(&input, None, OutputType::F16).unwrap();
+    let wide = f32.submit(&input, None, OutputType::F32).unwrap();
+    if device.supports_completion_query() {
+        poll_producer(&wide);
+    }
+    assert_eq!(wide.read().unwrap(), LinearOutput::F32(expected.clone()));
+    assert_eq!(
+        narrow.read().unwrap(),
+        LinearOutput::F16(expected.into_iter().map(half).collect())
+    );
+}
+
+#[cfg(feature = "native")]
+#[test]
 fn native_humming_writes_fp32_accumulators_for_shards() {
     use plait_ops::native::{NativeW4A16, W4Activation};
     use std::path::Path;
