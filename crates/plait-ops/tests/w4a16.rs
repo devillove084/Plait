@@ -387,6 +387,85 @@ fn native_chains_reference_and_marlin_on_one_queue() {
 
 #[cfg(feature = "native")]
 #[test]
+fn native_marlin_preserves_fp32_through_split_k() {
+    use plait_ops::OperatorError;
+    use plait_ops::native::NativeW4A16;
+    use std::path::Path;
+
+    let Some(path) = std::env::var_os("PLAIT_MARLIN_F32_TEST_LIBRARY") else {
+        return;
+    };
+    let backend = unsafe { NativeW4A16::load(Path::new(&path)) }.unwrap();
+    let session = backend.open_device(0).unwrap();
+    let (n, k) = (256, 4096);
+    let packed = vec![0x99; (n * k / 2) as usize];
+    let row_sign = |row: u32| if row % 2 == 0 { 1.0 } else { -1.0 };
+    let bump = |row: u32| (1 + row % 3) as f32 / 256.0;
+    let scale = |column, group| [0.25, 0.5, 1.0, 2.0][(column * 3 + column / 7 + group) % 4];
+
+    for group_size in [128, k] {
+        let groups = (k / group_size) as usize;
+        let scales: Vec<_> = (0..n as usize)
+            .flat_map(|column| (0..groups).map(move |group| half(scale(column, group))))
+            .collect();
+        let weights = W4Weights::new(k, n, group_size, &packed, &scales, None).unwrap();
+        let linear = session.prepare_marlin_f32(weights).unwrap();
+        let empty = session.upload_f16(0, k, &[]).unwrap();
+        assert!(matches!(
+            linear.submit(&empty, None, OutputType::F16),
+            Err(OperatorError::Unsupported(_))
+        ));
+        assert_eq!(
+            linear
+                .submit(&empty, None, OutputType::F32)
+                .unwrap()
+                .read()
+                .unwrap(),
+            LinearOutput::F32(vec![])
+        );
+        for rows in [1, 33, 129] {
+            // Every K=128 tile contains an increment below a half ULP of its sum.
+            // The output also crosses row panels at M=129.
+            let input: Vec<_> = (0..rows)
+                .flat_map(|row| {
+                    (0..k).map(move |column| {
+                        let increment = if column % 128 == 0 { bump(row) } else { 0.0 };
+                        half(row_sign(row) * (1.0 + increment))
+                    })
+                })
+                .collect();
+            let expected: Vec<_> = (0..rows)
+                .flat_map(|row| {
+                    (0..n as usize).map(move |column| {
+                        let unscaled = group_size as f32 + (group_size / 128) as f32 * bump(row);
+                        row_sign(row)
+                            * (0..groups)
+                                .map(|group| unscaled * scale(column, group))
+                                .sum::<f32>()
+                    })
+                })
+                .collect();
+            assert!(
+                expected
+                    .iter()
+                    .all(|&v| f16::from_bits(half(v)).to_f32() != v)
+            );
+            let input = session.upload_f16(rows, k, &input).unwrap();
+            let output = linear.submit(&input, None, OutputType::F32).unwrap();
+            let LinearOutput::F32(actual) = output.read().unwrap() else {
+                panic!("expected FP32 Marlin result");
+            };
+            assert_eq!(actual.len(), expected.len());
+            for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+                assert_eq!(actual, expected, "M={rows} G={group_size} index={index}");
+            }
+            println!("Marlin FP32 split-K matches reference: M={rows} N={n} K={k} G={group_size}");
+        }
+    }
+}
+
+#[cfg(feature = "native")]
+#[test]
 fn native_humming_writes_fp32_accumulators_for_shards() {
     use plait_ops::native::{NativeW4A16, W4Activation};
     use std::path::Path;

@@ -98,6 +98,17 @@ typedef struct {
 
 const plait_w4a16_marlin_api *plait_w4a16_marlin_api_v1(void);
 
+/* Optional FP32 split-K accumulation and final output with Marlin-packed weights.
+ * Available when Marlin is built with PLAIT_W4_MARLIN_SHARDS.
+ * If also exported, the workspace query gives the bytes needed for the shape.
+ * Otherwise the FP16 ABI's lock workspace size applies.
+ */
+size_t plait_w4a16_marlin_f32_workspace_v1(uint32_t rows, uint32_t columns);
+
+int plait_w4a16_marlin_f32_launch_v1(
+    void *session, const plait_w4a16_shape *shape, const void *activation,
+    const void *weight, const void *scale, void *workspace, void *output, void **completion);
+
 /* Optional CUDA-compatible Humming extension on the same queue. probe returns -1
  * when the device or weight shape lacks a compiled kernel. repack transforms
  * canonical weights into an equally sized device buffer. launch accepts

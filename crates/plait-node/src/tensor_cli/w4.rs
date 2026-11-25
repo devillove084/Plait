@@ -171,7 +171,7 @@ impl W4WeightInput {
 
 struct W4Partition<'lib> {
     canonical: PreparedW4A16<'lib>,
-    humming: Option<PreparedW4A16<'lib>>,
+    optimized_a16: Option<(&'static str, PreparedW4A16<'lib>)>,
 }
 
 impl<'lib> W4Partition<'lib> {
@@ -180,12 +180,19 @@ impl<'lib> W4Partition<'lib> {
         weights: W4Weights<'_>,
     ) -> Result<Self, OperatorError> {
         let canonical = device.prepare(weights)?;
-        let humming = match device.prepare_humming_f32(weights) {
-            Ok(weights) => Some(weights),
-            Err(OperatorError::Unsupported(_)) => None,
+        let optimized_a16 = match device.prepare_humming_f32(weights) {
+            Ok(weights) => Some(("Humming", weights)),
+            Err(OperatorError::Unsupported(_)) => match device.prepare_marlin_f32(weights) {
+                Ok(weights) => Some(("Marlin", weights)),
+                Err(OperatorError::Unsupported(_)) => None,
+                Err(error) => return Err(error),
+            },
             Err(error) => return Err(error),
         };
-        Ok(Self { canonical, humming })
+        Ok(Self {
+            canonical,
+            optimized_a16,
+        })
     }
 
     fn project(
@@ -194,8 +201,8 @@ impl<'lib> W4Partition<'lib> {
         activations: &[u16],
         activation: W4Activation,
     ) -> Result<Vec<f32>, OperatorError> {
-        let weights = match activation {
-            W4Activation::F16 => self.humming.as_ref().unwrap_or(&self.canonical),
+        let weights = match (activation, &self.optimized_a16) {
+            (W4Activation::F16, Some((_, weights))) => weights,
             _ => &self.canonical,
         };
         device.project_w4_f32(weights, activations, None, activation)

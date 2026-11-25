@@ -42,6 +42,17 @@ type QuantizeF16 = unsafe extern "C" fn(
     *mut *mut c_void,
 ) -> i32;
 type CompletionQuery = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u32) -> i32;
+type MarlinWorkspace = unsafe extern "C" fn(u32, u32) -> usize;
+type MarlinLaunch = unsafe extern "C" fn(
+    *mut c_void,
+    *const Shape,
+    *const c_void,
+    *const c_void,
+    *const c_void,
+    *mut c_void,
+    *mut c_void,
+    *mut *mut c_void,
+) -> i32;
 type HummingLaunch = unsafe extern "C" fn(
     *mut c_void,
     *const Shape,
@@ -82,22 +93,15 @@ struct Session<'lib> {
     quantized_launch: Option<QuantizedLaunch>,
     quantize_f16: Option<QuantizeF16>,
     completion_query: Option<CompletionQuery>,
+    marlin_launch_f32: Option<MarlinLaunch>,
+    marlin_workspace_f32: Option<MarlinWorkspace>,
     humming_launch_f32: Option<HummingLaunch>,
 }
 
 #[repr(C)]
 struct MarlinApi {
     probe: unsafe extern "C" fn(*mut c_void) -> i32,
-    launch: unsafe extern "C" fn(
-        *mut c_void,
-        *const Shape,
-        *const c_void,
-        *const c_void,
-        *const c_void,
-        *mut c_void,
-        *mut c_void,
-        *mut *mut c_void,
-    ) -> i32,
+    launch: MarlinLaunch,
 }
 
 #[repr(C)]
@@ -287,6 +291,12 @@ impl<'lib> DeviceSession<'lib> {
             completion_query: unsafe { library.get(b"plait_w4_completion_query_v1") }
                 .ok()
                 .map(|symbol| *symbol),
+            marlin_launch_f32: unsafe { library.get(b"plait_w4a16_marlin_f32_launch_v1") }
+                .ok()
+                .map(|symbol| *symbol),
+            marlin_workspace_f32: unsafe { library.get(b"plait_w4a16_marlin_f32_workspace_v1") }
+                .ok()
+                .map(|symbol| *symbol),
             humming_launch_f32: unsafe { library.get(b"plait_w4a16_humming_f32_launch_v1") }
                 .ok()
                 .map(|symbol| *symbol),
@@ -320,6 +330,36 @@ impl<'lib> DeviceSession<'lib> {
         &self,
         weights: W4Weights<'_>,
     ) -> Result<PreparedW4A16<'lib>, OperatorError> {
+        self.prepare_marlin_kernel(weights, None)
+    }
+
+    /// Prepare Marlin to retain FP32 across device split-K and write FP32 shards.
+    pub fn prepare_marlin_f32(
+        &self,
+        weights: W4Weights<'_>,
+    ) -> Result<PreparedW4A16<'lib>, OperatorError> {
+        let launch = self.0.marlin_launch_f32.ok_or(OperatorError::Unsupported(
+            "library has no FP32 Marlin output",
+        ))?;
+        // Grouped scales multiply the signed INT4 weights before MMA in FP16.
+        // Channelwise scales are applied to the final FP32 sum instead.
+        let scale_limit = half::f16::MAX.to_f32() / 8.0;
+        if weights.scales.iter().any(|&bits| {
+            let scale = half::f16::from_bits(bits).to_f32();
+            !scale.is_finite() || (weights.group_size != weights.k && scale.abs() > scale_limit)
+        }) {
+            return Err(OperatorError::Unsupported(
+                "Marlin shard weight scales exceed the supported range",
+            ));
+        }
+        self.prepare_marlin_kernel(weights, Some(launch))
+    }
+
+    fn prepare_marlin_kernel(
+        &self,
+        weights: W4Weights<'_>,
+        launch_f32: Option<MarlinLaunch>,
+    ) -> Result<PreparedW4A16<'lib>, OperatorError> {
         let session = &self.0;
         type Entry = unsafe extern "C" fn() -> *const MarlinApi;
         let entry = unsafe { session.library.get::<Entry>(b"plait_w4a16_marlin_api_v1") }
@@ -335,6 +375,14 @@ impl<'lib> DeviceSession<'lib> {
         status("probe Marlin device", probe)?;
         let (packed, scales, _) = marlin_layout::pack(weights)?;
         let workspace_bytes = weights.n as usize / 128 * 16 * size_of::<i32>();
+        let (launch, output) = launch_f32.map_or((api.launch, OutputType::F16), |launch| {
+            (launch, OutputType::F32)
+        });
+        let workspace = if output == OutputType::F32 && session.marlin_workspace_f32.is_some() {
+            None
+        } else {
+            Some(Buffer::new(session, ptr::null(), workspace_bytes)?)
+        };
         Ok(PreparedW4A16 {
             k: weights.k,
             n: weights.n,
@@ -342,8 +390,9 @@ impl<'lib> DeviceSession<'lib> {
             packed: Buffer::upload(session, &packed)?,
             scale: Buffer::upload(session, &scales)?,
             kernel: Kernel::Marlin {
-                api,
-                workspace: Buffer::new(session, ptr::null(), workspace_bytes)?,
+                launch,
+                output,
+                workspace,
             },
         })
     }
@@ -589,8 +638,9 @@ enum Kernel<'lib> {
         zero: Buffer<'lib>,
     },
     Marlin {
-        api: &'lib MarlinApi,
-        workspace: Buffer<'lib>,
+        launch: MarlinLaunch,
+        output: OutputType,
+        workspace: Option<Buffer<'lib>>,
     },
     Humming {
         api: &'lib HummingApi,
@@ -700,10 +750,10 @@ impl<'lib> PreparedW4A16<'lib> {
             ));
         }
         self.check_bias(bias)?;
-        if matches!(self.kernel, Kernel::Marlin { .. }) {
-            if bias.is_some() || output != OutputType::F16 {
+        if let Kernel::Marlin { output: kind, .. } = self.kernel {
+            if bias.is_some() || output != kind {
                 return Err(OperatorError::Unsupported(
-                    "Marlin requires an FP16 output without fused bias",
+                    "Marlin requires the prepared output type without fused bias",
                 ));
             }
             if (input.rows as u64) * (self.k.max(self.n) as u64) > i32::MAX as u64 {
@@ -726,9 +776,24 @@ impl<'lib> PreparedW4A16<'lib> {
             Kernel::Humming { api, .. } => Some(api.launch),
             _ => None,
         };
+        let marlin_scratch = match &self.kernel {
+            Kernel::Marlin {
+                workspace: None, ..
+            } if input.rows != 0 => {
+                let query = session
+                    .marlin_workspace_f32
+                    .expect("Marlin workspace query");
+                let bytes = unsafe { query(input.rows, self.n) };
+                if bytes == 0 || bytes > isize::MAX as usize {
+                    return Err(OperatorError::Shape("invalid Marlin scratch size"));
+                }
+                Some(Buffer::new(session, ptr::null(), bytes)?)
+            }
+            _ => None,
+        };
         let kernel_buffer = match &self.kernel {
-            Kernel::Reference { zero } | Kernel::Humming { zero, .. } => zero,
-            Kernel::Marlin { workspace, .. } => workspace,
+            Kernel::Reference { zero } | Kernel::Humming { zero, .. } => Some(zero),
+            Kernel::Marlin { workspace, .. } => workspace.as_ref().or(marlin_scratch.as_ref()),
         };
         self.submit_output(
             input.rows,
@@ -739,7 +804,7 @@ impl<'lib> PreparedW4A16<'lib> {
             ],
             &[
                 Some(&input.buffer),
-                Some(kernel_buffer),
+                kernel_buffer,
                 bias.map(|tensor| &tensor.buffer),
             ],
             |shape, buffer, event| unsafe {
@@ -755,13 +820,13 @@ impl<'lib> PreparedW4A16<'lib> {
                         buffer,
                         event,
                     ),
-                    Kernel::Marlin { api, workspace } => (api.launch)(
+                    Kernel::Marlin { launch, .. } => launch(
                         session.handle.as_ptr(),
                         shape,
                         input.buffer.ptr(),
                         self.packed.ptr(),
                         self.scale.ptr(),
-                        workspace.ptr(),
+                        kernel_buffer.expect("Marlin workspace allocated").ptr(),
                         buffer,
                         event,
                     ),

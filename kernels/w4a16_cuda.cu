@@ -23,6 +23,15 @@ extern "C" int plait_marlin_launch(
     const uint16_t *activation, const uint32_t *packed_weight, uint16_t *scale,
     uint16_t *output, int32_t *workspace, int m, int n, int k, int group_size,
     int device, void *stream);
+#if defined(PLAIT_W4_MARLIN_SHARDS)
+extern "C" int plait_marlin_f32_launch(
+    const uint16_t *activation, const uint32_t *packed_weight, uint16_t *scale,
+    float *output, int32_t *workspace, int m, int n, int k, int group_size,
+    int device, void *stream);
+#if defined(PLAIT_W4_PPU_INTEGER_MMA)
+size_t marlin_f32_workspace_bytes(uint32_t m, uint32_t n);
+#endif
+#endif
 #endif
 
 #if defined(PLAIT_W4A16_HUMMING)
@@ -317,24 +326,42 @@ int marlin_probe(void *handle) {
     return properties.major * 10 + properties.minor == compiled_architecture ? 0 : -1;
 }
 
-int device_launch_marlin(void *handle, const plait_w4a16_shape *shape,
+template<typename Output, typename Launch>
+int submit_marlin(void *handle, const plait_w4a16_shape *shape,
                         const void *activation, const void *weight, const void *scale,
-                        void *workspace, void *output, void **completion) {
+                        void *workspace, void *output, void **completion, Launch launch) {
+    if (!shape || shape->output_bits != sizeof(Output) * 8) return cudaErrorInvalidValue;
     auto session = static_cast<Session *>(handle);
     const auto s = *shape;
     return record_submission(session, completion, [&] {
-        const size_t workspace_bytes = size_t(s.n / 128) * 16 * sizeof(int32_t);
-        auto status = PLAIT_GPU(MemsetAsync)(workspace, 0, workspace_bytes, session->stream);
-        if (status != PLAIT_GPU(Success)) return static_cast<int>(status);
-        status = PLAIT_GPU(MemsetAsync)(output, 0, size_t(s.m) * s.n * sizeof(uint16_t), session->stream);
-        if (status != PLAIT_GPU(Success)) return static_cast<int>(status);
-        return plait_marlin_launch(
+#if defined(PLAIT_W4_PPU_INTEGER_MMA)
+        constexpr bool needs_locks = sizeof(Output) == sizeof(uint16_t);
+#else
+        constexpr bool needs_locks = true;
+#endif
+        if constexpr (needs_locks) {
+            const size_t workspace_bytes = size_t(s.n / 128) * 16 * sizeof(int32_t);
+            const auto status = PLAIT_GPU(MemsetAsync)(workspace, 0, workspace_bytes, session->stream);
+            if (status != PLAIT_GPU(Success)) return static_cast<int>(status);
+        }
+        if constexpr (sizeof(Output) == sizeof(uint16_t)) {
+            const auto status = PLAIT_GPU(MemsetAsync)(output, 0, size_t(s.m) * s.n * sizeof(Output), session->stream);
+            if (status != PLAIT_GPU(Success)) return static_cast<int>(status);
+        }
+        return launch(
             static_cast<const uint16_t *>(activation), static_cast<const uint32_t *>(weight),
             const_cast<uint16_t *>(static_cast<const uint16_t *>(scale)),
-            static_cast<uint16_t *>(output), static_cast<int32_t *>(workspace),
+            static_cast<Output *>(output), static_cast<int32_t *>(workspace),
             s.m, s.n, s.k, s.group_size == s.k ? -1 : static_cast<int>(s.group_size),
             session->ordinal, session->stream);
     });
+}
+
+int device_launch_marlin(void *handle, const plait_w4a16_shape *shape,
+                         const void *activation, const void *weight, const void *scale,
+                         void *workspace, void *output, void **completion) {
+    return submit_marlin<uint16_t>(handle, shape, activation, weight, scale, workspace,
+                                   output, completion, plait_marlin_launch);
 }
 
 const plait_w4a16_marlin_api marlin_api = {marlin_probe, device_launch_marlin};
@@ -397,6 +424,21 @@ const plait_w4a16_device_api api = {
 extern "C" const plait_w4a16_device_api *plait_w4a16_device_api_v1(void) {
     return &api;
 }
+
+#if defined(PLAIT_W4A16_MARLIN) && defined(PLAIT_W4_MARLIN_SHARDS)
+#if defined(PLAIT_W4_PPU_INTEGER_MMA)
+extern "C" size_t plait_w4a16_marlin_f32_workspace_v1(uint32_t rows, uint32_t columns) {
+    return marlin_f32_workspace_bytes(rows, columns);
+}
+#endif
+
+extern "C" int plait_w4a16_marlin_f32_launch_v1(
+    void *handle, const plait_w4a16_shape *shape, const void *activation,
+    const void *weight, const void *scale, void *workspace, void *output, void **completion) {
+    return submit_marlin<float>(handle, shape, activation, weight, scale, workspace,
+                                output, completion, plait_marlin_f32_launch);
+}
+#endif
 
 #if defined(PLAIT_W4A16_HUMMING) && defined(PLAIT_W4_HUMMING_SHARDS)
 extern "C" int plait_w4a16_humming_f32_launch_v1(

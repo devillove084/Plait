@@ -200,9 +200,9 @@ pub(in crate::tensor_cli) async fn run(
     let backend = unsafe { NativeW4A16::load(&command.device.library) }?;
     let device = backend.open_device(command.device.ordinal)?;
     let linear = W4Partition::prepare(&device, weights)?;
-    if linear.humming.is_some() {
+    if let Some((kernel, _)) = &linear.optimized_a16 {
         eprintln!(
-            "resident W4 using Humming FP32 output for A16, N={} K={}",
+            "resident W4 using {kernel} FP32 output for A16, N={} K={}",
             command.output_columns,
             end - start
         );
