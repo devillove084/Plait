@@ -412,7 +412,7 @@ dependencies = [
 name = "plait-device"
 version = "0.2.0"
 dependencies = [
- "cudarc",
+ "libloading 0.8.9",
  "plait-core",
  "serde",
 ]
