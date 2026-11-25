@@ -758,20 +758,31 @@ fn native_humming_catalog_interleaves_shapes_on_one_queue() {
 }
 
 #[cfg(feature = "native")]
-#[test]
-fn native_humming_mfma_runs_staged_shapes_and_rejects_misalignment() {
-    use plait_ops::native::NativeW4A16;
-    use std::path::Path;
-
-    let Some(path) = std::env::var_os("PLAIT_HUMMING_MFMA_TEST_LIBRARY") else {
-        return;
-    };
-    let backend = unsafe { NativeW4A16::load(Path::new(&path)) }.unwrap();
+fn check_dynamic_humming_shapes(library: &std::path::Path) {
+    let backend = unsafe { plait_ops::native::NativeW4A16::load(library) }.unwrap();
     let session = backend.open_device(0).unwrap();
     check_interleaved_humming_shapes(&session, &[(64, 128), (192, 384), (320, 640), (256, 4096)]);
     check_humming_shape_rejected(&session, 208, 384, 128);
     check_humming_shape_rejected(&session, 192, 320, 128);
     check_humming_shape_rejected(&session, 192, 384, 64);
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn native_humming_mfma_runs_staged_shapes_and_rejects_misalignment() {
+    let Some(path) = std::env::var_os("PLAIT_HUMMING_MFMA_TEST_LIBRARY") else {
+        return;
+    };
+    check_dynamic_humming_shapes(std::path::Path::new(&path));
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn native_humming_metal_runs_staged_shapes_and_rejects_misalignment() {
+    let Some(path) = std::env::var_os("PLAIT_HUMMING_METAL_TEST_LIBRARY") else {
+        return;
+    };
+    check_dynamic_humming_shapes(std::path::Path::new(&path));
 }
 
 #[cfg(feature = "native")]
