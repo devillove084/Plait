@@ -8,9 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use plait_core::serving::{
-    DecoderRouteWork, EXECUTION_PULSE_MS, GroupPhase, HostMemory, ResidentOwner, RouteSetId,
-    ServingAction, ServingError, ServingLookup, ServingOperation, ServingView, W4ShardLayout,
-    WorkerGrant,
+    DecoderRouteWork, EXECUTION_PULSE_MS, GroupPhase, GroupView, HostMemory, ResidentOwner,
+    RouteSetId, ServingAction, ServingError, ServingLookup, ServingOperation, ServingView,
+    W4ShardLayout, WorkerGrant,
 };
 use plait_core::tensor::KPartial;
 use plait_core::{DeviceId, NodeId, OpId};
@@ -101,7 +101,6 @@ enum HostRequest {
 enum State {
     Idle,
     Running(WorkerGrant, WorkerProcess),
-    Exited(WorkerGrant),
     Recovering(Recovery),
 }
 
@@ -285,12 +284,19 @@ async fn run_device(
                 if invocation.response.is_closed() && matches!(invocation.request, Request::Execute(_)) {
                     continue;
                 }
-                let reply = match &mut state {
+                let (reply, unusable) = match &mut state {
                     State::Running(grant, process) if invocation.request.partial().grant == *grant => {
-                        process.call(&invocation.request).await
+                        let reply = process.call(&invocation.request).await;
+                        (reply, (!process.has_usable_pipe()).then_some(*grant))
                     }
-                    _ => Err(io::Error::other("node has no resident worker for this grant")),
+                    _ => (Err(io::Error::other("node has no resident worker for this grant")), None),
                 };
+                if let Some(grant) = unusable {
+                    eprintln!("{id:?}: resident worker {grant:?} lost its response pipe");
+                    // Dropping the process initiates termination. The device
+                    // reservation stays fenced until recovery checks the lease.
+                    state = State::Recovering(Recovery::new(grant, supervisor, true));
+                }
                 let _ = invocation.response.send(reply.unwrap_or_else(|error| json!({ "error": error.to_string() })));
             }
             _ = tick.tick() => {
@@ -328,7 +334,7 @@ async fn reconcile(
             };
             grant
         }
-        State::Running(grant, _) | State::Exited(grant) => *grant,
+        State::Running(grant, _) => *grant,
         State::Recovering(recovery) => recovery.grant,
     };
     let ServingView::Group(Some(view)) = control.query(ServingLookup::Group(grant.version)).await?
@@ -348,7 +354,9 @@ async fn reconcile(
         else {
             return Err(io::Error::other("expected a resident owner"));
         };
-        if let Some(owner) = owner.filter(|owner| *owner != supervisor) {
+        if let Some(owner) =
+            owner.filter(|owner| *owner != supervisor || view.phase == GroupPhase::Revoked)
+        {
             if owner.supervisor_lock != supervisor.supervisor_lock
                 || owner.device_lock != supervisor.device_lock
             {
@@ -356,11 +364,8 @@ async fn reconcile(
                     "resident grant belongs to a different lock directory or replaced lock file",
                 ));
             }
-            *state = if view.stopped.contains(&id) {
-                State::Exited(grant)
-            } else {
-                State::Recovering(Recovery::new(grant, owner, true))
-            };
+            let needs_check = owner != supervisor && !view.stopped.contains(&id);
+            *state = State::Recovering(Recovery::new(grant, owner, needs_check));
         }
     }
     if let State::Running(_, process) = state
@@ -374,14 +379,14 @@ async fn reconcile(
     if let State::Recovering(recovery) = state {
         if recover(
             recovery,
-            view.phase,
+            &view,
             device.release_check.as_deref(),
             lock,
             control,
         )
         .await?
         {
-            *state = State::Exited(grant);
+            *state = State::Idle;
         }
         return Ok(());
     }
@@ -456,39 +461,13 @@ async fn reconcile(
                 let State::Running(_, process) = std::mem::replace(state, State::Idle) else {
                     unreachable!()
                 };
-                match process.stop().await {
-                    Ok(()) => *state = State::Exited(grant),
-                    Err(error) => {
-                        *state = State::Recovering(Recovery::new(grant, supervisor, true));
-                        return Err(error);
-                    }
-                }
-            }
-            if matches!(state, State::Exited(_)) {
-                if !view.stopped.contains(&id) {
-                    apply(control, ServingAction::WorkerStopped(grant)).await?;
-                }
-                if view
-                    .grants
-                    .keys()
-                    .all(|device| *device == id || view.stopped.contains(device))
-                {
-                    let version = grant.version;
-                    // Multiple hosts can observe the last stop concurrently.
-                    let origin = NodeId::derive(&format!("plait/w4/retire/{}", version.group.0));
-                    let operation = ServingOperation {
-                        id: OpId::new(origin, version.epoch),
-                        action: ServingAction::Retire {
-                            version,
-                            workers: view.grants.keys().copied().collect(),
-                        },
-                    };
-                    control
-                        .apply(&operation)
-                        .await?
-                        .map_err(|error| io::Error::other(format!("{error:?}")))?;
-                    *state = State::Idle;
-                }
+                let stopped = process.stop().await;
+                *state = State::Recovering(Recovery::new(grant, supervisor, stopped.is_err()));
+                stopped?;
+            } else if matches!(state, State::Idle) && !view.ready.contains(&id) {
+                // A revoked candidate may never have started this device.
+                let _lease = lock.acquire()?;
+                reclaim(control, grant, None, &view).await?;
             }
         }
         GroupPhase::Retired => unreachable!("retired grant resets the local slot"),
@@ -540,13 +519,13 @@ async fn reconcile_decoder_routes(control: &mut GroupControl, model: &str) -> io
 
 async fn recover(
     recovery: &mut Recovery,
-    phase: GroupPhase,
+    view: &GroupView,
     release_check: Option<&Path>,
     lock: &SlotLock,
     control: &mut GroupControl,
 ) -> io::Result<bool> {
     let grant = recovery.grant;
-    if phase != GroupPhase::Revoked {
+    if view.phase != GroupPhase::Revoked {
         apply(
             control,
             ServingAction::LoseResident {
@@ -573,8 +552,25 @@ async fn recover(
     {
         check_release(check, grant).await?;
     }
-    apply(control, ServingAction::WorkerStopped(grant)).await?;
+    reclaim(control, grant, Some(recovery.owner), view).await?;
     Ok(true)
+}
+
+async fn reclaim(
+    control: &mut GroupControl,
+    grant: WorkerGrant,
+    owner: Option<ResidentOwner>,
+    view: &GroupView,
+) -> io::Result<()> {
+    apply(
+        control,
+        ServingAction::ReclaimResident {
+            grant,
+            owner,
+            workers: view.grants.keys().copied().collect(),
+        },
+    )
+    .await
 }
 
 async fn check_release(program: &Path, grant: WorkerGrant) -> io::Result<()> {

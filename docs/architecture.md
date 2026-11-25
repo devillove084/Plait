@@ -242,6 +242,15 @@ remote key, so the same descriptor is usable by loopback and verbs transports.
 - Durable control replicas restore their identity, accepted state, and
   execution order from the replica journal.
 
+In a native execution group, an unusable W4 worker response pipe initiates
+worker termination and revokes its group version. A sibling whose device lease
+can be verified can rejoin a new epoch immediately. The failed device retains
+its reservation until the original lock is available and its backend release
+check succeeds. `ReclaimResident` orders each device release against new grants.
+The final release retires the old version and returns its shared host-memory
+budget. Retirement preserves grants issued to already reclaimed devices.
+[Resident reclaim model](../specs/PlaitResidentReclaim.tla)
+
 ## 7. Asynchronous versioned reduction
 
 With NCCL, each rank issues the matching operation on its communicator.
