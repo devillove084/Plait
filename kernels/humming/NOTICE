@@ -11,3 +11,6 @@ upstream humming.cuh GEMM and process.cuh weight repacker at the same revision.
 w4a16_config.cuh adapts the upstream Humming JIT configuration for dense
 groupwise W4A16, and plait-ops adapts the scale and zero point permutations
 from humming/transform.py.
+
+plait_humming_hip.cuh ports dense groupwise W4A16 tiling and staging to
+CDNA3 MFMA, reusing the Humming scale and zero point layout.

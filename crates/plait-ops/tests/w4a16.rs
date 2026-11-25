@@ -637,23 +637,34 @@ fn check_tiled_marlin(path: &std::path::Path) {
 }
 
 #[cfg(feature = "native")]
-#[test]
-fn native_humming_catalog_interleaves_shapes_on_one_queue() {
+fn check_humming_shape_rejected(
+    session: &plait_ops::native::DeviceSession<'_>,
+    n: u32,
+    k: u32,
+    group_size: u32,
+) {
     use plait_ops::OperatorError;
-    use plait_ops::native::NativeW4A16;
-    use std::path::Path;
+    let packed = vec![0x99; (n * k / 2) as usize];
+    let scales = vec![half(1.0); (n * k.div_ceil(group_size)) as usize];
+    let weights = W4Weights::new(k, n, group_size, &packed, &scales, None).unwrap();
+    assert!(matches!(
+        session.prepare_humming(weights),
+        Err(OperatorError::Unsupported(_))
+    ));
+    assert!(matches!(
+        session.prepare_humming_f32(weights),
+        Err(OperatorError::Unsupported(_))
+    ));
+}
 
-    let Some(path) = std::env::var_os("PLAIT_HUMMING_CATALOG_TEST_LIBRARY") else {
-        return;
-    };
-    let backend = unsafe { NativeW4A16::load(Path::new(&path)) }.unwrap();
-    let session = backend.open_device(0).unwrap();
+#[cfg(feature = "native")]
+fn check_interleaved_humming_shapes(
+    session: &plait_ops::native::DeviceSession<'_>,
+    shapes: &[(u32, u32)],
+) {
     let mut kernels = Vec::new();
     let mut prepared = Vec::new();
-    for (index, (n, k)) in [(256, 512), (256, 256), (256, 768), (512, 1024)]
-        .into_iter()
-        .enumerate()
-    {
+    for (index, &(n, k)) in shapes.iter().enumerate() {
         let group_size = 128;
         let seed = index as u32;
         let packed: Vec<_> = (0..n * k / 2)
@@ -685,18 +696,6 @@ fn native_humming_catalog_interleaves_shapes_on_one_queue() {
         }
     }
 
-    let missing_weights = vec![0x99; 256 * 384 / 2];
-    let missing_scales = vec![half(1.0); 256 * 3];
-    let missing = W4Weights::new(384, 256, 128, &missing_weights, &missing_scales, None).unwrap();
-    assert!(matches!(
-        session.prepare_humming(missing),
-        Err(OperatorError::Unsupported(_))
-    ));
-    assert!(matches!(
-        session.prepare_humming_f32(missing),
-        Err(OperatorError::Unsupported(_))
-    ));
-
     let mut pending = Vec::new();
     for (index, n, k, rows, output, input, expected) in prepared.into_iter().rev() {
         let (f16, f32) = &kernels[index];
@@ -706,12 +705,36 @@ fn native_humming_catalog_interleaves_shapes_on_one_queue() {
     }
     drop(kernels);
     for (n, k, rows, output, result, expected) in pending {
-        assert_eq!(
-            result.read().unwrap(),
-            expected,
-            "M={rows} N={n} K={k} output={output:?}"
-        );
+        let actual = result.read().unwrap();
+        if let (LinearOutput::F32(actual), LinearOutput::F32(expected)) = (&actual, &expected) {
+            assert_eq!(actual.len(), expected.len());
+            for (i, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "M={rows} N={n} K={k} output={output:?} index={i}"
+                );
+            }
+        } else {
+            assert_eq!(actual, expected, "M={rows} N={n} K={k} output={output:?}");
+        }
     }
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn native_humming_catalog_interleaves_shapes_on_one_queue() {
+    use plait_ops::OperatorError;
+    use plait_ops::native::NativeW4A16;
+    use std::path::Path;
+
+    let Some(path) = std::env::var_os("PLAIT_HUMMING_CATALOG_TEST_LIBRARY") else {
+        return;
+    };
+    let backend = unsafe { NativeW4A16::load(Path::new(&path)) }.unwrap();
+    let session = backend.open_device(0).unwrap();
+    check_interleaved_humming_shapes(&session, &[(256, 512), (256, 256), (256, 768), (512, 1024)]);
+    check_humming_shape_rejected(&session, 256, 384, 128);
 
     if let Some(fp16_only) = std::env::var_os("PLAIT_HUMMING_FP16_CATALOG_TEST_LIBRARY") {
         let backend = unsafe { NativeW4A16::load(Path::new(&fp16_only)) }.unwrap();
@@ -732,6 +755,23 @@ fn native_humming_catalog_interleaves_shapes_on_one_queue() {
             Err(OperatorError::Unsupported(_))
         ));
     }
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn native_humming_mfma_runs_staged_shapes_and_rejects_misalignment() {
+    use plait_ops::native::NativeW4A16;
+    use std::path::Path;
+
+    let Some(path) = std::env::var_os("PLAIT_HUMMING_MFMA_TEST_LIBRARY") else {
+        return;
+    };
+    let backend = unsafe { NativeW4A16::load(Path::new(&path)) }.unwrap();
+    let session = backend.open_device(0).unwrap();
+    check_interleaved_humming_shapes(&session, &[(64, 128), (192, 384), (320, 640), (256, 4096)]);
+    check_humming_shape_rejected(&session, 208, 384, 128);
+    check_humming_shape_rejected(&session, 192, 320, 128);
+    check_humming_shape_rejected(&session, 192, 384, 64);
 }
 
 #[cfg(feature = "native")]

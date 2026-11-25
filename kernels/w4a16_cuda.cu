@@ -38,9 +38,25 @@ size_t marlin_f32_workspace_bytes(uint32_t m, uint32_t n);
 #include "humming/plait_humming.h"
 #endif
 
-#if defined(__HIP__) && defined(PLAIT_W4_HIP_MARLIN_MFMA)
+#if defined(__HIP__) && (defined(PLAIT_W4_HIP_MARLIN_MFMA) || defined(PLAIT_W4_HIP_HUMMING_MFMA))
 #include <string.h>
+static int probe_gfx942(int ordinal) {
+    hipDeviceProp_t properties;
+    const auto status = hipGetDeviceProperties(&properties, ordinal);
+    if (status != hipSuccess) return status;
+    const auto *arch = properties.gcnArchName;
+    return strncmp(arch, "gfx942", 6) == 0 && (arch[6] == 0 || arch[6] == ':') ? 0 : -1;
+}
+#endif
+
+#if defined(__HIP__) && defined(PLAIT_W4_HIP_MARLIN_MFMA)
 #include "marlin/plait_marlin_hip.cuh"
+#endif
+#if defined(__HIP__) && defined(PLAIT_W4_HIP_HUMMING_MFMA)
+#include "humming/plait_humming_hip.cuh"
+#define PLAIT_W4_HUMMING_ABI_V2
+#elif defined(PLAIT_W4A16_HUMMING)
+#define PLAIT_W4_HUMMING_ABI_V2
 #endif
 
 #if defined(PLAIT_W4_CUDA_INTEGER_MMA) || defined(PLAIT_W4_PPU_INTEGER_MMA)
@@ -375,11 +391,7 @@ const plait_w4a16_marlin_api marlin_api = {marlin_probe, device_launch_marlin};
 #if defined(__HIP__) && defined(PLAIT_W4_HIP_MARLIN_MFMA)
 int marlin_mfma_probe(void *handle) {
     const auto session = static_cast<Session *>(handle);
-    hipDeviceProp_t properties;
-    const auto status = hipGetDeviceProperties(&properties, session->ordinal);
-    if (status != hipSuccess) return status;
-    const auto *arch = properties.gcnArchName;
-    return strncmp(arch, "gfx942", 6) == 0 && (arch[6] == 0 || arch[6] == ':') ? 0 : -1;
+    return probe_gfx942(session->ordinal);
 }
 
 int device_launch_marlin_mfma(void *handle, const plait_w4a16_shape *shape,
@@ -403,6 +415,18 @@ const plait_w4a16_marlin_mfma_api marlin_mfma_api = {
 };
 #endif
 
+#if defined(PLAIT_W4_HUMMING_ABI_V2)
+int submit_humming(void *handle, const plait_w4a16_shape *shape,
+                   const void *activation, const void *weight, const void *scale,
+                   const void *zero, void *output, void **completion,
+                   decltype(&plait_humming_launch_shape) launch) {
+    auto session = static_cast<Session *>(handle);
+    return record_submission(session, completion, [&] {
+        return launch(shape, activation, weight, scale, zero, output, session->stream);
+    });
+}
+#endif
+
 #if defined(PLAIT_W4A16_HUMMING)
 int humming_probe(void *handle, uint32_t n, uint32_t k, uint32_t group_size) {
     const auto session = static_cast<Session *>(handle);
@@ -417,46 +441,39 @@ int humming_repack(void *handle, const void *canonical, void *packed) {
     return submitted == cudaSuccess ? cudaStreamSynchronize(session->stream) : submitted;
 }
 
-int submit_humming(void *handle, const plait_w4a16_shape *shape,
-                   const void *activation, const void *weight, const void *scale,
-                   const void *zero, void *output, void **completion,
-                   decltype(&plait_humming_launch) launch = plait_humming_launch) {
-    auto session = static_cast<Session *>(handle);
-    return record_submission(session, completion, [&] {
-        return launch(shape, activation, weight, scale, zero, output, session->stream);
-    });
-}
-
 int device_launch_humming(void *handle, const plait_w4a16_shape *shape,
                          const void *activation, const void *weight, const void *scale,
                          const void *zero, void *output, void **completion) {
     if (!shape || shape->output_bits != 16) return cudaErrorInvalidValue;
-    return submit_humming(handle, shape, activation, weight, scale, zero, output, completion);
+    return submit_humming(handle, shape, activation, weight, scale, zero, output, completion,
+                          plait_humming_launch);
 }
 
 const plait_w4a16_humming_api humming_api = {humming_probe, humming_repack, device_launch_humming};
+#endif
 
+#if defined(PLAIT_W4_HUMMING_ABI_V2)
 int humming_probe_shape(void *handle, uint32_t n, uint32_t k, uint32_t group, uint32_t bits) {
-    if (!handle) return cudaErrorInvalidValue;
+    if (!handle) return PLAIT_GPU(ErrorInvalidValue);
     const auto session = static_cast<Session *>(handle);
     return plait_humming_probe_shape(session->ordinal, n, k, group, bits);
 }
 
 int humming_repack_shape(void *handle, uint32_t n, uint32_t k, uint32_t group,
                           const void *canonical, void *packed) {
-    if (!handle) return cudaErrorInvalidValue;
+    if (!handle) return PLAIT_GPU(ErrorInvalidValue);
     auto session = static_cast<Session *>(handle);
     const auto status = session->bind();
-    if (status != cudaSuccess) return status;
+    if (status != PLAIT_GPU(Success)) return status;
     const int submitted = plait_humming_repack_shape(n, k, group, canonical, packed, session->stream);
-    return submitted == cudaSuccess ? cudaStreamSynchronize(session->stream) : submitted;
+    return submitted == PLAIT_GPU(Success) ? PLAIT_GPU(StreamSynchronize)(session->stream) : submitted;
 }
 
 int device_launch_humming_shape(void *handle, const plait_w4a16_shape *shape,
                                const void *activation, const void *weight, const void *scale,
                                const void *zero, void *output, void **completion) {
     if (!handle || !shape || !activation || !weight || !scale || !zero || !output || !completion) {
-        return cudaErrorInvalidValue;
+        return PLAIT_GPU(ErrorInvalidValue);
     }
     return submit_humming(handle, shape, activation, weight, scale, zero, output, completion,
                           plait_humming_launch_shape);
@@ -519,7 +536,8 @@ extern "C" int plait_w4a16_humming_f32_launch_v1(
     const void *weight, const void *scale, const void *zero, void *output, void **completion) {
     if (!shape || shape->output_bits != 32 || !handle || !activation || !weight ||
         !scale || !zero || !output || !completion) return cudaErrorInvalidValue;
-    return submit_humming(handle, shape, activation, weight, scale, zero, output, completion);
+    return submit_humming(handle, shape, activation, weight, scale, zero, output, completion,
+                          plait_humming_launch);
 }
 #endif
 
@@ -599,7 +617,9 @@ extern "C" const plait_w4a16_marlin_api *plait_w4a16_marlin_api_v1(void) {
 extern "C" const plait_w4a16_humming_api *plait_w4a16_humming_api_v1(void) {
     return &humming_api;
 }
+#endif
 
+#if defined(PLAIT_W4_HUMMING_ABI_V2)
 extern "C" const plait_w4a16_humming_api_v2_table *plait_w4a16_humming_api_v2(void) {
     return &humming_api_v2;
 }
