@@ -218,10 +218,28 @@ impl<'lib> DeviceSession<'lib> {
         bias: Option<&DeviceTensor<'lib>>,
         activation: W4Activation,
     ) -> Result<Vec<f32>, OperatorError> {
+        let output = self.submit_w4_f32(weights, activations_f16, bias, activation)?;
+        match output.read()? {
+            LinearOutput::F32(values) => Ok(values),
+            LinearOutput::F16(_) => Err(OperatorError::Backend(
+                "W4 projection requires FP32 output".into(),
+            )),
+        }
+    }
+
+    /// Stage host input and enqueue a W4 projection with an FP32 device result.
+    /// The result retains the native buffers used by the queued operations.
+    pub fn submit_w4_f32(
+        &self,
+        weights: &PreparedW4A16<'lib>,
+        activations_f16: &[u16],
+        bias: Option<&DeviceTensor<'lib>>,
+        activation: W4Activation,
+    ) -> Result<DeviceTensor<'lib>, OperatorError> {
         let rows = crate::w4a16::checked_rows(weights.k, weights.n, activations_f16.len())?;
         let upload = || self.upload_f16(rows, weights.k, activations_f16);
-        let output = match activation {
-            W4Activation::F16 => weights.submit(&upload()?, bias, OutputType::F32)?.read()?,
+        match activation {
+            W4Activation::F16 => weights.submit(&upload()?, bias, OutputType::F32),
             W4Activation::Host(bits) => {
                 let host = QuantizedActivations::from_f16(
                     bits,
@@ -229,23 +247,13 @@ impl<'lib> DeviceSession<'lib> {
                     weights.group_size,
                     activations_f16,
                 )?;
-                weights
-                    .submit_quantized(&self.upload_quantized(&host)?, bias, OutputType::F32)?
-                    .read()?
+                weights.submit_quantized(&self.upload_quantized(&host)?, bias, OutputType::F32)
             }
             W4Activation::Device(bits) => {
                 let input = upload()?;
                 let low = self.quantize_f16(&input, bits, weights.group_size)?;
-                weights
-                    .submit_quantized(&low, bias, OutputType::F32)?
-                    .read()?
+                weights.submit_quantized(&low, bias, OutputType::F32)
             }
-        };
-        match output {
-            LinearOutput::F32(values) => Ok(values),
-            LinearOutput::F16(_) => Err(OperatorError::Backend(
-                "W4 projection requires FP32 output".into(),
-            )),
         }
     }
 
@@ -482,8 +490,11 @@ impl<'lib> DeviceSession<'lib> {
             Some(Rc::new(Completion {
                 session: Rc::clone(session),
                 handle: handle_or_error(event)?,
-                dependencies: [input.completion.clone(), None],
-                invalid: Some(invalid),
+                inputs: SubmissionInputs {
+                    dependencies: [input.completion.clone(), None],
+                    _inputs: vec![input.buffer.clone()],
+                    invalid: Some(invalid),
+                },
                 result: OnceCell::new(),
             }))
         };
@@ -593,6 +604,12 @@ impl<'lib> PreparedW4A16<'lib> {
                 input.completion.clone(),
                 bias.and_then(|tensor| tensor.completion.clone()),
             ],
+            &[
+                Some(&input.codes),
+                Some(&input.scale),
+                Some(zero),
+                bias.map(|tensor| &tensor.buffer),
+            ],
             |shape, buffer, event| unsafe {
                 launch(
                     session.handle.as_ptr(),
@@ -666,12 +683,21 @@ impl<'lib> PreparedW4A16<'lib> {
                 "Humming requires an FP16 output without fused bias",
             ));
         }
+        let kernel_buffer = match &self.kernel {
+            Kernel::Reference { zero } | Kernel::Humming { zero, .. } => zero,
+            Kernel::Marlin { workspace, .. } => workspace,
+        };
         self.submit_output(
             input.rows,
             output,
             [
                 input.completion.clone(),
                 bias.and_then(|tensor| tensor.completion.clone()),
+            ],
+            &[
+                Some(&input.buffer),
+                Some(kernel_buffer),
+                bias.map(|tensor| &tensor.buffer),
             ],
             |shape, buffer, event| unsafe {
                 match &self.kernel {
@@ -716,6 +742,7 @@ impl<'lib> PreparedW4A16<'lib> {
         rows: u32,
         output: OutputType,
         dependencies: [Option<Rc<Completion<'lib>>>; 2],
+        inputs: &[Option<&Buffer<'lib>>],
         submit: impl FnOnce(&Shape, *mut c_void, *mut *mut c_void) -> i32,
     ) -> Result<DeviceTensor<'lib>, OperatorError> {
         let session = &self.packed.session;
@@ -744,8 +771,17 @@ impl<'lib> PreparedW4A16<'lib> {
             Some(Rc::new(Completion {
                 session: Rc::clone(session),
                 handle: handle_or_error(event)?,
-                dependencies,
-                invalid: None,
+                inputs: SubmissionInputs {
+                    dependencies,
+                    _inputs: inputs
+                        .iter()
+                        .flatten()
+                        .copied()
+                        .chain([&self.packed, &self.scale])
+                        .cloned()
+                        .collect(),
+                    invalid: None,
+                },
                 result: OnceCell::new(),
             }))
         };
@@ -798,9 +834,15 @@ impl DeviceTensor<'_> {
     }
 }
 
+#[derive(Clone)]
 struct Buffer<'lib> {
     session: Rc<Session<'lib>>,
-    handle: Option<NonNull<c_void>>,
+    allocation: Option<Rc<Allocation<'lib>>>,
+}
+
+struct Allocation<'lib> {
+    session: Rc<Session<'lib>>,
+    handle: NonNull<c_void>,
 }
 
 impl<'lib> Buffer<'lib> {
@@ -813,31 +855,36 @@ impl<'lib> Buffer<'lib> {
         source: *const c_void,
         bytes: usize,
     ) -> Result<Self, OperatorError> {
-        let handle = if bytes == 0 {
+        let allocation = if bytes == 0 {
             None
         } else {
             let mut buffer = ptr::null_mut();
             status("allocate device buffer", unsafe {
                 (session.api.buffer_new)(session.handle.as_ptr(), source, bytes, &mut buffer)
             })?;
-            Some(handle_or_error(buffer)?)
+            Some(Rc::new(Allocation {
+                session: Rc::clone(session),
+                handle: handle_or_error(buffer)?,
+            }))
         };
         Ok(Self {
             session: Rc::clone(session),
-            handle,
+            allocation,
         })
     }
 
     fn ptr(&self) -> *mut c_void {
-        self.handle.map_or(ptr::null_mut(), NonNull::as_ptr)
+        self.allocation
+            .as_ref()
+            .map_or(ptr::null_mut(), |allocation| allocation.handle.as_ptr())
     }
 
     fn read<T>(&self, destination: &mut [T]) -> Result<(), OperatorError> {
-        if let Some(handle) = self.handle {
+        if let Some(allocation) = &self.allocation {
             status("read device buffer", unsafe {
                 (self.session.api.buffer_read)(
                     self.session.handle.as_ptr(),
-                    handle.as_ptr(),
+                    allocation.handle.as_ptr(),
                     destination.as_mut_ptr().cast(),
                     size_of_val(destination),
                 )
@@ -847,22 +894,25 @@ impl<'lib> Buffer<'lib> {
     }
 }
 
-impl Drop for Buffer<'_> {
+impl Drop for Allocation<'_> {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle {
-            unsafe {
-                (self.session.api.buffer_free)(self.session.handle.as_ptr(), handle.as_ptr())
-            };
-        }
+        unsafe {
+            (self.session.api.buffer_free)(self.session.handle.as_ptr(), self.handle.as_ptr())
+        };
     }
 }
 
 struct Completion<'lib> {
     session: Rc<Session<'lib>>,
     handle: NonNull<c_void>,
-    dependencies: [Option<Rc<Completion<'lib>>>; 2],
-    invalid: Option<Buffer<'lib>>,
+    inputs: SubmissionInputs<'lib>,
     result: OnceCell<Result<(), OperatorError>>,
+}
+
+struct SubmissionInputs<'lib> {
+    dependencies: [Option<Rc<Completion<'lib>>>; 2],
+    _inputs: Vec<Buffer<'lib>>,
+    invalid: Option<Buffer<'lib>>,
 }
 
 impl Completion<'_> {
@@ -894,11 +944,11 @@ impl Completion<'_> {
                 let own = status("wait for W4 linear", unsafe {
                     (self.session.api.wait)(self.session.handle.as_ptr(), self.handle.as_ptr())
                 });
-                for dependency in self.dependencies.iter().flatten() {
+                for dependency in self.inputs.dependencies.iter().flatten() {
                     dependency.wait()?;
                 }
                 own?;
-                if let Some(invalid) = &self.invalid {
+                if let Some(invalid) = &self.inputs.invalid {
                     let mut flag = [0u32];
                     invalid.read(&mut flag)?;
                     if flag[0] != 0 {

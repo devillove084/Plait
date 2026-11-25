@@ -261,6 +261,14 @@ checks upstream operations and the device quantizer's invalid-input flag.
 Libraries implementing the original device API can keep using `wait`.
 [Resident W4 C header](../kernels/w4a16.h)
 
+`DeviceSession::submit_w4_f32` stages host input and returns an FP32 device
+tensor. Its completion retains the allocations the queued operation uses,
+including temporary activation buffers, weights, bias, and kernel workspace.
+The caller can drop the original wrappers after submission. Input preparation
+and staging can still synchronize with the backend. The synchronous worker
+projection uses the same submission path and reads the returned tensor before
+publishing a shard.
+
 With NCCL, each rank issues the matching operation on its communicator.
 Execution is ordered on CUDA streams, and NCCL provides asynchronous enqueue
 and nonblocking group calls. [NCCL collective operations](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html) · [NCCL group calls](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/groups.html)
