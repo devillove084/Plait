@@ -779,6 +779,22 @@ impl<'lib> PreparedW4A16<'lib> {
         self.group_size
     }
 
+    /// Bytes held by the prepared weight layout and persistent workspace.
+    pub fn resident_bytes(&self) -> u64 {
+        let auxiliary = match &self.kernel {
+            Kernel::Reference { zero } | Kernel::Humming { zero, .. } => zero.bytes(),
+            Kernel::Marlin {
+                workspace: MarlinWorkspace::Resident(workspace),
+                ..
+            } => workspace.bytes(),
+            Kernel::Marlin { .. } => 0,
+        };
+        self.packed
+            .bytes()
+            .saturating_add(self.scale.bytes())
+            .saturating_add(auxiliary)
+    }
+
     /// Run a signed INT4 or INT8 activation against canonical INT4 weights.
     pub fn submit_quantized(
         &self,
@@ -1074,6 +1090,7 @@ struct Buffer<'lib> {
 struct Allocation<'lib> {
     session: Rc<Session<'lib>>,
     handle: NonNull<c_void>,
+    bytes: usize,
 }
 
 impl<'lib> Buffer<'lib> {
@@ -1096,12 +1113,19 @@ impl<'lib> Buffer<'lib> {
             Some(Rc::new(Allocation {
                 session: Rc::clone(session),
                 handle: handle_or_error(buffer)?,
+                bytes,
             }))
         };
         Ok(Self {
             session: Rc::clone(session),
             allocation,
         })
+    }
+
+    fn bytes(&self) -> u64 {
+        self.allocation
+            .as_ref()
+            .map_or(0, |allocation| allocation.bytes as u64)
     }
 
     fn ptr(&self) -> *mut c_void {

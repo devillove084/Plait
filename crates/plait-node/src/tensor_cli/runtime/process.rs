@@ -84,7 +84,7 @@ impl WorkerProcess {
             "library": artifact.library, "ordinal": grant.device.ordinal,
             "group_size": artifact.group_size, "grant": grant, "k_range": artifact.k_range,
             "output_columns": artifact.output_columns, "listen": listen,
-            "device_lock": lock.path, "control": control
+            "device_lock": lock.path, "control": control, "kernel_profiles": artifact.kernel_profiles
         });
         let weights = tokio::fs::read_to_string(&artifact.weights).await?;
         let weights = weights.trim();

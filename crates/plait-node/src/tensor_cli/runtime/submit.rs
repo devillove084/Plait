@@ -116,6 +116,12 @@ pub(super) struct Operator {
     activations_f16: Vec<u16>,
 }
 
+impl Operator {
+    pub(super) fn has_kernel_profiles(&self) -> bool {
+        self.profiles.iter().any(|profile| profile.kernel.is_some())
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Shard {
     addr: SocketAddr,
@@ -370,14 +376,20 @@ async fn release(server: &Arc<DispatchServer>, shards: &[Shard]) {
 #[serde(tag = "request", rename_all = "snake_case")]
 enum SubmitMessage {
     Submit(Operator),
+    SubmitProfiled(Operator),
 }
 
 pub(in crate::tensor_cli) async fn run(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-    let operator = serde_json::from_reader(io::stdin().lock())?;
+    let operator: Operator = serde_json::from_reader(io::stdin().lock())?;
+    let message = if operator.has_kernel_profiles() {
+        SubmitMessage::SubmitProfiled(operator)
+    } else {
+        SubmitMessage::Submit(operator)
+    };
     let (header, output) = tokio::time::timeout(CALL_TIMEOUT, async {
         let mut stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true)?;
-        write_frame(&mut stream, &SubmitMessage::Submit(operator)).await?;
+        write_frame(&mut stream, &message).await?;
         let header: Value = read_frame(&mut stream).await?;
         if let Some(error) = header.get("error").and_then(Value::as_str) {
             return Err(io::Error::other(error.to_owned()));
@@ -492,6 +504,7 @@ mod tests {
                         calibration_id: [0; 32],
                         activation_bits: 16,
                         quantization: None,
+                        kernel: None,
                         latency_ns: 1,
                         error_ppm: 0,
                         valid_until_ms: u64::MAX,
@@ -560,7 +573,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_held_pull_does_not_block_the_next_reduction_on_the_same_workers() {
-        let first = test_shards();
+        let first = test_shards().map(|mut shard| {
+            shard.decision.profile.kernel = Some(plait_parallel::precision::W4Kernel::Reference);
+            shard
+        });
         let second = first.map(|mut shard| {
             let partial = &mut shard.decision.shard.partial;
             partial.op = OpId::new(partial.grant.device.node, 2);
@@ -582,6 +598,7 @@ mod tests {
                 let contributions = [(first, [2.0f32, 3.0][index]), (second, [7.0, 11.0][index])];
                 for (partial, value) in contributions {
                     let invocation = requests.recv().await.unwrap();
+                    assert!(matches!(invocation.request, Request::ExecuteProfiled(_)));
                     assert_eq!(invocation.request.partial(), partial);
                     invocation
                         .response

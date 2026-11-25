@@ -595,6 +595,7 @@ async fn tensor_admission_follows_the_active_epoch_and_fences_draining_results()
             calibration_id: [3; 32],
             activation_bits: 16,
             quantization: None,
+            kernel: None,
             latency_ns: 100 + ordinal as u64,
             error_ppm: 0,
             valid_until_ms: expiration,

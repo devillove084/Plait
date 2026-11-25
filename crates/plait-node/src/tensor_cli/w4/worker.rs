@@ -33,12 +33,15 @@ pub(in crate::tensor_cli) struct WorkerW4 {
     advertise: Option<SocketAddr>,
     device_lock: Option<PathBuf>,
     control: ControlPeers,
+    #[serde(default)]
+    kernel_profiles: bool,
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "request", rename_all = "snake_case")]
 pub(in crate::tensor_cli) enum Request {
     Execute(Box<Invocation>),
+    ExecuteProfiled(Box<Invocation>),
     Release { partial: KPartial },
 }
 
@@ -56,16 +59,23 @@ impl Request {
         activations_f16: Vec<u16>,
         retention_ms: u64,
     ) -> Self {
-        Self::Execute(Box::new(Invocation {
+        let invocation = Box::new(Invocation {
             decision,
             activations_f16,
             retention_ms: Some(retention_ms),
-        }))
+        });
+        if decision.profile.kernel.is_some() {
+            Self::ExecuteProfiled(invocation)
+        } else {
+            Self::Execute(invocation)
+        }
     }
 
     pub(in crate::tensor_cli) fn partial(&self) -> KPartial {
         match self {
-            Self::Execute(invocation) => invocation.decision.shard.partial,
+            Self::Execute(invocation) | Self::ExecuteProfiled(invocation) => {
+                invocation.decision.shard.partial
+            }
             Self::Release { partial } => *partial,
         }
     }
@@ -151,6 +161,7 @@ struct ResidentWorker<'lib> {
     scope: W4Scope,
     device: DeviceSession<'lib>,
     linear: W4Partition<'lib>,
+    kernel_profiles: bool,
     control: GroupControl,
     published: Arc<Mutex<Publications>>,
     addr: SocketAddr,
@@ -199,8 +210,21 @@ pub(in crate::tensor_cli) async fn run(
     // The local deployment configuration chooses a trusted native device library.
     let backend = unsafe { NativeW4A16::load(&command.device.library) }?;
     let device = backend.open_device(command.device.ordinal)?;
-    let linear = W4Partition::prepare(&device, weights)?;
-    if let Some((kernel, _)) = &linear.optimized_a16 {
+    let linear = W4Partition::prepare(&device, weights, command.kernel_profiles)?;
+    if command.kernel_profiles {
+        let reserved = view.plan.workers[&command.grant.device].device_bytes;
+        let resident = linear.resident_bytes();
+        if resident > reserved {
+            return Err(format!(
+                "profiled W4 weight layouts use {resident} bytes, exceeding the {reserved} byte device reservation"
+            ).into());
+        }
+    } else if let Some(kernel) = linear
+        .humming
+        .as_ref()
+        .map(|_| "Humming")
+        .or_else(|| linear.marlin.as_ref().map(|_| "Marlin"))
+    {
         eprintln!(
             "resident W4 using {kernel} FP32 output for A16, N={} K={}",
             command.output_columns,
@@ -217,6 +241,7 @@ pub(in crate::tensor_cli) async fn run(
         scope,
         device,
         linear,
+        kernel_profiles: command.kernel_profiles,
         control,
         published: published.clone(),
         addr,
@@ -248,7 +273,8 @@ pub(in crate::tensor_cli) async fn run(
 impl ResidentWorker<'_> {
     async fn handle(&mut self, request: Request) -> Result<Value, Box<dyn std::error::Error>> {
         match request {
-            Request::Execute(invocation) => self.invoke(*invocation).await,
+            Request::Execute(invocation) => self.invoke(*invocation, false).await,
+            Request::ExecuteProfiled(invocation) => self.invoke(*invocation, true).await,
             Request::Release { partial } => {
                 let released = self.published.lock().unwrap().release(partial);
                 Ok(json!({ "released": released }))
@@ -259,12 +285,19 @@ impl ResidentWorker<'_> {
     async fn invoke(
         &mut self,
         invocation: Invocation,
+        profiled: bool,
     ) -> Result<Value, Box<dyn std::error::Error>> {
         let Invocation {
             decision,
             activations_f16,
             retention_ms,
         } = invocation;
+        if profiled != decision.profile.kernel.is_some() {
+            return Err("W4 execution request format does not match its kernel profile".into());
+        }
+        if profiled && !self.kernel_profiles {
+            return Err("worker artifact has not enabled kernel profiles".into());
+        }
         if retention_ms.is_some_and(|ms| ms == 0 || ms > 120_000) {
             return Err("result retention must be between 1 and 120000 ms".into());
         }
@@ -306,9 +339,12 @@ impl ResidentWorker<'_> {
                 decision.profile.quantization,
                 self.device.supports_f16_quantization(),
             )?;
-            let values = self
-                .linear
-                .project(&self.device, &activations_f16, activation)?;
+            let values = self.linear.project(
+                &self.device,
+                &activations_f16,
+                activation,
+                decision.profile.kernel,
+            )?;
             self.control
                 .check_worker(self.grant, Some(partial.op))
                 .await?;
@@ -408,6 +444,7 @@ mod tests {
                     calibration_id: [0; 32],
                     activation_bits: 16,
                     quantization: None,
+                    kernel: None,
                     latency_ns: 1,
                     error_ppm: 0,
                     valid_until_ms: u64::MAX,

@@ -76,6 +76,8 @@ struct W4Artifact {
     output_columns: u32,
     library: PathBuf,
     weights: PathBuf,
+    #[serde(default)]
+    kernel_profiles: bool,
 }
 
 struct Invocation {
@@ -96,8 +98,10 @@ struct DispatchServer {
 #[serde(tag = "request", rename_all = "snake_case")]
 enum HostRequest {
     Execute(Box<WorkerInvocation>),
+    ExecuteProfiled(Box<WorkerInvocation>),
     Release { partial: KPartial },
     Submit(Box<submit::Operator>),
+    SubmitProfiled(Box<submit::Operator>),
 }
 
 enum State {
@@ -703,8 +707,16 @@ async fn serve(
     stream.set_nodelay(true)?;
     let request = match read_frame(&mut stream).await? {
         HostRequest::Execute(invocation) => Request::Execute(invocation),
+        HostRequest::ExecuteProfiled(invocation) => Request::ExecuteProfiled(invocation),
         HostRequest::Release { partial } => Request::Release { partial },
-        HostRequest::Submit(operator) => {
+        HostRequest::Submit(operator) if operator.has_kernel_profiles() => {
+            return write_frame(
+                &mut stream,
+                &json!({ "error": "kernel profiles require submit_profiled" }),
+            )
+            .await;
+        }
+        HostRequest::Submit(operator) | HostRequest::SubmitProfiled(operator) => {
             drop(slot);
             let Ok(_submission) = server.submissions.host.try_acquire() else {
                 return write_frame(

@@ -56,6 +56,7 @@ pub fn plan_w4(request: &W4PlacementRequest) -> Result<W4Selection, &'static str
     let mut catalog = Catalog::new();
     let mut modes = BTreeSet::new();
     let mut deadlines = BTreeSet::new();
+    let mut explicit = None;
     for &profile in &request.profiles {
         let scope = profile.scope;
         if profile.calibration_id != request.calibration_id
@@ -82,13 +83,9 @@ pub fn plan_w4(request: &W4PlacementRequest) -> Result<W4Selection, &'static str
         {
             continue;
         }
-        if !profile.is_valid() {
-            return Err("invalid W4 profile");
-        }
+        profile.check_calibration(&mut explicit)?;
         if !modes.insert((scope, profile.mode_key())) {
-            return Err(
-                "duplicate current W4 profile for the same precision and quantization path",
-            );
+            return Err("duplicate current W4 profile for the same execution mode");
         }
         catalog
             .entry(start)
@@ -376,6 +373,7 @@ mod tests {
             } else {
                 W4Quantization::Host
             }),
+            kernel: None,
             latency_ns,
             error_ppm,
             valid_until_ms: 90,
@@ -427,6 +425,43 @@ mod tests {
         let tighter = plan_w4(&request).unwrap();
         assert_eq!((tighter.critical_path_ns, tighter.error_bound_ppm), (80, 2));
         assert_eq!(tighter.decisions[0].shard.partial.k_end, 16);
+    }
+
+    #[test]
+    fn places_integer_and_named_a16_kernels_in_one_operation() {
+        use super::super::W4Kernel;
+
+        let mut request = request();
+        for profile in &mut request.profiles {
+            profile.kernel = Some(W4Kernel::Integer);
+        }
+        request.profiles.extend([
+            W4Profile {
+                activation_bits: 16,
+                quantization: None,
+                kernel: Some(W4Kernel::Humming),
+                latency_ns: 18,
+                error_ppm: 2,
+                ..request.profiles[1]
+            },
+            W4Profile {
+                activation_bits: 16,
+                quantization: None,
+                kernel: Some(W4Kernel::Marlin),
+                latency_ns: 21,
+                error_ppm: 0,
+                ..request.profiles[1]
+            },
+        ]);
+        request.max_error_ppm = 4;
+        let fast = plan_w4(&request).unwrap();
+        assert_eq!((fast.critical_path_ns, fast.error_bound_ppm), (20, 4));
+        assert_eq!(fast.decisions[0].profile.kernel, Some(W4Kernel::Integer));
+        assert_eq!(fast.decisions[1].profile.kernel, Some(W4Kernel::Humming));
+        request.max_error_ppm = 2;
+        let tight = plan_w4(&request).unwrap();
+        assert_eq!((tight.critical_path_ns, tight.error_bound_ppm), (21, 2));
+        assert_eq!(tight.decisions[1].profile.kernel, Some(W4Kernel::Marlin));
     }
 
     #[test]
