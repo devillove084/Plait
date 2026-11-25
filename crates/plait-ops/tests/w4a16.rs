@@ -473,13 +473,47 @@ fn native_marlin_preserves_fp32_through_split_k() {
 #[cfg(feature = "native")]
 #[test]
 fn native_marlin_mfma_handles_asymmetric_weights_and_tail_groups() {
-    use plait_ops::native::NativeW4A16;
-    use std::path::Path;
-
     let Some(path) = std::env::var_os("PLAIT_MARLIN_MFMA_TEST_LIBRARY") else {
         return;
     };
-    let backend = unsafe { NativeW4A16::load(Path::new(&path)) }.unwrap();
+    check_tiled_marlin(std::path::Path::new(&path));
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn native_marlin_metal_handles_asymmetric_weights_and_tail_groups() {
+    use plait_ops::native::{NativeW4A16, W4Activation};
+    use std::path::Path;
+
+    let Some(path) = std::env::var_os("PLAIT_MARLIN_METAL_TEST_LIBRARY") else {
+        return;
+    };
+    let path = Path::new(&path);
+    check_tiled_marlin(path);
+
+    // Both the grouped weight and the full result exceed the FP16 range.
+    let backend = unsafe { NativeW4A16::load(path) }.unwrap();
+    let session = backend.open_device(0).unwrap();
+    let packed = [0; 16 * 144 / 2];
+    let scales = [half(8192.0); 16 * 2];
+    let zeros = [15; 16 * 2];
+    let weights = W4Weights::new(144, 16, 128, &packed, &scales, Some(&zeros)).unwrap();
+    let prepared = session.prepare_marlin_f32(weights).unwrap();
+    let activation = [half(0.125); 144];
+    let expected = W4A16::new(weights, &activation, None, OutputType::F32)
+        .unwrap()
+        .run_cpu();
+    let actual = session
+        .project_w4_f32(&prepared, &activation, None, W4Activation::F16)
+        .unwrap();
+    assert_eq!(LinearOutput::F32(actual), expected);
+}
+
+#[cfg(feature = "native")]
+fn check_tiled_marlin(path: &std::path::Path) {
+    use plait_ops::native::NativeW4A16;
+
+    let backend = unsafe { NativeW4A16::load(path) }.unwrap();
     let session = backend.open_device(0).unwrap();
     for (n, k, group_size) in [(16u32, 16u32, 16), (80, 272, 128), (96, 272, 272)] {
         let packed: Vec<_> = (0..n * k / 2)
@@ -529,11 +563,11 @@ fn native_marlin_mfma_handles_asymmetric_weights_and_tail_groups() {
                             );
                         }
                     }
-                    _ => panic!("unexpected Marlin MFMA output format"),
+                    _ => panic!("unexpected tiled Marlin output format"),
                 }
             }
         }
-        println!("Marlin MFMA asymmetric FP16 and FP32 matched: N={n} K={k} G={group_size}");
+        println!("tiled Marlin asymmetric FP16 and FP32 matched: N={n} K={k} G={group_size}");
     }
 }
 

@@ -43,7 +43,7 @@ type QuantizeF16 = unsafe extern "C" fn(
 ) -> i32;
 type CompletionQuery = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u32) -> i32;
 type MarlinWorkspaceQuery = unsafe extern "C" fn(u32, u32) -> usize;
-type MfmaWorkspaceQuery = unsafe extern "C" fn(u32, u32, u32) -> usize;
+type TiledWorkspaceQuery = unsafe extern "C" fn(u32, u32, u32) -> usize;
 type MarlinLaunch = unsafe extern "C" fn(
     *mut c_void,
     *const Shape,
@@ -118,9 +118,9 @@ impl MarlinApi {
 }
 
 #[repr(C)]
-struct MarlinMfmaApi {
+struct MarlinTiledApi {
     kernel: MarlinApi,
-    workspace: MfmaWorkspaceQuery,
+    workspace: TiledWorkspaceQuery,
 }
 
 #[repr(C)]
@@ -366,23 +366,30 @@ impl<'lib> DeviceSession<'lib> {
         output: OutputType,
     ) -> Result<PreparedW4A16<'lib>, OperatorError> {
         let session = &self.0;
-        type MfmaEntry = unsafe extern "C" fn() -> *const MarlinMfmaApi;
-        let mfma = unsafe {
+        type TiledEntry = unsafe extern "C" fn() -> *const MarlinTiledApi;
+        let tiled = unsafe {
             session
                 .library
-                .get::<MfmaEntry>(b"plait_w4a16_marlin_mfma_api_v1")
+                .get::<TiledEntry>(b"plait_w4a16_marlin_metal_api_v1")
+                .map(|entry| (entry, false))
+                .or_else(|_| {
+                    session
+                        .library
+                        .get::<TiledEntry>(b"plait_w4a16_marlin_mfma_api_v1")
+                        .map(|entry| (entry, true))
+                })
         };
-        let (packed, scale, launch, workspace) = if let Ok(entry) = mfma {
+        let (packed, scale, launch, workspace) = if let Ok((entry, dequantize_in_f16)) = tiled {
             let api = unsafe { entry().as_ref() }.ok_or_else(|| {
-                OperatorError::Backend("resident Marlin MFMA API is null".to_owned())
+                OperatorError::Backend("resident tiled Marlin API is null".to_owned())
             })?;
             api.kernel.check_device(session)?;
-            let (packed, parameters) = marlin_layout::pack_mfma(weights)?;
+            let (packed, parameters) = marlin_layout::pack_tiled(weights, dequantize_in_f16)?;
             (
                 Buffer::upload(session, &packed)?,
                 Buffer::upload(session, &parameters)?,
                 api.kernel.launch,
-                MarlinWorkspace::Mfma(api.workspace),
+                MarlinWorkspace::Tiled(api.workspace),
             )
         } else {
             type Entry = unsafe extern "C" fn() -> *const MarlinApi;
@@ -695,7 +702,7 @@ enum Kernel<'lib> {
 enum MarlinWorkspace<'lib> {
     Resident(Buffer<'lib>),
     Shaped(MarlinWorkspaceQuery),
-    Mfma(MfmaWorkspaceQuery),
+    Tiled(TiledWorkspaceQuery),
 }
 
 impl MarlinWorkspace<'_> {
@@ -703,7 +710,7 @@ impl MarlinWorkspace<'_> {
         match self {
             Self::Resident(_) => 0,
             Self::Shaped(query) => unsafe { query(rows, n) },
-            Self::Mfma(query) => unsafe { query(rows, n, k) },
+            Self::Tiled(query) => unsafe { query(rows, n, k) },
         }
     }
 }

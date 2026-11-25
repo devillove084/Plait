@@ -150,9 +150,18 @@ static const char source[] =
 #include "w4_quantize_metal.h"
     ;
 
+#if defined(PLAIT_W4_METAL_MARLIN)
+static const char marlin_source[] =
+#include "marlin/plait_marlin_metal.h"
+    ;
+#endif
+
 static struct {
     id device, queue, pipeline, integer_pipeline, integer_simd_pipeline, quantize_pipeline, pack_pipeline;
     metal_index integer_simd_width;
+#if defined(PLAIT_W4_METAL_MARLIN)
+    id marlin_project, marlin_combine;
+#endif
 } metal;
 static pthread_once_t initialized = PTHREAD_ONCE_INIT;
 
@@ -190,6 +199,32 @@ static id make_pipeline(id device, id library, const char *name) {
     return pipeline;
 }
 
+#if defined(PLAIT_W4_METAL_MARLIN)
+static void initialize_marlin(id device, id options) {
+    const metal_index apple7 = 1007; /* MTLGPUFamilyApple7 */
+    if (!MESSAGE(BOOL (*)(id, SEL, metal_index))(device, SELECTOR("supportsFamily:"), apple7)) return;
+    id error = nil;
+    id library = MESSAGE(id (*)(id, SEL, id, id, id *))(
+        device, SELECTOR("newLibraryWithSource:options:error:"), string(marlin_source), options, &error);
+    if (!library) {
+        show_error(error);
+        return;
+    }
+    id project = make_pipeline(device, library, "marlin_project");
+    id combine = make_pipeline(device, library, "marlin_combine");
+    const metal_index width = MESSAGE(metal_index (*)(id, SEL))(
+        project, SELECTOR("threadExecutionWidth"));
+    if (width == 32 && combine) {
+        metal.marlin_project = project;
+        metal.marlin_combine = combine;
+    } else {
+        invoke(project, "release");
+        invoke(combine, "release");
+    }
+    invoke(library, "release");
+}
+#endif
+
 static void initialize(void) {
     id pool = autorelease_pool();
     id device = MTLCreateSystemDefaultDevice();
@@ -210,6 +245,9 @@ static void initialize(void) {
             metal.integer_simd_pipeline, SELECTOR("threadExecutionWidth"));
         metal.quantize_pipeline = make_pipeline(device, library, "quantize_f16");
         metal.pack_pipeline = make_pipeline(device, library, "pack_odd_groups");
+#if defined(PLAIT_W4_METAL_MARLIN)
+        initialize_marlin(device, options);
+#endif
     } else {
         show_error(error);
         invoke(pipeline, "release");
@@ -301,6 +339,64 @@ static int submit_kernel(void *handle, id pipeline, const plait_w4a16_shape *s,
     invoke(pool, "drain");
     return status;
 }
+
+#if defined(PLAIT_W4_METAL_MARLIN)
+typedef struct { uint32_t tiles, parts; } marlin_grid;
+
+static marlin_grid marlin_make_grid(uint32_t m, uint32_t n, uint32_t k) {
+    const uint32_t tiles = plait_ceil_div(m, 8) * (n / 16);
+    if (!tiles || !k) return (marlin_grid){tiles, 1};
+    const uint32_t units = plait_ceil_div(k, 128);
+    const uint32_t desired = plait_ceil_div(128, tiles);
+    const uint32_t parts = desired < units ? desired : units;
+    return (marlin_grid){tiles, parts < 16 ? parts : 16};
+}
+
+static size_t marlin_workspace(uint32_t m, uint32_t n, uint32_t k) {
+    const uint64_t elements = (uint64_t)m * n;
+    if (elements > UINT32_MAX) return SIZE_MAX;
+    const uint32_t parts = marlin_make_grid(m, n, k).parts;
+    return parts == 1 ? 0 : (size_t)elements * parts * sizeof(float);
+}
+
+static int marlin_probe(void *handle) {
+    return handle && metal.marlin_project && metal.marlin_combine ? 0 : -1;
+}
+
+static int marlin_launch(void *handle, const plait_w4a16_shape *s,
+                         const void *a, const void *w, const void *params,
+                         void *workspace, void *out, void **completion) {
+    if (!plait_w4a16_valid_shape(s) || s->k % 16 || s->n % 16 ||
+        (uint64_t)s->k * s->n > INT32_MAX ||
+        (s->group_size != s->k && s->group_size != 128) ||
+        !handle || !a || !w || !params || !out || !completion) return 1;
+    if (marlin_probe(handle)) return 2;
+    const marlin_grid grid = marlin_make_grid(s->m, s->n, s->k);
+    if (grid.parts > 1 && !workspace) return 1;
+
+    id pool = autorelease_pool();
+    id command = object((id)handle, "commandBuffer");
+    const id buffers[] = {(id)a, (id)w, (id)params, (id)(workspace ? workspace : out), (id)out};
+    int status = encode_kernel(command, metal.marlin_project, s, buffers, 5, &grid, sizeof grid,
+                               (metal_index)grid.tiles * grid.parts, true);
+    if (!status && grid.parts > 1) {
+        const id combine[] = {(id)workspace, (id)params, (id)out};
+        status = encode_kernel(command, metal.marlin_combine, s, combine, 3, &grid.parts,
+                               sizeof grid.parts, (metal_index)s->m * s->n, false);
+    }
+    if (!status) {
+        invoke(command, "commit");
+        *completion = object(command, "retain");
+    }
+    invoke(pool, "drain");
+    return status;
+}
+
+const plait_w4a16_marlin_tiled_api *plait_w4a16_marlin_metal_api_v1(void) {
+    static const plait_w4a16_marlin_tiled_api api = {{marlin_probe, marlin_launch}, marlin_workspace};
+    return &api;
+}
+#endif
 
 static int device_launch(void *handle, const plait_w4a16_shape *s,
                          const void *a, const void *w, const void *scale,

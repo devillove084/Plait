@@ -98,18 +98,22 @@ typedef struct {
 
 const plait_w4a16_marlin_api *plait_w4a16_marlin_api_v1(void);
 
-/* Optional AMD CDNA3 Marlin port. The same launch supports FP16 and FP32 result
- * types. Each 16-by-16 weight tile has one word of four INT4 codes per wave lane.
- * Tiles are ordered by output tile, then input tile. Group-major parameters
- * place the FP16 scale in the low 16 bits and the unsigned zero point above it.
- * The workspace query returns zero when the wave tiles need no split-K merge.
+/* Optional tiled Marlin extension for AMD CDNA3 or Apple Silicon.
+ * The same launch supports FP16 and FP32 results. Each 16-by-16 weight tile
+ * packs four consecutive K codes per uint16_t, ordered first by K group of four
+ * and then by output column. Tiles are ordered by output tile, then input tile.
+ * Group-major parameters place the FP16 scale in the low 16 bits and the
+ * unsigned zero point above it. The workspace query returns zero for direct
+ * output, or SIZE_MAX when the shape exceeds addressable scratch space.
  */
 typedef struct {
     plait_w4a16_marlin_api kernel;
     size_t (*workspace)(uint32_t rows, uint32_t columns, uint32_t input_columns);
-} plait_w4a16_marlin_mfma_api;
+} plait_w4a16_marlin_tiled_api;
 
+typedef plait_w4a16_marlin_tiled_api plait_w4a16_marlin_mfma_api;
 const plait_w4a16_marlin_mfma_api *plait_w4a16_marlin_mfma_api_v1(void);
+const plait_w4a16_marlin_tiled_api *plait_w4a16_marlin_metal_api_v1(void);
 
 /* Optional FP32 split-K accumulation and final output with Marlin-packed weights.
  * Available when Marlin is built with PLAIT_W4_MARLIN_SHARDS.
