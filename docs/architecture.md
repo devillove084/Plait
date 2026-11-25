@@ -286,6 +286,13 @@ supervisor. Admission closure fences late work, and release matches the exact
 descriptor. Retention expiry reclaims partials when release cannot reach a
 worker. The request retains its submission slot through bounded cleanup.
 
+The native W4 submitter enforces one host-wide limit and a separate limit for
+each admitted `(group, epoch)`. The execution config defaults to
+`"w4_submissions": {"host": 16, "per_epoch": 8}`. Set the epoch limit below the
+host limit so one draining version leaves space for the active version. The
+host limit still applies when several versions are busy. Both limits count
+requests until reply and cleanup complete. [Epoch admission model](../specs/PlaitEpochAdmission.tla)
+
 The current group can admit new work while an earlier epoch drains. A
 straggler in the earlier epoch holds up its own result. The TLA+ model covers
 independent publication and pull, two operations sharing workers in one epoch,

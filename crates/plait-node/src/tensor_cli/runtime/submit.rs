@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use plait_core::serving::{
@@ -17,6 +17,7 @@ use plait_parallel::precision::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use super::{CALL_TIMEOUT, DispatchServer, read_frame, read_payload, write_frame, write_payload};
@@ -29,6 +30,78 @@ const PULL_TIMEOUT: Duration = Duration::from_secs(5);
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(3);
 const CLOSE_ADMISSION_TIMEOUT: Duration = Duration::from_secs(2);
 const RESULT_RETENTION_MS: u64 = 90_000;
+
+#[derive(Deserialize)]
+#[serde(default)]
+pub(super) struct Limits {
+    host: usize,
+    per_epoch: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            host: 16,
+            per_epoch: 8,
+        }
+    }
+}
+
+pub(super) struct Submissions {
+    pub(super) host: Semaphore,
+    per_epoch: usize,
+    epochs: Mutex<BTreeMap<GroupVersion, usize>>,
+}
+
+impl Submissions {
+    pub(super) fn new(limits: Limits) -> io::Result<Self> {
+        if limits.per_epoch == 0
+            || limits.per_epoch >= limits.host
+            || limits.host > Semaphore::MAX_PERMITS
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "W4 submission limits require 0 < per_epoch < host",
+            ));
+        }
+        Ok(Self {
+            host: Semaphore::new(limits.host),
+            per_epoch: limits.per_epoch,
+            epochs: Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    fn try_epoch(&self, version: GroupVersion) -> Option<EpochSlot<'_>> {
+        let mut epochs = self.epochs.lock().unwrap();
+        let in_flight = epochs.entry(version).or_default();
+        if *in_flight == self.per_epoch {
+            return None;
+        }
+        *in_flight += 1;
+        Some(EpochSlot {
+            submissions: self,
+            version,
+        })
+    }
+}
+
+struct EpochSlot<'a> {
+    submissions: &'a Submissions,
+    version: GroupVersion,
+}
+
+impl Drop for EpochSlot<'_> {
+    fn drop(&mut self) {
+        let mut epochs = self.submissions.epochs.lock().unwrap();
+        let count = epochs
+            .get_mut(&self.version)
+            .expect("epoch slot is counted");
+        *count -= 1;
+        if *count == 0 {
+            epochs.remove(&self.version);
+        }
+    }
+}
 
 #[derive(Deserialize, Serialize)]
 pub(super) struct Operator {
@@ -58,7 +131,15 @@ pub(super) async fn serve(
         Ok(admission) => admission,
         Err(error) => return write_frame(stream, &json!({ "error": error.to_string() })).await,
     };
-    let (result, shards) = match plan_admitted(&mut control, version, work, &mut operator).await {
+    let epoch_slot = server.submissions.try_epoch(version);
+    let planned = match &epoch_slot {
+        Some(_) => plan_admitted(&mut control, version, work, &mut operator).await,
+        None => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("W4 submit group epoch {} is busy", version.epoch),
+        )),
+    };
+    let (result, shards) = match planned {
         Ok((selection, plan, shards)) => {
             let result = async {
                 let output = dispatch_and_reduce(
@@ -100,8 +181,9 @@ pub(super) async fn serve(
         }
         release(server, &shards).await;
     };
-    // The submission slot accounts for cleanup until both futures finish.
+    // Both the host and epoch slots account for cleanup until both futures finish.
     let (written, ()) = tokio::join!(reply, cleanup);
+    drop(epoch_slot);
     written
 }
 
@@ -317,10 +399,57 @@ mod tests {
     use plait_net::tensor::PartialSource;
     use plait_parallel::precision::W4Shard;
     use serde_json::json;
-    use tokio::sync::{Semaphore, mpsc, oneshot};
+    use tokio::sync::{mpsc, oneshot};
 
     use super::super::Invocation;
     use super::*;
+
+    #[test]
+    fn saturation_stays_in_the_admitted_version_and_slots_return_on_drop() {
+        let budget = Submissions::new(Limits {
+            host: 4,
+            per_epoch: 2,
+        })
+        .unwrap();
+        let group = GroupId(NodeId::derive("switching-submissions"));
+        let old = GroupVersion { group, epoch: 1 };
+        let new = GroupVersion { group, epoch: 2 };
+        let other = GroupVersion {
+            group: GroupId(NodeId::derive("other-submissions")),
+            epoch: 1,
+        };
+        let first = (
+            budget.host.try_acquire().unwrap(),
+            budget.try_epoch(old).unwrap(),
+        );
+        let second = (
+            budget.host.try_acquire().unwrap(),
+            budget.try_epoch(old).unwrap(),
+        );
+        assert!(budget.try_epoch(old).is_none());
+        let next = (
+            budget.host.try_acquire().unwrap(),
+            budget.try_epoch(new).unwrap(),
+        );
+        let unrelated = (
+            budget.host.try_acquire().unwrap(),
+            budget.try_epoch(other).unwrap(),
+        );
+        assert!(budget.host.try_acquire().is_err());
+        drop((first, second));
+        assert!(!budget.epochs.lock().unwrap().contains_key(&old));
+        assert_eq!(budget.host.available_permits(), 2);
+        drop((next, unrelated));
+        assert!(budget.epochs.lock().unwrap().is_empty());
+        assert_eq!(budget.host.available_permits(), 4);
+        assert!(
+            Submissions::new(Limits {
+                host: 2,
+                per_epoch: 2
+            })
+            .is_err()
+        );
+    }
 
     fn test_shards() -> [Shard; 2] {
         let host = NodeId::derive("async-reduction-test");
@@ -413,7 +542,7 @@ mod tests {
                 (slow.grant.device, send_slow),
                 (fast.grant.device, send_fast),
             ]),
-            submissions: Arc::new(Semaphore::new(1)),
+            submissions: Submissions::new(Limits::default()).unwrap(),
         });
         let plan = KSum::new(2, 1, vec![fast, slow]).unwrap();
         let output = tokio::time::timeout(
@@ -453,7 +582,7 @@ mod tests {
                 (failed.grant.device, send_failed),
                 (stalled.grant.device, send_stalled),
             ]),
-            submissions: Arc::new(Semaphore::new(1)),
+            submissions: Submissions::new(Limits::default()).unwrap(),
         });
         let plan = KSum::new(2, 1, vec![failed, stalled]).unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {

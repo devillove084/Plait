@@ -39,6 +39,8 @@ pub(crate) struct Config {
     host_memory: HostMemory,
     lock_dir: PathBuf,
     devices: Vec<Device>,
+    #[serde(default)]
+    w4_submissions: submit::Limits,
 }
 
 #[derive(Deserialize)]
@@ -87,7 +89,7 @@ struct DispatchServer {
     addr: SocketAddr,
     control: ControlPeers,
     routes: Routes,
-    submissions: Arc<Semaphore>,
+    submissions: submit::Submissions,
 }
 
 #[derive(Deserialize)]
@@ -128,6 +130,7 @@ pub(crate) async fn run(
     peers: BTreeMap<NodeId, String>,
     seeds: Vec<SocketAddr>,
 ) -> io::Result<()> {
+    let submissions = submit::Submissions::new(config.w4_submissions)?;
     if config.listen.ip().is_unspecified() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -213,7 +216,7 @@ pub(crate) async fn run(
         addr: dispatch_addr,
         control: control_config,
         routes,
-        submissions: Arc::new(Semaphore::new(8)),
+        submissions,
     });
     let slots = Arc::new(Semaphore::new(64));
     loop {
@@ -703,7 +706,7 @@ async fn serve(
         HostRequest::Release { partial } => Request::Release { partial },
         HostRequest::Submit(operator) => {
             drop(slot);
-            let Ok(_submission) = server.submissions.clone().try_acquire_owned() else {
+            let Ok(_submission) = server.submissions.host.try_acquire() else {
                 return write_frame(
                     &mut stream,
                     &json!({ "error": "W4 submit endpoint is busy" }),
