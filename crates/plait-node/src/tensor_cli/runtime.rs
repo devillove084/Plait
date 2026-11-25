@@ -65,7 +65,7 @@ enum Program {
     W4(W4Artifact),
     Decoder {
         decoder_config: PathBuf,
-        weights: PathBuf,
+        weights: Option<PathBuf>,
     },
 }
 

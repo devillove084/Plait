@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use super::{W4Device, W4WeightInput, activation_format, write_json};
 
 mod calibration;
+mod checkpoint;
 mod model;
 mod plan;
 mod service;
@@ -27,23 +28,70 @@ use transfer::{Publication, Source};
 pub(in crate::tensor_cli) struct DecoderCommand {
     #[serde(flatten)]
     device: W4Device,
-    hidden_size: u32,
-    intermediate_size: u32,
-    attention_heads: u32,
-    kv_heads: u32,
-    rope_theta: f32,
-    rms_epsilon: f32,
+    #[serde(flatten)]
+    legacy: LegacyModel,
+    checkpoint: Option<checkpoint::Config>,
     max_tokens: u32,
-    #[serde(default = "one_layer")]
-    layer_count: u32,
-    model: Option<model::Config>,
     tune_model: Option<calibration::ModelConfig>,
     plan: Option<plan::Config>,
     service: Option<service::Config>,
 }
 
-fn one_layer() -> u32 {
-    1
+#[derive(Deserialize)]
+struct LegacyModel {
+    hidden_size: Option<u32>,
+    intermediate_size: Option<u32>,
+    attention_heads: Option<u32>,
+    kv_heads: Option<u32>,
+    rope_theta: Option<f32>,
+    rms_epsilon: Option<f32>,
+    layer_count: Option<u32>,
+    model: Option<model::Config>,
+}
+
+impl LegacyModel {
+    fn is_configured(&self) -> bool {
+        self.hidden_size.is_some()
+            || self.intermediate_size.is_some()
+            || self.attention_heads.is_some()
+            || self.kv_heads.is_some()
+            || self.rope_theta.is_some()
+            || self.rms_epsilon.is_some()
+            || self.layer_count.is_some()
+            || self.model.is_some()
+    }
+
+    fn decoder_config(&self) -> io::Result<DecoderConfig> {
+        let (
+            Some(hidden_size),
+            Some(intermediate_size),
+            Some(attention_heads),
+            Some(kv_heads),
+            Some(rope_theta),
+            Some(rms_epsilon),
+        ) = (
+            self.hidden_size,
+            self.intermediate_size,
+            self.attention_heads,
+            self.kv_heads,
+            self.rope_theta,
+            self.rms_epsilon,
+        )
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "decoder-w4 needs dimensions for layer records or a checkpoint",
+            ));
+        };
+        Ok(DecoderConfig {
+            hidden_size,
+            intermediate_size,
+            attention_heads,
+            kv_heads,
+            rope_theta,
+            rms_epsilon,
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -186,19 +234,31 @@ impl LinearProjection for DeviceProjection<'_, '_> {
 pub(in crate::tensor_cli) async fn run(
     command: DecoderCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let config = DecoderConfig {
-        hidden_size: command.hidden_size,
-        intermediate_size: command.intermediate_size,
-        attention_heads: command.attention_heads,
-        kv_heads: command.kv_heads,
-        rope_theta: command.rope_theta,
-        rms_epsilon: command.rms_epsilon,
+    if command.checkpoint.is_some() && command.legacy.is_configured() {
+        return Err(
+            "provide either a checkpoint or explicit decoder dimensions and weights".into(),
+        );
+    }
+    let group_size = command.device.group_size;
+    let mut checkpoint = command
+        .checkpoint
+        .map(|source| checkpoint::Checkpoint::open(source, group_size, command.max_tokens))
+        .transpose()?;
+    let (config, layer_count, head_execution) = match &checkpoint {
+        Some(checkpoint) => (
+            checkpoint.decoder_config(),
+            checkpoint.layer_count(),
+            Some(checkpoint.head_execution()),
+        ),
+        None => (
+            command.legacy.decoder_config()?,
+            command.legacy.layer_count.unwrap_or(1),
+            command.legacy.model.as_ref().map(|model| model.execution),
+        ),
     };
     let shapes = config.projection_shapes()?;
     let mut lines = io::stdin().lock().lines();
-    let group_size = command.device.group_size;
-    let max_snapshot_bytes =
-        transfer::snapshot_size(command.layer_count, command.max_tokens, shapes[1].1)?;
+    let max_snapshot_bytes = transfer::snapshot_size(layer_count, command.max_tokens, shapes[1].1)?;
     let _lock = command
         .service
         .as_ref()
@@ -207,7 +267,7 @@ pub(in crate::tensor_cli) async fn run(
     let mut plan = command
         .plan
         .map(|plan| {
-            let head = command.model.as_ref().ok_or_else(|| {
+            let head = head_execution.ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "decoder plans require token model weights",
@@ -218,8 +278,8 @@ pub(in crate::tensor_cli) async fn run(
                 command.service.as_ref().map(service::Config::grant),
                 command.device.ordinal,
                 &command.device.library,
-                head.execution,
-                command.layer_count,
+                head,
+                layer_count,
                 command.tune_model.is_some(),
             )
         })
@@ -227,11 +287,20 @@ pub(in crate::tensor_cli) async fn run(
     // The local deployment configuration selects a trusted device library.
     let library = unsafe { NativeW4A16::load(&command.device.library) }?;
     let device = library.open_device(command.device.ordinal)?;
-    let (head, model_id) = command
-        .model
-        .map(|model| model::load(model, &device, config, group_size))
-        .transpose()?
-        .unzip();
+    let (head, model_id) = match &mut checkpoint {
+        Some(checkpoint) => Some(model::prepare(
+            checkpoint.load_head()?,
+            &device,
+            config,
+            group_size,
+        )?),
+        None => command
+            .legacy
+            .model
+            .map(|model| model::load(model, &device, config, group_size))
+            .transpose()?,
+    }
+    .unzip();
     let mut model_tuning = if let Some(tuning) = command.tune_model {
         let head = head
             .as_ref()
@@ -246,14 +315,16 @@ pub(in crate::tensor_cli) async fn run(
     };
     let mut blocks = Vec::new();
     let mut layers = Vec::new();
-    for position in 0..command.layer_count {
-        let mut input: LayerInput =
-            serde_json::from_str(&lines.next().ok_or("decoder-w4 needs layer weights")??)?;
+    for position in 0..layer_count {
+        let mut input: LayerInput = match &mut checkpoint {
+            Some(checkpoint) => checkpoint.load_layer(position, shapes)?,
+            None => serde_json::from_str(&lines.next().ok_or("decoder-w4 needs layer weights")??)?,
+        };
         let mut layer = layer_digest(config, group_size, &input, &shapes);
-        if command.layer_count > 1 || model_id.is_some() {
+        if layer_count > 1 || model_id.is_some() {
             let mut digest = Sha256::new();
             digest.update(b"plait-decoder-stack-layer-v1");
-            digest.update(command.layer_count.to_le_bytes());
+            digest.update(layer_count.to_le_bytes());
             digest.update(position.to_le_bytes());
             digest.update(layer);
             if let Some(model) = model_id {
@@ -336,7 +407,7 @@ pub(in crate::tensor_cli) async fn run(
             head,
             digest.finalize().into(),
             service::KvLimits {
-                layers: command.layer_count,
+                layers: layer_count,
                 bytes: max_snapshot_bytes,
                 tokens: command.max_tokens,
             },
@@ -384,7 +455,7 @@ pub(in crate::tensor_cli) async fn run(
                     Ok(json!({ "source": source }))
                 }
                 Request::PullKv { source } => {
-                    let snapshot = transfer::pull(source, max_snapshot_bytes, command.layer_count, Duration::from_secs(15)).await?;
+                    let snapshot = transfer::pull(source, max_snapshot_bytes, layer_count, Duration::from_secs(15)).await?;
                     let restored = stack.restore_cache(snapshot.layers, command.max_tokens)?;
                     if restored.tokens() != snapshot.tokens as usize {
                         return Err(io::Error::new(io::ErrorKind::InvalidData, "KV header has a different token count").into());

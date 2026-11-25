@@ -20,20 +20,51 @@ pub(super) struct Config {
     pub(super) execution: ProjectionExecution,
 }
 
+pub(super) struct Weights {
+    pub(super) vocab_size: u32,
+    pub(super) embeddings: Vec<u8>,
+    pub(super) norm: Vec<u16>,
+    pub(super) weights: W4WeightInput,
+    pub(super) execution: ProjectionExecution,
+}
+
 pub(super) fn load<'a, 'lib>(
     model: Config,
     device: &'a DeviceSession<'lib>,
     config: DecoderConfig,
     group_size: u32,
 ) -> Result<(TokenHead<DeviceProjection<'a, 'lib>>, [u8; 32]), Box<dyn std::error::Error>> {
-    let shape = (config.hidden_size, model.vocab_size);
-    let embeddings = std::fs::read(model.embeddings_f16)?;
-    let norm = read_f16(&model.final_norm_f16)?;
-    let weights = W4WeightInput {
-        packed: std::fs::read(model.head_packed)?,
-        scales_f16: read_f16(&model.head_scales_f16)?,
-        zero_points: model.head_zero_points.map(std::fs::read).transpose()?,
-    };
+    prepare(
+        Weights {
+            vocab_size: model.vocab_size,
+            embeddings: std::fs::read(model.embeddings_f16)?,
+            norm: read_f16(&model.final_norm_f16)?,
+            weights: W4WeightInput {
+                packed: std::fs::read(model.head_packed)?,
+                scales_f16: read_f16(&model.head_scales_f16)?,
+                zero_points: model.head_zero_points.map(std::fs::read).transpose()?,
+            },
+            execution: model.execution,
+        },
+        device,
+        config,
+        group_size,
+    )
+}
+
+pub(super) fn prepare<'a, 'lib>(
+    Weights {
+        vocab_size,
+        embeddings,
+        norm,
+        weights,
+        execution,
+    }: Weights,
+    device: &'a DeviceSession<'lib>,
+    config: DecoderConfig,
+    group_size: u32,
+) -> Result<(TokenHead<DeviceProjection<'a, 'lib>>, [u8; 32]), Box<dyn std::error::Error>> {
+    let shape = (config.hidden_size, vocab_size);
     let mut digest = Sha256::new();
     digest.update(b"plait-decoder-token-model-v1");
     digest.update(weights.digest(shape.0, shape.1, group_size));
@@ -44,9 +75,7 @@ pub(super) fn load<'a, 'lib>(
     let head = TokenHead::new(
         embeddings,
         &norm,
-        model
-            .execution
-            .prepare(device, &weights, None, shape, group_size)?,
+        execution.prepare(device, &weights, None, shape, group_size)?,
         config.rms_epsilon,
     )?;
     Ok((head, digest.finalize().into()))
