@@ -651,6 +651,11 @@ impl ServingState {
             ServingAction::Drain(version) => self.quiesce(*version, GroupPhase::Draining),
             ServingAction::Revoke(version) => self.quiesce(*version, GroupPhase::Revoked),
             ServingAction::WorkerStopped(grant) => self.worker_stopped(*grant),
+            ServingAction::ReclaimResident {
+                grant,
+                owner,
+                workers,
+            } => self.reclaim_resident(*grant, *owner, workers),
             ServingAction::ClaimResident {
                 grant,
                 owner,
@@ -1282,6 +1287,51 @@ impl ServingState {
         Ok(group_outcome(view.version, view.phase))
     }
 
+    fn reclaim_resident(
+        &mut self,
+        grant: WorkerGrant,
+        owner: Option<ResidentOwner>,
+        workers: &BTreeSet<DeviceId>,
+    ) -> ServingResult {
+        let version = grant.version;
+        let view = self
+            .group(version)
+            .ok_or(ServingError::UnknownVersion(version))?;
+        check_grant(view, grant)?;
+        check_launch_owner(view, None)?;
+        if !workers.iter().eq(view.grants.keys()) {
+            return Err(ServingError::InvalidPlan);
+        }
+        if view.phase == GroupPhase::Retired {
+            return Ok(group_outcome(version, GroupPhase::Retired));
+        }
+        if view.phase != GroupPhase::Revoked {
+            return Err(ServingError::InvalidPhase(view.phase));
+        }
+        if self.resident_owner(grant) != owner
+            || (owner.is_none() && view.ready.contains(&grant.device))
+        {
+            return Err(ServingError::LaunchOwnerMismatch);
+        }
+
+        let already_stopped = view.stopped.contains(&grant.device);
+        let worker = self
+            .workers
+            .get_mut(&grant.device)
+            .expect("reserved worker");
+        if worker.grant == Some(grant) {
+            worker.grant = None;
+        } else if !already_stopped {
+            return Err(ServingError::GrantMismatch);
+        }
+        let view = self.group_mut(version)?;
+        view.stopped.insert(grant.device);
+        if &view.stopped == workers {
+            return self.retire(version, workers);
+        }
+        Ok(group_outcome(version, GroupPhase::Revoked))
+    }
+
     fn claim_resident(
         &mut self,
         grant: WorkerGrant,
@@ -1422,8 +1472,11 @@ impl ServingState {
             return Err(ServingError::WorkersStillRunning);
         }
 
-        for device in workers {
-            self.workers.get_mut(device).expect("reserved worker").grant = None;
+        for (device, &grant) in &view.grants {
+            let worker = self.workers.get_mut(device).expect("reserved worker");
+            if worker.grant == Some(grant) {
+                worker.grant = None;
+            }
         }
         for (host, demand) in &view.plan.hosts {
             let reserved = &mut self.hosts.get_mut(host).expect("reserved host").reserved;
@@ -1753,5 +1806,98 @@ mod tests {
             Err(ServingError::GrantMismatch)
         );
         assert_eq!(state.apply(&committed), receipt);
+    }
+
+    #[test]
+    fn a_revoked_group_reclaims_each_verified_device_without_clearing_new_grants() {
+        let mut state = ServingState::default();
+        let host = NodeId::derive("reclaim-test");
+        let group = GroupId(host);
+        let old = GroupVersion { group, epoch: 1 };
+        let new = GroupVersion { group, epoch: 2 };
+        let [healthy, failed] = [0, 1].map(|index| DeviceId::new(host, index));
+        let workers = BTreeSet::from([healthy, failed]);
+        let memory = HostMemory {
+            bytes: 16,
+            pinned_bytes: 4,
+        };
+        let demand = WorkerDemand {
+            incarnation: 1,
+            device_bytes: 16,
+        };
+        let owner = |index: u64| ResidentOwner {
+            session: NodeId::derive(&format!("reclaim-owner-{index}")),
+            supervisor_lock: [1, 2],
+            device_lock: [1, 3 + index],
+        };
+        let plan = |workers: &BTreeSet<_>| GroupPlan {
+            role: ServingRole::Aggregated,
+            model: "reclaim-model".into(),
+            tensor_parallel: workers.len() as u32,
+            pipeline_parallel: 1,
+            launch_digest: [4; 32],
+            workers: workers.iter().map(|&device| (device, demand)).collect(),
+            hosts: BTreeMap::from([(host, memory)]),
+        };
+        state
+            .set_host_memory(host, add_memory(memory, memory).unwrap())
+            .unwrap();
+        for &device in &workers {
+            state.register_worker(device, 1, 32).unwrap();
+        }
+        state.prepare(group, 0, &plan(&workers)).unwrap();
+        let first = state.group(old).unwrap().grants[&healthy];
+        let second = state.group(old).unwrap().grants[&failed];
+        for (grant, owner) in [(first, owner(0)), (second, owner(1))] {
+            state.claim_resident(grant, owner, [4; 32]).unwrap();
+            state.worker_ready(grant, [4; 32]).unwrap();
+        }
+        state.activate(old).unwrap();
+        assert_eq!(
+            state.reclaim_resident(first, Some(owner(0)), &workers),
+            Err(ServingError::InvalidPhase(GroupPhase::Active))
+        );
+        state.lose_resident(second, owner(1)).unwrap();
+        assert_eq!(
+            state.reclaim_resident(second, Some(owner(0)), &workers),
+            Err(ServingError::LaunchOwnerMismatch)
+        );
+        assert_eq!(
+            state.reclaim_resident(first, Some(owner(0)), &BTreeSet::from([healthy])),
+            Err(ServingError::InvalidPlan)
+        );
+        state
+            .reclaim_resident(first, Some(owner(0)), &workers)
+            .unwrap();
+        assert_eq!(state.hosts[&host].reserved, memory);
+        assert_eq!(state.workers[&failed].grant, Some(second));
+        assert_eq!(
+            state.prepare(group, 1, &plan(&BTreeSet::from([failed]))),
+            Err(ServingError::WorkerBusy(failed))
+        );
+        state
+            .prepare(group, 1, &plan(&BTreeSet::from([healthy])))
+            .unwrap();
+        let replacement = state.group(new).unwrap().grants[&healthy];
+        assert_eq!(replacement.fence, first.fence + 1);
+        state.worker_ready(replacement, [4; 32]).unwrap();
+        state.activate(new).unwrap();
+        assert_eq!(
+            state.reclaim_resident(first, Some(owner(0)), &workers),
+            Ok(group_outcome(old, GroupPhase::Revoked))
+        );
+        assert_eq!(
+            state.reclaim_resident(second, Some(owner(1)), &workers),
+            Ok(group_outcome(old, GroupPhase::Retired))
+        );
+        assert_eq!(state.workers[&healthy].grant, Some(replacement));
+        assert_eq!(state.hosts[&host].reserved, memory);
+        assert_eq!(state.workers[&failed].grant, None);
+        assert!(!state.group(old).unwrap().allows_grant(first));
+        assert!(state.group(new).unwrap().allows_grant(replacement));
+        state
+            .reclaim_resident(second, Some(owner(1)), &workers)
+            .unwrap();
+        assert_eq!(state.hosts[&host].reserved, memory);
     }
 }

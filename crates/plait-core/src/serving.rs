@@ -618,6 +618,13 @@ pub enum ServingAction {
         work: OpId,
         grants: Vec<WorkerGrant>,
     },
+    /// Release one stopped device of a revoked native group. The final stop
+    /// also retires the version and releases its shared host reservations.
+    ReclaimResident {
+        grant: WorkerGrant,
+        owner: Option<ResidentOwner>,
+        workers: BTreeSet<DeviceId>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -821,6 +828,11 @@ impl ServingOperation {
             }
             ServingAction::Retire { version, workers } => {
                 keys.insert(Key::ServingGroup(version.group));
+                keys.extend(workers.iter().copied().map(Key::Device));
+                keys.extend(workers.iter().map(|device| Key::HostMemory(device.node)));
+            }
+            ServingAction::ReclaimResident { grant, workers, .. } => {
+                keys.insert(Key::ServingGroup(grant.version.group));
                 keys.extend(workers.iter().copied().map(Key::Device));
                 keys.extend(workers.iter().map(|device| Key::HostMemory(device.node)));
             }

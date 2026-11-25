@@ -185,6 +185,10 @@ impl WorkerProcess {
         self.child.try_wait()
     }
 
+    pub(super) fn has_usable_pipe(&self) -> bool {
+        self.usable
+    }
+
     pub(super) async fn call(&mut self, request: &Request) -> io::Result<Value> {
         self.check_running()?;
         if self.is_decoder() {
