@@ -175,8 +175,10 @@ impl DeviceRuntime for CudaRuntime {
 /// flags are required to build the NVIDIA wheel.
 struct AclApi {
     _library: libloading::Library,
+    set_device: unsafe extern "C" fn(i32) -> i32,
     memcpy: unsafe extern "C" fn(*mut c_void, usize, *const c_void, usize, u32) -> i32,
-    synchronize: unsafe extern "C" fn() -> i32,
+    synchronize_device: unsafe extern "C" fn() -> i32,
+    synchronize_stream: unsafe extern "C" fn(*mut c_void) -> i32,
 }
 
 unsafe impl Send for AclApi {}
@@ -184,6 +186,7 @@ unsafe impl Sync for AclApi {}
 
 pub struct HuaweiRuntime {
     api: Arc<AclApi>,
+    device: i32,
 }
 
 impl HuaweiRuntime {
@@ -209,29 +212,68 @@ impl HuaweiRuntime {
                 )
                 .map_err(|error| BackendError(format!("aclrtMemcpy: {error}")))?
         };
-        let synchronize = unsafe {
+        let synchronize_device = unsafe {
             *library
                 .get::<unsafe extern "C" fn() -> i32>(b"aclrtSynchronizeDevice\0")
                 .map_err(|error| BackendError(format!("aclrtSynchronizeDevice: {error}")))?
         };
-        if unsafe { init(std::ptr::null()) } != 0 {
-            return Err(BackendError("aclInit failed".to_owned()));
+        let synchronize_stream = unsafe {
+            *library
+                .get::<unsafe extern "C" fn(*mut c_void) -> i32>(b"aclrtSynchronizeStream\0")
+                .map_err(|error| BackendError(format!("aclrtSynchronizeStream: {error}")))?
+        };
+        const ACL_ERROR_REPEAT_INITIALIZE: i32 = 100002;
+        let status = unsafe { init(std::ptr::null()) };
+        if status != 0 && status != ACL_ERROR_REPEAT_INITIALIZE {
+            return Err(BackendError(format!("aclInit: {status}")));
         }
-        if unsafe { set_device(device as i32) } != 0 {
-            return Err(BackendError(format!("aclrtSetDevice({device}) failed")));
-        }
-        Ok(Self {
+        let runtime = Self {
             api: Arc::new(AclApi {
                 _library: library,
+                set_device,
                 memcpy,
-                synchronize,
+                synchronize_device,
+                synchronize_stream,
             }),
-        })
+            device: i32::try_from(device)
+                .map_err(|_| BackendError(format!("invalid ACL device index {device}")))?,
+        };
+        runtime.bind()?;
+        Ok(runtime)
+    }
+
+    fn bind(&self) -> Result<(), BackendError> {
+        let status = unsafe { (self.api.set_device)(self.device) };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(BackendError(format!(
+                "aclrtSetDevice({}): {status}",
+                self.device
+            )))
+        }
     }
 }
 
 impl DeviceRuntime for HuaweiRuntime {
+    fn synchronize_stream(&self, stream: u64) -> Result<(), BackendError> {
+        self.bind()?;
+        let status = unsafe {
+            if stream == 0 {
+                (self.api.synchronize_device)()
+            } else {
+                (self.api.synchronize_stream)(stream as *mut c_void)
+            }
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(BackendError(format!("ACL synchronization: {status}")))
+        }
+    }
+
     fn copy_host_to_device(&self, target: u64, source: &[u8]) -> Result<(), BackendError> {
+        self.bind()?;
         // ACL_MEMCPY_HOST_TO_DEVICE = 1.
         let status = unsafe {
             (self.api.memcpy)(
@@ -250,6 +292,7 @@ impl DeviceRuntime for HuaweiRuntime {
     }
 
     fn copy_device_to_host(&self, source: u64, target: &mut [u8]) -> Result<(), BackendError> {
+        self.bind()?;
         // ACL_MEMCPY_DEVICE_TO_HOST = 2.
         let status = unsafe {
             (self.api.memcpy)(
@@ -261,7 +304,6 @@ impl DeviceRuntime for HuaweiRuntime {
             )
         };
         if status == 0 {
-            let _ = unsafe { (self.api.synchronize)() };
             Ok(())
         } else {
             Err(BackendError(format!("aclrtMemcpy D2H: {status}")))
