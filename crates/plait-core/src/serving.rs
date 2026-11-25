@@ -612,6 +612,12 @@ pub enum ServingAction {
         standbys: Vec<DecoderStandby>,
         weights: Vec<DecoderRouteWeight>,
     },
+    /// Authorize one fully reduced output and close its tracked admission.
+    CompleteW4 {
+        version: GroupVersion,
+        work: OpId,
+        grants: Vec<WorkerGrant>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -834,6 +840,7 @@ impl ServingOperation {
             }
             ServingAction::Activate(version)
             | ServingAction::FinishW4 { version, .. }
+            | ServingAction::CompleteW4 { version, .. }
             | ServingAction::ExpireW4 { version, .. }
             | ServingAction::Drain(version)
             | ServingAction::Revoke(version)

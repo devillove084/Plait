@@ -248,8 +248,15 @@ impl ServingState {
                 now_ms,
                 expires_at_ms,
             } => self.admit_w4(*group, operation.id, *now_ms, *expires_at_ms),
-            ServingAction::CheckW4 { grant, work } => self.check_w4(*grant, *work),
+            ServingAction::CheckW4 { grant, work } => {
+                self.check_w4(grant.version, std::slice::from_ref(grant), *work)
+            }
             ServingAction::FinishW4 { version, work } => self.finish_w4(*version, *work),
+            ServingAction::CompleteW4 {
+                version,
+                work,
+                grants,
+            } => self.complete_w4(*version, *work, grants),
             ServingAction::ExpireW4 {
                 version,
                 through_ms,
@@ -1185,19 +1192,37 @@ impl ServingState {
         Ok(ServingOutcome::W4Admitted { version, tracked })
     }
 
-    fn check_w4(&self, grant: WorkerGrant, work: Option<OpId>) -> ServingResult {
+    fn check_w4(
+        &self,
+        version: GroupVersion,
+        grants: &[WorkerGrant],
+        work: Option<OpId>,
+    ) -> ServingResult {
         let view = self
-            .group(grant.version)
-            .ok_or(ServingError::UnknownVersion(grant.version))?;
-        if !view.allows_grant(grant) {
+            .group(version)
+            .ok_or(ServingError::UnknownVersion(version))?;
+        if grants.is_empty() || grants.iter().any(|&grant| !view.allows_grant(grant)) {
             return Err(ServingError::GrantMismatch);
         }
-        if let Some(pending) = self.w4_work.get(&grant.version)
+        if let Some(pending) = self.w4_work.get(&version)
             && !work.is_some_and(|id| pending.contains_key(&id))
         {
             return Err(ServingError::W4NotAdmitted);
         }
         Ok(group_outcome(view.version, view.phase))
+    }
+
+    fn complete_w4(
+        &mut self,
+        version: GroupVersion,
+        work: OpId,
+        grants: &[WorkerGrant],
+    ) -> ServingResult {
+        let authorized = self.check_w4(version, grants, Some(work))?;
+        if self.w4_work.contains_key(&version) {
+            return self.finish_w4(version, work);
+        }
+        Ok(authorized)
     }
 
     fn finish_w4(&mut self, version: GroupVersion, work: OpId) -> ServingResult {
@@ -1626,5 +1651,107 @@ mod tests {
         );
         assert_eq!(state.groups[&group].active, None);
         assert!(state.group(old).unwrap().allows_grant(old_grant));
+    }
+
+    #[test]
+    fn w4_completion_orders_all_grants_and_admission_against_expiry_and_revocation() {
+        let mut state = ServingState::default();
+        let host = NodeId::derive("w4-completion");
+        let group = GroupId(host);
+        let version = GroupVersion { group, epoch: 1 };
+        let [first, second] = [0, 1].map(|ordinal| DeviceId::new(host, ordinal));
+        let address = "127.0.0.1:7001".parse().unwrap();
+        let demand = WorkerDemand {
+            incarnation: 1,
+            device_bytes: 16,
+        };
+        let memory = HostMemory {
+            bytes: 16,
+            pinned_bytes: 4,
+        };
+        let id = |counter| OpId::new(host, counter);
+        state.set_host_memory(host, memory).unwrap();
+        for device in [first, second] {
+            state.register_worker(device, 1, 32).unwrap();
+        }
+        let layout = W4GroupLayout {
+            k: 16,
+            group_size: 8,
+            output_columns: 4,
+            shards: BTreeMap::from([(first, [0, 8]), (second, [8, 16])]),
+        };
+        state
+            .apply(&ServingOperation {
+                id: id(1),
+                action: ServingAction::PrepareManagedW4 {
+                    group,
+                    expected_epoch: 0,
+                    expected_active: None,
+                    plan: GroupPlan {
+                        role: ServingRole::Aggregated,
+                        model: "completion-model".into(),
+                        tensor_parallel: 2,
+                        pipeline_parallel: 1,
+                        launch_digest: [4; 32],
+                        workers: BTreeMap::from([(first, demand), (second, demand)]),
+                        hosts: BTreeMap::from([(host, memory)]),
+                    },
+                    layout: layout.clone(),
+                },
+            })
+            .unwrap();
+        let grants = [first, second].map(|device| state.group(version).unwrap().grants[&device]);
+        for grant in grants {
+            state
+                .worker_ready_at(grant, [4; 32], address, layout.shard(grant.device))
+                .unwrap();
+        }
+        for (counter, deadline) in [(2, 20), (3, 30), (4, 30)] {
+            assert_eq!(
+                state.admit_w4(group, id(counter), 10, deadline),
+                Ok(ServingOutcome::W4Admitted {
+                    version,
+                    tracked: true
+                })
+            );
+        }
+        state.quiesce(version, GroupPhase::Draining).unwrap();
+        state.expire_w4(version, 20).unwrap();
+
+        let complete = |counter, work, grants| ServingOperation {
+            id: id(counter),
+            action: ServingAction::CompleteW4 {
+                version,
+                work: id(work),
+                grants,
+            },
+        };
+        assert_eq!(
+            state.apply(&complete(5, 2, grants.to_vec())),
+            Err(ServingError::W4NotAdmitted)
+        );
+        let mut stale = grants;
+        stale[1].fence += 1;
+        assert_eq!(
+            state.apply(&complete(6, 3, stale.to_vec())),
+            Err(ServingError::GrantMismatch)
+        );
+        assert_eq!(state.w4_drain(version).unwrap().pending, 2);
+
+        let committed = complete(7, 3, grants.to_vec());
+        let receipt = Ok(group_outcome(version, GroupPhase::Draining));
+        assert_eq!(state.apply(&committed), receipt);
+        assert_eq!(state.w4_drain(version).unwrap().pending, 1);
+        assert_eq!(
+            state.apply(&complete(8, 3, grants.to_vec())),
+            Err(ServingError::W4NotAdmitted)
+        );
+
+        state.quiesce(version, GroupPhase::Revoked).unwrap();
+        assert_eq!(
+            state.apply(&complete(9, 4, grants.to_vec())),
+            Err(ServingError::GrantMismatch)
+        );
+        assert_eq!(state.apply(&committed), receipt);
     }
 }
