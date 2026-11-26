@@ -306,6 +306,7 @@ int device_buffer_read(void *handle, const void *buffer, void *destination, size
 
 template <typename Submit>
 int record_submission(Session *session, void **completion, Submit submit) {
+    if (!session || !completion) return PLAIT_GPU(ErrorInvalidValue);
     auto status = session->bind();
     if (status != PLAIT_GPU(Success)) return status;
     PLAIT_GPU(Event_t) event = nullptr;
