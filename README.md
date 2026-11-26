@@ -215,8 +215,9 @@ release the result after the matching completion has executed in the control pla
 | [Asynchronous reduction](specs/PlaitAsyncReduction.tla) | W4A4 device completion, stale-event rejection, and deterministic folding. An independent operation completes even while a producer or pull in another operation stalls. |
 | [Ordered publication](specs/PlaitOrderedPublication.tla) | Completion and revocation in the agreed command order, receipt identity on retry, and recovery from a replica's durable command prefix. |
 | [Peer collectives](specs/PlaitPeerCollective.tla) | Round pairing, replicated and sharded reduction, and completion of an independent communicator when a participant in another group is lost. |
+| [Serving ingress](specs/PlaitServingIngress.tla) | One admission per forwarded request, monotonic route refresh, and output pinned to the admitted epoch while the old gate drains. |
 
-TLC 2.19 passes all 26 configurations. The ordered publication configuration
+TLC 2.19 passes all 27 configurations. The ordered publication configuration
 explores 70,968 distinct states. Run the suite with `tlc` on your `PATH`.
 
 ```sh

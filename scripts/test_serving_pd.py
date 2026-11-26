@@ -1,4 +1,4 @@
-"""Regression tests for P/D handoff admission, drain, and route replacement."""
+"""Regression tests for versioned serving, drain, and route replacement."""
 
 import contextlib
 import http.client
@@ -16,11 +16,12 @@ from unittest.mock import Mock, patch
 
 from serving_group import (
     ADMISSION_HEADER, HANDOFF_HEADER, RELEASE_KV_PATH, VERSION_HEADER,
-    ControlError, Gate, group_proxy, record_host_stop, run,
+    ControlError, Endpoint, Gate, group_proxy, record_host_stop, run,
 )
 
 
 ROUTER = runpy.run_path(str(Path(__file__).with_name("serve-disaggregated.py")))
+INGRESS = runpy.run_path(str(Path(__file__).with_name("serve-aggregated.py")))
 PREFILL, DECODE, SPARE = (f"{number:032x}@1" for number in range(1, 4))
 TOKEN = "f" * 32
 COMPLETIONS = "/v1/completions"
@@ -176,6 +177,28 @@ class CalibrationTest(unittest.TestCase):
 
 
 class DirectoryTest(unittest.TestCase):
+    def test_aggregate_route_never_reopens_a_replaced_or_closed_epoch(self):
+        group = bytes(16)
+
+        def view(epoch, phase="Active"):
+            return {"result": {"Ok": {
+                "version": {"group": list(group), "epoch": epoch}, "phase": phase,
+                "role": "Aggregated", "endpoint": {"http": "127.0.0.1:12345", "api_model": "test"},
+            }}}
+
+        control = Mock()
+        control.request.side_effect = [
+            view(1), view(2), view(1), view(2, "Draining"), view(2), view(3),
+            {"result": {"Err": {"NoActiveGroup": list(group)}}}, view(3),
+        ]
+        directory = INGRESS["ActiveGroupDirectory"]("test", group, control)
+        for expected in (1, 2, 2, None, None, 3, None, None):
+            directory.refresh()
+            endpoint = directory.endpoint()
+            self.assertEqual(endpoint.version if endpoint else None, (
+                f"{group.hex()}@{expected}" if expected is not None else None
+            ))
+
     def test_stale_replicas_cannot_restore_an_older_or_drained_path(self):
         def path(decode):
             return {
@@ -246,6 +269,38 @@ class HandoffTest(unittest.TestCase):
             conn.request("POST", path, None if body is None else json.dumps(body).encode(), headers or {})
             with conn.getresponse() as response:
                 return response.status, response.headers, response.read()
+
+    def test_aggregate_ingress_retries_a_rejected_request_in_the_new_epoch(self):
+        old_port, old_gate = self.group("aggregated", DECODE, lambda _: self.fail("closed group ran"))
+        new_port, _ = self.group("aggregated", SPARE, lambda _: ("application/json", b'{"ok":true}'))
+        old_gate.close()
+        directory = SimpleNamespace(model="test", endpoint=Mock(side_effect=[
+            Endpoint("127.0.0.1", old_port, DECODE, "aggregated"),
+            Endpoint("127.0.0.1", new_port, SPARE, "aggregated"),
+        ]))
+        ingress = self.start(INGRESS["server"]("127.0.0.1", 0, directory, 2))
+        status, headers, body = self.request(ingress, COMPLETIONS, {"model": "test"})
+        self.assertEqual((status, headers[VERSION_HEADER], json.loads(body)), (200, SPARE, {"ok": True}))
+
+    def test_aggregate_ingress_does_not_replay_after_the_upstream_receives_bytes(self):
+        received = threading.Event()
+        new_port, _ = self.group("aggregated", SPARE, lambda _: self.fail("request was replayed"))
+
+        class Dropped(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                received.set()
+
+        old_port = self.start(ThreadingHTTPServer(("127.0.0.1", 0), Dropped))
+        directory = SimpleNamespace(model="test", endpoint=Mock(side_effect=[
+            Endpoint("127.0.0.1", old_port, DECODE, "aggregated"),
+            Endpoint("127.0.0.1", new_port, SPARE, "aggregated"),
+        ]))
+        ingress = self.start(INGRESS["server"]("127.0.0.1", 0, directory, 2))
+        status, _, _ = self.request(ingress, COMPLETIONS, {"model": "test"})
+        self.assertEqual(status, 502)
+        self.assertTrue(received.is_set())
+        directory.endpoint.assert_called_once()
 
     def test_drain_keeps_export_alive_until_versioned_release(self):
         port, gate = self.group("prefill", PREFILL, lambda _: ("application/json", b"{}"))

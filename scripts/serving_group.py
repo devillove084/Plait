@@ -16,7 +16,9 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 import serving_launch
 
@@ -29,6 +31,10 @@ HANDOFF_HEADER = "X-Plait-KV-Handoff"
 ADMISSION_HEADER = "X-Plait-Admission"
 RELEASE_KV_PATH = "/plait/release-kv"
 INFERENCE_PATHS = frozenset({"/v1/completions", "/v1/chat/completions"})
+MAX_JSON_BYTES = 16 * 1024 * 1024
+HTTP_ERRORS = (OSError, http.client.HTTPException)
+DIRECTORY_POLL_SECONDS = 0.5
+DIRECTORY_READ_TTL = 8.0
 
 
 class ControlError(RuntimeError):
@@ -50,8 +56,7 @@ class Control:
         self.counter = 0
 
     def execute(self, action: dict, *, retry: bool = True) -> dict:
-        self.counter += 1
-        operation = {"id": {"origin": self.holder, "counter": self.counter}, "action": action}
+        operation = {"id": self.next_operation_id(), "action": action}
         request = {"request": "execute", "operation": operation}
         try:
             return self.request(request)["result"]
@@ -59,6 +64,10 @@ class Control:
             if not retry:
                 raise
             return self.request(request)["result"]
+
+    def next_operation_id(self) -> dict:
+        self.counter += 1
+        return {"origin": self.holder, "counter": self.counter}
 
     def request(self, request: dict) -> dict:
         try:
@@ -155,6 +164,50 @@ class Gate:
     def may_stream(self) -> bool:
         with self.lock:
             return not self.revoked
+
+
+@dataclass(frozen=True)
+class Endpoint:
+    host: str
+    port: int
+    version: str
+    role: str
+
+    @classmethod
+    def parse(cls, config: dict, role: str) -> Endpoint:
+        url = urlsplit(config["url"])
+        if (
+            url.scheme != "http" or not url.hostname or not url.port
+            or url.path not in ("", "/") or url.query or url.fragment or url.username is not None
+        ):
+            raise ValueError("group URL must be an HTTP origin with an explicit port")
+        version = config["version"]
+        if not re.fullmatch(r"[a-f0-9]{32}@[1-9][0-9]*", version):
+            raise ValueError("invalid group version")
+        return cls(url.hostname, url.port, version, role)
+
+    def connect(self, timeout: float) -> http.client.HTTPConnection:
+        return http.client.HTTPConnection(self.host, self.port, timeout=timeout)
+
+    def headers(self) -> dict[str, str]:
+        return {VERSION_HEADER: self.version, ROLE_HEADER: self.role}
+
+
+def admission_rejected(response: http.client.HTTPResponse) -> bool:
+    return response.status in (409, 503) and response.getheader(ADMISSION_HEADER) == "rejected"
+
+
+def endpoint_ready(endpoint: Endpoint, timeout: float) -> bool:
+    try:
+        with contextlib.closing(endpoint.connect(min(2.0, timeout))) as connection:
+            connection.request("GET", "/health", headers=endpoint.headers())
+            with connection.getresponse() as response:
+                return (
+                    response.status == 200 and response.getheader(VERSION_HEADER) == endpoint.version
+                    and response.getheader(ROLE_HEADER) == endpoint.role
+                )
+    except HTTP_ERRORS:
+        return False
 
 
 HOP_HEADERS = frozenset({

@@ -32,6 +32,11 @@ enum Request {
     Inspect {
         version: GroupVersion,
     },
+    ObserveGroup {
+        id: OpId,
+        group: GroupId,
+        epoch: Option<u64>,
+    },
     W4Drain {
         version: GroupVersion,
     },
@@ -339,6 +344,9 @@ async fn handle(
             };
             Ok(json!({ "group": view.map(GroupInspection::from) }))
         }
+        Request::ObserveGroup { id, group, epoch } => {
+            observe_group(client, peers, id, group, epoch).await
+        }
         Request::W4Drain { version } => {
             let ServingView::W4Drain(status) =
                 query(client, peers, ServingLookup::W4Drain(version)).await?
@@ -603,6 +611,30 @@ async fn execute(
 ) -> io::Result<Value> {
     let result = apply(client, peers, &operation).await?;
     Ok(json!({ "result": result }))
+}
+
+async fn observe_group(
+    client: &mut Client,
+    peers: impl Iterator<Item = NodeId>,
+    id: OpId,
+    group: GroupId,
+    epoch: Option<u64>,
+) -> io::Result<Value> {
+    let mut last_error = None;
+    for node in peers {
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            client.observe_serving_group(node, id, group, epoch),
+        )
+        .await
+        {
+            Ok(Ok(result)) => return Ok(json!({ "result": result.map(GroupInspection::from) })),
+            Ok(Err(error)) if error.kind() == io::ErrorKind::InvalidData => return Err(error),
+            Ok(Err(error)) => last_error = Some(error),
+            Err(error) => last_error = Some(io::Error::new(io::ErrorKind::TimedOut, error)),
+        }
+    }
+    Err(last_error.expect("at least one peer"))
 }
 
 async fn apply(

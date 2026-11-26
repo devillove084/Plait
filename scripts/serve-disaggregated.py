@@ -9,7 +9,6 @@ import http.client
 import ipaddress
 import itertools
 import json
-import re
 import signal
 import threading
 import time
@@ -17,49 +16,15 @@ import uuid
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
 
 from serving_group import (
-    ADMISSION_HEADER, HANDOFF_HEADER, INFERENCE_PATHS, RELEASE_KV_PATH,
-    ROLE_HEADER, VERSION_HEADER, Control, ControlError,
+    DIRECTORY_POLL_SECONDS, DIRECTORY_READ_TTL, HANDOFF_HEADER, HTTP_ERRORS,
+    INFERENCE_PATHS, MAX_JSON_BYTES, RELEASE_KV_PATH, Control, ControlError,
+    Endpoint, admission_rejected, endpoint_ready,
 )
-
-
-MAX_JSON_BYTES = 16 * 1024 * 1024
-HTTP_ERRORS = (OSError, http.client.HTTPException)
-DIRECTORY_POLL_SECONDS = 0.5
-DIRECTORY_READ_TTL = 8.0
-
 
 class UpstreamError(RuntimeError):
     pass
-
-
-@dataclass(frozen=True)
-class Endpoint:
-    host: str
-    port: int
-    version: str
-    role: str
-
-    @classmethod
-    def parse(cls, config: dict, role: str) -> Endpoint:
-        url = urlsplit(config["url"])
-        if (
-            url.scheme != "http" or not url.hostname or not url.port
-            or url.path not in ("", "/") or url.query or url.fragment or url.username is not None
-        ):
-            raise ValueError("group URL must be an HTTP origin with an explicit port")
-        version = config["version"]
-        if not re.fullmatch(r"[a-f0-9]{32}@[1-9][0-9]*", version):
-            raise ValueError("invalid group version")
-        return cls(url.hostname, url.port, version, role)
-
-    def connect(self, timeout: float) -> http.client.HTTPConnection:
-        return http.client.HTTPConnection(self.host, self.port, timeout=timeout)
-
-    def headers(self) -> dict[str, str]:
-        return {VERSION_HEADER: self.version, ROLE_HEADER: self.role}
 
 
 @dataclass(frozen=True)
@@ -187,23 +152,6 @@ def transfer_descriptor(response: dict, route: Route) -> dict:
     ):
         raise UpstreamError("prefill did not export KV for the configured source")
     return params
-
-
-def admission_rejected(response: http.client.HTTPResponse) -> bool:
-    return response.status in (409, 503) and response.getheader(ADMISSION_HEADER) == "rejected"
-
-
-def endpoint_ready(endpoint: Endpoint, timeout: float) -> bool:
-    try:
-        with contextlib.closing(endpoint.connect(min(2.0, timeout))) as connection:
-            connection.request("GET", "/health", headers=endpoint.headers())
-            with connection.getresponse() as response:
-                return (
-                    response.status == 200 and response.getheader(VERSION_HEADER) == endpoint.version
-                    and response.getheader(ROLE_HEADER) == endpoint.role
-                )
-    except HTTP_ERRORS:
-        return False
 
 
 def release_transfer(endpoint: Endpoint, token: str) -> None:

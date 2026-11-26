@@ -101,6 +101,31 @@ Use a local `--verify-release` executable on each host to authorize
 grant reuse after that host has closed its workers and transports.
 Retirement requires every host's stop confirmation.
 
+### Keep one HTTP endpoint across group versions
+
+Point clients at `serve-aggregated.py`. Use the same API model alias
+for every version of the group. The ingress follows the active version
+through the control replicas.
+
+```sh
+python scripts/serve-aggregated.py --model "$SERVED_MODEL" --group-id "$GROUP_ID" \
+  --control-peer "$VOTER_ID@$VOTER_ADDR" --control-listen "$INGRESS_REPLY_ADDR" \
+  --host "$INGRESS_BIND_IP" --port 8192
+```
+
+Repeat `--control-peer` for each voter. The control reply address must be
+reachable by the voters. Use the current `plait-node` binary for the
+ordered group observation. The ingress serves `/v1/completions`,
+`/v1/chat/completions`, `/v1/models`, and `/health`.
+
+The ingress waits 500 ms between observations and expires its last
+route after eight seconds without a fresh observation. A response carries
+the group version that handled it. A request admitted by the old group
+keeps its upstream connection while the old group drains. The ingress can
+retry a connection that failed before sending request bytes or an explicit
+Plait admission rejection. Once forwarding starts, a disconnect without
+an admission rejection ends that attempt.
+
 ## Execute a collective
 
 For small all-reduces, each worker sends its complete contribution to each
