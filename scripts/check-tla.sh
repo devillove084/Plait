@@ -37,6 +37,7 @@ tlc -deadlock -config specs/PlaitServingIngress.cfg specs/PlaitServingIngress.tl
 tlc -deadlock -config specs/PlaitCompletionReplay.cfg specs/PlaitCompletionReplay.tla
 tlc -deadlock -config specs/PlaitCompletionKvResume.cfg specs/PlaitCompletionReplay.tla
 tlc -deadlock -config specs/PlaitKvPublication.cfg specs/PlaitKvPublication.tla
+tlc -deadlock -config specs/PlaitLayeredKv.cfg specs/PlaitLayeredKv.tla
 tlc -deadlock -config specs/PlaitKvHandoff.cfg specs/PlaitKvHandoff.tla
 tlc -deadlock -config specs/PlaitPdStreamReplay.cfg specs/PlaitPdStreamReplay.tla
 tlc -deadlock -config specs/PlaitKernelPrimitivesCheck.cfg specs/PlaitKernelPrimitivesCheck.tla

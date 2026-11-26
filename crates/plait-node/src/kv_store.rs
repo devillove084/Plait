@@ -1,8 +1,9 @@
-//! Bounded storage for complete, head-addressable KV blocks.
+//! Bounded storage for complete KV blocks in logical head and layer order.
 
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -12,9 +13,12 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 
 const MAGIC: &[u8; 8] = b"PLAITKV2";
+const RANGED_MAGIC: &[u8; 8] = b"PLAITKV3";
 const HEADER: usize = 73;
 const MAX_BLOCK_BYTES: usize = 64 << 20;
 const MAX_HEADS: usize = 1024;
+const MAX_PARTS: usize = 65536;
+const MAX_RANGES: usize = 4096;
 const PARTIAL_LIFETIME: Duration = Duration::from_secs(60);
 const DEADLINE: Duration = Duration::from_secs(15);
 const MISS: u8 = 0;
@@ -29,80 +33,117 @@ struct Request {
     key: Key,
     writer: Writer,
     heads: usize,
-    first: usize,
-    count: usize,
     head_bytes: usize,
+    part_bytes: usize,
+    ranges: Vec<Range<usize>>,
 }
 
 impl Request {
-    fn parse(header: [u8; HEADER]) -> io::Result<Self> {
-        if &header[..MAGIC.len()] != MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid KV header",
-            ));
-        }
+    async fn read(stream: &mut TcpStream) -> io::Result<Self> {
+        let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid KV request");
+        let mut header = [0; HEADER];
+        stream.read_exact(&mut header).await?;
+        let ranged = match &header[..8] {
+            bytes if bytes == MAGIC => false,
+            bytes if bytes == RANGED_MAGIC => true,
+            _ => return Err(invalid()),
+        };
         let field = |index: usize| {
             let start = 57 + 4 * index;
             u32::from_le_bytes(header[start..start + 4].try_into().unwrap()) as usize
         };
-        let request = Self {
+        let heads = field(0);
+        let head_bytes = field(3);
+        let part_bytes = if ranged { field(2) } else { head_bytes };
+        let Some(block_bytes) = heads.checked_mul(head_bytes) else {
+            return Err(invalid());
+        };
+        if !(1..=MAX_HEADS).contains(&heads)
+            || head_bytes == 0
+            || part_bytes == 0
+            || !head_bytes.is_multiple_of(part_bytes)
+            || block_bytes > MAX_BLOCK_BYTES
+            || block_bytes / part_bytes > MAX_PARTS
+        {
+            return Err(invalid());
+        }
+        let range = |first: usize, count: usize| {
+            let end = first.checked_add(count)?;
+            (count != 0 && end <= block_bytes / part_bytes)
+                .then(|| first * part_bytes..end * part_bytes)
+        };
+        let ranges = match (header[8], ranged) {
+            (b'H', true) if field(1) == 0 => Vec::new(),
+            (b'H', false) if field(1) == 0 && field(2) == 0 => Vec::new(),
+            (b'G' | b'P', false) => vec![range(field(1), field(2)).ok_or_else(invalid)?],
+            (b'G' | b'P', true) if (1..=MAX_RANGES).contains(&field(1)) => {
+                let mut table = vec![0; field(1) * 8];
+                stream.read_exact(&mut table).await?;
+                let mut end = 0;
+                let mut ranges = Vec::with_capacity(field(1));
+                for entry in table.chunks_exact(8) {
+                    let first = u32::from_le_bytes(entry[..4].try_into().unwrap()) as usize;
+                    let count = u32::from_le_bytes(entry[4..].try_into().unwrap()) as usize;
+                    let next = range(first, count).ok_or_else(invalid)?;
+                    if next.start < end {
+                        return Err(invalid());
+                    }
+                    end = next.end;
+                    ranges.push(next);
+                }
+                ranges
+            }
+            _ => return Err(invalid()),
+        };
+        Ok(Self {
             verb: header[8],
             key: header[9..41].try_into().unwrap(),
             writer: header[41..57].try_into().unwrap(),
-            heads: field(0),
-            first: field(1),
-            count: field(2),
-            head_bytes: field(3),
-        };
-        let range_valid = match request.verb {
-            b'H' => request.first == 0 && request.count == 0,
-            b'G' | b'P' => {
-                request.count != 0
-                    && request
-                        .first
-                        .checked_add(request.count)
-                        .is_some_and(|end| end <= request.heads)
-            }
-            _ => false,
-        };
-        if !range_valid
-            || !(1..=MAX_HEADS).contains(&request.heads)
-            || request.head_bytes == 0
-            || request
-                .head_bytes
-                .checked_mul(request.heads)
-                .is_none_or(|bytes| bytes > MAX_BLOCK_BYTES)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid KV block dimensions or head range",
-            ));
-        }
-        Ok(request)
+            heads,
+            head_bytes,
+            part_bytes,
+            ranges,
+        })
+    }
+
+    fn parts(&self) -> usize {
+        self.heads * (self.head_bytes / self.part_bytes)
     }
 
     fn reserved(&self) -> usize {
-        self.heads * (self.head_bytes + size_of::<Option<Bytes>>())
+        self.heads * self.head_bytes + self.parts() * size_of::<bool>()
+    }
+
+    fn part_indices(&self) -> impl Iterator<Item = usize> + Clone + '_ {
+        self.ranges
+            .iter()
+            .flat_map(|range| range.start / self.part_bytes..range.end / self.part_bytes)
     }
 }
 
 struct Block {
     writer: Writer,
     expires: Instant,
+    heads: usize,
     head_bytes: usize,
-    heads: Vec<Option<Bytes>>,
+    part_bytes: usize,
+    data: BlockData,
     present: usize,
     reserved: usize,
 }
 
+enum BlockData {
+    Staging { bytes: Vec<u8>, received: Vec<bool> },
+    Published(Bytes),
+}
+
 impl Block {
     fn matches(&self, request: &Request) -> bool {
-        self.head_bytes == request.head_bytes && self.heads.len() == request.heads
+        self.heads == request.heads && self.head_bytes == request.head_bytes
     }
 
     fn complete(&self) -> bool {
-        self.present == self.heads.len()
+        matches!(self.data, BlockData::Published(_))
     }
 }
 
@@ -123,13 +164,17 @@ impl Store {
 
     fn get(&self, request: &Request) -> Option<Vec<Bytes>> {
         let block = self.blocks.get(&request.key)?;
-        if !block.matches(request) || !block.complete() {
+        if !block.matches(request) {
             return None;
         }
+        let BlockData::Published(bytes) = &block.data else {
+            return None;
+        };
         Some(
-            block.heads[request.first..request.first + request.count]
+            request
+                .ranges
                 .iter()
-                .map(|head| head.as_ref().expect("complete block").clone())
+                .map(|range| bytes.slice(range.clone()))
                 .collect(),
         )
     }
@@ -165,8 +210,13 @@ impl Store {
                 Block {
                     writer: request.writer,
                     expires: now + PARTIAL_LIFETIME,
+                    heads: request.heads,
                     head_bytes: request.head_bytes,
-                    heads: vec![None; request.heads],
+                    part_bytes: request.part_bytes,
+                    data: BlockData::Staging {
+                        bytes: vec![0; request.heads * request.head_bytes],
+                        received: vec![false; request.parts()],
+                    },
                     present: 0,
                     reserved,
                 },
@@ -175,43 +225,58 @@ impl Store {
         }
 
         let block = self.blocks.get_mut(&request.key).expect("reserved block");
-        if !block.matches(request) || (!block.complete() && block.writer != request.writer) {
+        if !block.matches(request) {
             return false;
         }
-        let heads = &mut block.heads[request.first..request.first + request.count];
-        if heads
-            .iter()
-            .zip(payload.chunks_exact(request.head_bytes))
-            .any(|(existing, incoming)| {
-                existing
-                    .as_ref()
-                    .is_some_and(|head| head.as_ref() != incoming)
-            })
+        if let BlockData::Published(bytes) = &block.data {
+            let mut remaining = payload.as_ref();
+            for range in &request.ranges {
+                let Some(rest) = remaining.strip_prefix(&bytes[range.clone()]) else {
+                    return false;
+                };
+                remaining = rest;
+            }
+            return remaining.is_empty();
+        }
+        if block.writer != request.writer || block.part_bytes != request.part_bytes {
+            return false;
+        }
+        let BlockData::Staging { bytes, received } = &mut block.data else {
+            unreachable!("published blocks were checked already");
+        };
+        let target = |index| {
+            let start = index * request.part_bytes;
+            start..start + request.part_bytes
+        };
+        let parts = request.part_indices();
+        if parts
+            .clone()
+            .zip(payload.chunks_exact(request.part_bytes))
+            .any(|(index, incoming)| received[index] && bytes[target(index)] != *incoming)
         {
             return false;
         }
-        for (index, head) in heads.iter_mut().enumerate() {
-            if head.is_none() {
-                let start = index * request.head_bytes;
-                *head = Some(Bytes::copy_from_slice(
-                    &payload[start..start + request.head_bytes],
-                ));
+        for (index, incoming) in parts.zip(payload.chunks_exact(request.part_bytes)) {
+            if !received[index] {
+                bytes[target(index)].copy_from_slice(incoming);
+                received[index] = true;
                 block.present += 1;
             }
+        }
+        if block.present == received.len() {
+            block.data = BlockData::Published(Bytes::from(std::mem::take(bytes)));
         }
         true
     }
 }
 
 async fn exchange(mut stream: TcpStream, store: &Mutex<Store>, capacity: usize) -> io::Result<()> {
-    let mut header = [0; HEADER];
-    stream.read_exact(&mut header).await?;
-    let request = Request::parse(header)?;
+    let request = Request::read(&mut stream).await?;
     if request.verb == b'P' {
         if request.reserved() > capacity {
             return stream.write_u8(REJECTED).await;
         }
-        let mut payload = vec![0; request.count * request.head_bytes];
+        let mut payload = vec![0; request.ranges.iter().map(Range::len).sum()];
         stream.read_exact(&mut payload).await?;
         let stored =
             store
@@ -277,9 +342,9 @@ mod tests {
             key: [1; 32],
             writer: [writer; 16],
             heads: 4,
-            first,
-            count,
             head_bytes: 1,
+            part_bytes: 1,
+            ranges: vec![first..first + count],
         }
     }
 
@@ -307,5 +372,47 @@ mod tests {
         assert!(store.put(&request(0, 2, 2), Bytes::from_static(&[5, 6]), later));
         let heads = store.get(&request(0, 4, 2)).unwrap();
         assert_eq!(heads.concat(), [5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn pipeline_ranges_share_one_writer_and_retain_legacy_head_order() {
+        let mut store = Store::new(1024);
+        let now = Instant::now();
+        let ranges = |spans, part_bytes, writer| Request {
+            verb: b'P',
+            key: [2; 32],
+            writer: [writer; 16],
+            heads: 2,
+            head_bytes: 4,
+            part_bytes,
+            ranges: spans,
+        };
+        let first_stage = ranges(vec![0..2, 4..6], 2, 1);
+        let next_stage = ranges(vec![2..4, 6..8], 2, 1);
+        let old_head = ranges(vec![4..8], 4, 1);
+        let other_partition = ranges(vec![0..4, 6..8], 2, 1);
+        assert!(store.put(&next_stage, Bytes::from_static(&[3, 4, 7, 8]), now));
+        assert!(store.get(&first_stage).is_none());
+        assert!(store.get(&old_head).is_none());
+        assert!(!store.put(&old_head, Bytes::from_static(&[5, 6, 7, 8]), now));
+        let rival = ranges(vec![0..2, 4..6], 2, 2);
+        assert!(!store.put(&rival, Bytes::from_static(&[1, 2, 5, 6]), now));
+        assert!(store.put(&first_stage, Bytes::from_static(&[1, 2, 5, 6]), now));
+        assert_eq!(store.get(&old_head).unwrap().concat(), [5, 6, 7, 8]);
+        assert_eq!(
+            store.get(&other_partition).unwrap().concat(),
+            [1, 2, 3, 4, 7, 8]
+        );
+        assert!(store.put(&old_head, Bytes::from_static(&[5, 6, 7, 8]), now));
+        assert!(!store.put(&old_head, Bytes::from_static(&[9, 6, 7, 8]), now));
+
+        let mut store = Store::new(1024);
+        let all_heads = ranges(vec![0..8], 4, 3);
+        assert!(store.put(
+            &all_heads,
+            Bytes::from_static(&[1, 2, 3, 4, 5, 6, 7, 8]),
+            now
+        ));
+        assert_eq!(store.get(&next_stage).unwrap().concat(), [3, 4, 7, 8]);
     }
 }

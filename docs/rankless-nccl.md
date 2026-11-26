@@ -466,7 +466,7 @@ fields.
 | `model` | API alias used by the router and all endpoint recipes. |
 | `expected_revision` | Current route directory revision. Use zero for the initial publication. |
 | `kv` | Shared `store` as an IPv4 address and port, `namespace`, and `block_size`. |
-| `placements` | New groups with `group`, `expected_epoch`, `expected_active`, `plan`, and `recipe`. Use role `Prefill` or `Decode` and PP size one. The CLI computes the launch digest. A group may use one host or multiple hosts. |
+| `placements` | New groups with `group`, `expected_epoch`, `expected_active`, `plan`, and `recipe`. Use role `Prefill` or `Decode`. Reserve `TP × PP` devices for each group. The CLI computes the launch digest. A group may use one host or multiple hosts. |
 | `paths` | Complete desired path list. Each entry names its `prefill` and `decode` group versions. Include any existing versions the deployment is keeping. |
 
 The voters reserve all new groups in one operation. Each resident host
@@ -691,6 +691,23 @@ blocks. After activation, its TP2 replacement on CUDA and Ascend CANN
 reported 256 external prefix hits. The replacement's output token IDs and
 text matched its cold run, which reported zero external hits. The transfer
 uses host staging over TCP. The cache starts empty after a store restart.
+
+#### Align different Prefill and Decode pipelines
+
+Upgrade the store to a `plait-node` build that accepts `PLAITKV3` before
+starting a multi-stage Prefill or Decode group. Use the matching vLLM fork
+on the group's hosts. Choose TP, PP and `VLLM_PP_LAYER_PARTITION` for each
+role independently. Within one group, the hosts agree on the layer split
+before loading the model. The two roles use the same weights, KV dtype,
+block size and store namespace.
+
+The engine gives each stage the same global attention layer order. A
+worker sends one range request per page for its local layers and heads.
+The store publishes the page when one write attempt covers every layer
+and head. Until then the page is a miss, including at the sender's
+handoff check. The receiver requests its own ranges before executing
+the first unmatched token. Single-stage engines continue to use
+`PLAITKV2` whole-head requests against the same page keys and bytes.
 
 ### Resume a stream from its last emitted token
 

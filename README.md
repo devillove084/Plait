@@ -169,8 +169,8 @@ The vLLM fork uses peer transport for TP collectives and PP activations when
 Each worker exchanges endpoint metadata over Gloo and sends tensors directly
 to its peers. [Peer transport and startup](docs/rankless-nccl.md)
 
-Managed replacements can reuse complete prompt KV blocks across TP sizes
-with the vLLM fork's `PlaitKvConnector` and `plait-node kv-store`.
+Managed replacements reuse complete prompt KV blocks across TP sizes and PP
+layouts with the vLLM fork's `PlaitKvConnector` and `plait-node kv-store`.
 The ingress can restore a greedy stream's emitted token checkpoint and
 reuse pages from both the prompt and generated prefix.
 [KV setup and scope](docs/rankless-nccl.md#reuse-prompt-kv-across-tp-layouts)
@@ -247,10 +247,11 @@ release the result after the matching completion has executed in the control pla
 | [Serving ingress](specs/PlaitServingIngress.tla) | One admission per ordinary forwarded request, monotonic route refresh, and output pinned to the admitted epoch while the old gate drains. |
 | [Completion replay and KV resume](specs/PlaitCompletionReplay.tla) | Visible positions are preserved. Each KV resume sends the latest checkpoint and requires a matching acknowledgment and prefix before publishing a suffix. |
 | [KV publication](specs/PlaitKvPublication.tla) | All heads must come from one write attempt before a page becomes readable. A consumer reads its requested head range, and a complete page stays immutable. |
+| [Layered KV](specs/PlaitLayeredKv.tla) | A page publishes after one write attempt covers every layer and head. A consumer can read it with a different stage partition or a whole-head request. |
 | [Prefill to Decode handoff](specs/PlaitKvHandoff.tla) | The receipt matches the request context. Decode emits output after loading the required pages, including when the shared store can reset between admission and load. |
 | [P/D stream replay](specs/PlaitPdStreamReplay.tla) | A failed Decode version is excluded. Each attempt releases its own handoff, and suffix output follows a checked prefix. |
 
-TLC 2.19 passes all 45 configurations. The ordered publication configuration
+TLC 2.19 passes all 46 configurations. The ordered publication configuration
 explores 70,968 distinct states. Run the suite with `tlc` on your `PATH`.
 
 ```sh

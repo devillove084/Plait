@@ -175,7 +175,6 @@ impl HostedPdLaunch {
         recipe.validate_topology(plan, 1)?;
         if plan.role != self.role
             || plan.role == ServingRole::Aggregated
-            || plan.pipeline_parallel != 1
             || self.kv.store.port() == 0
             || self.kv.store.ip().is_unspecified()
             || self.kv.store.ip().is_multicast()

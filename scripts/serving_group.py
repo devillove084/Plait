@@ -480,7 +480,7 @@ def run(
             or view["role"] != args.role.capitalize()
             or view["model"] != args.model
             or view["tensor_parallel"] != args.tp
-            or (pp != 1 and (not hosted or args.role != "aggregated"))
+            or (pp != 1 and not hosted)
             or view["launch_digest"] != launch_digest
         ):
             raise ControlError("the native launch configuration differs from the committed plan")
