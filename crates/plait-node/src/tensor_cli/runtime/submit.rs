@@ -116,6 +116,12 @@ pub(super) struct Operator {
     activations_f16: Vec<u16>,
 }
 
+impl Operator {
+    pub(super) fn has_kernel_profiles(&self) -> bool {
+        self.profiles.iter().any(|profile| profile.kernel.is_some())
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Shard {
     addr: SocketAddr,
@@ -370,14 +376,20 @@ async fn release(server: &Arc<DispatchServer>, shards: &[Shard]) {
 #[serde(tag = "request", rename_all = "snake_case")]
 enum SubmitMessage {
     Submit(Operator),
+    SubmitProfiled(Operator),
 }
 
 pub(in crate::tensor_cli) async fn run(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-    let operator = serde_json::from_reader(io::stdin().lock())?;
+    let operator: Operator = serde_json::from_reader(io::stdin().lock())?;
+    let message = if operator.has_kernel_profiles() {
+        SubmitMessage::SubmitProfiled(operator)
+    } else {
+        SubmitMessage::Submit(operator)
+    };
     let (header, output) = tokio::time::timeout(CALL_TIMEOUT, async {
         let mut stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true)?;
-        write_frame(&mut stream, &SubmitMessage::Submit(operator)).await?;
+        write_frame(&mut stream, &message).await?;
         let header: Value = read_frame(&mut stream).await?;
         if let Some(error) = header.get("error").and_then(Value::as_str) {
             return Err(io::Error::other(error.to_owned()));
@@ -393,10 +405,11 @@ pub(in crate::tensor_cli) async fn run(addr: SocketAddr) -> Result<(), Box<dyn s
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use plait_core::serving::WorkerGrant;
     use plait_core::tensor::KPartial;
     use plait_core::{DeviceId, ShardId};
-    use plait_net::tensor::PartialSource;
+    use plait_net::tensor::{PartialListener, PartialSource};
     use plait_parallel::precision::W4Shard;
     use serde_json::json;
     use tokio::sync::{mpsc, oneshot};
@@ -491,6 +504,7 @@ mod tests {
                         calibration_id: [0; 32],
                         activation_bits: 16,
                         quantization: None,
+                        kernel: None,
                         latency_ns: 1,
                         error_ppm: 0,
                         valid_until_ms: u64::MAX,
@@ -555,6 +569,91 @@ mod tests {
         assert_eq!(output, 5.0f32.to_le_bytes());
         fast_worker.await.unwrap();
         slow_worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_held_pull_does_not_block_the_next_reduction_on_the_same_workers() {
+        let first = test_shards().map(|mut shard| {
+            shard.decision.profile.kernel = Some(plait_parallel::precision::W4Kernel::Reference);
+            shard
+        });
+        let second = first.map(|mut shard| {
+            let partial = &mut shard.decision.shard.partial;
+            partial.op = OpId::new(partial.grant.device.node, 2);
+            shard
+        });
+        let addr = first[0].addr;
+        let first_parts = first.map(|shard| shard.decision.shard.partial);
+        let second_parts = second.map(|shard| shard.decision.shard.partial);
+        let (hold, mut held) = mpsc::channel(1);
+        let mut routes = BTreeMap::new();
+        let mut workers = JoinSet::new();
+        for (index, (first, second)) in first_parts.into_iter().zip(second_parts).enumerate() {
+            let (route, mut requests) = mpsc::channel::<Invocation>(1);
+            routes.insert(first.grant.device, route);
+            let hold = hold.clone();
+            workers.spawn(async move {
+                let listener = PartialListener::bind(addr).await.unwrap();
+                let endpoint = listener.local_addr().unwrap();
+                let contributions = [(first, [2.0f32, 3.0][index]), (second, [7.0, 11.0][index])];
+                for (partial, value) in contributions {
+                    let invocation = requests.recv().await.unwrap();
+                    assert!(matches!(invocation.request, Request::ExecuteProfiled(_)));
+                    assert_eq!(invocation.request.partial(), partial);
+                    invocation
+                        .response
+                        .send(json!({"addr": endpoint, "partial": partial}))
+                        .unwrap();
+                    let connection = listener.accept().await.unwrap();
+                    let bytes = Bytes::copy_from_slice(&value.to_le_bytes());
+                    if index == 1 && partial == first {
+                        assert!(hold.send((connection, partial, bytes)).await.is_ok());
+                    } else {
+                        connection
+                            .serve(PULL_TIMEOUT, |requested| {
+                                (requested == partial).then_some(bytes)
+                            })
+                            .await
+                            .unwrap();
+                    }
+                }
+            });
+        }
+        drop(hold);
+        let server = Arc::new(DispatchServer {
+            addr,
+            control: crate::tensor_cli::ControlPeers::new(Vec::new(), Vec::new(), addr.to_string()),
+            routes,
+            submissions: Submissions::new(Limits::default()).unwrap(),
+        });
+        let slow_server = server.clone();
+        let in_flight = tokio::spawn(async move {
+            let plan = KSum::new(2, 1, first_parts.to_vec()).unwrap();
+            dispatch_and_reduce(&slow_server, &plan, &first, 2, &[0, 0]).await
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (connection, partial, bytes) = held.recv().await.unwrap();
+            let plan = KSum::new(2, 1, second_parts.to_vec()).unwrap();
+            let output = dispatch_and_reduce(&server, &plan, &second, 2, &[0, 0])
+                .await
+                .unwrap();
+            assert_eq!(output, 18.0f32.to_le_bytes());
+            assert!(!in_flight.is_finished());
+
+            connection
+                .serve(PULL_TIMEOUT, |requested| {
+                    (requested == partial).then_some(bytes)
+                })
+                .await
+                .unwrap();
+            assert_eq!(in_flight.await.unwrap().unwrap(), 5.0f32.to_le_bytes());
+            while let Some(result) = workers.join_next().await {
+                result.unwrap();
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

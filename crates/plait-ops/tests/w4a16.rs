@@ -199,6 +199,7 @@ fn native_chains_device_tensors_and_owns_the_queue() {
         let a = device.prepare(weights_a).unwrap();
         let b = device.prepare(weights_b).unwrap();
         let input = device.upload_f16(2, 3, &activation).unwrap();
+        assert!(input.is_ready().unwrap());
         let bias = device.upload_f16(1, 3, &bias).unwrap();
 
         let other = backend.open_device(ordinal).unwrap();
@@ -226,6 +227,15 @@ fn native_chains_device_tensors_and_owns_the_queue() {
         ));
         let first_again = a.submit(&input, Some(&bias), OutputType::F16).unwrap();
         let second_again = b.submit(&first_again, None, OutputType::F32).unwrap();
+        if device.supports_completion_query() {
+            poll_producer(&second_again);
+            assert!(first_again.is_ready().unwrap());
+        } else {
+            assert!(matches!(
+                second_again.is_ready(),
+                Err(OperatorError::Unsupported(_))
+            ));
+        }
 
         // The two outputs outlive their inputs, weights and original session.
         drop((device, a, b, input, bias, first, first_again, empty));
@@ -233,6 +243,18 @@ fn native_chains_device_tensors_and_owns_the_queue() {
         assert_eq!(second_again.read().unwrap(), expected);
         assert_eq!(second.read().unwrap(), expected);
         println!("resident W4A16 device {ordinal}: two chained submissions match Rust CPU");
+    }
+}
+
+#[cfg(feature = "native")]
+fn poll_producer(output: &plait_ops::native::DeviceTensor<'_>) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !output.is_ready().unwrap() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "producer never completed"
+        );
+        std::thread::yield_now();
     }
 }
 
@@ -326,6 +348,10 @@ fn native_chains_reference_and_marlin_on_one_queue() {
                 let second_final = after.submit(&second, None, OutputType::F32).unwrap();
                 drop((input, upstream));
 
+                if session.supports_completion_query() {
+                    poll_producer(&first);
+                }
+
                 let LinearOutput::F16(actual) = first.read().unwrap() else {
                     panic!("expected FP16 Marlin result");
                 };
@@ -357,6 +383,521 @@ fn native_chains_reference_and_marlin_on_one_queue() {
             }
         }
     }
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn native_marlin_preserves_fp32_through_split_k() {
+    use plait_ops::OperatorError;
+    use plait_ops::native::NativeW4A16;
+    use std::path::Path;
+
+    let Some(path) = std::env::var_os("PLAIT_MARLIN_F32_TEST_LIBRARY") else {
+        return;
+    };
+    let backend = unsafe { NativeW4A16::load(Path::new(&path)) }.unwrap();
+    let session = backend.open_device(0).unwrap();
+    let (n, k) = (256, 4096);
+    let packed = vec![0x99; (n * k / 2) as usize];
+    let row_sign = |row: u32| if row % 2 == 0 { 1.0 } else { -1.0 };
+    let bump = |row: u32| (1 + row % 3) as f32 / 256.0;
+    let scale = |column, group| [0.25, 0.5, 1.0, 2.0][(column * 3 + column / 7 + group) % 4];
+
+    for group_size in [128, k] {
+        let groups = (k / group_size) as usize;
+        let scales: Vec<_> = (0..n as usize)
+            .flat_map(|column| (0..groups).map(move |group| half(scale(column, group))))
+            .collect();
+        let weights = W4Weights::new(k, n, group_size, &packed, &scales, None).unwrap();
+        let linear = session.prepare_marlin_f32(weights).unwrap();
+        let empty = session.upload_f16(0, k, &[]).unwrap();
+        assert!(matches!(
+            linear.submit(&empty, None, OutputType::F16),
+            Err(OperatorError::Unsupported(_))
+        ));
+        assert_eq!(
+            linear
+                .submit(&empty, None, OutputType::F32)
+                .unwrap()
+                .read()
+                .unwrap(),
+            LinearOutput::F32(vec![])
+        );
+        for rows in [1, 33, 129] {
+            // Every K=128 tile contains an increment below a half ULP of its sum.
+            // The output also crosses row panels at M=129.
+            let input: Vec<_> = (0..rows)
+                .flat_map(|row| {
+                    (0..k).map(move |column| {
+                        let increment = if column % 128 == 0 { bump(row) } else { 0.0 };
+                        half(row_sign(row) * (1.0 + increment))
+                    })
+                })
+                .collect();
+            let expected: Vec<_> = (0..rows)
+                .flat_map(|row| {
+                    (0..n as usize).map(move |column| {
+                        let unscaled = group_size as f32 + (group_size / 128) as f32 * bump(row);
+                        row_sign(row)
+                            * (0..groups)
+                                .map(|group| unscaled * scale(column, group))
+                                .sum::<f32>()
+                    })
+                })
+                .collect();
+            assert!(
+                expected
+                    .iter()
+                    .all(|&v| f16::from_bits(half(v)).to_f32() != v)
+            );
+            let input = session.upload_f16(rows, k, &input).unwrap();
+            // Repeat each layout to exercise shared-memory reuse under different scheduling.
+            for replay in 0..4 {
+                let output = linear.submit(&input, None, OutputType::F32).unwrap();
+                let LinearOutput::F32(actual) = output.read().unwrap() else {
+                    panic!("expected FP32 Marlin result");
+                };
+                assert_eq!(actual.len(), expected.len());
+                for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        actual, expected,
+                        "M={rows} G={group_size} replay={replay} index={index}"
+                    );
+                }
+            }
+            println!("Marlin FP32 split-K matches reference: M={rows} N={n} K={k} G={group_size}");
+        }
+    }
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn native_marlin_mfma_handles_asymmetric_weights_and_tail_groups() {
+    let Some(path) = std::env::var_os("PLAIT_MARLIN_MFMA_TEST_LIBRARY") else {
+        return;
+    };
+    check_tiled_marlin(std::path::Path::new(&path));
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn native_marlin_metal_handles_asymmetric_weights_and_tail_groups() {
+    use std::path::Path;
+
+    let Some(path) = std::env::var_os("PLAIT_MARLIN_METAL_TEST_LIBRARY") else {
+        return;
+    };
+    let path = Path::new(&path);
+    check_tiled_marlin(path);
+    check_marlin_wide_dequantization(path);
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn native_marlin_ascend_bounds_workspace_across_k_waves_and_column_bands() {
+    use plait_ops::native::NativeW4A16;
+    use std::path::Path;
+
+    let Some(path) = std::env::var_os("PLAIT_MARLIN_ASCEND_TEST_LIBRARY") else {
+        return;
+    };
+    let path = Path::new(&path);
+    check_tiled_marlin(path);
+    check_marlin_wide_dequantization(path);
+
+    let backend = unsafe { NativeW4A16::load(path) }.unwrap();
+    let session = backend.open_device(0).unwrap();
+    let (n, k, group_size) = (4112u32, 8192u32, 128u32);
+    let groups = k / group_size;
+    let packed = vec![0x66; (n * k / 2) as usize];
+    let zeros: Vec<_> = (0..n * groups)
+        .map(|i| ((i * 3 + i / 19) % 16) as u8)
+        .collect();
+    let scale = |index| [0.25, 0.5, 1.0, 2.0][index % 4];
+    let scales: Vec<_> = (0..n as usize * groups as usize)
+        .map(|index| half(scale(index)))
+        .collect();
+    let x: Vec<_> = (0..k)
+        .map(|i| half(if i % 128 == 0 { 1.0 + 1.0 / 256.0 } else { 1.0 }))
+        .collect();
+    let reference: Vec<_> = (0..n as usize)
+        .map(|col| {
+            (0..groups as usize)
+                .map(|group| {
+                    let index = col * groups as usize + group;
+                    (128.0 + 1.0 / 256.0) * (6.0 - f32::from(zeros[index])) * scale(index)
+                })
+                .sum::<f32>()
+        })
+        .collect();
+    let weights = W4Weights::new(k, n, group_size, &packed, &scales, Some(&zeros)).unwrap();
+    let input = session.upload_f16(1, k, &x).unwrap();
+    for output in [OutputType::F32, OutputType::F16] {
+        let (prepared, expected) = match output {
+            OutputType::F32 => (
+                session.prepare_marlin_f32(weights).unwrap(),
+                LinearOutput::F32(reference.clone()),
+            ),
+            OutputType::F16 => (
+                session.prepare_marlin(weights).unwrap(),
+                LinearOutput::F16(reference.iter().copied().map(half).collect()),
+            ),
+        };
+        let result = prepared.submit(&input, None, output).unwrap();
+        drop(prepared);
+        if session.supports_completion_query() {
+            poll_producer(&result);
+        }
+        assert_eq!(result.read().unwrap(), expected);
+    }
+}
+
+#[cfg(feature = "native")]
+fn check_marlin_wide_dequantization(path: &std::path::Path) {
+    use plait_ops::native::{NativeW4A16, W4Activation};
+
+    // Both the grouped weight and the full result exceed the FP16 range.
+    let backend = unsafe { NativeW4A16::load(path) }.unwrap();
+    let session = backend.open_device(0).unwrap();
+    let packed = [0; 16 * 144 / 2];
+    let scales = [half(8192.0); 16 * 2];
+    let zeros = [15; 16 * 2];
+    let weights = W4Weights::new(144, 16, 128, &packed, &scales, Some(&zeros)).unwrap();
+    let prepared = session.prepare_marlin_f32(weights).unwrap();
+    let activation = [half(0.125); 144];
+    let expected = W4A16::new(weights, &activation, None, OutputType::F32)
+        .unwrap()
+        .run_cpu();
+    let actual = session
+        .project_w4_f32(&prepared, &activation, None, W4Activation::F16)
+        .unwrap();
+    assert_eq!(LinearOutput::F32(actual), expected);
+}
+
+#[cfg(feature = "native")]
+fn check_tiled_marlin(path: &std::path::Path) {
+    use plait_ops::native::NativeW4A16;
+
+    let backend = unsafe { NativeW4A16::load(path) }.unwrap();
+    let session = backend.open_device(0).unwrap();
+    for (n, k, group_size) in [(16u32, 16u32, 16), (80, 272, 128), (96, 272, 272)] {
+        let packed: Vec<_> = (0..n * k / 2)
+            .map(|i| (i * 59 + i / 23 + 47) as u8)
+            .collect();
+        let parameters = n * k.div_ceil(group_size);
+        let scales: Vec<_> = (0..parameters)
+            .map(|i| half((1 + i * 5 % 7) as f32 / 64.0))
+            .collect();
+        let zeros: Vec<_> = (0..parameters)
+            .map(|i| ((i * 11 + i / 9) % 16) as u8)
+            .collect();
+        let weights = W4Weights::new(k, n, group_size, &packed, &scales, Some(&zeros)).unwrap();
+        for rows in [1, 19, 33] {
+            let input: Vec<_> = (0..rows * k)
+                .map(|i| half(((i * 31 % 81) as i32 - 40) as f32 / 128.0))
+                .collect();
+            let activation = session.upload_f16(rows, k, &input).unwrap();
+            let prepared_f16 = session.prepare_marlin(weights).unwrap();
+            let prepared_f32 = session.prepare_marlin_f32(weights).unwrap();
+            let local = prepared_f16
+                .submit(&activation, None, OutputType::F16)
+                .unwrap();
+            let shard = prepared_f32
+                .submit(&activation, None, OutputType::F32)
+                .unwrap();
+            drop((activation, prepared_f16, prepared_f32));
+
+            for (output, result) in [(OutputType::F16, local), (OutputType::F32, shard)] {
+                let expected = W4A16::new(weights, &input, None, output).unwrap().run_cpu();
+                if session.supports_completion_query() {
+                    poll_producer(&result);
+                }
+                let actual = result.read().unwrap();
+                match (actual, expected) {
+                    (LinearOutput::F16(actual), LinearOutput::F16(expected)) => {
+                        assert_eq!(actual, expected, "M={rows} N={n} K={k} G={group_size}");
+                    }
+                    (LinearOutput::F32(actual), LinearOutput::F32(expected)) => {
+                        assert_eq!(actual.len(), expected.len());
+                        for (index, (&actual, &expected)) in
+                            actual.iter().zip(&expected).enumerate()
+                        {
+                            assert_eq!(
+                                actual, expected,
+                                "M={rows} N={n} K={k} G={group_size} index={index}"
+                            );
+                        }
+                    }
+                    _ => panic!("unexpected tiled Marlin output format"),
+                }
+            }
+        }
+        println!("tiled Marlin asymmetric FP16 and FP32 matched: N={n} K={k} G={group_size}");
+    }
+}
+
+#[cfg(feature = "native")]
+fn check_humming_shape_rejected(
+    session: &plait_ops::native::DeviceSession<'_>,
+    n: u32,
+    k: u32,
+    group_size: u32,
+) {
+    use plait_ops::OperatorError;
+    let packed = vec![0x99; (n * k / 2) as usize];
+    let scales = vec![half(1.0); (n * k.div_ceil(group_size)) as usize];
+    let weights = W4Weights::new(k, n, group_size, &packed, &scales, None).unwrap();
+    assert!(matches!(
+        session.prepare_humming(weights),
+        Err(OperatorError::Unsupported(_))
+    ));
+    assert!(matches!(
+        session.prepare_humming_f32(weights),
+        Err(OperatorError::Unsupported(_))
+    ));
+}
+
+#[cfg(feature = "native")]
+fn check_interleaved_humming_shapes(
+    session: &plait_ops::native::DeviceSession<'_>,
+    shapes: &[(u32, u32)],
+) {
+    let mut kernels = Vec::new();
+    let mut prepared = Vec::new();
+    for (index, &(n, k)) in shapes.iter().enumerate() {
+        let group_size = 128;
+        let seed = index as u32;
+        let packed: Vec<_> = (0..n * k / 2)
+            .map(|i| (i * 59 + i / 21 + seed * 31) as u8)
+            .collect();
+        let scales: Vec<_> = (0..n * (k / group_size))
+            .map(|i| half((1 + (i + seed) % 4) as f32 / 256.0))
+            .collect();
+        let zeros: Vec<_> = (0..n * (k / group_size))
+            .map(|i| ((i * 11 + i / 7 + seed) % 16) as u8)
+            .collect();
+        let weights = W4Weights::new(k, n, group_size, &packed, &scales, Some(&zeros)).unwrap();
+        let f16 = session.prepare_humming(weights).unwrap();
+        let f32 = session.prepare_humming_f32(weights).unwrap();
+        kernels.push((f16, f32));
+        for (rows, output) in [
+            (1, OutputType::F32),
+            (33, OutputType::F16),
+            (65, OutputType::F32),
+        ] {
+            let activations: Vec<_> = (0..rows * k)
+                .map(|i| half(((i * 43 + seed * 11) % 95) as f32 / 128.0 - 0.25))
+                .collect();
+            let input = session.upload_f16(rows, k, &activations).unwrap();
+            let expected = W4A16::new(weights, &activations, None, output)
+                .unwrap()
+                .run_cpu();
+            prepared.push((index, n, k, rows, output, input, expected));
+        }
+    }
+
+    let mut pending = Vec::new();
+    for (index, n, k, rows, output, input, expected) in prepared.into_iter().rev() {
+        let (f16, f32) = &kernels[index];
+        let linear = if output == OutputType::F32 { f32 } else { f16 };
+        let result = linear.submit(&input, None, output).unwrap();
+        pending.push((n, k, rows, output, result, expected));
+    }
+    drop(kernels);
+    for (n, k, rows, output, result, expected) in pending {
+        let actual = result.read().unwrap();
+        if let (LinearOutput::F32(actual), LinearOutput::F32(expected)) = (&actual, &expected) {
+            assert_eq!(actual.len(), expected.len());
+            for (i, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "M={rows} N={n} K={k} output={output:?} index={i}"
+                );
+            }
+        } else {
+            assert_eq!(actual, expected, "M={rows} N={n} K={k} output={output:?}");
+        }
+    }
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn native_humming_catalog_interleaves_shapes_on_one_queue() {
+    use plait_ops::OperatorError;
+    use plait_ops::native::NativeW4A16;
+    use std::path::Path;
+
+    let Some(path) = std::env::var_os("PLAIT_HUMMING_CATALOG_TEST_LIBRARY") else {
+        return;
+    };
+    let backend = unsafe { NativeW4A16::load(Path::new(&path)) }.unwrap();
+    let session = backend.open_device(0).unwrap();
+    check_interleaved_humming_shapes(&session, &[(256, 512), (256, 256), (256, 768), (512, 1024)]);
+    check_humming_shape_rejected(&session, 256, 384, 128);
+
+    if let Some(fp16_only) = std::env::var_os("PLAIT_HUMMING_FP16_CATALOG_TEST_LIBRARY") {
+        let backend = unsafe { NativeW4A16::load(Path::new(&fp16_only)) }.unwrap();
+        let device = backend.open_device(0).unwrap();
+        let packed = vec![0x99; 256 * 256 / 2];
+        let scales = vec![half(1.0); 256 * 2];
+        let weights = W4Weights::new(256, 256, 128, &packed, &scales, None).unwrap();
+        let linear = device.prepare_humming(weights).unwrap();
+        let activations = vec![half(0.5); 256];
+        let input = device.upload_f16(1, 256, &activations).unwrap();
+        let output = linear.submit(&input, None, OutputType::F16).unwrap();
+        assert_eq!(
+            output.read().unwrap(),
+            LinearOutput::F16(vec![half(128.0); 256])
+        );
+        assert!(matches!(
+            device.prepare_humming_f32(weights),
+            Err(OperatorError::Unsupported(_))
+        ));
+    }
+}
+
+#[cfg(feature = "native")]
+fn check_dynamic_humming_shapes(library: &std::path::Path) {
+    let backend = unsafe { plait_ops::native::NativeW4A16::load(library) }.unwrap();
+    let session = backend.open_device(0).unwrap();
+    check_interleaved_humming_shapes(&session, &[(64, 128), (192, 384), (320, 640), (256, 4096)]);
+    check_humming_shape_rejected(&session, 208, 384, 128);
+    check_humming_shape_rejected(&session, 192, 320, 128);
+    check_humming_shape_rejected(&session, 192, 384, 64);
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn native_humming_mfma_runs_staged_shapes_and_rejects_misalignment() {
+    let Some(path) = std::env::var_os("PLAIT_HUMMING_MFMA_TEST_LIBRARY") else {
+        return;
+    };
+    check_dynamic_humming_shapes(std::path::Path::new(&path));
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn native_humming_metal_runs_staged_shapes_and_rejects_misalignment() {
+    let Some(path) = std::env::var_os("PLAIT_HUMMING_METAL_TEST_LIBRARY") else {
+        return;
+    };
+    check_dynamic_humming_shapes(std::path::Path::new(&path));
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn native_humming_ascend_runs_staged_shapes_and_bounded_waves() {
+    use plait_ops::native::NativeW4A16;
+    use std::path::Path;
+
+    let Some(path) = std::env::var_os("PLAIT_HUMMING_ASCEND_TEST_LIBRARY") else {
+        return;
+    };
+    check_dynamic_humming_shapes(Path::new(&path));
+    let backend = unsafe { NativeW4A16::load(Path::new(&path)) }.unwrap();
+    let device = backend.open_device(0).unwrap();
+    // Force another K wave and another column band in a single submission.
+    let (n, k, group) = (4160, 8192, 128);
+    let groups = k / group;
+    let packed = vec![0xaa; (n * k / 2) as usize];
+    let scale = |col: u32, g: u32| (1 + (col / 64 + g) % 4) as f32 / 8.0;
+    let zero = |col: u32, g: u32| (8 + (col + g) % 2) as u8;
+    let scales: Vec<_> = (0..n)
+        .flat_map(|col| (0..groups).map(move |g| half(scale(col, g))))
+        .collect();
+    let zeros: Vec<_> = (0..n)
+        .flat_map(|col| (0..groups).map(move |g| zero(col, g)))
+        .collect();
+    let weights = W4Weights::new(k, n, group, &packed, &scales, Some(&zeros)).unwrap();
+    let activation: Vec<_> = (0..k)
+        .map(|i| {
+            half(if i % group == 0 {
+                1.0 + 1.0 / 256.0
+            } else {
+                1.0
+            })
+        })
+        .collect();
+    let input = device.upload_f16(1, k, &activation).unwrap();
+    let expected: Vec<f32> = (0..n)
+        .map(|col| {
+            (0..groups)
+                .map(|g| {
+                    (group as f32 + 1.0 / 256.0) * f32::from(10 - zero(col, g)) * scale(col, g)
+                })
+                .sum()
+        })
+        .collect();
+    let f16 = device.prepare_humming(weights).unwrap();
+    let f32 = device.prepare_humming_f32(weights).unwrap();
+    let narrow = f16.submit(&input, None, OutputType::F16).unwrap();
+    let wide = f32.submit(&input, None, OutputType::F32).unwrap();
+    if device.supports_completion_query() {
+        poll_producer(&wide);
+    }
+    assert_eq!(wide.read().unwrap(), LinearOutput::F32(expected.clone()));
+    assert_eq!(
+        narrow.read().unwrap(),
+        LinearOutput::F16(expected.into_iter().map(half).collect())
+    );
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn native_humming_writes_fp32_accumulators_for_shards() {
+    use plait_ops::native::{NativeW4A16, W4Activation};
+    use std::path::Path;
+
+    let Some(library) = std::env::var_os("PLAIT_HUMMING_F32_TEST_LIBRARY") else {
+        return;
+    };
+    let dims = std::env::var("PLAIT_HUMMING_TEST_NK").unwrap_or_else(|_| "256,512".into());
+    let (n, k) = dims.split_once(',').expect("shape is N,K");
+    let (n, k) = (n.parse::<u32>().unwrap(), k.parse::<u32>().unwrap());
+    let groups = k / 128;
+    let backend = unsafe { NativeW4A16::load(Path::new(&library)) }.unwrap();
+    let device = backend.open_device(0).unwrap();
+    let packed: Vec<_> = (0..n * k / 2).map(|i| (i * 47 + i / 17) as u8).collect();
+    let scales: Vec<_> = (0..n * groups)
+        .map(|i| half((1 + (i % 4)) as f32 / 256.0))
+        .collect();
+    let zeros: Vec<_> = (0..n * groups).map(|i| ((i * 5) % 16) as u8).collect();
+    let weights = W4Weights::new(k, n, 128, &packed, &scales, Some(&zeros)).unwrap();
+    let mut overflow_scales = scales.clone();
+    overflow_scales[0] = f16::MAX.to_bits();
+    let overflow = W4Weights::new(k, n, 128, &packed, &overflow_scales, Some(&zeros)).unwrap();
+    assert!(matches!(
+        device.prepare_humming_f32(overflow),
+        Err(plait_ops::OperatorError::Unsupported(_))
+    ));
+    let linear = device.prepare_humming_f32(weights).unwrap();
+    let mut would_round = 0;
+    for rows in [1, 33, 65] {
+        let activations: Vec<_> = (0..rows * k)
+            .map(|i| half(((i * 53 % 193) as i32 - 96) as f32 / 128.0))
+            .collect();
+        let expected = W4A16::new(weights, &activations, None, OutputType::F32)
+            .unwrap()
+            .run_cpu();
+        let pending = device
+            .submit_w4_f32(&linear, &activations, None, W4Activation::F16)
+            .unwrap();
+        if device.supports_completion_query() {
+            poll_producer(&pending);
+        }
+        let actual = pending.read().unwrap();
+        assert_eq!(actual, expected, "M={rows}");
+        let LinearOutput::F32(values) = actual else {
+            panic!("expected FP32 output");
+        };
+        would_round += values
+            .iter()
+            .filter(|&&value| f16::from_f32(value).to_f32() != value)
+            .count();
+    }
+    assert!(would_round > 0);
+    println!("FP32 Humming preserves {would_round} values that FP16 would round for N={n}, K={k}");
 }
 
 #[cfg(feature = "native")]
@@ -452,6 +993,9 @@ fn native_humming_runs_groupwise_w4a16_and_chains_on_device() {
                 let input = session.upload_f16(rows, k, &activation).unwrap();
                 let result = linear.submit(&input, None, OutputType::F16).unwrap();
                 let downstream = next.submit(&result, None, OutputType::F32).unwrap();
+                if session.supports_completion_query() {
+                    poll_producer(&result);
+                }
                 let LinearOutput::F16(actual) = result.read().unwrap() else {
                     panic!("expected FP16 Humming result");
                 };

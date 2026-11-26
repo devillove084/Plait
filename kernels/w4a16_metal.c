@@ -150,9 +150,26 @@ static const char source[] =
 #include "w4_quantize_metal.h"
     ;
 
+#if defined(PLAIT_W4_METAL_MARLIN)
+static const char marlin_source[] =
+#include "marlin/plait_marlin_metal.h"
+    ;
+#endif
+#if defined(PLAIT_W4_METAL_HUMMING)
+static const char humming_source[] =
+#include "humming/plait_humming_metal.h"
+    ;
+#endif
+
 static struct {
     id device, queue, pipeline, integer_pipeline, integer_simd_pipeline, quantize_pipeline, pack_pipeline;
     metal_index integer_simd_width;
+#if defined(PLAIT_W4_METAL_MARLIN)
+    id marlin_project, marlin_combine;
+#endif
+#if defined(PLAIT_W4_METAL_HUMMING)
+    id humming_repack, humming_project, humming_narrow;
+#endif
 } metal;
 static pthread_once_t initialized = PTHREAD_ONCE_INIT;
 
@@ -190,6 +207,66 @@ static id make_pipeline(id device, id library, const char *name) {
     return pipeline;
 }
 
+#if defined(PLAIT_W4_METAL_MARLIN) || defined(PLAIT_W4_METAL_HUMMING)
+static id matrix_library(id device, id options, const char *code) {
+    const metal_index apple7 = 1007; /* MTLGPUFamilyApple7 */
+    if (!MESSAGE(BOOL (*)(id, SEL, metal_index))(device, SELECTOR("supportsFamily:"), apple7)) return nil;
+    id error = nil;
+    id library = MESSAGE(id (*)(id, SEL, id, id, id *))(
+        device, SELECTOR("newLibraryWithSource:options:error:"), string(code), options, &error);
+    if (!library) show_error(error);
+    return library;
+}
+#endif
+
+#if defined(PLAIT_W4_METAL_MARLIN)
+static void initialize_marlin(id device, id options) {
+    id library = matrix_library(device, options, marlin_source);
+    if (!library) return;
+    id project = make_pipeline(device, library, "marlin_project");
+    id combine = make_pipeline(device, library, "marlin_combine");
+    const metal_index width = MESSAGE(metal_index (*)(id, SEL))(
+        project, SELECTOR("threadExecutionWidth"));
+    if (width == 32 && combine) {
+        metal.marlin_project = project;
+        metal.marlin_combine = combine;
+    } else {
+        invoke(project, "release");
+        invoke(combine, "release");
+    }
+    invoke(library, "release");
+}
+#endif
+
+#if defined(PLAIT_W4_METAL_HUMMING)
+enum { humming_simd_width = 32, humming_threads = 128 };
+
+static bool humming_has_workgroup(id pipeline) {
+    return MESSAGE(metal_index (*)(id, SEL))(pipeline, SELECTOR("threadExecutionWidth")) ==
+               humming_simd_width &&
+           MESSAGE(metal_index (*)(id, SEL))(pipeline, SELECTOR("maxTotalThreadsPerThreadgroup")) >=
+               humming_threads;
+}
+
+static void initialize_humming(id device, id options) {
+    id library = matrix_library(device, options, humming_source);
+    if (!library) return;
+    id repack = make_pipeline(device, library, "humming_repack");
+    id project = make_pipeline(device, library, "humming_project");
+    id narrow = make_pipeline(device, library, "humming_narrow");
+    if (repack && humming_has_workgroup(project) && humming_has_workgroup(narrow)) {
+        metal.humming_repack = repack;
+        metal.humming_project = project;
+        metal.humming_narrow = narrow;
+    } else {
+        invoke(repack, "release");
+        invoke(project, "release");
+        invoke(narrow, "release");
+    }
+    invoke(library, "release");
+}
+#endif
+
 static void initialize(void) {
     id pool = autorelease_pool();
     id device = MTLCreateSystemDefaultDevice();
@@ -210,6 +287,12 @@ static void initialize(void) {
             metal.integer_simd_pipeline, SELECTOR("threadExecutionWidth"));
         metal.quantize_pipeline = make_pipeline(device, library, "quantize_f16");
         metal.pack_pipeline = make_pipeline(device, library, "pack_odd_groups");
+#if defined(PLAIT_W4_METAL_MARLIN)
+        initialize_marlin(device, options);
+#endif
+#if defined(PLAIT_W4_METAL_HUMMING)
+        initialize_humming(device, options);
+#endif
     } else {
         show_error(error);
         invoke(pipeline, "release");
@@ -262,7 +345,8 @@ static int device_buffer_read(void *handle, const void *buffer, void *destinatio
 
 static int encode_kernel(id command, id pipeline, const plait_w4a16_shape *s,
                          const id *buffers, metal_index count, const void *options,
-                         size_t options_bytes, metal_index work, bool work_is_groups) {
+                         size_t options_bytes, metal_index work, bool work_is_groups,
+                         metal_index group_width) {
     id encoder = object(command, "computeCommandEncoder");
     if (!encoder) return 3;
     MESSAGE(void (*)(id, SEL, id))(encoder, SELECTOR("setComputePipelineState:"), pipeline);
@@ -276,24 +360,26 @@ static int encode_kernel(id command, id pipeline, const plait_w4a16_shape *s,
         MESSAGE(void (*)(id, SEL, const void *, metal_index, metal_index))(
             encoder, SELECTOR("setBytes:length:atIndex:"), options, options_bytes, count + 1);
     }
-    const metal_index width = MESSAGE(metal_index (*)(id, SEL))(
-        pipeline, SELECTOR("threadExecutionWidth"));
+    if (!group_width) {
+        group_width = MESSAGE(metal_index (*)(id, SEL))(pipeline, SELECTOR("threadExecutionWidth"));
+    }
     const char *dispatch = work_is_groups ? "dispatchThreadgroups:threadsPerThreadgroup:"
                                           : "dispatchThreads:threadsPerThreadgroup:";
     MESSAGE(void (*)(id, SEL, metal_size, metal_size))(
-        encoder, SELECTOR(dispatch), (metal_size){work, 1, 1}, (metal_size){width, 1, 1});
+        encoder, SELECTOR(dispatch), (metal_size){work, 1, 1}, (metal_size){group_width, 1, 1});
     invoke(encoder, "endEncoding");
     return 0;
 }
 
 static int submit_kernel(void *handle, id pipeline, const plait_w4a16_shape *s,
                          const id *buffers, metal_index count, const void *options,
-                         size_t options_bytes, metal_index groups, void **completion) {
+                         size_t options_bytes, metal_index groups, metal_index group_width,
+                         void **completion) {
     id pool = autorelease_pool();
     id command = object((id)handle, "commandBuffer");
     const metal_index work = groups ? groups : (metal_index)s->m * s->n;
     const int status = encode_kernel(command, pipeline, s, buffers, count, options, options_bytes,
-                                     work, groups != 0);
+                                     work, groups != 0, group_width);
     if (!status) {
         invoke(command, "commit");
         *completion = object(command, "retain");
@@ -302,6 +388,64 @@ static int submit_kernel(void *handle, id pipeline, const plait_w4a16_shape *s,
     return status;
 }
 
+#if defined(PLAIT_W4_METAL_MARLIN)
+typedef struct { uint32_t tiles, parts; } marlin_grid;
+
+static marlin_grid marlin_make_grid(uint32_t m, uint32_t n, uint32_t k) {
+    const uint32_t tiles = plait_ceil_div(m, 8) * (n / 16);
+    if (!tiles || !k) return (marlin_grid){tiles, 1};
+    const uint32_t units = plait_ceil_div(k, 128);
+    const uint32_t desired = plait_ceil_div(128, tiles);
+    const uint32_t parts = desired < units ? desired : units;
+    return (marlin_grid){tiles, parts < 16 ? parts : 16};
+}
+
+static size_t marlin_workspace(uint32_t m, uint32_t n, uint32_t k) {
+    const uint64_t elements = (uint64_t)m * n;
+    if (elements > UINT32_MAX) return SIZE_MAX;
+    const uint32_t parts = marlin_make_grid(m, n, k).parts;
+    return parts == 1 ? 0 : (size_t)elements * parts * sizeof(float);
+}
+
+static int marlin_probe(void *handle) {
+    return handle && metal.marlin_project && metal.marlin_combine ? 0 : -1;
+}
+
+static int marlin_launch(void *handle, const plait_w4a16_shape *s,
+                         const void *a, const void *w, const void *params,
+                         void *workspace, void *out, void **completion) {
+    if (!plait_w4a16_valid_shape(s) || s->k % 16 || s->n % 16 ||
+        (uint64_t)s->k * s->n > INT32_MAX ||
+        (s->group_size != s->k && s->group_size != 128) ||
+        !handle || !a || !w || !params || !out || !completion) return 1;
+    if (marlin_probe(handle)) return 2;
+    const marlin_grid grid = marlin_make_grid(s->m, s->n, s->k);
+    if (grid.parts > 1 && !workspace) return 1;
+
+    id pool = autorelease_pool();
+    id command = object((id)handle, "commandBuffer");
+    const id buffers[] = {(id)a, (id)w, (id)params, (id)(workspace ? workspace : out), (id)out};
+    int status = encode_kernel(command, metal.marlin_project, s, buffers, 5, &grid, sizeof grid,
+                               (metal_index)grid.tiles * grid.parts, true, 0);
+    if (!status && grid.parts > 1) {
+        const id combine[] = {(id)workspace, (id)params, (id)out};
+        status = encode_kernel(command, metal.marlin_combine, s, combine, 3, &grid.parts,
+                               sizeof grid.parts, (metal_index)s->m * s->n, false, 0);
+    }
+    if (!status) {
+        invoke(command, "commit");
+        *completion = object(command, "retain");
+    }
+    invoke(pool, "drain");
+    return status;
+}
+
+const plait_w4a16_marlin_tiled_api *plait_w4a16_marlin_metal_api_v1(void) {
+    static const plait_w4a16_marlin_tiled_api api = {{marlin_probe, marlin_launch}, marlin_workspace};
+    return &api;
+}
+#endif
+
 static int device_launch(void *handle, const plait_w4a16_shape *s,
                          const void *a, const void *w, const void *scale,
                          const void *zero, const void *bias, void *out, void **completion) {
@@ -309,7 +453,7 @@ static int device_launch(void *handle, const plait_w4a16_shape *s,
     // The shader skips the bias binding when the optional input is omitted.
     const id buffers[] = {(id)a, (id)w, (id)scale, (id)zero, (id)(bias ? bias : scale), (id)out};
     const uint32_t has_bias = bias != NULL;
-    return submit_kernel(handle, metal.pipeline, s, buffers, 6, &has_bias, sizeof has_bias, 0, completion);
+    return submit_kernel(handle, metal.pipeline, s, buffers, 6, &has_bias, sizeof has_bias, 0, 0, completion);
 }
 
 int plait_w4_quantized_launch_v1(
@@ -336,10 +480,10 @@ int plait_w4_quantized_launch_v1(
         const metal_index per_group = width / 8;
         const metal_index groups = (outputs + per_group - 1) / per_group;
         return submit_kernel(handle, metal.integer_simd_pipeline, s, buffers, 7, options,
-                             sizeof options, groups, completion);
+                             sizeof options, groups, 0, completion);
     }
     return submit_kernel(handle, metal.integer_pipeline, s, buffers, 7, options,
-                         sizeof options, 0, completion);
+                         sizeof options, 0, 0, completion);
 }
 
 int plait_w4_quantize_f16_v1(
@@ -361,11 +505,11 @@ int plait_w4_quantize_f16_v1(
     const id buffers[] = {(id)input, (id)codes, (id)scales, (id)invalid};
     const uint32_t groups = plait_ceil_div(columns, group_size);
     status = encode_kernel(command, metal.quantize_pipeline, &s, buffers, 4, &bits, sizeof bits,
-                           (metal_index)rows * groups, true);
+                           (metal_index)rows * groups, true, 0);
     if (!status && bits == 4 && group_size % 2 != 0) {
         const uint32_t stride = plait_ceil_div(columns, 2);
         status = encode_kernel(command, metal.pack_pipeline, &s, buffers, 3, NULL, 0,
-                               (metal_index)rows * stride, false);
+                               (metal_index)rows * stride, false, 0);
     }
     if (!status) {
         invoke(command, "commit");
@@ -376,13 +520,18 @@ done:
     return status;
 }
 
+static const metal_index command_completed = 4;  /* MTLCommandBufferStatusCompleted */
+
+static metal_index command_status(id command) {
+    return MESSAGE(metal_index (*)(id, SEL))(command, SELECTOR("status"));
+}
+
 static int device_wait(void *handle, void *completion) {
     (void)handle;
     id pool = autorelease_pool();
     id command = (id)completion;
     invoke(command, "waitUntilCompleted");
-    const metal_index completed = 4;  /* MTLCommandBufferStatusCompleted */
-    const bool succeeded = MESSAGE(metal_index (*)(id, SEL))(command, SELECTOR("status")) == completed;
+    const bool succeeded = command_status(command) == command_completed;
     if (!succeeded) show_error(object(command, "error"));
     invoke(pool, "drain");
     return succeeded ? 0 : 4;
@@ -393,6 +542,49 @@ static void device_completion_free(void *handle, void *completion) {
     invoke((id)completion, "release");
 }
 
+#if defined(PLAIT_W4_METAL_HUMMING)
+static int probe_humming(void *handle, uint32_t n, uint32_t k, uint32_t group_size, uint32_t bits) {
+    return handle && metal.humming_repack && n && n % 64 == 0 && k && k % 128 == 0 &&
+           group_size == 128 && (uint64_t)n * k <= INT32_MAX && (bits == 16 || bits == 32) ? 0 : -1;
+}
+
+static int repack_humming(void *handle, uint32_t n, uint32_t k, uint32_t group_size,
+                          const void *canonical, void *packed) {
+    if (!canonical || !packed || probe_humming(handle, n, k, group_size, 16)) return 1;
+    const plait_w4a16_shape s = {1, n, k, group_size, 16};
+    const id buffers[] = {(id)canonical, (id)packed};
+    const uint32_t groups = plait_ceil_div(n * k / 4, humming_simd_width);
+    void *completion = NULL;
+    int status = submit_kernel(handle, metal.humming_repack, &s, buffers, 2, NULL, 0,
+                               groups, humming_simd_width, &completion);
+    if (!status) status = device_wait(handle, completion);
+    device_completion_free(handle, completion);
+    return status;
+}
+
+static int launch_humming(void *handle, const plait_w4a16_shape *s,
+                          const void *a, const void *weight, const void *scale, const void *zero,
+                          void *output, void **completion) {
+    if (!plait_w4a16_valid_shape(s) || !a || !weight || !scale || !zero || !output || !completion ||
+        probe_humming(handle, s->n, s->k, s->group_size, s->output_bits) ||
+        (uint64_t)s->m * s->n > INT32_MAX || (uint64_t)s->m * s->k > INT32_MAX) return 1;
+    const id buffers[] = {(id)a, (id)weight, (id)scale, (id)zero, (id)output};
+    if (s->m <= 8) {
+        const metal_index width = s->k >= 512 ? humming_threads : humming_simd_width;
+        return submit_kernel(handle, metal.humming_narrow, s, buffers, 5, NULL, 0,
+                             s->n / 16, width, completion);
+    }
+    const metal_index groups = (metal_index)plait_ceil_div(s->m, 16) * (s->n / 32);
+    return submit_kernel(handle, metal.humming_project, s, buffers, 5, NULL, 0,
+                         groups, humming_threads, completion);
+}
+
+const plait_w4a16_humming_api_v2_table *plait_w4a16_humming_api_v2(void) {
+    static const plait_w4a16_humming_api_v2_table api = {probe_humming, repack_humming, launch_humming};
+    return &api;
+}
+#endif
+
 static const plait_w4a16_device_api api = {
     device_open, device_close, device_buffer_new, device_buffer_free,
     device_buffer_read, device_launch, device_wait, device_completion_free,
@@ -400,6 +592,14 @@ static const plait_w4a16_device_api api = {
 
 const plait_w4a16_device_api *plait_w4a16_device_api_v1(void) {
     return &api;
+}
+
+int plait_w4_completion_query_v1(void *handle, void *completion, uint32_t *ready) {
+    if (!handle || !completion || !ready) return 1;
+    const metal_index status = command_status((id)completion);
+    if (status > command_completed) return 4;
+    *ready = status == command_completed;
+    return 0;
 }
 
 int plait_w4a16_run_host(const plait_w4a16_shape *s, int ordinal,

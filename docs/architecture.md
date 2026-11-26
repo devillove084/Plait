@@ -253,6 +253,22 @@ budget. Retirement preserves grants issued to already reclaimed devices.
 
 ## 7. Asynchronous versioned reduction
 
+Resident W4 submissions return an event on their device session. Libraries can
+export `plait_w4_completion_query_v1` to query that event without waiting or
+copying the result. Rust exposes the capability on `DeviceSession` and the
+query on resident tensors and quantized activations. Waiting or reading still
+checks upstream operations and the device quantizer's invalid-input flag.
+Libraries implementing the original device API can keep using `wait`.
+[Resident W4 C header](../kernels/w4a16.h)
+
+`DeviceSession::submit_w4_f32` stages host input and returns an FP32 device
+tensor. Its completion retains the allocations the queued operation uses,
+including temporary activation buffers, weights, bias, and kernel workspace.
+The caller can drop the original wrappers after submission. Input preparation
+and staging can still synchronize with the backend. The synchronous worker
+projection uses the same submission path and reads the returned tensor before
+publishing a shard.
+
 With NCCL, each rank issues the matching operation on its communicator.
 Execution is ordered on CUDA streams, and NCCL provides asynchronous enqueue
 and nonblocking group calls. [NCCL collective operations](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html) · [NCCL group calls](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/groups.html)
@@ -264,6 +280,13 @@ pulls each immutable result as soon as its worker reports the descriptor.
 The reducer accumulates the contiguous K prefix and holds later shards until
 their predecessors arrive. This preserves FP32 summation order across network
 schedules.
+
+Libraries built with `PLAIT_W4_HUMMING_SHARDS` can write the dense Humming A16
+accumulators directly to an FP32 shard. Profiling and execution select that
+path for matching compiled shapes and finite in-range weight scales. The
+worker keeps canonical and repacked weights so A4 and A8 can use their
+integer kernels. The device library and weight digests bind the resulting
+profiles to their execution path.
 
 Each resident worker can keep partials from up to eight operations, with a
 64 MiB total retention limit. A new publication at capacity returns an error.

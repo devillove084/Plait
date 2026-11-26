@@ -49,6 +49,9 @@ using FragB = Vec<half2, 2>;
 using FragC = Vec<float, 4>;
 using FragS = Vec<half2, 1>; // quantization scales
 
+// Bound the scratch needed by the backend that schedules independent stripes.
+constexpr int max_parallel_k_parts = 8;
+
 // Predicated asynchronous global->shared copy; used for inputs A where we apply predication to handle batchsizes that
 // are not multiples of 16.
 __device__ inline void cp_async4_pred(void* smem_ptr, const void* glob_ptr, bool pred = true) {
@@ -192,17 +195,20 @@ template <
   const int thread_n_blocks, // same for n dimension (output) 
   const int thread_k_blocks, // same for k dimension (reduction)
   const int stages, // number of stages for the async global->shared fetch pipeline
-  const int group_blocks = -1 // number of consecutive 16x16 blocks with a separate quantization scale
+  const int group_blocks = -1, // number of consecutive 16x16 blocks with a separate quantization scale
+  bool fp32 = false,
+  bool parallel_k = false
 >
 __global__ void Marlin(
   const int4* __restrict__ A, // fp16 input matrix of shape mxk 
   const int4* __restrict__ B, // 4bit quantized weight matrix of shape kxn 
-        int4* __restrict__ C, // fp16 output buffer of shape mxn
+        int4* __restrict__ C, // output buffer of shape mxn
   const int4* __restrict__ s, // fp16 quantization scales of shape (k/groupsize)xn 
   int  prob_m, // batch dimension m
   int  prob_n, // output dimension n
   int  prob_k, // reduction dimension k
-  int* locks // extra global storage for barrier synchronization 
+  int* locks, // extra global storage for barrier synchronization
+  size_t plane_vectors // vectors per scratch plane for independent K stripes
 ) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the same size, which might involve multiple 
   // column "slices" (of width 16 * `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM example: 
@@ -222,7 +228,14 @@ __global__ void Marlin(
 
   int k_tiles = prob_k / 16 / thread_k_blocks;
   int n_tiles = prob_n / 16 / thread_n_blocks;
+  constexpr int output_vectors = fp32 ? 2 : 1;
   int iters = ceildiv(k_tiles * n_tiles * parallel, gridDim.x);
+  if constexpr (parallel_k) {
+    // A slice can start partway through a stripe. Allow one extra part.
+    const int minimum = ceildiv(k_tiles, max_parallel_k_parts - 1);
+    if (iters < minimum)
+      iters = minimum;
+  }
   // Ensure that the number of tiles in each stripe is a multiple of the groupsize; this avoids an annoying special case
   // where a stripe starts in the middle of group.
   if (group_blocks != -1)
@@ -238,8 +251,9 @@ __global__ void Marlin(
   // We can easily implement parallel problem execution by just remapping indices and advancing global pointers
   if (slice_col_par >= n_tiles) {
     A += (slice_col_par / n_tiles) * 16 * thread_m_blocks * prob_k / 8;
-    C += (slice_col_par / n_tiles) * 16 * thread_m_blocks * prob_n / 8;
-    locks += (slice_col_par / n_tiles) * n_tiles;
+    C += (slice_col_par / n_tiles) * 16 * thread_m_blocks * (prob_n / 8) * output_vectors;
+    if constexpr (!parallel_k)
+      locks += (slice_col_par / n_tiles) * n_tiles;
     slice_col = slice_col_par % n_tiles;
   }
 
@@ -271,8 +285,9 @@ __global__ void Marlin(
     }
     if (slice_col == n_tiles) {
       A += 16 * thread_m_blocks * prob_k / 8;
-      C += 16 * thread_m_blocks * prob_n / 8;
-      locks += n_tiles;
+      C += 16 * thread_m_blocks * (prob_n / 8) * output_vectors;
+      if constexpr (!parallel_k)
+        locks += n_tiles;
       slice_col = 0;
     }
   };
@@ -513,7 +528,6 @@ __global__ void Marlin(
   // small, we perform this reduction serially in L2 cache.
   auto global_reduce = [&] (bool first = false, bool last = false) {
     // We are very careful here to reduce directly in the output buffer to maximize L2 cache utilization in this step. 
-    // To do this, we write out results in FP16 (but still reduce with FP32 compute).
     constexpr int active_threads = 32 * thread_n_blocks / 4;
     if (threadIdx.x < active_threads) {
       int c_gl_stride = prob_n / 8;
@@ -526,6 +540,41 @@ __global__ void Marlin(
 
       int row = (threadIdx.x % 32) / 4;
 
+      if constexpr (fp32) {
+        auto* output = reinterpret_cast<float4*>(C);
+        auto* fragments = reinterpret_cast<float*>(frag_c);
+        #pragma unroll
+        for (int i = 0; i < thread_m_blocks * 4; i++) {
+          if (8 * (i / 2) + row < prob_m) {
+            const int offset = 2 * (c_gl_wr + c_gl_wr_delta_o * (i / 2) + c_gl_wr_delta_i * (i % 2));
+            #pragma unroll
+            for (int j = 0; j < 2; j++) {
+              auto* fragment = fragments + 32 * (i / 4) + 16 * j + (i % 4);
+              float4 sum = make_float4(fragment[0], fragment[4], fragment[8], fragment[12]);
+              if (!first) {
+                // Match the legacy .cg copies. The barrier orders writers, and
+                // bypassing L1 makes the previous CTA's values visible here.
+                const float4 previous = __ldcg(&output[offset + j]);
+                sum.x += previous.x;
+                sum.y += previous.y;
+                sum.z += previous.z;
+                sum.w += previous.w;
+              }
+              if (last) {
+                fragment[0] = sum.x;
+                fragment[4] = sum.y;
+                fragment[8] = sum.z;
+                fragment[12] = sum.w;
+              } else {
+                output[offset + j] = sum;
+              }
+            }
+          }
+        }
+        return;
+      }
+
+      // Legacy FP16 output also stores the intermediate sums in FP16.
       if (!first) {
         // Interestingly, doing direct global accesses here really seems to mess up the compiler and lead to slowdowns,
         // hence we also use async-copies even though these fetches are not actually asynchronous.
@@ -586,10 +635,19 @@ __global__ void Marlin(
 
     // We first reorder in shared memory to guarantee the most efficient final global write patterns
     auto write = [&] (int idx, float c0, float c1, FragS& s) {
-      half2 res = __halves2half2(__float2half(c0), __float2half(c1));
-      if (group_blocks == -1) // for per-column quantization we finally apply the scale here
-        res = __hmul2(res, s[0]);
-      ((half2*) sh)[idx] = res;
+      if constexpr (fp32) {
+        if constexpr (group_blocks == -1 && !parallel_k) {
+          const float2 scale = __half22float2(s[0]);
+          c0 *= scale.x;
+          c1 *= scale.y;
+        }
+        reinterpret_cast<float2*>(sh)[idx] = make_float2(c0, c1);
+      } else {
+        half2 res = __halves2half2(__float2half(c0), __float2half(c1));
+        if (group_blocks == -1) // for per-column quantization we finally apply the scale here
+          res = __hmul2(res, s[0]);
+        ((half2*) sh)[idx] = res;
+      }
     };
     if (threadIdx.x / 32 < thread_n_blocks / 4) {
       #pragma unroll
@@ -607,10 +665,15 @@ __global__ void Marlin(
     }
     __syncthreads();
 
+    int4* destination = C;
+    if constexpr (parallel_k)
+      destination += plane_vectors * slice_idx;
     #pragma unroll
     for (int i = 0; i < ceildiv(16 * thread_m_blocks, threads / (2 * thread_n_blocks)); i++) {
       if (c_gl_wr < c_gl_wr_end) {
-        C[c_gl_wr] = sh[c_sh_rd];
+        #pragma unroll
+        for (int v = 0; v < output_vectors; v++)
+          destination[output_vectors * c_gl_wr + v] = sh[output_vectors * c_sh_rd + v];
         c_gl_wr += c_gl_wr_delta;
         c_sh_rd += c_sh_rd_delta;
       }
@@ -655,15 +718,17 @@ __global__ void Marlin(
     // readable, other ways of writing the loop seemed to noticeably worse performance after compliation.
     if (slice_iters == 0) {
       cp_async_wait<0>();
+      if constexpr (parallel_k)
+        __syncthreads(); // All lanes finish staging before reusing shared memory.
       bool last = slice_idx == slice_count - 1;
       // For per-column scales, we only fetch them here in the final step before write-out
-      if (group_blocks == -1 && last) {
+      if (group_blocks == -1 && !parallel_k && last) {
         if (s_sh_wr_pred)
           cp_async4_stream(&sh_s[s_sh_wr], &s[s_gl_rd]);
         cp_async_fence();
       }
       thread_block_reduce();
-      if (group_blocks == -1 && last) {
+      if (group_blocks == -1 && !parallel_k && last) {
         cp_async_wait<0>();
         __syncthreads();
         if (threadIdx.x / 32 < thread_n_blocks / 4) {
@@ -671,13 +736,18 @@ __global__ void Marlin(
           reinterpret_cast<int4*>(&frag_s)[1] = sh_s[s_sh_rd + 4];
         }
       }
-      if (slice_count > 1) { // only globally reduce if there is more than one block in a slice
-        barrier_acquire(&locks[slice_col], slice_idx);
-        global_reduce(slice_idx == 0, last);
-        barrier_release(&locks[slice_col], last);
-      }
-      if (last) // only the last block in a slice actually writes the result
+      if constexpr (parallel_k) {
         write_result();
+        __syncthreads(); // Another stripe can immediately start staging in this buffer.
+      } else {
+        if (slice_count > 1) {
+          barrier_acquire(&locks[slice_col], slice_idx);
+          global_reduce(slice_idx == 0, last);
+          barrier_release(&locks[slice_col], last);
+        }
+        if (last)
+          write_result();
+      }
       slice_row = 0;
       slice_col_par++;
       slice_col++;
@@ -712,23 +782,24 @@ const int SHARED_MEM = 96 * 1024; // max shared memory on compute capability 8.6
     group_blocks == GROUP_BLOCKS \
   ) { \
     cudaFuncSetAttribute( \
-      Marlin<THREADS, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, STAGES, GROUP_BLOCKS>, \
+      Marlin<THREADS, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, STAGES, GROUP_BLOCKS, fp32, parallel_k>, \
       cudaFuncAttributeMaxDynamicSharedMemorySize, \
       SHARED_MEM \
     ); \
     Marlin< \
-      THREADS, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, STAGES, GROUP_BLOCKS \
+      THREADS, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, STAGES, GROUP_BLOCKS, fp32, parallel_k \
     ><<<blocks, THREADS, SHARED_MEM, stream>>>( \
       A_ptr, B_ptr, C_ptr, s_ptr, \
       prob_m, prob_n, prob_k, \
-      locks \
+      locks, plane_vectors \
     ); \
   }
 
 const int ERR_PROB_SHAPE = 1;
 const int ERR_KERN_SHAPE = 2;
 
-int marlin_cuda(
+template<bool fp32, bool parallel_k = false>
+int launch_marlin(
   const void* A,
   const void* B,
         void* C,
@@ -776,6 +847,7 @@ int marlin_cuda(
   const int4* B_ptr = (const int4*) B;
   int4* C_ptr = (int4*) C;
   const int4* s_ptr = (const int4*) s;
+  const size_t plane_vectors = parallel_k ? size_t(tot_m) * prob_n / 4 : 0;
 
   int cols = prob_n / thread_n;
   int* locks = (int*) workspace;
@@ -812,11 +884,68 @@ int marlin_cuda(
       ret = ERR_KERN_SHAPE;
 
     A_ptr += 16 * thread_m_blocks * (prob_k / 8) * par;
-    C_ptr += 16 * thread_m_blocks * (prob_n / 8) * par;
+    C_ptr += 16 * thread_m_blocks * (prob_n / 8) * par * (fp32 ? 2 : 1);
   }
 
   return ret;
 }
 
+int marlin_cuda(const void* a, const void* b, void* c, void* scale,
+                int m, int n, int k, void* workspace, int group_size,
+                int device, cudaStream_t stream, int thread_k, int thread_n,
+                int multiprocessors, int max_parallel) {
+  return launch_marlin<false>(a, b, c, scale, m, n, k, workspace, group_size,
+                              device, stream, thread_k, thread_n, multiprocessors, max_parallel);
+}
+
+#if defined(PLAIT_W4_MARLIN_SHARDS)
+#if defined(PLAIT_W4_PPU_INTEGER_MMA)
+size_t marlin_f32_workspace_bytes(uint32_t m, uint32_t n) {
+  const size_t row_bytes = size_t(n) * sizeof(float) * max_parallel_k_parts;
+  return m && row_bytes <= SIZE_MAX / m ? row_bytes * m : 0;
+}
+
+__global__ void combine_marlin_k(const float* partials, float* output,
+                                 const half* channel_scales, size_t elements, int n) {
+  const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= elements) return;
+  float sum = 0;
+  #pragma unroll
+  for (int part = 0; part < max_parallel_k_parts; part++)
+    sum += partials[part * elements + index];
+  if (channel_scales) {
+    // Inverse of the channelwise 32-scale packing used by the Marlin loader.
+    const int column = index % n;
+    const int lane = (column % 8) / 2;
+    const int group = (column % 32) / 8;
+    const int packed = (column / 32) * 32 + lane * 8 + group * 2 + column % 2;
+    sum *= __half2float(channel_scales[packed]);
+  }
+  output[index] = sum;
+}
+#endif
+
+int marlin_cuda_f32(const void* a, const void* b, void* c, void* scale,
+                    int m, int n, int k, void* workspace, int group_size,
+                    int device, cudaStream_t stream) {
+#if defined(PLAIT_W4_PPU_INTEGER_MMA)
+  // Independent stripes avoid a device-wide scheduling dependency on spinning CTAs.
+  auto status = cudaMemsetAsync(workspace, 0, marlin_f32_workspace_bytes(m, n), stream);
+  if (status != cudaSuccess) return status;
+  const int launched = launch_marlin<true, true>(a, b, workspace, scale, m, n, k, nullptr,
+                                                group_size, device, stream);
+  if (launched) return launched;
+  status = cudaGetLastError();
+  if (status != cudaSuccess) return status;
+  const size_t elements = size_t(m) * n;
+  const auto* channel_scales = group_size == -1 ? static_cast<const half*>(scale) : nullptr;
+  combine_marlin_k<<<(elements + THREADS - 1) / THREADS, THREADS, 0, stream>>>(
+      static_cast<const float*>(workspace), static_cast<float*>(c), channel_scales, elements, n);
+  return cudaGetLastError();
+#else
+  return launch_marlin<true>(a, b, c, scale, m, n, k, workspace, group_size, device, stream);
+#endif
+}
+#endif
 
 #endif

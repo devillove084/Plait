@@ -28,7 +28,8 @@ template <
     class MmaOpClass,
     class ProblemShape, class BlockShape, class WarpShape, class PadShape,
     class ElementA, class ElementQB, class ElementC, class ElementBS,
-    class LayerConfig, class ComputeConfig, class TuningConfig>
+    class LayerConfig, class ComputeConfig, class TuningConfig,
+    template <class, class, class> class OutputPipeline = EpiloguePipeline>
 __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPerSm) void humming(
     const __grid_constant__ typename KernelTensorParamType<TuningConfig::kUseTmaA>::Type A,
     const __grid_constant__ typename KernelTensorParamType<TuningConfig::kUseTmaB>::Type B,
@@ -67,7 +68,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
   using MainloopArithmetic = MainloopArithmetic<Ctx>;
   using EpilogueArithmetic = EpilogueArithmetic<Ctx>;
   using MMA = Mma<Ctx, MainloopArithmetic>;
-  using Epilogue = EpiloguePipeline<Ctx, MMA, EpilogueArithmetic>;
+  using Epilogue = OutputPipeline<Ctx, MMA, EpilogueArithmetic>;
   using S2RMemoryPipeline = S2RMemoryPipeline<Ctx, MMA, Epilogue>;
 
   extern __shared__ int4 shared_memory[];

@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 bincode.workspace = true
 bytes.workspace = true
+half = "2"
 plait-core.workspace = true
 plait-consensus.workspace = true
 plait-device.workspace = true

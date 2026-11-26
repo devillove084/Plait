@@ -57,6 +57,13 @@ typedef struct {
 
 const plait_w4a16_device_api *plait_w4a16_device_api_v1(void);
 
+/* Optional completion query for a handle returned by submission on this session.
+ * Returns 0 with ready set to 0 (pending) or 1 (finished). A nonzero result is
+ * the backend error status. The query does not wait, copy results, or release
+ * the completion. Read a quantizer's invalid flag separately after completion.
+ */
+int plait_w4_completion_query_v1(void *session, void *completion, uint32_t *ready);
+
 /* Optional integer activation GEMM on an existing session queue. Activations
  * are signed INT4 (low nibble first) or INT8. Each row and K group has an FP32
  * activation scale. The dot is accumulated in INT32 for each group, then
@@ -91,6 +98,35 @@ typedef struct {
 
 const plait_w4a16_marlin_api *plait_w4a16_marlin_api_v1(void);
 
+/* Optional tiled Marlin extension for AMD CDNA3, Apple Silicon, or Ascend 950.
+ * The same launch supports FP16 and FP32 results. Each 16-by-16 weight tile
+ * packs four consecutive K codes per uint16_t, ordered first by K group of four
+ * and then by output column. Tiles are ordered by output tile, then input tile.
+ * Group-major parameters place the FP16 scale in the low 16 bits and the
+ * unsigned zero point above it. The workspace query returns zero for direct
+ * output, or SIZE_MAX when the shape exceeds addressable scratch space.
+ */
+typedef struct {
+    plait_w4a16_marlin_api kernel;
+    size_t (*workspace)(uint32_t rows, uint32_t columns, uint32_t input_columns);
+} plait_w4a16_marlin_tiled_api;
+
+typedef plait_w4a16_marlin_tiled_api plait_w4a16_marlin_mfma_api;
+const plait_w4a16_marlin_mfma_api *plait_w4a16_marlin_mfma_api_v1(void);
+const plait_w4a16_marlin_tiled_api *plait_w4a16_marlin_metal_api_v1(void);
+const plait_w4a16_marlin_tiled_api *plait_w4a16_marlin_ascend_api_v1(void);
+
+/* Optional FP32 split-K accumulation and final output with Marlin-packed weights.
+ * Available when Marlin is built with PLAIT_W4_MARLIN_SHARDS.
+ * If also exported, the workspace query gives the bytes needed for the shape.
+ * Otherwise the FP16 ABI's lock workspace size applies.
+ */
+size_t plait_w4a16_marlin_f32_workspace_v1(uint32_t rows, uint32_t columns);
+
+int plait_w4a16_marlin_f32_launch_v1(
+    void *session, const plait_w4a16_shape *shape, const void *activation,
+    const void *weight, const void *scale, void *workspace, void *output, void **completion);
+
 /* Optional CUDA-compatible Humming extension on the same queue. probe returns -1
  * when the device or weight shape lacks a compiled kernel. repack transforms
  * canonical weights into an equally sized device buffer. launch accepts
@@ -105,6 +141,29 @@ typedef struct {
 } plait_w4a16_humming_api;
 
 const plait_w4a16_humming_api *plait_w4a16_humming_api_v1(void);
+
+/* Optional FP32 output on the same prepared Humming buffers and queue.
+ * Available when Humming is built with PLAIT_W4_HUMMING_SHARDS.
+ */
+int plait_w4a16_humming_f32_launch_v1(
+    void *session, const plait_w4a16_shape *shape, const void *activation,
+    const void *weight, const void *scale, const void *zero, void *output, void **completion);
+
+/* Shape-aware Humming extension. Probe returns -1 if the device, shape,
+ * weight group size, or output type is unavailable. Repack uses the supplied
+ * shape and requires n*k/2 bytes in both buffers. It does not retain probe
+ * state. Launch selects the compiled kernel for that same shape and output.
+ */
+typedef struct {
+    int (*probe)(void *session, uint32_t n, uint32_t k, uint32_t group_size, uint32_t output_bits);
+    int (*repack)(void *session, uint32_t n, uint32_t k, uint32_t group_size,
+                  const void *canonical, void *packed);
+    int (*launch)(void *session, const plait_w4a16_shape *shape,
+                  const void *activation, const void *weight, const void *scale,
+                  const void *zero, void *output, void **completion);
+} plait_w4a16_humming_api_v2_table;
+
+const plait_w4a16_humming_api_v2_table *plait_w4a16_humming_api_v2(void);
 
 #ifdef __cplusplus
 }

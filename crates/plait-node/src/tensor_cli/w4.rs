@@ -7,8 +7,8 @@ use plait_core::tensor::KPartial;
 use plait_ops::native::{DeviceSession, NativeW4A16, PreparedW4A16, W4Activation};
 use plait_ops::{ActivationBits, OperatorError, W4Weights};
 use plait_parallel::precision::{
-    W4Decision, W4PlacementRequest, W4Profile, W4Quantization, W4Scope, W4SelectionRequest,
-    plan_w4, select_w4,
+    W4Decision, W4Kernel, W4PlacementRequest, W4Profile, W4Quantization, W4Scope,
+    W4SelectionRequest, plan_w4, select_w4,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -67,6 +67,8 @@ pub(super) struct ProfileW4 {
     delivery_ns: u64,
     samples: usize,
     valid_until_ms: u64,
+    #[serde(default)]
+    kernel_profiles: bool,
 }
 
 #[derive(Deserialize)]
@@ -169,6 +171,76 @@ impl W4WeightInput {
     }
 }
 
+struct W4Partition<'lib> {
+    canonical: PreparedW4A16<'lib>,
+    humming: Option<PreparedW4A16<'lib>>,
+    marlin: Option<PreparedW4A16<'lib>>,
+}
+
+impl<'lib> W4Partition<'lib> {
+    fn prepare(
+        device: &DeviceSession<'lib>,
+        weights: W4Weights<'_>,
+        kernel_profiles: bool,
+    ) -> Result<Self, OperatorError> {
+        let canonical = device.prepare(weights)?;
+        let humming = optional_kernel(device.prepare_humming_f32(weights))?;
+        let marlin = if kernel_profiles || humming.is_none() {
+            optional_kernel(device.prepare_marlin_f32(weights))?
+        } else {
+            None
+        };
+        Ok(Self {
+            canonical,
+            humming,
+            marlin,
+        })
+    }
+
+    fn resident_bytes(&self) -> u64 {
+        [&self.humming, &self.marlin]
+            .into_iter()
+            .flatten()
+            .fold(self.canonical.resident_bytes(), |bytes, kernel| {
+                bytes.saturating_add(kernel.resident_bytes())
+            })
+    }
+
+    fn project(
+        &self,
+        device: &DeviceSession<'lib>,
+        activations: &[u16],
+        activation: W4Activation,
+        kernel: Option<W4Kernel>,
+    ) -> Result<Vec<f32>, OperatorError> {
+        let weights = match (kernel, activation) {
+            (Some(W4Kernel::Humming), _) => self.humming.as_ref().ok_or(
+                OperatorError::Unsupported("profiled Humming kernel is unavailable on this worker"),
+            )?,
+            (Some(W4Kernel::Marlin), _) => self.marlin.as_ref().ok_or(
+                OperatorError::Unsupported("profiled Marlin kernel is unavailable on this worker"),
+            )?,
+            (None, W4Activation::F16) => self
+                .humming
+                .as_ref()
+                .or(self.marlin.as_ref())
+                .unwrap_or(&self.canonical),
+            _ => &self.canonical,
+        };
+        device.project_w4_f32(weights, activations, None, activation)
+    }
+}
+
+fn optional_kernel<'lib>(
+    weights: Result<PreparedW4A16<'lib>, OperatorError>,
+) -> Result<Option<PreparedW4A16<'lib>>, OperatorError> {
+    match weights {
+        Ok(weights) => Ok(Some(weights)),
+        Err(OperatorError::Unsupported(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 pub(super) async fn publish(command: PublishW4) -> Result<(), Box<dyn std::error::Error>> {
     let partial = command.source.partial;
     command.device.check_partial(partial)?;
@@ -179,15 +251,20 @@ pub(super) async fn publish(command: PublishW4) -> Result<(), Box<dyn std::error
     }
     let input: W4Input = serde_json::from_reader(io::stdin().lock())?;
     let weights = command.device.weights(partial, &input)?;
-    let (bits, quantization) = if let Some(decision) = command.decision {
+    let (bits, quantization, kernel) = if let Some(decision) = command.decision {
         let scope = command.device.scope(partial, &input.weights)?;
         validate_decision(decision, partial, scope)?;
         (
             decision.profile.activation_bits,
             decision.profile.quantization,
+            decision.profile.kernel,
         )
     } else {
-        (command.activation_bits.unwrap_or(16), command.quantization)
+        (
+            command.activation_bits.unwrap_or(16),
+            command.quantization,
+            None,
+        )
     };
     let mut control = if let Some(peers) = command.control {
         let mut control = GroupControl::connect(peers).await?;
@@ -204,8 +281,17 @@ pub(super) async fn publish(command: PublishW4) -> Result<(), Box<dyn std::error
         let backend = unsafe { NativeW4A16::load(&command.device.library) }?;
         let device = backend.open_device(command.device.ordinal)?;
         let activation = activation_format(bits, quantization, device.supports_f16_quantization())?;
-        let linear = device.prepare(weights)?;
-        device.project_w4_f32(&linear, &input.activations_f16, None, activation)?
+        if let Some(kernel) = kernel {
+            let prepared = match kernel {
+                W4Kernel::Humming => device.prepare_humming_f32(weights)?,
+                W4Kernel::Marlin => device.prepare_marlin_f32(weights)?,
+                W4Kernel::Reference | W4Kernel::Integer => device.prepare(weights)?,
+            };
+            device.project_w4_f32(&prepared, &input.activations_f16, None, activation)?
+        } else {
+            let linear = W4Partition::prepare(&device, weights, false)?;
+            linear.project(&device, &input.activations_f16, activation, None)?
+        }
     };
     if let Some(control) = &mut control {
         control.check_worker(partial.grant, None).await?;
@@ -272,28 +358,40 @@ pub(super) fn profile(command: ProfileW4) -> Result<(), Box<dyn std::error::Erro
     // The local deployment configuration selects a trusted Plait device library.
     let backend = unsafe { NativeW4A16::load(&command.device.library) }?;
     let device = backend.open_device(command.device.ordinal)?;
-    let linear = device.prepare(weights)?;
+    let linear = W4Partition::prepare(&device, weights, command.kernel_profiles)?;
     let mut profiles = Vec::new();
     let mut references: Vec<Vec<f32>> = Vec::with_capacity(cases.len());
     let device_quantization = device.supports_f16_quantization();
-    'modes: for (bits, quantization) in [
-        (16, None),
-        (8, Some(W4Quantization::Host)),
-        (8, Some(W4Quantization::Device)),
-        (4, Some(W4Quantization::Host)),
-        (4, Some(W4Quantization::Device)),
-    ] {
+    let reference = command.kernel_profiles.then_some(W4Kernel::Reference);
+    let integer = command.kernel_profiles.then_some(W4Kernel::Integer);
+    let mut modes = vec![(16, None, reference)];
+    if command.kernel_profiles {
+        if linear.humming.is_some() {
+            modes.push((16, None, Some(W4Kernel::Humming)));
+        }
+        if linear.marlin.is_some() {
+            modes.push((16, None, Some(W4Kernel::Marlin)));
+        }
+    }
+    modes.extend([
+        (8, Some(W4Quantization::Host), integer),
+        (8, Some(W4Quantization::Device), integer),
+        (4, Some(W4Quantization::Host), integer),
+        (4, Some(W4Quantization::Device), integer),
+    ]);
+    'modes: for (bits, quantization, kernel) in modes {
         if quantization == Some(W4Quantization::Device) && !device_quantization {
             continue;
         }
+        let baseline = bits == 16 && kernel == reference;
         let activation = activation_format(bits, quantization, device_quantization)?;
         let mut latency_ns = 0;
         let mut error_ppm = 0;
         for (index, &(activations, layer_norm)) in cases.iter().enumerate() {
-            let run = || device.project_w4_f32(&linear, activations, None, activation);
+            let run = || linear.project(&device, activations, activation, kernel);
             match run() {
                 Ok(_) => {}
-                Err(OperatorError::Unsupported(_)) if bits != 16 => continue 'modes,
+                Err(OperatorError::Unsupported(_)) if !baseline => continue 'modes,
                 Err(error) => return Err(error.into()),
             }
             let mut durations = Vec::with_capacity(command.samples);
@@ -303,16 +401,19 @@ pub(super) fn profile(command: ProfileW4) -> Result<(), Box<dyn std::error::Erro
                 let values = run()?;
                 durations.push(u64::try_from(started.elapsed().as_nanos())?.max(1));
                 if values.iter().any(|value| !value.is_finite()) {
+                    if command.kernel_profiles && !baseline {
+                        continue 'modes;
+                    }
                     return Err("calibration produced a non-finite output".into());
                 }
-                if bits == 16 {
+                if baseline {
                     reference = values;
                 } else {
                     error_ppm =
                         error_ppm.max(calibration_error(&values, &references[index], layer_norm)?);
                 }
             }
-            if bits == 16 {
+            if baseline {
                 references.push(reference);
             }
             durations.sort_unstable();
@@ -326,6 +427,7 @@ pub(super) fn profile(command: ProfileW4) -> Result<(), Box<dyn std::error::Erro
             calibration_id: command.calibration_id,
             activation_bits: bits,
             quantization,
+            kernel,
             latency_ns,
             error_ppm,
             valid_until_ms: command.valid_until_ms,

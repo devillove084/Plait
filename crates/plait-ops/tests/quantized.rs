@@ -31,6 +31,75 @@ fn quantization_packs_signed_codes_and_preserves_the_tail() {
 
 #[cfg(feature = "native")]
 #[test]
+fn native_host_submission_keeps_inputs_until_completion() {
+    use plait_ops::native::{NativeW4A16, W4Activation};
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    let Some(library) = std::env::var_os("PLAIT_QUANTIZED_TEST_LIBRARY") else {
+        return;
+    };
+    let backend = unsafe { NativeW4A16::load(Path::new(&library)) }.unwrap();
+    let indices = std::env::var("PLAIT_W4A16_TEST_DEVICES").unwrap_or_else(|_| "0".to_owned());
+    let (rows, columns, k, group) = (128, 192, 4096, 128);
+    let packed = vec![0x99; (columns * k / 2) as usize];
+    let scales = vec![half(1.0); (columns * k / group) as usize];
+    let weight = W4Weights::new(k, columns, group, &packed, &scales, None).unwrap();
+    for ordinal in indices
+        .split(',')
+        .map(|index| index.parse::<i32>().unwrap())
+    {
+        let device = backend.open_device(ordinal).unwrap();
+        let mut modes = vec![
+            ("A16", W4Activation::F16),
+            ("host A4", W4Activation::Host(ActivationBits::I4)),
+            ("host A8", W4Activation::Host(ActivationBits::I8)),
+        ];
+        if device.supports_f16_quantization() {
+            modes.extend([
+                ("device A4", W4Activation::Device(ActivationBits::I4)),
+                ("device A8", W4Activation::Device(ActivationBits::I8)),
+            ]);
+        }
+        for (name, mode) in modes {
+            let output = {
+                let weights = device.prepare(weight).unwrap();
+                let host_input = vec![half(1.0); (rows * k) as usize];
+                let bias = device
+                    .upload_f16(1, columns, &vec![half(2.0); columns as usize])
+                    .unwrap();
+                // No prepared weight, staging tensor, or bias owner survives this scope.
+                device
+                    .submit_w4_f32(&weights, &host_input, Some(&bias), mode)
+                    .unwrap()
+            };
+            if device.supports_completion_query() {
+                let ready = output.is_ready().unwrap();
+                println!(
+                    "device {ordinal}: host submission {name}, pending on return={}",
+                    !ready
+                );
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while !output.is_ready().unwrap() {
+                    assert!(Instant::now() < deadline, "projection did not complete");
+                    std::thread::sleep(Duration::from_micros(50));
+                }
+            }
+            let LinearOutput::F32(values) = output.read().unwrap() else {
+                panic!("expected FP32 projection");
+            };
+            assert_eq!(values.len(), (rows * columns) as usize);
+            assert!(
+                values
+                    .iter()
+                    .all(|value| (value - (k as f32 + 2.)).abs() <= 0.01)
+            );
+        }
+    }
+}
+
+#[cfg(feature = "native")]
+#[test]
 fn native_integer_activation_matches_groupwise_cpu() {
     use plait_ops::native::NativeW4A16;
     use std::path::Path;
@@ -155,6 +224,9 @@ fn check_device_quantization_chain(device: &plait_ops::native::DeviceSession<'_>
         let quantized = device
             .quantize_f16(&computed, ActivationBits::I4, 8)
             .unwrap();
+        if device.supports_completion_query() {
+            let _ = quantized.is_ready().unwrap();
+        }
         let output = identity
             .submit_quantized(&quantized, None, OutputType::F32)
             .unwrap();
@@ -166,6 +238,9 @@ fn check_device_quantization_chain(device: &plait_ops::native::DeviceSession<'_>
                 "quantized activations must be finite"
             ))
         ));
+        if device.supports_completion_query() {
+            assert!(output.is_ready().unwrap());
+        }
     }
     println!("device quantization chain: round-to-even, subnormal and non-finite inputs verified");
 }

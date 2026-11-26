@@ -41,6 +41,32 @@ type QuantizeF16 = unsafe extern "C" fn(
     *mut c_void,
     *mut *mut c_void,
 ) -> i32;
+type CompletionQuery = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u32) -> i32;
+type MarlinWorkspaceQuery = unsafe extern "C" fn(u32, u32) -> usize;
+type TiledWorkspaceQuery = unsafe extern "C" fn(u32, u32, u32) -> usize;
+type MarlinLaunch = unsafe extern "C" fn(
+    *mut c_void,
+    *const Shape,
+    *const c_void,
+    *const c_void,
+    *const c_void,
+    *mut c_void,
+    *mut c_void,
+    *mut *mut c_void,
+) -> i32;
+type HummingLaunch = unsafe extern "C" fn(
+    *mut c_void,
+    *const Shape,
+    *const c_void,
+    *const c_void,
+    *const c_void,
+    *const c_void,
+    *mut c_void,
+    *mut *mut c_void,
+) -> i32;
+type HummingRepackV1 = unsafe extern "C" fn(*mut c_void, *const c_void, *mut c_void) -> i32;
+type HummingRepackV2 =
+    unsafe extern "C" fn(*mut c_void, u32, u32, u32, *const c_void, *mut c_void) -> i32;
 
 #[repr(C)]
 struct DeviceApi {
@@ -70,37 +96,53 @@ struct Session<'lib> {
     handle: NonNull<c_void>,
     quantized_launch: Option<QuantizedLaunch>,
     quantize_f16: Option<QuantizeF16>,
+    completion_query: Option<CompletionQuery>,
+    marlin_launch_f32: Option<MarlinLaunch>,
+    marlin_workspace_f32: Option<MarlinWorkspaceQuery>,
+    humming_launch_f32: Option<HummingLaunch>,
 }
 
 #[repr(C)]
 struct MarlinApi {
     probe: unsafe extern "C" fn(*mut c_void) -> i32,
-    launch: unsafe extern "C" fn(
-        *mut c_void,
-        *const Shape,
-        *const c_void,
-        *const c_void,
-        *const c_void,
-        *mut c_void,
-        *mut c_void,
-        *mut *mut c_void,
-    ) -> i32,
+    launch: MarlinLaunch,
+}
+
+impl MarlinApi {
+    fn check_device(&self, session: &Session<'_>) -> Result<(), OperatorError> {
+        let probe = unsafe { (self.probe)(session.handle.as_ptr()) };
+        if probe == -1 {
+            return Err(OperatorError::Unsupported(
+                "the Marlin library was built for a different device architecture",
+            ));
+        }
+        status("probe Marlin device", probe)
+    }
+}
+
+#[repr(C)]
+struct MarlinTiledApi {
+    kernel: MarlinApi,
+    workspace: TiledWorkspaceQuery,
 }
 
 #[repr(C)]
 struct HummingApi {
     probe: unsafe extern "C" fn(*mut c_void, u32, u32, u32) -> i32,
-    repack: unsafe extern "C" fn(*mut c_void, *const c_void, *mut c_void) -> i32,
-    launch: unsafe extern "C" fn(
-        *mut c_void,
-        *const Shape,
-        *const c_void,
-        *const c_void,
-        *const c_void,
-        *const c_void,
-        *mut c_void,
-        *mut *mut c_void,
-    ) -> i32,
+    repack: HummingRepackV1,
+    launch: HummingLaunch,
+}
+
+#[repr(C)]
+struct HummingApiV2 {
+    probe: unsafe extern "C" fn(*mut c_void, u32, u32, u32, u32) -> i32,
+    repack: HummingRepackV2,
+    launch: HummingLaunch,
+}
+
+enum HummingRepack {
+    Legacy(HummingRepackV1),
+    Shaped(HummingRepackV2),
 }
 
 impl Drop for Session<'_> {
@@ -216,10 +258,28 @@ impl<'lib> DeviceSession<'lib> {
         bias: Option<&DeviceTensor<'lib>>,
         activation: W4Activation,
     ) -> Result<Vec<f32>, OperatorError> {
+        let output = self.submit_w4_f32(weights, activations_f16, bias, activation)?;
+        match output.read()? {
+            LinearOutput::F32(values) => Ok(values),
+            LinearOutput::F16(_) => Err(OperatorError::Backend(
+                "W4 projection requires FP32 output".into(),
+            )),
+        }
+    }
+
+    /// Stage host input and enqueue a W4 projection with an FP32 device result.
+    /// The result retains the native buffers used by the queued operations.
+    pub fn submit_w4_f32(
+        &self,
+        weights: &PreparedW4A16<'lib>,
+        activations_f16: &[u16],
+        bias: Option<&DeviceTensor<'lib>>,
+        activation: W4Activation,
+    ) -> Result<DeviceTensor<'lib>, OperatorError> {
         let rows = crate::w4a16::checked_rows(weights.k, weights.n, activations_f16.len())?;
         let upload = || self.upload_f16(rows, weights.k, activations_f16);
-        let output = match activation {
-            W4Activation::F16 => weights.submit(&upload()?, bias, OutputType::F32)?.read()?,
+        match activation {
+            W4Activation::F16 => weights.submit(&upload()?, bias, OutputType::F32),
             W4Activation::Host(bits) => {
                 let host = QuantizedActivations::from_f16(
                     bits,
@@ -227,23 +287,13 @@ impl<'lib> DeviceSession<'lib> {
                     weights.group_size,
                     activations_f16,
                 )?;
-                weights
-                    .submit_quantized(&self.upload_quantized(&host)?, bias, OutputType::F32)?
-                    .read()?
+                weights.submit_quantized(&self.upload_quantized(&host)?, bias, OutputType::F32)
             }
             W4Activation::Device(bits) => {
                 let input = upload()?;
                 let low = self.quantize_f16(&input, bits, weights.group_size)?;
-                weights
-                    .submit_quantized(&low, bias, OutputType::F32)?
-                    .read()?
+                weights.submit_quantized(&low, bias, OutputType::F32)
             }
-        };
-        match output {
-            LinearOutput::F32(values) => Ok(values),
-            LinearOutput::F16(_) => Err(OperatorError::Backend(
-                "W4 projection requires FP32 output".into(),
-            )),
         }
     }
 
@@ -270,6 +320,18 @@ impl<'lib> DeviceSession<'lib> {
                 .ok()
                 .map(|symbol| *symbol),
             quantize_f16: unsafe { library.get(b"plait_w4_quantize_f16_v1") }
+                .ok()
+                .map(|symbol| *symbol),
+            completion_query: unsafe { library.get(b"plait_w4_completion_query_v1") }
+                .ok()
+                .map(|symbol| *symbol),
+            marlin_launch_f32: unsafe { library.get(b"plait_w4a16_marlin_f32_launch_v1") }
+                .ok()
+                .map(|symbol| *symbol),
+            marlin_workspace_f32: unsafe { library.get(b"plait_w4a16_marlin_f32_workspace_v1") }
+                .ok()
+                .map(|symbol| *symbol),
+            humming_launch_f32: unsafe { library.get(b"plait_w4a16_humming_f32_launch_v1") }
                 .ok()
                 .map(|symbol| *symbol),
         })))
@@ -302,30 +364,105 @@ impl<'lib> DeviceSession<'lib> {
         &self,
         weights: W4Weights<'_>,
     ) -> Result<PreparedW4A16<'lib>, OperatorError> {
+        self.prepare_marlin_kernel(weights, OutputType::F16)
+    }
+
+    /// Prepare Marlin to retain FP32 across device split-K and write FP32 shards.
+    pub fn prepare_marlin_f32(
+        &self,
+        weights: W4Weights<'_>,
+    ) -> Result<PreparedW4A16<'lib>, OperatorError> {
+        self.prepare_marlin_kernel(weights, OutputType::F32)
+    }
+
+    fn prepare_marlin_kernel(
+        &self,
+        weights: W4Weights<'_>,
+        output: OutputType,
+    ) -> Result<PreparedW4A16<'lib>, OperatorError> {
         let session = &self.0;
-        type Entry = unsafe extern "C" fn() -> *const MarlinApi;
-        let entry = unsafe { session.library.get::<Entry>(b"plait_w4a16_marlin_api_v1") }
-            .map_err(|_| OperatorError::Unsupported("library has no resident Marlin kernel"))?;
-        let api = unsafe { entry().as_ref() }
-            .ok_or_else(|| OperatorError::Backend("resident Marlin API is null".to_owned()))?;
-        let probe = unsafe { (api.probe)(session.handle.as_ptr()) };
-        if probe == -1 {
-            return Err(OperatorError::Unsupported(
-                "the Marlin library was built for a different device architecture",
-            ));
-        }
-        status("probe Marlin device", probe)?;
-        let (packed, scales, _) = marlin_layout::pack(weights)?;
-        let workspace_bytes = weights.n as usize / 128 * 16 * size_of::<i32>();
+        type TiledEntry = unsafe extern "C" fn() -> *const MarlinTiledApi;
+        let tiled = unsafe {
+            session
+                .library
+                .get::<TiledEntry>(b"plait_w4a16_marlin_metal_api_v1")
+                .or_else(|_| {
+                    session
+                        .library
+                        .get::<TiledEntry>(b"plait_w4a16_marlin_ascend_api_v1")
+                })
+                .map(|entry| (entry, false))
+                .or_else(|_| {
+                    session
+                        .library
+                        .get::<TiledEntry>(b"plait_w4a16_marlin_mfma_api_v1")
+                        .map(|entry| (entry, true))
+                })
+        };
+        let (packed, scale, launch, workspace) = if let Ok((entry, dequantize_in_f16)) = tiled {
+            let api = unsafe { entry().as_ref() }.ok_or_else(|| {
+                OperatorError::Backend("resident tiled Marlin API is null".to_owned())
+            })?;
+            api.kernel.check_device(session)?;
+            let (packed, parameters) = marlin_layout::pack_tiled(weights, dequantize_in_f16)?;
+            (
+                Buffer::upload(session, &packed)?,
+                Buffer::upload(session, &parameters)?,
+                api.kernel.launch,
+                MarlinWorkspace::Tiled(api.workspace),
+            )
+        } else {
+            type Entry = unsafe extern "C" fn() -> *const MarlinApi;
+            let entry = unsafe { session.library.get::<Entry>(b"plait_w4a16_marlin_api_v1") }
+                .map_err(|_| OperatorError::Unsupported("library has no resident Marlin kernel"))?;
+            let api = unsafe { entry().as_ref() }
+                .ok_or_else(|| OperatorError::Backend("resident Marlin API is null".to_owned()))?;
+            api.check_device(session)?;
+            let launch = match output {
+                OutputType::F16 => api.launch,
+                OutputType::F32 => {
+                    let launch = session.marlin_launch_f32.ok_or(OperatorError::Unsupported(
+                        "library has no FP32 Marlin output",
+                    ))?;
+                    // Grouped scales are applied before MMA, with signed codes in [-8, 7].
+                    let limit = half::f16::MAX.to_f32() / 8.0;
+                    if weights.scales.iter().any(|&bits| {
+                        let scale = half::f16::from_bits(bits).to_f32();
+                        !scale.is_finite()
+                            || (weights.group_size != weights.k && scale.abs() > limit)
+                    }) {
+                        return Err(OperatorError::Unsupported(
+                            "Marlin shard weight scales exceed the supported range",
+                        ));
+                    }
+                    launch
+                }
+            };
+            let (packed, scales, _) = marlin_layout::pack(weights)?;
+            let workspace = match (output, session.marlin_workspace_f32) {
+                (OutputType::F32, Some(query)) => MarlinWorkspace::Shaped(query),
+                _ => {
+                    let bytes = weights.n as usize / 128 * 16 * size_of::<i32>();
+                    MarlinWorkspace::Resident(Buffer::new(session, ptr::null(), bytes)?)
+                }
+            };
+            (
+                Buffer::upload(session, &packed)?,
+                Buffer::upload(session, &scales)?,
+                launch,
+                workspace,
+            )
+        };
         Ok(PreparedW4A16 {
             k: weights.k,
             n: weights.n,
             group_size: weights.group_size,
-            packed: Buffer::upload(session, &packed)?,
-            scale: Buffer::upload(session, &scales)?,
+            packed,
+            scale,
             kernel: Kernel::Marlin {
-                api,
-                workspace: Buffer::new(session, ptr::null(), workspace_bytes)?,
+                launch,
+                output,
+                workspace,
             },
         })
     }
@@ -336,23 +473,64 @@ impl<'lib> DeviceSession<'lib> {
         &self,
         weights: W4Weights<'_>,
     ) -> Result<PreparedW4A16<'lib>, OperatorError> {
+        self.prepare_humming_kernel(weights, OutputType::F16)
+    }
+
+    fn prepare_humming_kernel(
+        &self,
+        weights: W4Weights<'_>,
+        output: OutputType,
+    ) -> Result<PreparedW4A16<'lib>, OperatorError> {
         let session = &self.0;
-        type Entry = unsafe extern "C" fn() -> *const HummingApi;
-        let entry = unsafe { session.library.get::<Entry>(b"plait_w4a16_humming_api_v1") }
-            .map_err(|_| OperatorError::Unsupported("library has no resident Humming kernel"))?;
-        let api = unsafe { entry().as_ref() }
-            .ok_or_else(|| OperatorError::Backend("resident Humming API is null".to_owned()))?;
-        let probe = unsafe {
-            (api.probe)(
-                session.handle.as_ptr(),
-                weights.n,
-                weights.k,
-                weights.group_size,
+        let handle = session.handle.as_ptr();
+        let (n, k, group_size) = (weights.n, weights.k, weights.group_size);
+        type EntryV2 = unsafe extern "C" fn() -> *const HummingApiV2;
+        let shaped = unsafe {
+            session
+                .library
+                .get::<EntryV2>(b"plait_w4a16_humming_api_v2")
+        };
+        let (probe, repack, launch, launch_f32) = if let Ok(entry) = shaped {
+            let api = unsafe { entry().as_ref() }
+                .ok_or_else(|| OperatorError::Backend("Humming v2 API is null".to_owned()))?;
+            let bits = if output == OutputType::F32 { 32 } else { 16 };
+            let probe = unsafe { (api.probe)(handle, n, k, group_size, bits) };
+            (
+                probe,
+                HummingRepack::Shaped(api.repack),
+                api.launch,
+                (output == OutputType::F32).then_some(api.launch),
+            )
+        } else {
+            type Entry = unsafe extern "C" fn() -> *const HummingApi;
+            let entry = unsafe { session.library.get::<Entry>(b"plait_w4a16_humming_api_v1") }
+                .map_err(|_| {
+                    OperatorError::Unsupported("library has no resident Humming kernel")
+                })?;
+            let api = unsafe { entry().as_ref() }
+                .ok_or_else(|| OperatorError::Backend("Humming v1 API is null".to_owned()))?;
+            let launch_f32 = if output == OutputType::F32 {
+                Some(
+                    session
+                        .humming_launch_f32
+                        .ok_or(OperatorError::Unsupported(
+                            "library has no FP32 Humming output",
+                        ))?,
+                )
+            } else {
+                None
+            };
+            let probe = unsafe { (api.probe)(handle, n, k, group_size) };
+            (
+                probe,
+                HummingRepack::Legacy(api.repack),
+                api.launch,
+                launch_f32,
             )
         };
         if probe == -1 {
             return Err(OperatorError::Unsupported(
-                "Humming library has no kernel for this device and weight shape",
+                "Humming library has no kernel for this device, weight shape, and output type",
             ));
         }
         status("probe Humming device", probe)?;
@@ -360,7 +538,12 @@ impl<'lib> DeviceSession<'lib> {
         let canonical = Buffer::upload(session, weights.packed)?;
         let packed = Buffer::new(session, ptr::null(), weights.packed.len())?;
         status("repack Humming weights", unsafe {
-            (api.repack)(session.handle.as_ptr(), canonical.ptr(), packed.ptr())
+            match repack {
+                HummingRepack::Legacy(repack) => repack(handle, canonical.ptr(), packed.ptr()),
+                HummingRepack::Shaped(repack) => {
+                    repack(handle, n, k, group_size, canonical.ptr(), packed.ptr())
+                }
+            }
         })?;
         Ok(PreparedW4A16 {
             k: weights.k,
@@ -369,10 +552,29 @@ impl<'lib> DeviceSession<'lib> {
             packed,
             scale: Buffer::upload(session, &scales)?,
             kernel: Kernel::Humming {
-                api,
+                launch,
                 zero: Buffer::upload(session, &zeros)?,
+                launch_f32,
             },
         })
+    }
+
+    /// Prepare Humming for FP32 output on a matching weight shape.
+    pub fn prepare_humming_f32(
+        &self,
+        weights: W4Weights<'_>,
+    ) -> Result<PreparedW4A16<'lib>, OperatorError> {
+        // The tensor-core path decodes the INT4 weights in FP16 before MMA.
+        let scale_limit = half::f16::MAX.to_f32() / 15.0;
+        if weights.scales.iter().any(|&bits| {
+            let scale = half::f16::from_bits(bits).to_f32();
+            !scale.is_finite() || scale.abs() > scale_limit
+        }) {
+            return Err(OperatorError::Unsupported(
+                "Humming shard weight scales exceed the FP16 dequantization range",
+            ));
+        }
+        self.prepare_humming_kernel(weights, OutputType::F32)
     }
 
     /// Upload a row-major FP16 tensor. The host slice may be reused on return.
@@ -415,6 +617,10 @@ impl<'lib> DeviceSession<'lib> {
 
     pub fn supports_f16_quantization(&self) -> bool {
         self.0.quantized_launch.is_some() && self.0.quantize_f16.is_some()
+    }
+
+    pub fn supports_completion_query(&self) -> bool {
+        self.0.completion_query.is_some()
     }
 
     /// Quantize an existing FP16 allocation without moving its data to the host.
@@ -473,8 +679,11 @@ impl<'lib> DeviceSession<'lib> {
             Some(Rc::new(Completion {
                 session: Rc::clone(session),
                 handle: handle_or_error(event)?,
-                dependencies: [input.completion.clone(), None],
-                invalid: Some(invalid),
+                inputs: SubmissionInputs {
+                    dependencies: [input.completion.clone(), None],
+                    _inputs: vec![input.buffer.clone()],
+                    invalid: Some(invalid),
+                },
                 result: OnceCell::new(),
             }))
         };
@@ -509,6 +718,16 @@ pub struct DeviceQuantizedActivations<'lib> {
     completion: Option<Rc<Completion<'lib>>>,
 }
 
+impl DeviceQuantizedActivations<'_> {
+    /// Query the producer event without waiting or reading device memory.
+    /// Input finiteness is checked when a downstream result is waited on or read.
+    pub fn is_ready(&self) -> Result<bool, OperatorError> {
+        self.completion
+            .as_ref()
+            .map_or(Ok(true), |event| event.is_ready())
+    }
+}
+
 /// One resident packed weight matrix. Reuse it across submissions.
 pub struct PreparedW4A16<'lib> {
     k: u32,
@@ -524,13 +743,31 @@ enum Kernel<'lib> {
         zero: Buffer<'lib>,
     },
     Marlin {
-        api: &'lib MarlinApi,
-        workspace: Buffer<'lib>,
+        launch: MarlinLaunch,
+        output: OutputType,
+        workspace: MarlinWorkspace<'lib>,
     },
     Humming {
-        api: &'lib HummingApi,
+        launch: HummingLaunch,
         zero: Buffer<'lib>,
+        launch_f32: Option<HummingLaunch>,
     },
+}
+
+enum MarlinWorkspace<'lib> {
+    Resident(Buffer<'lib>),
+    Shaped(MarlinWorkspaceQuery),
+    Tiled(TiledWorkspaceQuery),
+}
+
+impl MarlinWorkspace<'_> {
+    fn scratch_bytes(&self, rows: u32, n: u32, k: u32) -> usize {
+        match self {
+            Self::Resident(_) => 0,
+            Self::Shaped(query) => unsafe { query(rows, n) },
+            Self::Tiled(query) => unsafe { query(rows, n, k) },
+        }
+    }
 }
 
 impl<'lib> PreparedW4A16<'lib> {
@@ -540,6 +777,22 @@ impl<'lib> PreparedW4A16<'lib> {
 
     pub fn group_size(&self) -> u32 {
         self.group_size
+    }
+
+    /// Bytes held by the prepared weight layout and persistent workspace.
+    pub fn resident_bytes(&self) -> u64 {
+        let auxiliary = match &self.kernel {
+            Kernel::Reference { zero } | Kernel::Humming { zero, .. } => zero.bytes(),
+            Kernel::Marlin {
+                workspace: MarlinWorkspace::Resident(workspace),
+                ..
+            } => workspace.bytes(),
+            Kernel::Marlin { .. } => 0,
+        };
+        self.packed
+            .bytes()
+            .saturating_add(self.scale.bytes())
+            .saturating_add(auxiliary)
     }
 
     /// Run a signed INT4 or INT8 activation against canonical INT4 weights.
@@ -573,6 +826,12 @@ impl<'lib> PreparedW4A16<'lib> {
             [
                 input.completion.clone(),
                 bias.and_then(|tensor| tensor.completion.clone()),
+            ],
+            &[
+                Some(&input.codes),
+                Some(&input.scale),
+                Some(zero),
+                bias.map(|tensor| &tensor.buffer),
             ],
             |shape, buffer, event| unsafe {
                 launch(
@@ -628,10 +887,10 @@ impl<'lib> PreparedW4A16<'lib> {
             ));
         }
         self.check_bias(bias)?;
-        if matches!(self.kernel, Kernel::Marlin { .. }) {
-            if bias.is_some() || output != OutputType::F16 {
+        if let Kernel::Marlin { output: kind, .. } = self.kernel {
+            if bias.is_some() || output != kind {
                 return Err(OperatorError::Unsupported(
-                    "Marlin requires an FP16 output without fused bias",
+                    "Marlin requires the prepared output type without fused bias",
                 ));
             }
             if (input.rows as u64) * (self.k.max(self.n) as u64) > i32::MAX as u64 {
@@ -640,19 +899,51 @@ impl<'lib> PreparedW4A16<'lib> {
                 ));
             }
         }
-        if matches!(self.kernel, Kernel::Humming { .. })
-            && (bias.is_some() || output != OutputType::F16)
-        {
+        if matches!(self.kernel, Kernel::Humming { .. }) && bias.is_some() {
             return Err(OperatorError::Unsupported(
-                "Humming requires an FP16 output without fused bias",
+                "Humming does not support fused bias",
             ));
         }
+        let humming_launch = match &self.kernel {
+            Kernel::Humming { launch_f32, .. } if output == OutputType::F32 => {
+                Some(launch_f32.ok_or(OperatorError::Unsupported(
+                    "Humming weights were not prepared for FP32 output",
+                ))?)
+            }
+            Kernel::Humming { launch, .. } => Some(*launch),
+            _ => None,
+        };
+        let scratch_bytes = match &self.kernel {
+            Kernel::Marlin { workspace, .. } if input.rows != 0 => {
+                workspace.scratch_bytes(input.rows, self.n, self.k)
+            }
+            _ => 0,
+        };
+        if scratch_bytes > isize::MAX as usize {
+            return Err(OperatorError::Shape("invalid Marlin scratch size"));
+        }
+        let marlin_scratch = (scratch_bytes != 0)
+            .then(|| Buffer::new(session, ptr::null(), scratch_bytes))
+            .transpose()?;
+        let kernel_buffer = match &self.kernel {
+            Kernel::Reference { zero } | Kernel::Humming { zero, .. } => Some(zero),
+            Kernel::Marlin {
+                workspace: MarlinWorkspace::Resident(locks),
+                ..
+            } => Some(locks),
+            Kernel::Marlin { .. } => marlin_scratch.as_ref(),
+        };
         self.submit_output(
             input.rows,
             output,
             [
                 input.completion.clone(),
                 bias.and_then(|tensor| tensor.completion.clone()),
+            ],
+            &[
+                Some(&input.buffer),
+                kernel_buffer,
+                bias.map(|tensor| &tensor.buffer),
             ],
             |shape, buffer, event| unsafe {
                 match &self.kernel {
@@ -667,17 +958,18 @@ impl<'lib> PreparedW4A16<'lib> {
                         buffer,
                         event,
                     ),
-                    Kernel::Marlin { api, workspace } => (api.launch)(
+                    Kernel::Marlin { launch, .. } => launch(
                         session.handle.as_ptr(),
                         shape,
                         input.buffer.ptr(),
                         self.packed.ptr(),
                         self.scale.ptr(),
-                        workspace.ptr(),
+                        kernel_buffer.map_or(ptr::null_mut(), Buffer::ptr),
                         buffer,
                         event,
                     ),
-                    Kernel::Humming { api, zero } => (api.launch)(
+                    Kernel::Humming { zero, .. } => humming_launch
+                        .expect("Humming output validated")(
                         session.handle.as_ptr(),
                         shape,
                         input.buffer.ptr(),
@@ -697,6 +989,7 @@ impl<'lib> PreparedW4A16<'lib> {
         rows: u32,
         output: OutputType,
         dependencies: [Option<Rc<Completion<'lib>>>; 2],
+        inputs: &[Option<&Buffer<'lib>>],
         submit: impl FnOnce(&Shape, *mut c_void, *mut *mut c_void) -> i32,
     ) -> Result<DeviceTensor<'lib>, OperatorError> {
         let session = &self.packed.session;
@@ -725,8 +1018,17 @@ impl<'lib> PreparedW4A16<'lib> {
             Some(Rc::new(Completion {
                 session: Rc::clone(session),
                 handle: handle_or_error(event)?,
-                dependencies,
-                invalid: None,
+                inputs: SubmissionInputs {
+                    dependencies,
+                    _inputs: inputs
+                        .iter()
+                        .flatten()
+                        .copied()
+                        .chain([&self.packed, &self.scale])
+                        .cloned()
+                        .collect(),
+                    invalid: None,
+                },
                 result: OnceCell::new(),
             }))
         };
@@ -750,6 +1052,14 @@ pub struct DeviceTensor<'lib> {
 }
 
 impl DeviceTensor<'_> {
+    /// Query the producer event without waiting or copying the result.
+    /// Use `wait` or `read` to check upstream errors and quantizer flags.
+    pub fn is_ready(&self) -> Result<bool, OperatorError> {
+        self.completion
+            .as_ref()
+            .map_or(Ok(true), |event| event.is_ready())
+    }
+
     /// Wait for this tensor and propagate any failed upstream GPU operation.
     pub fn wait(&self) -> Result<(), OperatorError> {
         self.completion
@@ -771,9 +1081,16 @@ impl DeviceTensor<'_> {
     }
 }
 
+#[derive(Clone)]
 struct Buffer<'lib> {
     session: Rc<Session<'lib>>,
-    handle: Option<NonNull<c_void>>,
+    allocation: Option<Rc<Allocation<'lib>>>,
+}
+
+struct Allocation<'lib> {
+    session: Rc<Session<'lib>>,
+    handle: NonNull<c_void>,
+    bytes: usize,
 }
 
 impl<'lib> Buffer<'lib> {
@@ -786,31 +1103,43 @@ impl<'lib> Buffer<'lib> {
         source: *const c_void,
         bytes: usize,
     ) -> Result<Self, OperatorError> {
-        let handle = if bytes == 0 {
+        let allocation = if bytes == 0 {
             None
         } else {
             let mut buffer = ptr::null_mut();
             status("allocate device buffer", unsafe {
                 (session.api.buffer_new)(session.handle.as_ptr(), source, bytes, &mut buffer)
             })?;
-            Some(handle_or_error(buffer)?)
+            Some(Rc::new(Allocation {
+                session: Rc::clone(session),
+                handle: handle_or_error(buffer)?,
+                bytes,
+            }))
         };
         Ok(Self {
             session: Rc::clone(session),
-            handle,
+            allocation,
         })
     }
 
+    fn bytes(&self) -> u64 {
+        self.allocation
+            .as_ref()
+            .map_or(0, |allocation| allocation.bytes as u64)
+    }
+
     fn ptr(&self) -> *mut c_void {
-        self.handle.map_or(ptr::null_mut(), NonNull::as_ptr)
+        self.allocation
+            .as_ref()
+            .map_or(ptr::null_mut(), |allocation| allocation.handle.as_ptr())
     }
 
     fn read<T>(&self, destination: &mut [T]) -> Result<(), OperatorError> {
-        if let Some(handle) = self.handle {
+        if let Some(allocation) = &self.allocation {
             status("read device buffer", unsafe {
                 (self.session.api.buffer_read)(
                     self.session.handle.as_ptr(),
-                    handle.as_ptr(),
+                    allocation.handle.as_ptr(),
                     destination.as_mut_ptr().cast(),
                     size_of_val(destination),
                 )
@@ -820,36 +1149,61 @@ impl<'lib> Buffer<'lib> {
     }
 }
 
-impl Drop for Buffer<'_> {
+impl Drop for Allocation<'_> {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle {
-            unsafe {
-                (self.session.api.buffer_free)(self.session.handle.as_ptr(), handle.as_ptr())
-            };
-        }
+        unsafe {
+            (self.session.api.buffer_free)(self.session.handle.as_ptr(), self.handle.as_ptr())
+        };
     }
 }
 
 struct Completion<'lib> {
     session: Rc<Session<'lib>>,
     handle: NonNull<c_void>,
-    dependencies: [Option<Rc<Completion<'lib>>>; 2],
-    invalid: Option<Buffer<'lib>>,
+    inputs: SubmissionInputs<'lib>,
     result: OnceCell<Result<(), OperatorError>>,
 }
 
+struct SubmissionInputs<'lib> {
+    dependencies: [Option<Rc<Completion<'lib>>>; 2],
+    _inputs: Vec<Buffer<'lib>>,
+    invalid: Option<Buffer<'lib>>,
+}
+
 impl Completion<'_> {
+    fn is_ready(&self) -> Result<bool, OperatorError> {
+        let query = self
+            .session
+            .completion_query
+            .ok_or(OperatorError::Unsupported(
+                "device library has no W4 completion query",
+            ))?;
+        let mut ready = u32::MAX;
+        status("query W4 completion", unsafe {
+            query(
+                self.session.handle.as_ptr(),
+                self.handle.as_ptr(),
+                &mut ready,
+            )
+        })?;
+        match ready {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(OperatorError::Backend("invalid W4 completion state".into())),
+        }
+    }
+
     fn wait(&self) -> Result<(), OperatorError> {
         self.result
             .get_or_init(|| {
                 let own = status("wait for W4 linear", unsafe {
                     (self.session.api.wait)(self.session.handle.as_ptr(), self.handle.as_ptr())
                 });
-                for dependency in self.dependencies.iter().flatten() {
+                for dependency in self.inputs.dependencies.iter().flatten() {
                     dependency.wait()?;
                 }
                 own?;
-                if let Some(invalid) = &self.invalid {
+                if let Some(invalid) = &self.inputs.invalid {
                     let mut flag = [0u32];
                     invalid.read(&mut flag)?;
                     if flag[0] != 0 {

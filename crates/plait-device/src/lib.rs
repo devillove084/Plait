@@ -10,7 +10,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::process::Command;
 
-use cudarc::driver::{CudaContext, sys};
 use plait_core::{AcceleratorKind, ComputeRequirement, DeviceId, DeviceProfile, NodeId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,18 +199,65 @@ fn discover_nvidia(node: NodeId) -> Vec<DeviceProfile> {
     if !output.status.success() {
         return Vec::new();
     }
-    parse_nvidia(&String::from_utf8_lossy(&output.stdout), node)
+    let driver = CudaDriver::open();
+    parse_nvidia(&String::from_utf8_lossy(&output.stdout), node, |index| {
+        driver.as_ref()?.sm_count(index)
+    })
 }
 
-fn nvidia_sm_count(index: u32) -> Option<u32> {
-    let context = CudaContext::new(index as usize).ok()?;
-    context
-        .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
-        .ok()
-        .and_then(|value| u32::try_from(value).ok())
+struct CudaDriver {
+    _library: libloading::Library,
+    device_get: unsafe extern "system" fn(*mut i32, i32) -> i32,
+    attribute: unsafe extern "system" fn(*mut i32, i32, i32) -> i32,
 }
 
-fn parse_nvidia(text: &str, node: NodeId) -> Vec<DeviceProfile> {
+impl CudaDriver {
+    fn open() -> Option<Self> {
+        let name = match std::env::consts::OS {
+            "linux" => "libcuda.so.1",
+            "windows" => "nvcuda.dll",
+            "macos" => "libcuda.dylib",
+            _ => return None,
+        };
+        // These are the device query entry points of the system CUDA driver.
+        // Discovery keeps using the management tool if the driver is unavailable.
+        unsafe {
+            let library = libloading::Library::new(name).ok()?;
+            let init = library
+                .get::<unsafe extern "system" fn(u32) -> i32>(b"cuInit")
+                .ok()?;
+            if init(0) != 0 {
+                return None;
+            }
+            Some(Self {
+                device_get: *library.get(b"cuDeviceGet").ok()?,
+                attribute: *library.get(b"cuDeviceGetAttribute").ok()?,
+                _library: library,
+            })
+        }
+    }
+
+    fn sm_count(&self, index: u32) -> Option<u32> {
+        const MULTIPROCESSOR_COUNT: i32 = 16;
+        let ordinal = i32::try_from(index).ok()?;
+        let mut device = 0;
+        let mut count = 0;
+        unsafe {
+            if (self.device_get)(&mut device, ordinal) != 0
+                || (self.attribute)(&mut count, MULTIPROCESSOR_COUNT, device) != 0
+            {
+                return None;
+            }
+        }
+        (count > 0).then_some(count as u32)
+    }
+}
+
+fn parse_nvidia(
+    text: &str,
+    node: NodeId,
+    sm_count: impl Fn(u32) -> Option<u32>,
+) -> Vec<DeviceProfile> {
     let mut profiles = Vec::new();
     for line in text.lines() {
         let fields: Vec<&str> = line.split(',').map(str::trim).collect();
@@ -227,7 +273,7 @@ fn parse_nvidia(text: &str, node: NodeId) -> Vec<DeviceProfile> {
         let clock_mhz = fields[3].parse::<u64>().unwrap_or(0);
         let name = fields[1];
         let capability = fields[4].trim();
-        let sm_count = nvidia_sm_count(index).unwrap_or(1);
+        let sm_count = sm_count(index).unwrap_or(1);
         let tensor_ops_per_sm = match capability {
             "12.0" => 256,
             "9.0" => 256,
@@ -446,10 +492,14 @@ mod tests {
     #[test]
     fn nvidia_csv_parses_into_a_profile() {
         let node = NodeId::derive("dev-parse");
-        let profiles = parse_nvidia("0, NVIDIA Blackwell, 73415, 2600, 12.0\n", node);
+        let profiles = parse_nvidia("0, NVIDIA Blackwell, 73415, 2600, 12.0\n", node, |index| {
+            assert_eq!(index, 0);
+            Some(110)
+        });
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0].arch, AcceleratorKind::Nvidia);
         assert_eq!(profiles[0].memory_bytes, 73415 * 1024 * 1024);
+        assert_eq!(profiles[0].compute_units, 110);
         assert!(profiles[0].flops > 0);
     }
 

@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use plait_core::serving::{
     ExecutionHostLiveness, GroupPhase, GroupVersion, ServingError, ServingOutcome, ServingResult,
+    WorkerGrant,
 };
 use plait_core::{DeviceId, NodeId, OpId};
 
@@ -56,12 +57,28 @@ impl ServingState {
         Ok(ServingOutcome::ExecutionHostOnline)
     }
 
+    pub(crate) fn execution_versions_on(&self, host: NodeId) -> BTreeSet<GroupVersion> {
+        self.versions_on(host, |grant| {
+            self.resident_owner(grant).is_some() || self.host_has_launch(grant.version, host)
+        })
+    }
+
     pub(crate) fn resident_versions_on(&self, host: NodeId) -> BTreeSet<GroupVersion> {
+        self.versions_on(host, |grant| self.resident_owner(grant).is_some())
+    }
+
+    fn versions_on(
+        &self,
+        host: NodeId,
+        holds_launch: impl Fn(WorkerGrant) -> bool,
+    ) -> BTreeSet<GroupVersion> {
         self.workers
             .range(DeviceId::new(host, 0)..=DeviceId::new(host, u32::MAX))
             .filter_map(|(_, worker)| {
                 let grant = worker.grant?;
-                self.resident_owner(grant)?;
+                if !holds_launch(grant) {
+                    return None;
+                }
                 let group = self.group(grant.version)?;
                 matches!(
                     group.phase,
@@ -84,7 +101,7 @@ impl ServingState {
         let old = self
             .execution_host(host)
             .ok_or(ServingError::StaleExecutionHost)?;
-        if old.pulse != pulse || !old.online || &self.resident_versions_on(host) != groups {
+        if old.pulse != pulse || !old.online || &self.execution_versions_on(host) != groups {
             return Err(ServingError::StaleExecutionHost);
         }
         for &version in groups {
@@ -156,7 +173,7 @@ mod tests {
         state.activate(version).unwrap();
         state.pulse_execution_host(host, pulses[1], lock).unwrap();
 
-        let affected = state.resident_versions_on(host);
+        let affected = state.execution_versions_on(host);
         assert_eq!(affected, BTreeSet::from([version]));
         assert_eq!(
             state.expire_execution_host(host, pulses[0], &affected),

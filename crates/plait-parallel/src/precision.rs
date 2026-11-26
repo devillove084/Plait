@@ -48,6 +48,15 @@ pub enum W4Quantization {
     Device,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum W4Kernel {
+    Reference,
+    Humming,
+    Marlin,
+    Integer,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct W4Profile {
     pub scope: W4Scope,
@@ -56,6 +65,10 @@ pub struct W4Profile {
     /// Older profiles defer to the loaded library's default low-bit path.
     #[serde(default)]
     pub quantization: Option<W4Quantization>,
+    /// Explicit kernels are calibrated against the canonical FP32 output.
+    /// Omitted kernels use the legacy calibration and dispatch rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<W4Kernel>,
     /// Includes preparation for this invocation, execution, and delivery to the reducer.
     pub latency_ns: u64,
     /// Upper bound for this shard's L2 error, normalized by a common layer norm.
@@ -66,23 +79,52 @@ pub struct W4Profile {
 impl W4Profile {
     pub fn is_valid(self) -> bool {
         self.latency_ns != 0
-            && match self.activation_bits {
-                4 | 8 => true,
-                16 => self.quantization.is_none() && self.error_ppm == 0,
+            && match (self.activation_bits, self.kernel) {
+                (4 | 8, None) => true,
+                (4 | 8, Some(W4Kernel::Integer)) => self.quantization.is_some(),
+                (16, None | Some(W4Kernel::Reference)) => {
+                    self.quantization.is_none() && self.error_ppm == 0
+                }
+                (16, Some(W4Kernel::Humming | W4Kernel::Marlin)) => self.quantization.is_none(),
                 _ => false,
             }
     }
 
-    fn mode_key(&self) -> (u32, Option<W4Quantization>) {
-        (self.activation_bits, self.quantization)
+    fn check_calibration(&self, explicit: &mut Option<bool>) -> Result<(), &'static str> {
+        if !self.is_valid() {
+            return Err("invalid W4 profile");
+        }
+        let named = self.kernel.is_some();
+        if explicit
+            .replace(named)
+            .is_some_and(|current| current != named)
+        {
+            return Err("W4 selection cannot mix legacy and explicit kernel calibrations");
+        }
+        Ok(())
     }
 
-    fn preference(&self) -> (u64, u64, Reverse<u32>, bool) {
+    fn mode_key(&self) -> (u32, Option<W4Quantization>, Option<W4Kernel>) {
+        (self.activation_bits, self.quantization, self.kernel)
+    }
+
+    fn preference(
+        &self,
+    ) -> (
+        u64,
+        u64,
+        Reverse<u32>,
+        bool,
+        Option<W4Quantization>,
+        Option<W4Kernel>,
+    ) {
         (
             self.error_ppm,
             self.latency_ns,
             Reverse(self.activation_bits),
             self.quantization.is_none(),
+            self.quantization,
+            self.kernel,
         )
     }
 }
@@ -133,6 +175,7 @@ pub fn select_w4(request: &W4SelectionRequest) -> Result<W4Selection, &'static s
         candidates.insert(shard.scope, BTreeMap::new());
     }
     let mut deadlines = BTreeSet::new();
+    let mut explicit = None;
     for profile in &request.profiles {
         let Some(modes) = candidates.get_mut(&profile.scope) else {
             continue;
@@ -142,13 +185,9 @@ pub fn select_w4(request: &W4SelectionRequest) -> Result<W4Selection, &'static s
         {
             continue;
         }
-        if !profile.is_valid() {
-            return Err("invalid W4 profile");
-        }
+        profile.check_calibration(&mut explicit)?;
         if modes.insert(profile.mode_key(), *profile).is_some() {
-            return Err(
-                "duplicate current W4 profile for the same precision and quantization path",
-            );
+            return Err("duplicate current W4 profile for the same execution mode");
         }
         deadlines.insert(profile.latency_ns);
     }
@@ -255,6 +294,7 @@ mod tests {
                 calibration_id: [9; 32],
                 activation_bits: bits,
                 quantization: None,
+                kernel: None,
                 latency_ns: time,
                 error_ppm: error,
                 valid_until_ms: 100,
@@ -311,8 +351,72 @@ mod tests {
         request.profiles.push(request.profiles[0]);
         assert_eq!(
             select_w4(&request).unwrap_err(),
-            "duplicate current W4 profile for the same precision and quantization path"
+            "duplicate current W4 profile for the same execution mode"
         );
+    }
+
+    #[test]
+    fn selects_a16_kernels_under_the_canonical_error_budget() {
+        let mut request = request();
+        request
+            .profiles
+            .retain(|profile| profile.activation_bits == 16);
+        for profile in &mut request.profiles {
+            profile.kernel = Some(W4Kernel::Reference);
+        }
+        request.profiles.extend([
+            W4Profile {
+                kernel: Some(W4Kernel::Humming),
+                latency_ns: 30,
+                error_ppm: 8,
+                ..request.profiles[0]
+            },
+            W4Profile {
+                kernel: Some(W4Kernel::Marlin),
+                latency_ns: 40,
+                ..request.profiles[0]
+            },
+            W4Profile {
+                kernel: Some(W4Kernel::Humming),
+                latency_ns: 35,
+                error_ppm: 1,
+                ..request.profiles[1]
+            },
+        ]);
+        let assert_plan = |plan: W4Selection, time, error, kernels| {
+            assert_eq!((plan.critical_path_ns, plan.error_bound_ppm), (time, error));
+            assert_eq!(
+                plan.decisions
+                    .iter()
+                    .map(|d| d.profile.kernel.unwrap())
+                    .collect::<Vec<_>>(),
+                kernels
+            );
+        };
+        request.max_error_ppm = 9;
+        assert_plan(
+            select_w4(&request).unwrap(),
+            35,
+            9,
+            [W4Kernel::Humming, W4Kernel::Humming],
+        );
+        request.max_error_ppm = 0;
+        assert_plan(
+            select_w4(&request).unwrap(),
+            100,
+            0,
+            [W4Kernel::Marlin, W4Kernel::Reference],
+        );
+
+        request.profiles[1].kernel = None;
+        assert_eq!(
+            select_w4(&request).unwrap_err(),
+            "W4 selection cannot mix legacy and explicit kernel calibrations"
+        );
+        request.profiles[1].valid_until_ms = request.now_ms;
+        assert!(select_w4(&request).is_err());
+        request.max_error_ppm = 9;
+        assert!(select_w4(&request).is_ok());
     }
 
     #[test]

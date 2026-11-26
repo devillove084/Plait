@@ -68,23 +68,23 @@ class CommHandle:
     ) -> int:
         return self._handle.all_reduce_fp8_to_f32(send, recv, count)
 
-    def all_gather(self, send: int, recv: int, count: int, dtype: int) -> int:
-        return self._handle.all_gather(send, recv, count, dtype)
+    def all_gather(self, send: int, recv: int, count: int, dtype: int, stream: int = 0) -> int:
+        return self._handle.all_gather(send, recv, count, dtype, stream)
 
-    def broadcast(self, send: int, recv: int, count: int, dtype: int, root: int) -> int:
-        return self._handle.broadcast(send, recv, count, dtype, root)
+    def broadcast(self, send: int, recv: int, count: int, dtype: int, root: int, stream: int = 0) -> int:
+        return self._handle.broadcast(send, recv, count, dtype, root, stream)
 
-    def reduce_scatter(self, send: int, recv: int, count: int, dtype: int, op: int) -> int:
-        return self._handle.reduce_scatter(send, recv, count, dtype, op)
+    def reduce_scatter(self, send: int, recv: int, count: int, dtype: int, op: int, stream: int = 0) -> int:
+        return self._handle.reduce_scatter(send, recv, count, dtype, op, stream)
 
-    def reduce(self, send: int, recv: int, count: int, dtype: int, op: int, root: int) -> int:
-        return self._handle.reduce(send, recv, count, dtype, op, root)
+    def reduce(self, send: int, recv: int, count: int, dtype: int, op: int, root: int, stream: int = 0) -> int:
+        return self._handle.reduce(send, recv, count, dtype, op, root, stream)
 
-    def send(self, ptr: int, count: int, dtype: int, dest: int) -> int:
-        return self._handle.send(ptr, count, dtype, dest)
+    def send(self, ptr: int, count: int, dtype: int, dest: int, stream: int = 0) -> int:
+        return self._handle.send(ptr, count, dtype, dest, stream)
 
-    def recv(self, ptr: int, count: int, dtype: int, src: int) -> int:
-        return self._handle.recv(ptr, count, dtype, src)
+    def recv(self, ptr: int, count: int, dtype: int, src: int, stream: int = 0) -> int:
+        return self._handle.recv(ptr, count, dtype, src, stream)
 
 
 def _port() -> int:
@@ -113,12 +113,16 @@ class NCCLLibrary:
     path_to_library_cache: dict[str, Any] = {}
     path_to_dict_mapping: dict[str, Any] = {}
 
-    def __init__(self, so_file: str | None = None) -> None:
+    def __init__(self, so_file: str | None = None, *, device: int | None = None) -> None:
         self.so_file = so_file
+        self.device = device
         self._comms: set[CommHandle] = set()
 
     def NCCL_CHECK(self, result: int) -> None:
         _check(result)
+
+    def has_symbol(self, name: str) -> bool:
+        return callable(getattr(self, name, None))
 
     def ncclGetRawVersion(self) -> int:
         return VERSION
@@ -144,7 +148,10 @@ class NCCLLibrary:
     def ncclCommInitRank(self, world_size: int, unique_id: ncclUniqueId, rank: int) -> CommHandle:
         raw = bytes(unique_id.internal)
         port = int.from_bytes(raw[4:6], "little") if raw[:4] == b"PLNC" else _port()
-        device = int(os.environ.get("PLAIT_NCCL_DEVICE", os.environ.get("LOCAL_RANK", rank)))
+        # A vLLM worker can belong to a subgroup whose rank is not its device index.
+        device = self.device
+        if device is None:
+            device = int(os.environ.get("PLAIT_NCCL_DEVICE", os.environ.get("LOCAL_RANK", rank)))
         handle = _plait_nccl.CommHandle(rank, world_size, device, port)
         comm = CommHandle(handle)
         self._comms.add(comm)
@@ -172,22 +179,22 @@ class NCCLLibrary:
             raise RuntimeError(f"Plait NCCL error {result}")
 
     def ncclAllGather(self, sendbuff, recvbuff, count: int, datatype: int, comm: CommHandle, stream) -> None:
-        _check(comm.all_gather(_ptr(sendbuff), _ptr(recvbuff), count, datatype))
+        _check(comm.all_gather(_ptr(sendbuff), _ptr(recvbuff), count, datatype, _ptr(stream)))
 
     def ncclReduceScatter(self, sendbuff, recvbuff, count: int, datatype: int, op: int, comm: CommHandle, stream) -> None:
-        _check(comm.reduce_scatter(_ptr(sendbuff), _ptr(recvbuff), count, datatype, op))
+        _check(comm.reduce_scatter(_ptr(sendbuff), _ptr(recvbuff), count, datatype, op, _ptr(stream)))
 
     def ncclReduce(self, sendbuff, recvbuff, count: int, datatype: int, op: int, root: int, comm: CommHandle, stream) -> None:
-        _check(comm.reduce(_ptr(sendbuff), _ptr(recvbuff), count, datatype, op, root))
+        _check(comm.reduce(_ptr(sendbuff), _ptr(recvbuff), count, datatype, op, root, _ptr(stream)))
 
     def ncclBroadcast(self, sendbuff, recvbuff, count: int, datatype: int, root: int, comm: CommHandle, stream) -> None:
-        _check(comm.broadcast(_ptr(sendbuff), _ptr(recvbuff), count, datatype, root))
+        _check(comm.broadcast(_ptr(sendbuff), _ptr(recvbuff), count, datatype, root, _ptr(stream)))
 
     def ncclSend(self, sendbuff, count: int, datatype: int, dest: int, comm: CommHandle, stream) -> None:
-        _check(comm.send(_ptr(sendbuff), count, datatype, dest))
+        _check(comm.send(_ptr(sendbuff), count, datatype, dest, _ptr(stream)))
 
     def ncclRecv(self, recvbuff, count: int, datatype: int, src: int, comm: CommHandle, stream) -> None:
-        _check(comm.recv(_ptr(recvbuff), count, datatype, src))
+        _check(comm.recv(_ptr(recvbuff), count, datatype, src, _ptr(stream)))
 
     def ncclCommDestroy(self, comm: CommHandle) -> None:
         self._comms.discard(comm)

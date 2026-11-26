@@ -62,7 +62,7 @@ impl WorkerProcess {
                 Self::start_decoder(
                     grant,
                     config,
-                    weights,
+                    weights.as_deref(),
                     artifact.launch_digest,
                     listen,
                     lock,
@@ -84,7 +84,7 @@ impl WorkerProcess {
             "library": artifact.library, "ordinal": grant.device.ordinal,
             "group_size": artifact.group_size, "grant": grant, "k_range": artifact.k_range,
             "output_columns": artifact.output_columns, "listen": listen,
-            "device_lock": lock.path, "control": control
+            "device_lock": lock.path, "control": control, "kernel_profiles": artifact.kernel_profiles
         });
         let weights = tokio::fs::read_to_string(&artifact.weights).await?;
         let weights = weights.trim();
@@ -115,7 +115,7 @@ impl WorkerProcess {
     async fn start_decoder(
         grant: WorkerGrant,
         mut config: Value,
-        weights: &Path,
+        weights: Option<&Path>,
         launch_digest: [u8; 32],
         listen: SocketAddr,
         lock: &SlotLock,
@@ -127,6 +127,21 @@ impl WorkerProcess {
                 "decoder artifact configuration must be an object",
             )
         })?;
+        let has_checkpoint = object
+            .get("checkpoint")
+            .is_some_and(|value| !value.is_null());
+        let input = match (has_checkpoint, weights) {
+            (true, None) => Stdio::null(),
+            (false, Some(weights)) => {
+                Stdio::from(tokio::fs::File::open(weights).await?.into_std().await)
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "decoder worker needs exactly one checkpoint or weight record file",
+                ));
+            }
+        };
         object.insert("ordinal".into(), json!(grant.device.ordinal));
         object.insert(
             "service".into(),
@@ -135,8 +150,7 @@ impl WorkerProcess {
                 "grant": grant, "launch_digest": launch_digest, "managed": true,
             }),
         );
-        let file = tokio::fs::File::open(weights).await?.into_std().await;
-        let mut process = Self::spawn("decoder-w4", config, Stdio::from(file), lock)?;
+        let mut process = Self::spawn("decoder-w4", config, input, lock)?;
         let ready = tokio::time::timeout(Duration::from_secs(90), process.read()).await??;
         let endpoint: DecoderEndpoint = serde_json::from_value(ready["ready"].clone())?;
         if endpoint.grant != grant || endpoint.addr.ip() != listen.ip() || endpoint.addr.port() == 0
