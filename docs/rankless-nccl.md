@@ -867,8 +867,59 @@ reads without a complete peer manifest are declined. The target computes
 the uncovered prefix when the read reservation cannot be admitted.
 Required P/D prompt I/O uses the original protocol. The store's
 `--stats` response reports per-peer successful bytes, refusals, and
-pending bytes in each direction. These application budgets are local to one
-store and one registered IP per configured path.
+pending bytes in each direction.
+
+#### Share a peer budget across KV stores
+
+Set `--checkpoint-peer-budget-plan PATH` on each store when several stores
+use the same worker's network connection. The plan's `peers` list declares
+total budgets. Each member of `stores` names a concrete listening
+`endpoint` and its own `peers` list. Each peer entry has an `address`
+and a `limit` with the same read and write fields as the per-store map.
+For example, a shared 8 MiB/s read budget with a 2 MiB burst can allocate
+5 and 3 MiB/s with a 1 MiB burst to each of two stores. Add the read rates,
+read bursts, write rates, and write bursts separately. All four totals must
+fit the declared peer budgets.
+
+```json
+{
+  "peers": [
+    {"address": "192.0.2.10", "limit": {
+      "read": {"bytes_per_second": 8388608, "burst_bytes": 2097152},
+      "write": {"bytes_per_second": 6291456, "burst_bytes": 2097152}
+    }}
+  ],
+  "stores": [
+    {"endpoint": "192.0.2.11:7952", "peers": [
+      {"address": "192.0.2.10", "limit": {
+        "read": {"bytes_per_second": 5242880, "burst_bytes": 1048576},
+        "write": {"bytes_per_second": 2097152, "burst_bytes": 1048576}
+      }}
+    ]},
+    {"endpoint": "192.0.2.12:7952", "peers": [
+      {"address": "192.0.2.10", "limit": {
+        "read": {"bytes_per_second": 3145728, "burst_bytes": 1048576},
+        "write": {"bytes_per_second": 4194304, "burst_bytes": 1048576}
+      }}
+    ]}
+  ]
+}
+```
+
+A store installs only the share for its `--listen` endpoint. An empty
+`peers` list on a member gives that store no optional peer capacity. A
+direction with both fields set to zero can be disabled independently.
+Store buckets start empty on each restart and refill at their assigned
+rate, so restarting a member never supplies another initial burst.
+
+With all stores listening, run
+`plait-node kv-store --audit-checkpoint-peer-budget-plan PATH`. It
+verifies the installed plan ID and actual read and write shares at every
+endpoint. A successful audit prints the common ID and member list.
+The budget holds while the configured endpoints run their assigned shares
+under the common plan. Complete the retirement of an old allocation before
+bringing a different allocation into use. The audit observes the running
+configuration. Shares are fixed for the lifetime of each store process.
 
 ## Execute a collective
 

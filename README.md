@@ -217,6 +217,9 @@ and reports payload bytes and refusals.
 Per-peer directional limits charge the shards of a checkpoint to their
 actual TCP sources with one atomic page reservation.
 [Directional checkpoint budgets](docs/rankless-nccl.md#limit-checkpoint-traffic-by-peer-and-direction)
+Multiple stores can enforce disjoint shares of one peer budget and report
+their installed plan for a deployment audit.
+[Shared peer budgets](docs/rankless-nccl.md#share-a-peer-budget-across-kv-stores)
 
 `begin_execution_drain` withdraws one device or a whole execution host from
 new placements. The hosted planner can move affected groups at the incumbent
@@ -283,6 +286,7 @@ release the result after the matching completion has executed in the control pla
 | [Hosted checkpoint budget](specs/PlaitHostedCheckpointBudget.tla) | A replacement preserves the incumbent rate after steady traffic and in-flight checkpoint reservations are charged to shared ports and storage. |
 | [Checkpoint admission](specs/PlaitCheckpointAdmission.tla) | Optional writes and reserved reads share a burst. Refill accounts for bytes already granted to unfinished transfers. |
 | [Checkpoint peers](specs/PlaitCheckpointPeers.tla) | A complete page reservation fits every peer and the store. Each peer claims only its own reserved bytes. |
+| [Shared checkpoint peer budget](specs/PlaitCheckpointPeerPlan.tla) | Independent store shares stay inside one directional budget over any sampled interval, including a store restart. |
 | [Hosted mode selection](specs/PlaitHostedModeSelection.tla) | Mixed routes fit the combined port and KV-store budgets. A switch preserves the incumbent SLO rate and has positive benefit after startup and drain. |
 | [Execution maintenance](specs/PlaitExecutionMaintenance.tla) | A new grant avoids a withdrawn target, a separate device keeps its group, and confirmation waits for both grants and deferred holds to release. |
 | [Hosted P/D budgeting](specs/PlaitHostedPdBudget.tla) | Equal path shares consume the same Prefill and directional port budgets. The model checks combined TP and KV demand on shared ports. |

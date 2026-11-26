@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use super::peer_plan::Membership;
 use super::{Key, Writer};
 
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
@@ -14,7 +15,7 @@ const MAX_LEASES: usize = 1024;
 const LEASE_LIFETIME: Duration = Duration::from_secs(30);
 pub(super) const MAX_PEERS: usize = 128;
 
-#[derive(Clone, Copy, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Limit {
     pub(super) bytes_per_second: u64,
@@ -25,9 +26,13 @@ impl Limit {
     pub(super) fn valid(self) -> bool {
         self.bytes_per_second > 0 && self.burst_bytes > 0
     }
+
+    pub(super) fn valid_share(self) -> bool {
+        self.valid() || (self.bytes_per_second == 0 && self.burst_bytes == 0)
+    }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct PeerLimit {
     pub(super) read: Limit,
@@ -66,6 +71,8 @@ pub(super) struct Snapshot<'a> {
     pending_bytes: u64,
     read_leases: usize,
     peers: BTreeMap<IpAddr, PeerSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peer_budget_plan: Option<&'a Membership>,
     #[serde(flatten)]
     counters: &'a Counters,
 }
@@ -147,6 +154,7 @@ struct PeerSnapshot {
 struct State {
     global: Bucket,
     peers: BTreeMap<IpAddr, PeerBuckets>,
+    plan: Option<Membership>,
     started: Instant,
     updated: Instant,
     reads: HashMap<(Key, Writer), ReadLease>,
@@ -154,6 +162,10 @@ struct State {
 }
 
 impl State {
+    fn peers_are_restricted(&self) -> bool {
+        self.plan.is_some() || !self.peers.is_empty()
+    }
+
     fn refresh(&mut self, now: Instant) {
         let now = now.max(self.updated);
         let elapsed = now.duration_since(self.updated).as_nanos();
@@ -189,7 +201,7 @@ impl State {
 
     fn fits_read(&self, bytes: u64, peers: Option<&BTreeMap<IpAddr, u64>>) -> bool {
         self.global.fits(bytes)
-            && (self.peers.is_empty()
+            && (!self.peers_are_restricted()
                 || peers.is_some_and(|peers| {
                     peers.iter().all(|(ip, &bytes)| {
                         self.peers.get(ip).is_some_and(|peer| peer.read.fits(bytes))
@@ -218,13 +230,25 @@ impl Checkpoints {
         limit: Option<Limit>,
         peers: BTreeMap<IpAddr, PeerLimit>,
         now: Instant,
+        plan: Option<Membership>,
     ) -> Self {
+        let mut global = Bucket::new(limit);
+        let mut peers: BTreeMap<_, _> = peers
+            .into_iter()
+            .map(|(ip, limit)| (ip, PeerBuckets::new(limit)))
+            .collect();
+        if plan.is_some() {
+            // Restarting a store may not mint another burst of a shared link.
+            global.credits = 0;
+            for peer in peers.values_mut() {
+                peer.read.credits = 0;
+                peer.write.credits = 0;
+            }
+        }
         Self(Mutex::new(State {
-            global: Bucket::new(limit),
-            peers: peers
-                .into_iter()
-                .map(|(ip, limit)| (ip, PeerBuckets::new(limit)))
-                .collect(),
+            global,
+            peers,
+            plan,
             started: now,
             updated: now,
             reads: HashMap::new(),
@@ -323,7 +347,7 @@ impl Checkpoints {
         let mut state = self.0.lock().expect("checkpoint budget");
         state.refresh(now);
         if !state.global.fits(bytes)
-            || (!state.peers.is_empty()
+            || (state.peers_are_restricted()
                 && !state
                     .peers
                     .get(&peer)
@@ -381,6 +405,7 @@ impl Checkpoints {
                     )
                 })
                 .collect(),
+            peer_budget_plan: state.plan.as_ref(),
             counters: &state.counters,
         })
         .expect("serializable checkpoint metrics")
@@ -442,6 +467,7 @@ mod tests {
             }),
             BTreeMap::new(),
             start,
+            None,
         );
         let mut state = budget.0.lock().unwrap();
         state.global.charge(20);
@@ -463,6 +489,7 @@ mod tests {
             }),
             BTreeMap::new(),
             now,
+            None,
         );
         assert!(budget.reserve_read([1; 32], [1; 16], 80, None, now));
         let held = budget.write(local(), 20, now).unwrap();
@@ -517,6 +544,7 @@ mod tests {
                 ),
             ]),
             now,
+            None,
         );
         let key = [1; 32];
         let lease = [2; 16];

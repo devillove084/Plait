@@ -13,7 +13,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 
 mod checkpoints;
+mod peer_plan;
 use checkpoints::{Checkpoints, Limit, MAX_PEERS, PeerLimit};
+use peer_plan::PeerPlan;
 
 const MAGIC: &[u8; 8] = b"PLAITKV2";
 const RANGED_MAGIC: &[u8; 8] = b"PLAITKV3";
@@ -414,12 +416,24 @@ pub(super) async fn run(
         println!("{body}");
         return Ok(());
     }
+    if first.as_deref() == Some("--audit-checkpoint-peer-budget-plan") {
+        let path = args
+            .next()
+            .ok_or("--audit-checkpoint-peer-budget-plan needs a file")?;
+        if args.next().is_some() {
+            return Err("--audit-checkpoint-peer-budget-plan accepts a single file".into());
+        }
+        let report = PeerPlan::load(&path)?.audit().await?;
+        println!("{report}");
+        return Ok(());
+    }
     let mut args = first.into_iter().chain(args);
     let mut listen = "127.0.0.1:7952".parse::<SocketAddr>()?;
     let mut capacity = 256 << 20;
     let mut checkpoint_rate = None;
     let mut checkpoint_burst = None;
     let mut peers = BTreeMap::new();
+    let mut plan_path = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--listen" => listen = args.next().ok_or("--listen needs IP:port")?.parse()?,
@@ -453,6 +467,15 @@ pub(super) async fn run(
                         .ok_or("--checkpoint-peer-limits needs a JSON file")?,
                 )?;
             }
+            "--checkpoint-peer-budget-plan" => {
+                if plan_path.is_some() {
+                    return Err("the checkpoint budget plan may only be supplied once".into());
+                }
+                plan_path = Some(
+                    args.next()
+                        .ok_or("--checkpoint-peer-budget-plan needs a file")?,
+                );
+            }
             _ => return Err(format!("unknown KV store argument {arg}").into()),
         }
     }
@@ -469,9 +492,19 @@ pub(super) async fn run(
         }
         _ => return Err("checkpoint byte rate and burst must both be positive".into()),
     };
+    let membership = if let Some(path) = plan_path {
+        if !peers.is_empty() {
+            return Err("choose a checkpoint peer map or a shared budget plan".into());
+        }
+        let (membership, allocated) = PeerPlan::load(&path)?.share_for(listen)?;
+        peers = allocated;
+        Some(membership)
+    } else {
+        None
+    };
     let listener = TcpListener::bind(listen).await?;
     let store = Arc::new(Mutex::new(Store::new(capacity)));
-    let checkpoints = Arc::new(Checkpoints::new(limits, peers, Instant::now()));
+    let checkpoints = Arc::new(Checkpoints::new(limits, peers, Instant::now(), membership));
     let connections = Arc::new(Semaphore::new(32));
     println!("Plait KV store listening on {}", listener.local_addr()?);
     loop {
@@ -561,6 +594,7 @@ mod tests {
                 }),
                 BTreeMap::new(),
                 Instant::now(),
+                None,
             );
             for _ in 0..7 {
                 let (stream, peer) = listener.accept().await.unwrap();
