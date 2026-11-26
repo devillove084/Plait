@@ -136,3 +136,25 @@ def host_command(
         "--plait-tp-layout", *map(str, layout),
         *(["--headless"] if node_rank else []),
     ]
+
+
+def supports_kv_resume(command: list[str], env: dict[str, str]) -> bool:
+    if env.get("VLLM_USE_V2_MODEL_RUNNER") != "1":
+        return False
+    config = None
+    for index, argument in enumerate(command):
+        flag, separator, value = argument.partition("=")
+        if flag.replace("_", "-") != "--kv-transfer-config":
+            continue
+        if separator:
+            config = value
+        elif index + 1 < len(command):
+            config = command[index + 1]
+    if config is None:
+        return False
+    try:
+        item = json.loads(config)
+    except ValueError:
+        return False
+    return (isinstance(item, dict) and item.get("kv_connector") == "PlaitKvConnector"
+            and item.get("kv_role") in ("kv_consumer", "kv_both"))

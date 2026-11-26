@@ -22,6 +22,10 @@ class UpstreamInterrupted(Exception):
     pass
 
 
+class PlannedHandoff(Exception):
+    pass
+
+
 def sse(payload: dict) -> bytes:
     return b"data: " + json.dumps(payload, separators=(",", ":")).encode() + b"\n\n"
 
@@ -99,12 +103,19 @@ class CompletionReplay:
     def attempt_payload(self) -> bytes:
         if self.mode != RESUME_KV_MODE or not self.tokens:
             return self.payload
-        return json.dumps({
-            **self.request,
-            "kv_transfer_params": {"plait_resume_token_ids": self.tokens},
-        }).encode()
+        return json.dumps(self.generation_request()).encode()
 
-    def drain_attempt(self, response: HTTPResponse, emit: Callable[[bytes], object]) -> None:
+    def generation_request(self, allow_resume: bool = True) -> dict:
+        request = dict(self.request)
+        if allow_resume and self.mode == RESUME_KV_MODE and self.tokens:
+            request["kv_transfer_params"] = {"plait_resume_token_ids": self.tokens.copy()}
+        return request
+
+    def drain_attempt(
+        self, response: HTTPResponse, emit: Callable[[bytes], object],
+        should_handoff: Callable[[], bool] | None = None,
+        *, allow_resume: bool = True,
+    ) -> None:
         reference_ids = self.tokens.copy()
         reference_text = "".join(self.text)
         token_offset = text_offset = 0
@@ -138,7 +149,7 @@ class CompletionReplay:
                 raise ReplayMismatch("completion stream did not carry one token-addressable choice")
             prompt = choice.pop("prompt_token_ids", None)
             resumed_tokens = choice.pop("plait_resumed_tokens", None)
-            if first_choice and self.mode == RESUME_KV_MODE and reference_ids:
+            if first_choice and allow_resume and self.mode == RESUME_KV_MODE and reference_ids:
                 if type(resumed_tokens) is not int or resumed_tokens != len(reference_ids):
                     raise ReplayMismatch("replacement did not restore the emitted token checkpoint")
             if first_choice or prompt is not None:
@@ -180,6 +191,10 @@ class CompletionReplay:
                 self.text.append(new_delta)
                 self.text_bytes += new_size
                 self.prompt_sent = self.prompt_sent or self.prompt_ids is not None
+                if should_handoff is not None:
+                    limit = self.request.get("max_tokens")
+                    if (type(limit) is not int or len(self.tokens) < limit) and should_handoff():
+                        raise PlannedHandoff
             new_ids = []
             new_text = []
             new_size = 0

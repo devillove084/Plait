@@ -29,6 +29,7 @@ VERSION_HEADER = "X-Plait-Group-Version"
 ROLE_HEADER = "X-Plait-Group-Role"
 HANDOFF_HEADER = "X-Plait-KV-Handoff"
 ADMISSION_HEADER = "X-Plait-Admission"
+KV_RESUME_HEADER = "X-Plait-KV-Resume"
 RELEASE_KV_PATH = "/plait/release-kv"
 INFERENCE_PATHS = frozenset({"/v1/completions", "/v1/chat/completions"})
 MAX_JSON_BYTES = 16 * 1024 * 1024
@@ -203,17 +204,22 @@ def admission_rejected(response: http.client.HTTPResponse) -> bool:
     return response.status in (409, 503) and response.getheader(ADMISSION_HEADER) == "rejected"
 
 
-def endpoint_ready(endpoint: Endpoint, timeout: float) -> bool:
+def probe_endpoint(endpoint: Endpoint, timeout: float) -> bool | None:
+    """Return the ready engine's KV resume capability, or None while unavailable."""
     try:
         with contextlib.closing(endpoint.connect(min(2.0, timeout))) as connection:
             connection.request("GET", "/health", headers=endpoint.headers())
             with connection.getresponse() as response:
-                return (
-                    response.status == 200 and response.getheader(VERSION_HEADER) == endpoint.version
-                    and response.getheader(ROLE_HEADER) == endpoint.role
-                )
+                if (response.status == 200 and response.getheader(VERSION_HEADER) == endpoint.version
+                        and response.getheader(ROLE_HEADER) == endpoint.role):
+                    return response.getheader(KV_RESUME_HEADER) == "1"
     except HTTP_ERRORS:
-        return False
+        pass
+    return None
+
+
+def endpoint_ready(endpoint: Endpoint, timeout: float) -> bool:
+    return probe_endpoint(endpoint, timeout) is not None
 
 
 HOP_HEADERS = frozenset({
@@ -221,7 +227,7 @@ HOP_HEADERS = frozenset({
     "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade",
 })
 PRIVATE_HEADERS = frozenset(header.lower() for header in (
-    VERSION_HEADER, ROLE_HEADER, HANDOFF_HEADER, ADMISSION_HEADER,
+    VERSION_HEADER, ROLE_HEADER, HANDOFF_HEADER, ADMISSION_HEADER, KV_RESUME_HEADER,
 ))
 
 
@@ -234,6 +240,7 @@ def handoff_token(value: str | None) -> str | None:
 def group_proxy(
     port: int, backend_port: int, gate: Gate, version: str, *,
     bind: str = "127.0.0.1", role: str = "aggregated", kv_lease: float = 0,
+    kv_resume: bool = False,
 ) -> ThreadingHTTPServer:
     class Proxy(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -279,6 +286,8 @@ def group_proxy(
                     self.send_response(200)
                     self.send_header(VERSION_HEADER, version)
                     self.send_header(ROLE_HEADER, role)
+                    if kv_resume:
+                        self.send_header(KV_RESUME_HEADER, "1")
                     self.end_headers()
                     return
                 self.forward(token if role == "prefill" and self.path in INFERENCE_PATHS else None)
@@ -528,6 +537,7 @@ def run(
             server = group_proxy(
                 args.port_base, args.backend_port, gate, version_tag,
                 bind=args.proxy_host, role=args.role, kv_lease=args.kv_lease_seconds,
+                kv_resume=serving_launch.supports_kv_resume(command, child_env),
             )
             check_backend_port(args.backend_port)
         phase = change(

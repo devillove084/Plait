@@ -23,7 +23,7 @@ from serving_group import (
 )
 from serving_launch import host_command, resident_spec
 from serving_load import Load
-from serving_replay import RECOVERY_HEADER, RECOVERY_MODE, sse
+from serving_replay import RECOVERY_HEADER, RECOVERY_MODE, RESUME_KV_MODE, sse
 
 
 ROUTER = runpy.run_path(str(Path(__file__).with_name("serve-disaggregated.py")))
@@ -353,10 +353,11 @@ class HandoffTest(unittest.TestCase):
 
         return self.start(ThreadingHTTPServer(("127.0.0.1", 0), Native))
 
-    def group(self, role, version, respond):
+    def group(self, role, version, respond, *, kv_resume=False):
         gate = Gate()
         gate.allow_until(time.monotonic() + 30)
-        port = self.start(group_proxy(0, self.backend(respond), gate, version, role=role, kv_lease=30))
+        port = self.start(group_proxy(0, self.backend(respond), gate, version, role=role, kv_lease=30,
+                                      kv_resume=kv_resume))
         return port, gate
 
     def request(self, port, path, body=None, headers=None):
@@ -616,6 +617,73 @@ class HandoffTest(unittest.TestCase):
             status, _, data = first.result(timeout=2)
             self.assertEqual((status, data), (200, stream))
         self.assertTrue(gate.drained())
+
+    def test_planned_stream_handoff_uses_only_delivered_tokens_and_checks_capability(self):
+        for capable in (True, False):
+            with self.subTest(kv_resume=capable):
+                routes = []
+                transfers = []
+
+                def prefill(body):
+                    params = body["kv_transfer_params"]
+                    self.assertEqual(set(params), {"plait_handoff"})
+                    ticket = params["plait_handoff"]["ticket"]
+                    transfers.append(ticket)
+                    return "application/json", json.dumps({"kv_transfer_params": {"plait_handoff": {
+                        "ticket": ticket, "store": "127.0.0.1:9100",
+                        "prompt_sha256": "b" * 64, "cached_tokens": 128,
+                    }}}).encode()
+
+                def chunk(identity, ids, text, *, first=False, resumed=None, finish=None):
+                    choice = {"index": 0, "text": text, "token_ids": ids, "finish_reason": finish}
+                    if first:
+                        choice["prompt_token_ids"] = [4]
+                    if resumed is not None:
+                        choice["plait_resumed_tokens"] = resumed
+                    return sse({"id": identity, "model": "test", "choices": [choice]})
+
+                def source(body):
+                    self.assertEqual(body["kv_transfer_params"]["plait_handoff"]["ticket"], transfers[0])
+                    self.assertIs(body["kv_transfer_params"]["plait_checkpoint"], True)
+                    routes[:] = [target]
+                    # A healthy source has already computed a different suffix.
+                    return "text/event-stream", (chunk("source", [8], "a", first=True)
+                        + chunk("source", [99], "x", finish="length") + b"data: [DONE]\n\n")
+
+                def replacement(body):
+                    kv = body["kv_transfer_params"]
+                    self.assertEqual(kv["plait_handoff"]["ticket"], transfers[1])
+                    self.assertIs(kv["plait_checkpoint"], True)
+                    if capable:
+                        self.assertEqual(kv["plait_resume_token_ids"], [8])
+                    else:
+                        self.assertNotIn("plait_resume_token_ids", kv)
+                    return "text/event-stream", (
+                        chunk("replacement", [8, 9], "ab", first=True, resumed=1 if capable else None)
+                        + chunk("replacement", [], "", finish="length") + b"data: [DONE]\n\n")
+
+                p_port, gate = self.group("prefill", PREFILL, prefill)
+                old_port, _ = self.group("decode", DECODE, source, kv_resume=True)
+                new_port, _ = self.group("decode", SPARE, replacement, kv_resume=capable)
+                prefill_endpoint = Endpoint("127.0.0.1", p_port, PREFILL, "prefill")
+                old, target = [ROUTER["Route"](prefill_endpoint, Endpoint("127.0.0.1", port, version, "decode"),
+                                                "127.0.0.1", 9100)
+                               for port, version in [(old_port, DECODE), (new_port, SPARE)]]
+                routes.append(old)
+                directory = SimpleNamespace(routes=lambda: ("test", routes.copy()))
+                router = self.start(ROUTER["server"]("127.0.0.1", 0, directory, 3, kv_transport="plait"))
+                status, headers, body = self.request(router, COMPLETIONS, {
+                    "model": "test", "prompt": [4], "max_tokens": 2, "stream": True,
+                    "temperature": 0, "return_token_ids": True,
+                }, {RECOVERY_HEADER: RESUME_KV_MODE})
+                self.assertEqual((status, headers[VERSION_HEADER]), (200, DECODE))
+                frames = [line[6:] for line in body.splitlines() if line.startswith(b"data: ")]
+                self.assertEqual(frames.count(b"[DONE]"), 1)
+                frames = [json.loads(item) for item in frames if item != b"[DONE]"]
+                self.assertEqual({item["id"] for item in frames}, {"source"})
+                self.assertEqual([token for item in frames for c in item["choices"] for token in c["token_ids"]], [8, 9])
+                self.assertEqual(len(set(transfers)), 2)
+                self.assertTrue(gate.drained())
 
     def test_load_counts_valid_arrivals_when_routes_are_unavailable(self):
         directory = Mock()

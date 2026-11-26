@@ -60,6 +60,8 @@ struct EngineProfile {
     env: BTreeMap<String, String>,
     #[serde(default, skip_serializing)]
     pipeline_layers: Option<Vec<u32>>,
+    #[serde(default)]
+    stream_checkpoints: bool,
     verify_release: Option<PathBuf>,
     release_driver: Option<ReleaseDriver>,
 }

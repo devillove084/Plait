@@ -22,11 +22,12 @@ from typing import Union
 from serving_group import (
     DIRECTORY_POLL_SECONDS, DIRECTORY_READ_TTL, HANDOFF_HEADER, HTTP_ERRORS,
     INFERENCE_PATHS, MAX_JSON_BYTES, RELEASE_KV_PATH, Control, ControlError,
-    Endpoint, admission_rejected, endpoint_ready,
+    Endpoint, admission_rejected, endpoint_ready, probe_endpoint,
 )
 from serving_load import Load, listen as load_listener, parse_address as parse_load_address
 from serving_replay import (
-    RECOVERY_HEADER, RECOVERY_MODE, CompletionReplay, ReplayMismatch, UpstreamInterrupted, sse,
+    RECOVERY_HEADER, RECOVERY_MODE, RESUME_KV_MODE, CompletionReplay, PlannedHandoff,
+    ReplayMismatch, UpstreamInterrupted, sse,
 )
 
 class UpstreamError(RuntimeError):
@@ -65,6 +66,10 @@ class Route:
 
 
 Destination = Union[Endpoint, Route]
+
+
+def generator(route: Destination) -> Endpoint:
+    return route.decode if isinstance(route, Route) else route
 
 
 class Directory:
@@ -279,8 +284,8 @@ def server(
                 recovery = self.headers.get(RECOVERY_HEADER)
                 replay = None
                 if recovery is not None:
-                    if recovery != RECOVERY_MODE or kv_transport != "plait" or self.path != "/v1/completions":
-                        raise ValueError("P/D replay requires Plait KV and a text completion")
+                    if recovery not in (RECOVERY_MODE, RESUME_KV_MODE) or kv_transport != "plait" or self.path != "/v1/completions":
+                        raise ValueError("stream recovery requires Plait KV and a text completion")
                     replay = CompletionReplay(body, recovery)
                 body.pop("kv_transfer_params", None)
             except (OSError, ValueError) as error:
@@ -311,7 +316,7 @@ def server(
                 budget = deadline - time.monotonic()
                 if budget <= 0:
                     break
-                endpoint = route.decode if isinstance(route, Route) else route
+                endpoint = generator(route)
                 if not endpoint_ready(endpoint, budget):
                     continue
                 try:
@@ -369,14 +374,16 @@ def server(
             failed_generators = set()
             while time.monotonic() < deadline:
                 tried_prefills = set()
+                handed_off = False
                 for route in routes:
                     budget = deadline - time.monotonic()
                     if budget <= 0:
                         break
-                    endpoint = route.decode if isinstance(route, Route) else route
+                    endpoint = generator(route)
                     if endpoint.version in failed_generators:
                         continue
-                    if not endpoint_ready(endpoint, min(1.0, budget)):
+                    can_resume = probe_endpoint(endpoint, min(1.0, budget))
+                    if can_resume is None:
                         continue
                     transfer = None
                     if isinstance(route, Route):
@@ -394,9 +401,15 @@ def server(
                             tried_prefills.add(route.prefill.version)
                             continue
                     try:
-                        completed = self.replay_generation(endpoint, transfer, deadline, replay)
+                        completed = self.replay_generation(
+                            endpoint, transfer, deadline, replay, failed_generators, can_resume,
+                        )
                         if completed is not None:
                             return completed
+                    except PlannedHandoff:
+                        failed_generators.add(endpoint.version)
+                        handed_off = True
+                        break
                     except (*HTTP_ERRORS, UpstreamError, UpstreamInterrupted):
                         failed_generators.add(endpoint.version)
                     except ReplayMismatch as error:
@@ -406,25 +419,61 @@ def server(
                         # Plait stored the prompt pages independently of this handoff lease.
                         if isinstance(route, Route) and transfer is not None:
                             release_transfer(route.prefill, transfer.token)
-                time.sleep(min(DIRECTORY_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
-                routes = []
-                with contextlib.suppress(OSError, ValueError, KeyError, TypeError, AttributeError):
-                    model, current = directory.routes()
-                    if model == replay.model:
-                        routes = current
+                if not handed_off:
+                    time.sleep(min(DIRECTORY_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+                routes = self.current_routes(replay.model)
             self.fail_replay(503, "no serving replacement accepted the completion before its deadline", replay)
             return False
 
-        def replay_generation(self, endpoint: Endpoint, transfer: Transfer | None, deadline: float, replay: CompletionReplay) -> bool | None:
+        def current_routes(self, model: str) -> list[Destination]:
+            with contextlib.suppress(OSError, ValueError, KeyError, TypeError, AttributeError):
+                current_model, routes = directory.routes()
+                if current_model == model:
+                    return routes
+            return []
+
+        def replay_generation(
+            self, endpoint: Endpoint, transfer: Transfer | None, deadline: float,
+            replay: CompletionReplay, failed_generators: set[str], can_resume: bool,
+        ) -> bool | None:
             budget = deadline - time.monotonic()
             if budget <= 0:
                 return None
+            next_check = 0.0
+
+            def should_handoff() -> bool:
+                nonlocal next_check
+                now = time.monotonic()
+                if now < next_check or now >= deadline:
+                    return False
+                next_check = now + DIRECTORY_POLL_SECONDS
+                routes = self.current_routes(replay.model)
+                if any(generator(route).version == endpoint.version for route in routes):
+                    return False
+                for route in routes:
+                    budget = min(0.2, deadline - time.monotonic())
+                    if budget <= 0:
+                        break
+                    candidate = generator(route)
+                    if candidate.version in failed_generators:
+                        continue
+                    # A replacement must be accepting before the source is closed.
+                    if endpoint_ready(candidate, budget) and (
+                        not isinstance(route, Route) or endpoint_ready(route.prefill, budget)
+                    ):
+                        return True
+                return False
+
             with contextlib.closing(endpoint.connect(budget)) as connection:
-                payload = dict(replay.request)
-                request_id = uuid.uuid4().hex
+                payload = replay.generation_request(can_resume)
+                kv = payload.get("kv_transfer_params", {})
+                if replay.mode == RESUME_KV_MODE:
+                    kv["plait_checkpoint"] = True
                 if transfer is not None:
-                    payload["kv_transfer_params"] = transfer.params
-                    request_id = transfer.request_id
+                    kv.update(transfer.params)
+                if kv:
+                    payload["kv_transfer_params"] = kv
+                request_id = uuid.uuid4().hex if transfer is None else transfer.request_id
                 with request_engine(connection, endpoint, self.path, payload, request_id) as response:
                     if admission_rejected(response):
                         return None
@@ -446,7 +495,11 @@ def server(
                                 self.send_header(key, value)
                             self.end_headers()
                             replay.started = True
-                        replay.drain_attempt(response, self.wfile.write)
+                        replay.drain_attempt(
+                            response, self.wfile.write,
+                            should_handoff if replay.mode == RESUME_KV_MODE else None,
+                            allow_resume=can_resume,
+                        )
                     except HTTP_ERRORS:
                         return False
                     return True

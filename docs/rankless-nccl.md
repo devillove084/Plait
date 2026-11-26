@@ -734,6 +734,22 @@ token IDs and text before forwarding the suffix. The client keeps the
 original completion ID, usage budget, and one terminal event. The ingress
 and its client connection must survive the replacement.
 
+On the unified ingress (`serve-disaggregated.py --kv-transport plait`), the
+same header also opts in to planned handoff. When the active directory stops
+routing to the current generator and a replacement path accepts work, the
+ingress cuts after a complete emitted SSE frame. It closes the source attempt
+before starting the replacement. A changed Prefill with the same available
+Decode version leaves the generation attempt in place.
+
+Set `stream_checkpoints: true` on the resident Decode engine profile to
+publish pages for these requests. A destination advertises token resume when
+its launch uses a V2 Plait KV consumer. A split destination obtains a fresh
+Prefill receipt and checks every promised prompt page. Complete pages that
+include generated tokens can extend the hit, and the engine computes any
+uncovered known tokens before continuing. A destination without token resume
+matches the emitted prefix by replay. The request stays on the original
+ingress connection in either case.
+
 In the four-backend fault test, the source emitted six tokens before one
 of its TP4 workers was killed. The TP2 replacement reported 256 external
 hits for a 254-token prompt. The client received all 16 output tokens on
