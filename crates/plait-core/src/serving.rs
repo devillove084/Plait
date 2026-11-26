@@ -30,6 +30,13 @@ pub enum ServingRole {
     Decode,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HostedActivation {
+    #[default]
+    OnReady,
+    OnRevocation,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerDemand {
     pub incarnation: u64,
@@ -651,6 +658,15 @@ pub enum ServingAction {
         host: NodeId,
         holder: NodeId,
     },
+    /// Arm an aggregated HTTP group for an ordered switch after host readiness.
+    PrepareHostedSwitch {
+        group: GroupId,
+        expected_epoch: u64,
+        expected_active: Option<u64>,
+        plan: GroupPlan,
+        activation: HostedActivation,
+        request_sha256: Option<[u8; 32]>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -847,7 +863,8 @@ impl ServingOperation {
             }
             ServingAction::Prepare { group, plan, .. }
             | ServingAction::PrepareW4Switch { group, plan, .. }
-            | ServingAction::PrepareManagedW4 { group, plan, .. } => {
+            | ServingAction::PrepareManagedW4 { group, plan, .. }
+            | ServingAction::PrepareHostedSwitch { group, plan, .. } => {
                 keys.insert(Key::ServingGroup(*group));
                 keys.extend(plan.workers.keys().copied().map(Key::Device));
                 keys.extend(plan.hosts.keys().copied().map(Key::HostMemory));

@@ -101,6 +101,45 @@ Use a local `--verify-release` executable on each host to authorize
 grant reuse after that host has closed its workers and transports.
 Retirement requires every host's stop confirmation.
 
+### Commit an automatic rollout or standby
+
+Send one JSON line per operation to `plait-node serving`. Provide the same
+control peers and reachable reply address used by the launchers.
+
+```sh
+plait-node serving --listen "$CONTROL_REPLY_ADDR" --peer "$VOTER_ID@$VOTER_ADDR" < requests.jsonl
+```
+
+`prepare_hosted` takes `id`, `group`, `expected_epoch`, `expected_active`,
+`plan`, and `activation`. Use the latest known epoch as `expected_epoch`.
+For an initial group, use epoch zero and a null `expected_active`. Group
+and operation origin IDs are 16-byte arrays. A plan supplies the model,
+role `Aggregated`, TP size, PP size of one, launch digest, and
+device and host reservations. Represent the device and host maps as
+arrays of key/value pairs. Launch each planned host as described above.
+
+`replan_hosted` takes `id`, `forecast`, `candidates`, and `activation`.
+Each candidate supplies `group`, `expected_epoch`, `plan`, `capacity`,
+`ready_after_ms`, and `transition_loss_requests`. A capacity contains
+`rps` and `valid_until_ms`, the Unix millisecond deadline for that
+measurement. The planner checks device capacity, host memory, and current
+grants, then scores the feasible candidates against the forecast's
+demand, horizon, and minimum gain. Supply capacity measurements for the
+candidate's topology. The control plane rechecks reservations and the
+current epoch when it applies the selected plan. Retry with the same
+operation ID and inputs to retrieve the original decision receipt.
+
+| Activation | When the committed plan starts admitting requests |
+| --- | --- |
+| `OnReady` (default) | Activation waits for all worker grants to be ready and the HTTP endpoint to be published. The final report moves an active incumbent to `Draining` in the same operation. |
+| `OnRevocation` | A ready standby is promoted when the named active epoch is revoked. If revocation arrives first, the last readiness report completes the switch. |
+
+An explicit drain leaves a standby in `Ready`. A failed host's other
+device grants are included in the same host-expiry transition. The model
+and HTTP alias used by a replacement must match the incumbent. A prepared
+standby keeps its grants while waiting, so account for those reservations
+alongside the active group.
+
 ### Keep one HTTP endpoint across group versions
 
 Point clients at `serve-aggregated.py`. Use the same API model alias

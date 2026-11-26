@@ -104,10 +104,6 @@ impl ServingState {
         if old.pulse != pulse || !old.online || &self.execution_versions_on(host) != groups {
             return Err(ServingError::StaleExecutionHost);
         }
-        for &version in groups {
-            self.fail_resident_version(version)
-                .expect("affected groups checked");
-        }
         self.execution_hosts.insert(
             host,
             ExecutionHostLiveness {
@@ -115,6 +111,10 @@ impl ServingState {
                 ..old
             },
         );
+        for &version in groups {
+            self.fail_resident_version(version)
+                .expect("affected groups checked");
+        }
         Ok(ServingOutcome::ExecutionHostOffline)
     }
 }

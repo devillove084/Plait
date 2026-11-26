@@ -17,7 +17,7 @@ mod decoder;
 mod host;
 mod host_launch;
 use decoder::{DecoderState, RecoveryPolicy};
-use host_launch::HostLaunch;
+use host_launch::{HostLaunch, HostedSwitch};
 
 #[derive(Clone)]
 struct HostState {
@@ -76,6 +76,7 @@ pub(crate) struct ServingState {
     w4_work: BTreeMap<GroupVersion, BTreeMap<OpId, u64>>,
     resident: BTreeMap<GroupVersion, BTreeMap<DeviceId, ResidentOwner>>,
     host_launches: BTreeMap<GroupVersion, HostLaunch>,
+    hosted_switches: BTreeMap<GroupVersion, HostedSwitch>,
     execution_hosts: BTreeMap<NodeId, ExecutionHostLiveness>,
     decoder: DecoderState,
 }
@@ -219,6 +220,20 @@ impl ServingState {
                 expected_epoch,
                 plan,
             } => self.prepare(*group, *expected_epoch, plan),
+            ServingAction::PrepareHostedSwitch {
+                group,
+                expected_epoch,
+                expected_active,
+                plan,
+                activation,
+                ..
+            } => self.prepare_hosted_switch(
+                *group,
+                *expected_epoch,
+                *expected_active,
+                plan,
+                *activation,
+            ),
             ServingAction::PrepareW4Switch {
                 group,
                 expected_epoch,
@@ -1181,7 +1196,8 @@ impl ServingState {
         }
         view.phase = phase;
         let history = self.groups.get_mut(&version.group).expect("known group");
-        if history.active == Some(version.epoch) {
+        let was_active = history.active == Some(version.epoch);
+        if was_active {
             history.active = None;
         }
         let phase = if phase == GroupPhase::Draining {
@@ -1191,6 +1207,9 @@ impl ServingState {
         } else {
             if let Some(work) = self.w4_work.get_mut(&version) {
                 work.clear();
+            }
+            if was_active {
+                self.hosted_incumbent_revoked(version);
             }
             phase
         };
@@ -1502,6 +1521,7 @@ impl ServingState {
         self.w4_work.remove(&version);
         self.resident.remove(&version);
         self.host_launches.remove(&version);
+        self.hosted_switches.remove(&version);
         self.decoder.endpoints.remove(&version);
         self.decoder.managed.remove(&version);
         Ok(group_outcome(version, GroupPhase::Retired))

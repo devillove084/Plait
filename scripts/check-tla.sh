@@ -20,6 +20,8 @@ tlc -deadlock -config specs/PlaitResidentReclaim.cfg specs/PlaitResidentReclaim.
 tlc -deadlock -config specs/PlaitResidentReclaimVerified.cfg specs/PlaitResidentReclaim.tla
 tlc -deadlock -config specs/PlaitEpochAdmission.cfg specs/PlaitEpochAdmission.tla
 tlc -deadlock -config specs/PlaitHostLaunch.cfg specs/PlaitHostLaunch.tla
+tlc -deadlock -config specs/PlaitHostRollout.cfg specs/PlaitHostLaunch.tla
+tlc -deadlock -config specs/PlaitHostFailover.cfg specs/PlaitHostLaunch.tla
 tlc -deadlock -config specs/PlaitServingIngress.cfg specs/PlaitServingIngress.tla
 tlc -deadlock -config specs/PlaitCompletionReplay.cfg specs/PlaitCompletionReplay.tla
 tlc -deadlock -config specs/PlaitCompletionKvResume.cfg specs/PlaitCompletionReplay.tla

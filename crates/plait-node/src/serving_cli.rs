@@ -3,9 +3,9 @@ use std::io::{self, BufRead, Write};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use plait_core::serving::{
-    GroupId, GroupPhase, GroupPlan, GroupVersion, GroupView, HostMemory, RouteDirectory,
-    RouteSetId, ServingAction, ServingEndpoint, ServingLookup, ServingOperation, ServingResources,
-    ServingRole, ServingView, W4GroupLayout, WorkerDemand, WorkerGrant,
+    GroupId, GroupPhase, GroupPlan, GroupVersion, GroupView, HostMemory, HostedActivation,
+    RouteDirectory, RouteSetId, ServingAction, ServingEndpoint, ServingLookup, ServingOperation,
+    ServingResources, ServingRole, ServingView, W4GroupLayout, WorkerDemand, WorkerGrant,
 };
 use plait_core::{DeviceId, NodeId, OpId};
 use plait_node::{Client, discover_voters};
@@ -15,6 +15,7 @@ use plait_parallel::serving::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+mod hosted;
 mod replanning;
 
 #[derive(Deserialize)]
@@ -28,6 +29,15 @@ enum Request {
         group: GroupId,
         expected_epoch: u64,
         plan: NativePlanInput,
+    },
+    PrepareHosted {
+        id: OpId,
+        group: GroupId,
+        expected_epoch: u64,
+        expected_active: Option<u64>,
+        plan: NativePlanInput,
+        #[serde(default)]
+        activation: HostedActivation,
     },
     Inspect {
         version: GroupVersion,
@@ -67,6 +77,13 @@ enum Request {
     Select {
         forecast: ServingForecast,
         candidates: Vec<CandidateInput>,
+    },
+    ReplanHosted {
+        id: OpId,
+        forecast: ServingForecast,
+        candidates: Vec<CandidateInput>,
+        #[serde(default)]
+        activation: HostedActivation,
     },
     ReplanW4 {
         id: OpId,
@@ -123,7 +140,7 @@ impl TryFrom<W4CandidateInput> for (ServingCandidate, W4GroupLayout) {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct CandidateInput {
     group: GroupId,
     expected_epoch: u64,
@@ -310,6 +327,12 @@ async fn handle(
                 .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
             Ok(json!({ "selection": result }))
         }
+        Request::ReplanHosted {
+            id,
+            forecast,
+            candidates,
+            activation,
+        } => hosted::replan(client, peers, id, forecast, candidates, activation).await,
         Request::ReplanW4 {
             id,
             forecast,
@@ -410,6 +433,24 @@ async fn handle(
                 group,
                 expected_epoch,
                 plan: plan.try_into()?,
+            };
+            execute(client, peers, ServingOperation { id, action }).await
+        }
+        Request::PrepareHosted {
+            id,
+            group,
+            expected_epoch,
+            expected_active,
+            plan,
+            activation,
+        } => {
+            let action = ServingAction::PrepareHostedSwitch {
+                group,
+                expected_epoch,
+                expected_active,
+                plan: plan.try_into()?,
+                activation,
+                request_sha256: None,
             };
             execute(client, peers, ServingOperation { id, action }).await
         }
