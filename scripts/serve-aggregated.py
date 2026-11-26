@@ -17,6 +17,9 @@ from serving_group import (
     MAX_JSON_BYTES, PRIVATE_HEADERS, Control, ControlError,
     Endpoint, admission_rejected, endpoint_ready,
 )
+from serving_replay import (
+    RECOVERY_HEADER, RECOVERY_MODE, CompletionReplay, ReplayMismatch, UpstreamInterrupted, sse,
+)
 
 
 class ActiveGroupDirectory:
@@ -103,6 +106,13 @@ def server(bind: str, port: int, directory: ActiveGroupDirectory, timeout: float
                 body = json.loads(raw)
                 if len(raw) != size or not isinstance(body, dict) or body.get("model") != directory.model:
                     raise ValueError("expected a complete request for the configured model")
+                recovery = self.headers.get(RECOVERY_HEADER)
+                replay = None
+                if recovery is not None:
+                    if recovery != RECOVERY_MODE or self.path != "/v1/completions":
+                        raise ValueError("unsupported stream recovery mode")
+                    replay = CompletionReplay(body)
+                    raw = replay.payload
             except (OSError, ValueError) as error:
                 self.fail(400, str(error))
                 return
@@ -111,12 +121,16 @@ def server(bind: str, port: int, directory: ActiveGroupDirectory, timeout: float
             request_id = uuid.uuid4().hex
             while (budget := deadline - time.monotonic()) > 0:
                 endpoint = directory.endpoint()
-                if endpoint is not None and self.try_endpoint(endpoint, raw, request_id, budget):
-                    return
+                if endpoint is not None and (replay is None or endpoint.epoch > replay.failed_epoch):
+                    if self.try_endpoint(endpoint, raw, request_id, budget, replay):
+                        return
                 time.sleep(min(DIRECTORY_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
-            self.fail(503, "no active execution group accepted the request")
+            self.fail_forward(503, "no active execution group accepted the request", replay)
 
-        def try_endpoint(self, endpoint: Endpoint, raw: bytes, request_id: str, budget: float) -> bool:
+        def try_endpoint(
+            self, endpoint: Endpoint, raw: bytes, request_id: str, budget: float,
+            replay: CompletionReplay | None,
+        ) -> bool:
             version_headers = endpoint.headers()
             headers = {**version_headers, "Content-Type": "application/json", "X-Request-Id": request_id}
             with contextlib.closing(endpoint.connect(min(2.0, budget))) as connection:
@@ -131,6 +145,9 @@ def server(bind: str, port: int, directory: ActiveGroupDirectory, timeout: float
                     connection.request("POST", self.path, body=raw, headers=headers)
                     response = connection.getresponse()
                 except HTTP_ERRORS:
+                    if replay is not None and replay.started:
+                        replay.failed_epoch = endpoint.epoch
+                        return False
                     self.fail(502, "execution group disconnected after forwarding began")
                     return True
 
@@ -138,8 +155,14 @@ def server(bind: str, port: int, directory: ActiveGroupDirectory, timeout: float
                     if admission_rejected(response):
                         return False
                     if any(response.getheader(key) != value for key, value in version_headers.items()):
-                        self.fail(502, "upstream response does not match the admitted group")
+                        self.fail_forward(502, "upstream response does not match the admitted group", replay)
                         return True
+                    if replay is not None:
+                        if response.status == 200 and response.getheader("Content-Type", "").startswith("text/event-stream"):
+                            return self.forward_replay(response, version_headers, endpoint, replay)
+                        if replay.started:
+                            self.fail_forward(502, "replacement did not return a completion stream", replay)
+                            return True
                     with contextlib.suppress(*HTTP_ERRORS):
                         self.send_response(response.status, response.reason)
                         for key, value in response.getheaders():
@@ -150,6 +173,27 @@ def server(bind: str, port: int, directory: ActiveGroupDirectory, timeout: float
                         self.end_headers()
                         while chunk := response.read1(65536):
                             self.wfile.write(chunk)
+            return True
+
+        def forward_replay(self, response, version_headers, endpoint, replay) -> bool:
+            try:
+                if not replay.started:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header(RECOVERY_HEADER, RECOVERY_MODE)
+                    for key, value in version_headers.items():
+                        self.send_header(key, value)
+                    self.end_headers()
+                    replay.started = True
+                replay.drain_attempt(response, self.wfile.write)
+            except UpstreamInterrupted:
+                replay.failed_epoch = endpoint.epoch
+                return False
+            except ReplayMismatch as error:
+                self.fail_forward(502, str(error), replay)
+            except HTTP_ERRORS:
+                # The client's connection has closed.
+                pass
             return True
 
         def write_json(self, status: int, body: dict, headers: dict | None = None) -> None:
@@ -165,6 +209,13 @@ def server(bind: str, port: int, directory: ActiveGroupDirectory, timeout: float
 
         def fail(self, status: int, message: str) -> None:
             self.write_json(status, {"error": {"message": message, "type": "plait_error"}})
+
+        def fail_forward(self, status: int, message: str, replay: CompletionReplay | None) -> None:
+            if replay is not None and replay.started:
+                with contextlib.suppress(*HTTP_ERRORS):
+                    self.wfile.write(sse({"error": {"message": message, "type": "plait_recovery_error"}}))
+            else:
+                self.fail(status, message)
 
     return ThreadingHTTPServer((bind, port), Entry)
 

@@ -119,12 +119,33 @@ ordered group observation. The ingress serves `/v1/completions`,
 `/v1/chat/completions`, `/v1/models`, and `/health`.
 
 The ingress waits 500 ms between observations and expires its last
-route after eight seconds without a fresh observation. A response carries
-the group version that handled it. A request admitted by the old group
+route after eight seconds without a fresh observation. The response header
+identifies the group that first admitted the request. A request admitted by the old group
 keeps its upstream connection while the old group drains. The ingress can
 retry a connection that failed before sending request bytes or an explicit
 Plait admission rejection. Once forwarding starts, a disconnect without
 an admission rejection ends that attempt.
+
+### Recover a greedy completion stream
+
+Set `X-Plait-Stream-Recovery: replay-prefix` on `POST /v1/completions`
+with `stream: true` and `temperature: 0`. Send one prompt and request one
+completion. This mode supports text and token-array prompts and final usage.
+Use plain greedy completions without echo, log probabilities, beam search,
+continuous usage statistics, or an external KV transfer descriptor.
+
+After an admitted stream breaks, the ingress waits for a newer active
+epoch within the request timeout and submits the original completion
+there. It checks the prompt token IDs and compares both the token IDs
+and text already emitted, even when stream chunks have different boundaries.
+It sends only the suffix after both comparisons pass. The client keeps
+the same HTTP connection and completion ID. The ingress sends a single
+successful `[DONE]` together with the final completion frames. A
+prefix mismatch yields a `plait_recovery_error` event.
+
+Recovery retains the visible prefix in the running ingress process and
+rebuilds KV by recomputation on the replacement. The same connection
+must remain open throughout recovery.
 
 ## Execute a collective
 

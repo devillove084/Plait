@@ -192,6 +192,10 @@ class Endpoint:
     def headers(self) -> dict[str, str]:
         return {VERSION_HEADER: self.version, ROLE_HEADER: self.role}
 
+    @property
+    def epoch(self) -> int:
+        return int(self.version.rsplit("@", 1)[1])
+
 
 def admission_rejected(response: http.client.HTTPResponse) -> bool:
     return response.status in (409, 503) and response.getheader(ADMISSION_HEADER) == "rejected"
