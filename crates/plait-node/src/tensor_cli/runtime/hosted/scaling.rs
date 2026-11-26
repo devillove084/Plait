@@ -7,13 +7,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use plait_core::serving::{
-    GroupPhase, HostedLinkSample, HostedPdPlanning, HostedPdReconfiguration, HostedPdRecovery,
-    RouteSetId, ServingAction, ServingLookup, ServingOperation, ServingOutcome, ServingView,
+    GroupPhase, GroupVersion, HostedAssignment, HostedLinkSample, HostedPdPlanning,
+    HostedPdReconfiguration, HostedPdRecovery, RouteSetId, ServingAction, ServingLookup,
+    ServingOperation, ServingOutcome, ServingView,
 };
 use plait_core::{NodeId, OpId};
 use plait_parallel::serving::{
-    GroupProfile, HostedLinkPolicy, HostedPdPool, ServingForecast, plan_hosted_pd_recovery,
-    plan_hosted_pd_with_releases,
+    GroupProfile, HostedLinkPolicy, HostedPdIncumbents, HostedPdPool, ServingForecast,
+    plan_hosted_pd_recovery, plan_hosted_pd_with_assignments,
 };
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -403,7 +404,19 @@ async fn decide(
         planning: snapshot,
         releases,
     } = snapshot;
-    let groups = current_profiles(control, &snapshot, &pool).await?;
+    let assignments = active_assignments(control, &snapshot).await?;
+    let groups = snapshot
+        .active
+        .iter()
+        .filter_map(|active| {
+            let assignment = assignments.get(&active.version)?;
+            let capacity = pool.calibrated_assignment_capacity(active, assignment)?;
+            Some(GroupProfile {
+                version: active.version,
+                capacity,
+            })
+        })
+        .collect();
     let links = collect_links(control, &snapshot).await?;
     let forecast = ServingForecast {
         model: checkpoint.to_owned(),
@@ -417,14 +430,17 @@ async fn decide(
     };
     let model = model.to_owned();
     tokio::task::spawn_blocking(move || {
-        let selection = plan_hosted_pd_with_releases(
+        let selection = plan_hosted_pd_with_assignments(
             &model,
             &snapshot,
             &forecast,
             &pool,
             link_policy,
             &links,
-            &releases,
+            HostedPdIncumbents {
+                assignments: Some(&assignments),
+                releases: &releases,
+            },
         )
         .map_err(io::Error::other)?;
         Ok(selection
@@ -453,11 +469,10 @@ async fn collect_links(
     Ok(hosted_probe::collect(endpoints, Some(&hosts)).await)
 }
 
-async fn current_profiles(
+async fn active_assignments(
     control: &mut GroupControl,
     snapshot: &HostedPdPlanning,
-    pool: &HostedPdPool,
-) -> io::Result<Vec<GroupProfile>> {
+) -> io::Result<BTreeMap<GroupVersion, HostedAssignment>> {
     let mut recipes = BTreeMap::new();
     let hosts: BTreeSet<_> = snapshot
         .active
@@ -477,23 +492,7 @@ async fn current_profiles(
             }
         }
     }
-    Ok(snapshot
-        .active
-        .iter()
-        .filter_map(|active| {
-            let assignment = recipes.get(&active.version)?;
-            let capacity = pool.calibrated_capacity(
-                active.version.group,
-                active.role,
-                &assignment.recipe.profile,
-                assignment.tensor_parallel,
-            )?;
-            Some(GroupProfile {
-                version: active.version,
-                capacity,
-            })
-        })
-        .collect())
+    Ok(recipes)
 }
 
 async fn sample_cohort(ingress: &[SocketAddr], model: &str) -> io::Result<Cohort> {

@@ -9,6 +9,7 @@ use plait_core::serving::{
 use serde::{Deserialize, Serialize};
 
 use super::super::{ServingCandidate, ServingForecast, SloProfile, valid_rate};
+use super::pipeline::{PipelineProfile, search_pipeline};
 use super::{HostedLinkLimit, HostedLinkPolicy, LinkEvidence, limit_hosted_ranks};
 
 #[derive(Deserialize, Serialize)]
@@ -21,7 +22,10 @@ pub struct HostedPool {
     gpu_memory_bps: u16,
     prefix_caching: bool,
     ports: PortRange,
+    #[serde(default)]
     sizes: Vec<SizeProfile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pipelines: Vec<PipelineProfile>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -51,6 +55,13 @@ struct AvailableHost {
     ports: Option<[u16; 3]>,
 }
 
+pub(super) struct InventoryHost {
+    pub address: HostedAddress,
+    pub workers: Vec<WorkerResources>,
+    pub memory: HostMemory,
+    pub ports: Option<[u16; 3]>,
+}
+
 #[derive(Clone)]
 struct Layout {
     ranks: BTreeMap<NodeId, u64>,
@@ -60,7 +71,7 @@ struct Layout {
 
 // Keep alternatives with different progress, host counts and ability to host
 // the API. A wider search improves coverage at the cost of planning time.
-const LAYOUTS_PER_BUCKET: usize = 16;
+pub(super) const LAYOUTS_PER_BUCKET: usize = 16;
 type Search = BTreeMap<(u32, usize, bool), Vec<Layout>>;
 
 pub fn generate_hosted_candidates(
@@ -149,20 +160,7 @@ pub(super) fn generate_layouts(
                         )
                     }));
             }
-            if let Some((role, kv)) = pd {
-                let launch = HostedPdLaunch {
-                    role,
-                    kv: kv.clone(),
-                };
-                plan.launch_digest = launch.launch_digest(&recipe);
-                launch
-                    .validate(&recipe, &plan)
-                    .map_err(|_| "invalid hosted P/D pool recipe")?;
-            } else {
-                recipe
-                    .validate(&plan)
-                    .map_err(|_| "invalid hosted pool recipe")?;
-            }
+            bind_launch(&mut plan, &recipe, pd)?;
             candidates.push((
                 ServingCandidate {
                     group: pool.group,
@@ -176,7 +174,77 @@ pub(super) fn generate_layouts(
             ));
         }
     }
+    for pipeline in &pool.pipelines {
+        let profile = pipeline
+            .qualified_name()
+            .expect("validated pipeline profile");
+        let hosts = inventory_hosts(resources, planning, &profile, &pool.ports);
+        for layout in search_pipeline(pipeline, &hosts, evidence) {
+            let [master_port, http_port, backend_port] = hosts[&layout.api_host]
+                .ports
+                .expect("pipeline API host has free ports");
+            let recipe = HostedRecipe {
+                profile: profile.clone(),
+                api_host: layout.api_host,
+                hosts: layout
+                    .hosts
+                    .keys()
+                    .map(|host| hosts[host].address.clone())
+                    .collect(),
+                master_port,
+                http_port,
+                backend_port,
+                api_model: pool.api_model.clone(),
+                max_model_len: pool.max_model_len,
+                gpu_memory_bps: pool.gpu_memory_bps,
+                prefix_caching: pool.prefix_caching,
+            };
+            let mut plan = GroupPlan {
+                role: pd.expect("pipelines are enabled only for P/D").0,
+                model: checkpoint.to_owned(),
+                tensor_parallel: pipeline.tensor_parallel,
+                pipeline_parallel: pipeline.stages.len() as u32,
+                launch_digest: [0; 32],
+                workers: layout.workers,
+                hosts: layout.hosts,
+            };
+            bind_launch(&mut plan, &recipe, pd)?;
+            candidates.push((
+                ServingCandidate {
+                    group: pool.group,
+                    expected_epoch,
+                    plan,
+                    capacity: layout.capacity,
+                    ready_after_ms: pipeline.ready_after_ms,
+                    transition_loss_requests: pipeline.transition_loss_requests,
+                },
+                recipe,
+            ));
+        }
+    }
     Ok(candidates)
+}
+
+fn bind_launch(
+    plan: &mut GroupPlan,
+    recipe: &HostedRecipe,
+    pd: Option<(ServingRole, &HostedPdKv)>,
+) -> Result<(), &'static str> {
+    if let Some((role, kv)) = pd {
+        let launch = HostedPdLaunch {
+            role,
+            kv: kv.clone(),
+        };
+        plan.launch_digest = launch.launch_digest(recipe);
+        launch
+            .validate(recipe, plan)
+            .map_err(|_| "invalid hosted P/D pool recipe")
+    } else {
+        plan.launch_digest = recipe.launch_digest();
+        recipe
+            .validate(plan)
+            .map_err(|_| "invalid hosted pool recipe")
+    }
 }
 
 impl HostedPool {
@@ -198,13 +266,30 @@ impl HostedPool {
             .map(|size| size.capacity)
     }
 
+    pub(super) fn pipeline(
+        &self,
+        profile: &str,
+        tensor_parallel: u32,
+        pipeline_parallel: u32,
+    ) -> Option<&PipelineProfile> {
+        self.pipelines.iter().find(|entry| {
+            entry.tensor_parallel == tensor_parallel
+                && entry.stages.len() == pipeline_parallel as usize
+                && entry.qualified_name().as_deref() == Some(profile)
+        })
+    }
+
+    pub(super) fn has_pipelines(&self) -> bool {
+        !self.pipelines.is_empty()
+    }
+
     pub(super) fn validate(&self, allow_local: bool) -> Result<(), &'static str> {
         let end = u32::from(self.ports.first) + u32::from(self.ports.count);
         if self.ports.first == 0 || self.ports.count < 3 || end > u32::from(u16::MAX) + 1 {
             return Err("hosted pool requires a port range with at least three valid ports");
         }
         let mut degrees = BTreeSet::new();
-        if self.sizes.is_empty()
+        if (self.sizes.is_empty() && self.pipelines.is_empty())
             || self.sizes.iter().any(|size| {
                 size.tensor_parallel < if allow_local { 1 } else { 2 }
                     || !degrees.insert(size.tensor_parallel)
@@ -216,6 +301,17 @@ impl HostedPool {
             })
         {
             return Err("hosted pool requires distinct supported TP sizes and valid budgets");
+        }
+        let mut shapes = BTreeSet::new();
+        for pipeline in &self.pipelines {
+            if !allow_local
+                || !pipeline.validate()
+                || !shapes.insert((pipeline.qualified_name(), pipeline.tensor_parallel))
+            {
+                return Err(
+                    "hosted P/D pool requires distinct supported pipelines and valid stage budgets",
+                );
+            }
         }
         Ok(())
     }
@@ -251,6 +347,7 @@ impl HostedPool {
                 ready_after_ms: 10,
                 transition_loss_requests: 0.0,
             }],
+            pipelines: Vec::new(),
         }
     }
 
@@ -267,6 +364,56 @@ fn available_hosts(
     pool: &HostedPool,
     size: &SizeProfile,
 ) -> BTreeMap<NodeId, AvailableHost> {
+    inventory_hosts(resources, planning, &pool.profile, &pool.ports)
+        .into_iter()
+        .filter_map(|(host, available)| {
+            let mut workers: Vec<_> = available
+                .workers
+                .into_iter()
+                .filter(|worker| worker.device_bytes >= size.device_bytes)
+                .collect();
+            let max_ranks = workers.len().min(size.tensor_parallel as usize);
+            let memory: Vec<_> = (1..=max_ranks as u64)
+                .map_while(|count| {
+                    Some(HostMemory {
+                        bytes: size
+                            .host_base
+                            .bytes
+                            .checked_add(size.host_per_worker.bytes.checked_mul(count)?)?,
+                        pinned_bytes: size
+                            .host_base
+                            .pinned_bytes
+                            .checked_add(size.host_per_worker.pinned_bytes.checked_mul(count)?)?,
+                    })
+                })
+                .take_while(|memory| {
+                    memory.bytes <= available.memory.bytes
+                        && memory.pinned_bytes <= available.memory.pinned_bytes
+                })
+                .collect();
+            if memory.is_empty() {
+                return None;
+            }
+            workers.truncate(memory.len());
+            Some((
+                host,
+                AvailableHost {
+                    address: available.address,
+                    workers,
+                    memory,
+                    ports: available.ports,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn inventory_hosts(
+    resources: &ServingResources,
+    planning: &HostedPlanning,
+    profile: &str,
+    ports: &PortRange,
+) -> BTreeMap<NodeId, InventoryHost> {
     let memory: BTreeMap<_, _> = resources
         .hosts
         .iter()
@@ -275,13 +422,12 @@ fn available_hosts(
     let inventories: BTreeMap<_, _> = planning
         .hosts
         .iter()
-        .filter(|inventory| inventory.profiles.contains(&pool.profile))
+        .filter(|inventory| inventory.profiles.contains(profile))
         .map(|inventory| (inventory.host, inventory))
         .collect();
     let mut workers: BTreeMap<NodeId, Vec<_>> = BTreeMap::new();
     for &worker in &resources.workers {
         if worker.grant.is_none()
-            && worker.device_bytes >= size.device_bytes
             && inventories
                 .get(&worker.device.node)
                 .and_then(|inventory| inventory.devices.get(&worker.device.ordinal))
@@ -299,37 +445,20 @@ fn available_hosts(
                 .capacity
                 .pinned_bytes
                 .saturating_sub(limits.reserved.pinned_bytes);
-            let max_ranks = workers.len().min(size.tensor_parallel as usize);
-            let memory: Vec<_> = (1..=max_ranks as u64)
-                .map_while(|count| {
-                    Some(HostMemory {
-                        bytes: size
-                            .host_base
-                            .bytes
-                            .checked_add(size.host_per_worker.bytes.checked_mul(count)?)?,
-                        pinned_bytes: size
-                            .host_base
-                            .pinned_bytes
-                            .checked_add(size.host_per_worker.pinned_bytes.checked_mul(count)?)?,
-                    })
-                })
-                .take_while(|memory| memory.bytes <= bytes && memory.pinned_bytes <= pinned)
-                .collect();
-            if memory.is_empty() {
-                return None;
-            }
             workers.sort_by_key(|worker| worker.device.ordinal);
-            workers.truncate(memory.len());
             Some((
                 host,
-                AvailableHost {
+                InventoryHost {
                     address: HostedAddress {
                         host,
                         address: inventories[&host].address,
                     },
                     workers,
-                    memory,
-                    ports: free_ports(host, &pool.ports, &planning.occupied),
+                    memory: HostMemory {
+                        bytes,
+                        pinned_bytes: pinned,
+                    },
+                    ports: free_ports(host, ports, &planning.occupied),
                 },
             ))
         })
@@ -520,6 +649,7 @@ mod tests {
                 ready_after_ms: 10,
                 transition_loss_requests: 0.0,
             }],
+            pipelines: Vec::new(),
         };
         let policy = HostedLinkPolicy {
             bytes_per_rank_pair: 100,

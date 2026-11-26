@@ -1,13 +1,17 @@
-use std::{collections::BTreeSet, io};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io,
+};
 
 use plait_core::serving::{
-    HostedPdReconfiguration, RouteSetId, ServingAction, ServingError, ServingLookup,
+    GroupPhase, HostedPdReconfiguration, RouteSetId, ServingAction, ServingError, ServingLookup,
     ServingOperation, ServingView,
 };
 use plait_core::{NodeId, OpId};
 use plait_node::Client;
 use plait_parallel::serving::{
-    HostedLinkPolicy, HostedPdPool, ServingForecast, plan_hosted_pd_with_releases,
+    HostedLinkPolicy, HostedPdIncumbents, HostedPdPool, ServingForecast,
+    plan_hosted_pd_with_assignments,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -80,6 +84,28 @@ pub(super) async fn replan(
         let result: Result<(), _> = Err(ServingError::HostedPdInProgress { staged });
         return Ok(json!({ "selection": null, "result": result }));
     }
+    let mut assignments = BTreeMap::new();
+    let active_hosts: BTreeSet<_> = snapshot
+        .active
+        .iter()
+        .filter_map(|active| active.ranks.keys().next().copied())
+        .collect();
+    for host in active_hosts {
+        let ServingView::HostedManagedAssignments(entries) = query(
+            client,
+            peers.clone(),
+            ServingLookup::HostedManagedAssignments(host),
+        )
+        .await?
+        else {
+            return Err(io::Error::other("expected active hosted assignments"));
+        };
+        for entry in entries {
+            if entry.pd.is_some() && entry.assignment.phase == GroupPhase::Active {
+                assignments.insert(entry.assignment.version, entry.assignment);
+            }
+        }
+    }
     let hosts: BTreeSet<_> = snapshot
         .inventory
         .hosts
@@ -89,14 +115,17 @@ pub(super) async fn replan(
     let links =
         hosted_probe::collect(probe_endpoints(client, peers.clone()).await?, Some(&hosts)).await;
     forecast.now_ms = hosted_probe::now_ms()?;
-    let selection = plan_hosted_pd_with_releases(
+    let selection = plan_hosted_pd_with_assignments(
         &model,
         &snapshot,
         &forecast,
         &pool,
         link_policy,
         &links,
-        &releases,
+        HostedPdIncumbents {
+            assignments: Some(&assignments),
+            releases: &releases,
+        },
     )
     .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let mut reply = json!({ "selection": selection, "result": null });

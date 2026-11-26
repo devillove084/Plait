@@ -23,7 +23,7 @@ enum Driver {
     Ascend,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReleaseDriver {
     driver: Driver,

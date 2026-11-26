@@ -131,6 +131,26 @@ impl HostedRecipe {
     }
 }
 
+/// Inventory identifier for an engine profile with a specific layer partition.
+pub fn hosted_pipeline_profile(profile: &str, layers: &[u32]) -> Option<String> {
+    if layers.len() < 2
+        || layers.contains(&0)
+        || profile.is_empty()
+        || !profile
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"plait-hosted-layer-partition-v1");
+    for &count in layers {
+        digest.update(count.to_le_bytes());
+    }
+    let name = format!("{profile}.pp.{:x}", digest.finalize());
+    (name.len() <= 128).then_some(name)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedAssignment {
     pub version: GroupVersion,

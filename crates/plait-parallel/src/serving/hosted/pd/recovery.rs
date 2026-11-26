@@ -6,8 +6,8 @@ use plait_core::serving::{
 };
 
 use super::{
-    HostedLinkPolicy, HostedPdPool, LAYOUTS_PER_SHAPE, LinkEvidence, Traffic, available, endpoint,
-    generate_layouts, validate_placement,
+    EndpointContext, HostedLinkPolicy, HostedPdPool, LAYOUTS_PER_SHAPE, LinkEvidence, Traffic,
+    available, generate_layouts, validate_placement,
 };
 
 #[derive(Clone)]
@@ -52,6 +52,11 @@ pub fn plan_hosted_pd_recovery(
         policy,
         now_ms,
         links,
+    };
+    let context = EndpointContext {
+        evidence,
+        store_host,
+        kv_bytes: pool.kv_bytes_per_request,
     };
     let mut layouts = vec![RecoveryLayout {
         placements: Vec::new(),
@@ -105,27 +110,16 @@ pub fn plan_hosted_pd_recovery(
                 ) else {
                     continue;
                 };
-                let mut ranks = BTreeMap::new();
-                for device in candidate.plan.workers.keys() {
-                    *ranks.entry(device.node).or_default() += 1;
-                }
-                let Some(endpoint) = endpoint(
-                    version,
-                    role,
-                    candidate.capacity,
-                    &ranks,
-                    evidence,
-                    store_host,
-                    pool.kv_bytes_per_request,
-                ) else {
+                let Some(endpoint) = context.candidate(version, &candidate, &recipe, &slot.pool)
+                else {
                     continue;
                 };
-                if !candidate.capacity.is_valid(now_ms) || candidate.capacity.rps == 0.0 {
+                if !endpoint.capacity.is_valid(now_ms) || endpoint.capacity.rps == 0.0 {
                     continue;
                 }
                 let mut trial = layout.clone();
                 trial.ready_after_ms = trial.ready_after_ms.max(candidate.ready_after_ms);
-                trial.compute_rps = trial.compute_rps.min(candidate.capacity.rps / share);
+                trial.compute_rps = trial.compute_rps.min(endpoint.capacity.rps / share);
                 trial.traffic.include(&endpoint.traffic, share);
                 trial.versions.insert(failed, version);
                 trial.placements.push(HostedPdPlacement {

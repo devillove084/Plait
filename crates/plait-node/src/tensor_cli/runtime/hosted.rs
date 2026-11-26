@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use plait_core::serving::{
     GroupPhase, GroupVersion, HostMemory, HostedInventory, HostedManagedAssignment, ServingAction,
-    ServingLookup, ServingView,
+    ServingLookup, ServingView, hosted_pipeline_profile,
 };
 use plait_core::{DeviceId, NodeId};
 use serde::{Deserialize, Serialize};
@@ -48,7 +48,7 @@ struct Device {
     device_bytes: u64,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct EngineProfile {
     argv: Vec<String>,
@@ -58,6 +58,8 @@ struct EngineProfile {
     args: Vec<String>,
     #[serde(default)]
     env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing)]
+    pipeline_layers: Option<Vec<u32>>,
     verify_release: Option<PathBuf>,
     release_driver: Option<ReleaseDriver>,
 }
@@ -91,6 +93,48 @@ pub(crate) async fn run(
         ));
     }
     scaling::validate(&config.pd_scaling)?;
+    let mut pipeline_profiles = BTreeMap::new();
+    for (name, profile) in &config.profiles {
+        let Some(layers) = &profile.pipeline_layers else {
+            continue;
+        };
+        let qualified = hosted_pipeline_profile(name, layers).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid hosted pipeline profile",
+            )
+        })?;
+        let partition = layers
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        if profile
+            .env
+            .get("VLLM_PP_LAYER_PARTITION")
+            .is_some_and(|old| old != &partition)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pipeline_layers differs from VLLM_PP_LAYER_PARTITION",
+            ));
+        }
+        let mut profile = profile.clone();
+        profile
+            .env
+            .insert("VLLM_PP_LAYER_PARTITION".into(), partition);
+        pipeline_profiles.insert(qualified, profile);
+    }
+    if pipeline_profiles
+        .keys()
+        .any(|name| config.profiles.contains_key(name))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "pipeline profile collides with an installed profile",
+        ));
+    }
+    config.profiles.extend(pipeline_profiles);
     for profile in config.profiles.values() {
         if let Some(driver) = &profile.release_driver
             && (profile.verify_release.is_some()

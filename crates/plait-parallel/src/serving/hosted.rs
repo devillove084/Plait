@@ -5,10 +5,11 @@ use plait_core::serving::{GroupPlan, HostedLinkSample};
 use serde::{Deserialize, Serialize};
 
 mod pd;
+mod pipeline;
 mod pool;
 pub use pd::{
-    HostedPdDecision, HostedPdPool, HostedPdSelection, plan_hosted_pd, plan_hosted_pd_recovery,
-    plan_hosted_pd_with_releases,
+    HostedPdDecision, HostedPdIncumbents, HostedPdPool, HostedPdSelection, plan_hosted_pd,
+    plan_hosted_pd_recovery, plan_hosted_pd_with_assignments, plan_hosted_pd_with_releases,
 };
 pub use pool::{HostedPool, generate_hosted_candidates};
 
