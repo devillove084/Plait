@@ -30,11 +30,23 @@ pub struct HostedPdPool {
     /// Aggregate throughput of the store, counting reads and writes.
     store_bytes_per_second: u64,
     store_valid_until_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpoint_traffic: Option<CheckpointTraffic>,
     slots: Vec<RoleSlot>,
     #[serde(default)]
     allow_scale_down: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reconfigure: Option<Reconfiguration>,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointTraffic {
+    /// Additional page data, beyond the ordinary split prompt handoff.
+    write_bytes_per_stream: u64,
+    read_bytes_per_stream: u64,
+    minimum_fraction_bps: u16,
+    handoff_window_ms: u64,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -176,7 +188,14 @@ struct Endpoint {
     role: ServingRole,
     capacity: SloProfile,
     traffic: Traffic,
+    checkpoint: Option<CheckpointIo>,
     devices: u64,
+}
+
+#[derive(Clone)]
+struct CheckpointIo {
+    write: Traffic,
+    read: Traffic,
 }
 
 #[derive(Clone, Default)]
@@ -278,6 +297,8 @@ pub fn plan_hosted_pd_with_assignments(
         evidence,
         store_host: Some(store_host),
         kv_bytes: pool.kv_bytes_per_request,
+        checkpoint: pool.observed_checkpoint_traffic(forecast),
+        aggregate_checkpoints: false,
     };
     let profiles: BTreeMap<_, _> = forecast
         .groups
@@ -371,9 +392,17 @@ pub fn plan_hosted_pd_with_assignments(
             continue;
         }
         selection.layouts_evaluated += 1;
+        let Some((handoff_rate, handoff_ms)) = handoff_capacity(forecast, pool, &active, layout)
+        else {
+            continue;
+        };
+        if handoff_rate < baseline_rps {
+            continue;
+        }
         let gain = (layout.potential - baseline_rps)
             * (forecast.horizon_ms - layout.ready_after_ms) as f64
             / 1000.0
+            - (layout.potential - handoff_rate) * handoff_ms as f64 / 1000.0
             - layout.transition_loss_requests;
         let devices = layout.devices();
         let improves = gain > 0.0 && gain >= forecast.minimum_gain_requests;
@@ -404,6 +433,7 @@ pub fn plan_hosted_pd_with_assignments(
         search.reconfigure(
             snapshot,
             &layouts,
+            &active,
             incumbents.releases,
             policy,
             &mut selection,
@@ -529,6 +559,22 @@ impl Search<'_> {
 }
 
 impl HostedPdPool {
+    fn checkpoint_fraction(&self, forecast: &ServingForecast) -> f64 {
+        self.checkpoint_traffic.map_or(0.0, |profile| {
+            let floor = f64::from(profile.minimum_fraction_bps) / 10_000.0;
+            forecast
+                .checkpoints
+                .map_or(1.0, |load| load.fraction.max(floor))
+        })
+    }
+
+    fn observed_checkpoint_traffic(&self, forecast: &ServingForecast) -> Option<CheckpointTraffic> {
+        self.checkpoint_traffic.filter(|_| {
+            self.checkpoint_fraction(forecast) > 0.0
+                || forecast.checkpoints.is_some_and(|load| load.in_flight > 0)
+        })
+    }
+
     pub fn can_reconfigure(&self) -> bool {
         self.reconfigure.is_some()
     }
@@ -586,6 +632,13 @@ impl HostedPdPool {
         {
             return Err("hosted P/D requires current store capacity");
         }
+        if self.checkpoint_traffic.is_some_and(|profile| {
+            (profile.write_bytes_per_stream == 0 && profile.read_bytes_per_stream == 0)
+                || profile.minimum_fraction_bps > 10_000
+                || profile.handoff_window_ms == 0
+        }) {
+            return Err("invalid checkpoint traffic profile");
+        }
         let mut groups = BTreeSet::new();
         for slot in &self.slots {
             slot.pool.validate(true)?;
@@ -638,6 +691,8 @@ struct EndpointContext<'a> {
     evidence: LinkEvidence<'a>,
     store_host: Option<NodeId>,
     kv_bytes: u64,
+    checkpoint: Option<CheckpointTraffic>,
+    aggregate_checkpoints: bool,
 }
 
 impl EndpointContext<'_> {
@@ -686,26 +741,57 @@ impl EndpointContext<'_> {
         } else {
             (self.evidence.tp_traffic(ranks).ok()?, ranks.clone())
         };
-        if role != ServingRole::Aggregated {
-            let store = self.store_host?;
-            let total: u64 = weights.values().sum();
-            for (host, weight) in weights {
-                let bytes = self.kv_bytes as f64 * weight as f64 / total as f64;
-                let (from, to) = if role == ServingRole::Prefill {
-                    (host, store)
-                } else {
-                    (store, host)
-                };
-                self.evidence.add(&mut traffic, from, to, bytes).ok()?;
+        match role {
+            ServingRole::Prefill => {
+                self.add_store_io(&mut traffic, &weights, self.kv_bytes, true)?
             }
+            ServingRole::Decode => {
+                self.add_store_io(&mut traffic, &weights, self.kv_bytes, false)?
+            }
+            ServingRole::Aggregated => {}
         }
+        let checkpoint = self.checkpoint.filter(|_| {
+            role == ServingRole::Decode
+                || (role == ServingRole::Aggregated && self.aggregate_checkpoints)
+        });
+        let checkpoint = if let Some(profile) = checkpoint {
+            let (mut write, mut read) = (Traffic::new(), Traffic::new());
+            self.add_store_io(&mut write, &weights, profile.write_bytes_per_stream, true)?;
+            self.add_store_io(&mut read, &weights, profile.read_bytes_per_stream, false)?;
+            Some(CheckpointIo { write, read })
+        } else {
+            None
+        };
         Some(Endpoint {
             version,
             role,
             capacity,
             traffic,
+            checkpoint,
             devices: ranks.values().sum(),
         })
+    }
+
+    fn add_store_io(
+        &self,
+        traffic: &mut Traffic,
+        weights: &BTreeMap<NodeId, u64>,
+        bytes: u64,
+        write: bool,
+    ) -> Option<()> {
+        if bytes == 0 {
+            return Some(());
+        }
+        let store = self.store_host?;
+        let total: u64 = weights.values().sum();
+        for (&host, &weight) in weights {
+            let (from, to) = if write { (host, store) } else { (store, host) };
+            let proportional_bytes = bytes as f64 * weight as f64 / total as f64;
+            self.evidence
+                .add(traffic, from, to, proportional_bytes)
+                .ok()?;
+        }
+        Some(())
     }
 }
 
@@ -744,9 +830,26 @@ fn rate<'a>(
     at: u64,
     endpoints: impl IntoIterator<Item = (&'a Endpoint, f64)>,
 ) -> Option<f64> {
+    rate_with_reservation(forecast, pool, at, endpoints, None)
+}
+
+struct CheckpointReservation {
+    ports: Traffic,
+    store_bytes_per_second: f64,
+}
+
+fn rate_with_reservation<'a>(
+    forecast: &ServingForecast,
+    pool: &HostedPdPool,
+    at: u64,
+    endpoints: impl IntoIterator<Item = (&'a Endpoint, f64)>,
+    reserved: Option<&CheckpointReservation>,
+) -> Option<f64> {
     let mut result = forecast.demand_rps;
     let mut traffic = Traffic::new();
     let (mut writes, mut reads) = (0.0f64, 0.0f64);
+    let fraction = pool.checkpoint_fraction(forecast);
+    let mut checkpoint_share = 0.0;
     for (endpoint, share) in endpoints {
         if !endpoint.capacity.is_valid(at) {
             return None;
@@ -758,19 +861,122 @@ fn rate<'a>(
         }
         result = result.min(endpoint.capacity.rps / share);
         traffic.include(&endpoint.traffic, share);
+        if let Some(io) = &endpoint.checkpoint
+            && fraction > 0.0
+        {
+            if io.write.valid_until_ms.min(io.read.valid_until_ms) <= at {
+                return None;
+            }
+            let share = share * fraction;
+            traffic.include(&io.write, share);
+            traffic.include(&io.read, share);
+            checkpoint_share += share;
+        }
     }
     // A partial search layout has a virtual counterpart for its P or D.
-    let store_fraction = writes.max(reads);
-    if store_fraction > 0.0 {
+    let additional = pool.checkpoint_traffic.map_or(0.0, |profile| {
+        (profile.write_bytes_per_stream as f64 + profile.read_bytes_per_stream as f64)
+            * checkpoint_share
+    });
+    let store_bytes_per_request =
+        2.0 * pool.kv_bytes_per_request as f64 * writes.max(reads) + additional;
+    let reserved_store = reserved.map_or(0.0, |reserve| reserve.store_bytes_per_second);
+    if store_bytes_per_request > 0.0 || reserved_store > 0.0 {
         if pool.store_valid_until_ms <= at {
             return None;
         }
-        result = result.min(
-            pool.store_bytes_per_second as f64
-                / (2.0 * pool.kv_bytes_per_request as f64 * store_fraction),
-        );
+        let available = pool.store_bytes_per_second as f64 - reserved_store;
+        if available < 0.0 {
+            return None;
+        }
+        if store_bytes_per_request > 0.0 {
+            result = result.min(available / store_bytes_per_request);
+        }
     }
-    Some(result.min(traffic.rate_limit()))
+    let link_limit = if let Some(reserve) = reserved {
+        if reserve.ports.valid_until_ms <= at {
+            return None;
+        }
+        traffic.rate_limit_after(&reserve.ports)?
+    } else {
+        traffic.rate_limit()
+    };
+    Some(result.min(link_limit))
+}
+
+fn handoff_capacity(
+    forecast: &ServingForecast,
+    pool: &HostedPdPool,
+    active: &BTreeMap<GroupId, Endpoint>,
+    layout: &Layout,
+) -> Option<(f64, u64)> {
+    let Some((profile, load)) = pool.checkpoint_traffic.zip(forecast.checkpoints) else {
+        return Some((layout.potential, 0));
+    };
+    if load.in_flight == 0 {
+        return Some((layout.potential, 0));
+    }
+    let mut removed_generator = false;
+    let mut source_write = Traffic::new();
+    let mut target_read = Traffic::new();
+    let mut target_prefill = Traffic::new();
+    let (mut write_bytes, mut read_bytes) = (0, 0);
+    for source in active.values() {
+        if source.role == ServingRole::Prefill
+            || layout
+                .endpoints
+                .iter()
+                .any(|target| target.version == source.version)
+        {
+            continue;
+        }
+        removed_generator = true;
+        if let Some(io) = &source.checkpoint {
+            source_write.include_peak(&io.write);
+            write_bytes = profile.write_bytes_per_stream;
+        }
+    }
+    if !removed_generator {
+        return Some((layout.potential, 0));
+    }
+    for target in &layout.endpoints {
+        let mut inbound = Traffic::new();
+        match target.role {
+            ServingRole::Prefill => {
+                target_prefill.include_peak(&target.traffic);
+                continue;
+            }
+            ServingRole::Decode | ServingRole::Aggregated => inbound.include(&target.traffic, 1.0),
+        }
+        if let Some(io) = &target.checkpoint {
+            inbound.include(&io.read, 1.0);
+            read_bytes = profile.read_bytes_per_stream;
+        }
+        target_read.include_peak(&inbound);
+    }
+    // An ingress may send every resumed stream to the same ready generator.
+    // Each direction reserves the largest contribution on each shared port.
+    let streams_per_second = load.in_flight as f64 * 1000.0 / profile.handoff_window_ms as f64;
+    let mut ports = Traffic::new();
+    ports.include(&source_write, streams_per_second);
+    ports.include(&target_read, streams_per_second);
+    ports.include(&target_prefill, streams_per_second);
+    let split_bytes = if layout.roles.has_split() {
+        2.0 * pool.kv_bytes_per_request as f64
+    } else {
+        0.0
+    };
+    let reserve = CheckpointReservation {
+        ports,
+        store_bytes_per_second: (write_bytes as f64 + read_bytes as f64 + split_bytes)
+            * streams_per_second,
+    };
+    let at = forecast.now_ms.checked_add(layout.ready_after_ms)?;
+    let capacity = rate_with_reservation(forecast, pool, at, layout.shares(), Some(&reserve))?;
+    let duration = profile
+        .handoff_window_ms
+        .min(forecast.horizon_ms - layout.ready_after_ms);
+    Some((capacity, duration))
 }
 
 impl Layout {
@@ -1024,6 +1230,7 @@ mod tests {
             resources,
         };
         let forecast = ServingForecast {
+            checkpoints: None,
             model: "weights".into(),
             demand_rps: 20.0,
             now_ms: 1000,
@@ -1047,6 +1254,7 @@ mod tests {
             pool: HostedPool::fixture(version.group, profile, "api").with_capacity(tp, rps),
         };
         let mut pool = HostedPdPool {
+            checkpoint_traffic: None,
             kv,
             kv_bytes_per_request: 100,
             store_bytes_per_second: 200_000,
@@ -1157,6 +1365,7 @@ mod tests {
             inventory,
         };
         let forecast = ServingForecast {
+            checkpoints: None,
             model: "weights".into(),
             demand_rps: 20.0,
             now_ms: 1000,
@@ -1171,6 +1380,7 @@ mod tests {
             pool: HostedPool::fixture(GroupId(node(group)), profile, "api"),
         };
         let pool = HostedPdPool {
+            checkpoint_traffic: None,
             kv: HostedPdKv {
                 store: "192.0.2.1:7952".parse().unwrap(),
                 namespace: "weights".into(),
@@ -1243,6 +1453,8 @@ mod tests {
             evidence,
             store_host: Some(store),
             kv_bytes: 200,
+            checkpoint: None,
+            aggregate_checkpoints: false,
         }
         .endpoint(
             GroupVersion {

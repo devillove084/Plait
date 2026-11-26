@@ -729,6 +729,11 @@ class HandoffTest(unittest.TestCase):
         snapshot = load.snapshot()
         self.assertEqual((snapshot["arrivals"], snapshot["completed"],
                           snapshot["failed"], snapshot["in_flight"]), (1, 0, 1, 0))
+        self.assertEqual(snapshot["checkpoints"], {"arrivals": 0, "in_flight": 0})
+        checkpoint = {**request, "stream": True, "temperature": 0}
+        self.assertEqual(self.request(port, COMPLETIONS, checkpoint,
+                                      {RECOVERY_HEADER: RESUME_KV_MODE})[0], 503)
+        self.assertEqual(load.snapshot()["checkpoints"], {"arrivals": 1, "in_flight": 0})
 
 
 if __name__ == "__main__":

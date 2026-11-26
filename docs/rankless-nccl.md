@@ -792,9 +792,29 @@ switch into split serving, the ingress still obtains the target Prefill's
 KV receipt. During a switch into aggregation, the engine looks up the
 original prompt and committed output history directly. Both can import
 complete pages from the old layout and compute the remaining known tokens.
-Calibrate SLO capacity under the intended fraction of checkpointing streams.
-The mode selector budgets steady-state split handoffs. Checkpoint export
-and import consume additional store and link capacity during these requests.
+#### Budget checkpoint traffic during a rollout
+
+Add `checkpoint_traffic` to `pd_scaling.pool`. Set
+`write_bytes_per_stream` and `read_bytes_per_stream` from measurements of
+checkpoint traffic. For split serving, exclude the usual prompt handoff
+bytes already in `kv_bytes_per_request`. Include prompt pages in the
+aggregate generator's checkpoint measurements when it stores or reads them.
+Use the upper budget across the layouts in the pool.
+
+`minimum_fraction_bps` sets the floor for the fraction of requests that
+use `resume-kv`, in basis points. The load listener reports the opted-in
+arrivals and their in-flight count. An older listener without these counters
+is budgeted as if all its arrivals and in-flight requests opted in.
+The planner combines those estimates with the normal TP, PP, and split
+handoff traffic on each directional port and at the store.
+
+`handoff_window_ms` is the calibrated interval over which the in-flight
+requests are expected to migrate. When a generating group is replaced, the
+planner reserves old-generation writes, target imports, and any new split
+prefill handoff during that interval. It reserves enough for concentration
+on one target because resumed requests can converge on the first available
+group. A candidate must sustain the incumbent's modeled service rate after
+those reserves. The forecast does not pace individual transfers.
 
 ## Execute a collective
 

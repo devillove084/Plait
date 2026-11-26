@@ -59,12 +59,18 @@ pub fn plan_hosted_pd_recovery(
         evidence,
         store_host: Some(store_host),
         kv_bytes: pool.kv_bytes_per_request,
+        checkpoint: pool.checkpoint_traffic,
+        aggregate_checkpoints: false,
     };
+    let checkpoint_bytes = pool.checkpoint_traffic.map_or(0.0, |profile| {
+        profile.write_bytes_per_stream as f64 + profile.read_bytes_per_stream as f64
+    });
     let mut layouts = vec![RecoveryLayout {
         placements: Vec::new(),
         versions: BTreeMap::new(),
         ready_after_ms: 0,
-        compute_rps: pool.store_bytes_per_second as f64 / (2.0 * pool.kv_bytes_per_request as f64),
+        compute_rps: pool.store_bytes_per_second as f64
+            / (2.0 * pool.kv_bytes_per_request as f64 + checkpoint_bytes),
         traffic: Traffic::new(),
     }];
     for (&failed, &role) in &recovery.failed {
@@ -123,6 +129,10 @@ pub fn plan_hosted_pd_recovery(
                 trial.ready_after_ms = trial.ready_after_ms.max(candidate.ready_after_ms);
                 trial.compute_rps = trial.compute_rps.min(endpoint.capacity.rps / share);
                 trial.traffic.include(&endpoint.traffic, share);
+                if let Some(io) = &endpoint.checkpoint {
+                    trial.traffic.include(&io.write, share);
+                    trial.traffic.include(&io.read, share);
+                }
                 trial.versions.insert(failed, version);
                 trial.placements.push(HostedPdPlacement {
                     group: failed.group,

@@ -13,8 +13,8 @@ use plait_core::serving::{
 };
 use plait_core::{NodeId, OpId};
 use plait_parallel::serving::{
-    GroupProfile, HostedLinkPolicy, HostedModePolicy, HostedPdIncumbents, HostedPdPool,
-    ServingForecast, plan_hosted_evacuation, plan_hosted_pd_recovery,
+    CheckpointLoad, GroupProfile, HostedLinkPolicy, HostedModePolicy, HostedPdIncumbents,
+    HostedPdPool, ServingForecast, plan_hosted_evacuation, plan_hosted_pd_recovery,
     plan_hosted_pd_with_assignments,
 };
 use serde::Deserialize;
@@ -85,12 +85,43 @@ struct Counters {
     completed: u64,
     failed: u64,
     in_flight: u64,
+    checkpoints: Option<CheckpointCounters>,
+}
+
+#[derive(Deserialize)]
+struct CheckpointCounters {
+    arrivals: u64,
+    in_flight: u64,
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct ObservedDemand {
+    rps: f64,
+    checkpoint_rps: f64,
+    checkpoint_in_flight: u64,
+}
+
+impl ObservedDemand {
+    fn checkpoints(&self) -> CheckpointLoad {
+        CheckpointLoad {
+            fraction: if self.rps > 0.0 {
+                (self.checkpoint_rps / self.rps).min(1.0)
+            } else {
+                0.0
+            },
+            in_flight: self.checkpoint_in_flight,
+        }
+    }
 }
 
 impl Counters {
     fn is_valid(&self, model: &str) -> bool {
         self.model == model
             && NodeId::from_hex(&self.session).is_ok()
+            && self.checkpoints.as_ref().is_none_or(|count| {
+                count.arrivals <= self.arrivals
+                    && count.in_flight <= count.arrivals.min(self.in_flight)
+            })
             && self
                 .completed
                 .checked_add(self.failed)
@@ -98,7 +129,7 @@ impl Counters {
                 == Some(self.arrivals)
     }
 
-    fn arrival_rate(&self, before: &Self, window_ms: u64) -> Option<f64> {
+    fn demand(&self, before: &Self, window_ms: u64, horizon_ms: u64) -> Option<ObservedDemand> {
         let elapsed = self.uptime_ms.checked_sub(before.uptime_ms)?;
         if self.session != before.session
             || elapsed == 0
@@ -109,9 +140,30 @@ impl Counters {
         {
             return None;
         }
-        self.arrivals
-            .checked_sub(before.arrivals)
-            .map(|count| count as f64 * 1000.0 / elapsed as f64)
+        let arrivals = self.arrivals.checked_sub(before.arrivals)?;
+        let (checkpoint_arrivals, checkpoint_in_flight) =
+            match (&self.checkpoints, &before.checkpoints) {
+                (Some(current), Some(previous)) => {
+                    let count = current.arrivals.checked_sub(previous.arrivals)?;
+                    if count > arrivals
+                        || current.in_flight > previous.in_flight.checked_add(count)?
+                    {
+                        return None;
+                    }
+                    (count, current.in_flight)
+                }
+                (None, None) => (arrivals, self.in_flight),
+                _ => return None,
+            };
+        let to_rps = |arrivals, in_flight| {
+            arrivals as f64 * 1000.0 / elapsed as f64
+                + in_flight as f64 * 1000.0 / horizon_ms as f64
+        };
+        Some(ObservedDemand {
+            rps: to_rps(arrivals, self.in_flight),
+            checkpoint_rps: to_rps(checkpoint_arrivals, checkpoint_in_flight),
+            checkpoint_in_flight,
+        })
     }
 }
 
@@ -137,7 +189,7 @@ impl Evidence {
         window_ms: u64,
         cooldown: Duration,
         horizon_ms: u64,
-    ) -> Option<f64> {
+    ) -> Option<ObservedDemand> {
         if self.revision.is_some_and(|seen| revision < seen) {
             self.reset();
             return None;
@@ -167,9 +219,14 @@ impl Evidence {
             .as_ref()
             .expect("installed counters")
             .iter()
-            .try_fold(0.0, |rate, (addr, current)| {
-                let rps = current.arrival_rate(before.get(addr)?, window_ms)?;
-                Some(rate + rps + current.in_flight as f64 * 1000.0 / horizon_ms as f64)
+            .try_fold(ObservedDemand::default(), |mut sum, (addr, current)| {
+                let measured = current.demand(before.get(addr)?, window_ms, horizon_ms)?;
+                sum.rps += measured.rps;
+                sum.checkpoint_rps += measured.checkpoint_rps;
+                sum.checkpoint_in_flight = sum
+                    .checkpoint_in_flight
+                    .checked_add(measured.checkpoint_in_flight)?;
+                Some(sum)
             });
         if measured.is_none() {
             self.proposal = None;
@@ -292,7 +349,7 @@ async fn run_model(policy: Policy, peers: ControlPeers) -> io::Result<()> {
             }
         };
         let observed_at = Instant::now();
-        let Some(demand_rps) = evidence.observe(
+        let Some(demand) = evidence.observe(
             snapshot.current.split.revision,
             snapshot.current.split.pending.is_some(),
             samples,
@@ -303,10 +360,12 @@ async fn run_model(policy: Policy, peers: ControlPeers) -> io::Result<()> {
         ) else {
             continue;
         };
+        let demand_rps = demand.rps;
+        let checkpoints = (!ingress.is_empty()).then(|| demand.checkpoints());
         let planned = if serving_modes.is_some() || !snapshot.withdrawing.is_empty() {
             // Without an ingress cohort, preserve the full modeled incumbent capacity.
             let demand_rps = if ingress.is_empty() {
-                f64::MAX
+                f64::MAX / horizon_ms as f64
             } else {
                 demand_rps
             };
@@ -320,6 +379,7 @@ async fn run_model(policy: Policy, peers: ControlPeers) -> io::Result<()> {
                 ServingForecast {
                     model: checkpoint.clone(),
                     demand_rps,
+                    checkpoints,
                     now_ms: 0,
                     horizon_ms,
                     minimum_gain_requests,
@@ -334,7 +394,7 @@ async fn run_model(policy: Policy, peers: ControlPeers) -> io::Result<()> {
                 &mut control,
                 &model,
                 &checkpoint,
-                demand_rps,
+                demand,
                 horizon_ms,
                 minimum_gain_requests,
                 HostedPdReconfiguration {
@@ -434,7 +494,7 @@ async fn decide(
     control: &mut GroupControl,
     model: &str,
     checkpoint: &str,
-    demand_rps: f64,
+    demand: ObservedDemand,
     horizon_ms: u64,
     minimum_gain_requests: f64,
     snapshot: HostedPdReconfiguration,
@@ -461,7 +521,8 @@ async fn decide(
     let links = collect_links(control, &snapshot).await?;
     let forecast = ServingForecast {
         model: checkpoint.to_owned(),
-        demand_rps,
+        demand_rps: demand.rps,
+        checkpoints: Some(demand.checkpoints()),
         now_ms: hosted_probe::now_ms()?,
         horizon_ms,
         minimum_gain_requests,
@@ -619,6 +680,7 @@ mod tests {
                 completed: arrivals - in_flight,
                 failed: 0,
                 in_flight,
+                checkpoints: None,
             },
         )])
     }
@@ -645,20 +707,57 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_samples_track_opt_in_and_use_all_legacy_arrivals_as_the_bound() {
+        let [mut previous, mut current] = [sample(1, 1000, 5, 2), sample(1, 2000, 9, 3)]
+            .map(|cohort| cohort.into_values().next().unwrap());
+        let legacy = current.demand(&previous, 1000, 10000).unwrap();
+        assert_eq!(
+            legacy.checkpoints(),
+            CheckpointLoad {
+                fraction: 1.0,
+                in_flight: 3
+            }
+        );
+        previous.checkpoints = Some(CheckpointCounters {
+            arrivals: 2,
+            in_flight: 1,
+        });
+        current.checkpoints = Some(CheckpointCounters {
+            arrivals: 3,
+            in_flight: 2,
+        });
+        assert!(current.is_valid("model"));
+        let mixed = current.demand(&previous, 1000, 10000).unwrap();
+        assert_eq!(mixed.rps, 4.3);
+        assert_eq!(
+            mixed.checkpoints(),
+            CheckpointLoad {
+                fraction: 1.2 / 4.3,
+                in_flight: 2
+            }
+        );
+        current.checkpoints.as_mut().unwrap().arrivals = 8;
+        assert!(current.is_valid("model"));
+        assert!(current.demand(&previous, 1000, 10000).is_none());
+    }
+
+    #[test]
     fn stability_resets_on_different_plan_ingress_session_and_revision() {
         let t = Instant::now();
         let mut state = Evidence::default();
         let observe =
             |state: &mut Evidence, revision, pending, session, uptime, arrivals, in_flight, now| {
-                state.observe(
-                    revision,
-                    pending,
-                    sample(session, uptime, arrivals, in_flight),
-                    t + Duration::from_millis(now),
-                    1000,
-                    Duration::from_millis(2000),
-                    10000,
-                )
+                state
+                    .observe(
+                        revision,
+                        pending,
+                        sample(session, uptime, arrivals, in_flight),
+                        t + Duration::from_millis(now),
+                        1000,
+                        Duration::from_millis(2000),
+                        10000,
+                    )
+                    .map(|demand| demand.rps)
             };
         assert_eq!(observe(&mut state, 0, false, 1, 1000, 0, 0, 1000), None);
         assert_eq!(

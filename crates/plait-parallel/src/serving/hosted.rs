@@ -166,6 +166,47 @@ impl Traffic {
                 .add(budget.bytes_per_second, budget.bytes_per_request * share);
         }
     }
+
+    fn include_peak(&mut self, other: &Self) {
+        self.valid_until_ms = self.valid_until_ms.min(other.valid_until_ms);
+        for (&key, incoming) in &other.ports {
+            self.ports
+                .entry(key)
+                .and_modify(|port| {
+                    port.bytes_per_second = port.bytes_per_second.min(incoming.bytes_per_second);
+                    port.bytes_per_request = port.bytes_per_request.max(incoming.bytes_per_request);
+                })
+                .or_insert_with(|| incoming.clone());
+        }
+    }
+
+    fn rate_limit_after(&self, reserved: &Self) -> Option<f64> {
+        // Reserved stream bytes have already been scaled to bytes per second.
+        for (key, port) in &reserved.ports {
+            let capacity = self.ports.get(key).map_or(port.bytes_per_second, |steady| {
+                steady.bytes_per_second.min(port.bytes_per_second)
+            });
+            if port.bytes_per_request > capacity as f64 {
+                return None;
+            }
+        }
+        Some(
+            self.ports
+                .iter()
+                .map(|(key, port)| {
+                    let available =
+                        reserved
+                            .ports
+                            .get(key)
+                            .map_or(port.bytes_per_second as f64, |fixed| {
+                                port.bytes_per_second.min(fixed.bytes_per_second) as f64
+                                    - fixed.bytes_per_request
+                            });
+                    available / port.bytes_per_request
+                })
+                .fold(f64::INFINITY, f64::min),
+        )
+    }
 }
 
 #[derive(Clone, Default)]

@@ -638,6 +638,7 @@ mod tests {
             }],
         };
         let forecast = ServingForecast {
+            checkpoints: None,
             model: "model".into(),
             demand_rps: 8.0,
             now_ms: 10,

@@ -296,7 +296,8 @@ def server(
             if load is None:
                 self.route_request(routes, body, replay)
                 return
-            load.begin()
+            checkpoint = replay is not None and replay.mode == RESUME_KV_MODE
+            load.begin(checkpoint)
             completed = False
             try:
                 config = self.read_directory()
@@ -304,7 +305,7 @@ def server(
                     _, routes = config
                     completed = self.route_request(routes, body, replay)
             finally:
-                load.finish(completed)
+                load.finish(completed, checkpoint)
 
         def route_request(self, routes: list[Destination], body: dict, replay: CompletionReplay | None = None) -> bool:
             deadline = time.monotonic() + timeout

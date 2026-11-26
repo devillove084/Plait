@@ -4,12 +4,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use plait_core::DeviceId;
 use plait_core::serving::{
-    ActiveGroup, GroupPhase, GroupResources, GroupVersion, HostedPdPlanning, HostedPdRelease,
-    HostedPdStage, PdRoute,
+    ActiveGroup, GroupId, GroupPhase, GroupResources, GroupVersion, HostedPdPlanning,
+    HostedPdRelease, HostedPdStage, PdRoute,
 };
 use serde::{Deserialize, Serialize};
 
-use super::{Bridge, HostedPdDecision, HostedPdSelection, Layout, Search, available};
+use super::{
+    Bridge, Endpoint, HostedPdDecision, HostedPdSelection, Layout, Search, available,
+    handoff_capacity,
+};
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -22,6 +25,7 @@ impl Search<'_> {
         &self,
         snapshot: &HostedPdPlanning,
         layouts: &[Layout],
+        incumbents: &BTreeMap<GroupId, Endpoint>,
         releases: &[HostedPdRelease],
         policy: Reconfiguration,
         selection: &mut HostedPdSelection,
@@ -55,7 +59,22 @@ impl Search<'_> {
                 .then_with(|| a.ready_after_ms.cmp(&b.ready_after_ms))
                 .then_with(|| a.placements.len().cmp(&b.placements.len()))
         });
-        for (bridge, paths, release, start_target_after_ms) in bridges.into_iter().take(16) {
+        for (bridge, paths, release, _) in bridges.into_iter().take(16) {
+            let Some((bridge_handoff, bridge_handoff_ms)) =
+                handoff_capacity(self.forecast, self.pool, incumbents, bridge)
+            else {
+                continue;
+            };
+            if bridge_handoff < baseline {
+                continue;
+            }
+            let Some(start_target_after_ms) = bridge
+                .ready_after_ms
+                .checked_add(policy.drain_ms.max(bridge_handoff_ms))
+                .filter(|&elapsed| elapsed < self.forecast.horizon_ms)
+            else {
+                continue;
+            };
             let Some(projected) = project(snapshot, bridge, &release, &self.forecast.model) else {
                 continue;
             };
@@ -93,12 +112,23 @@ impl Search<'_> {
                 if bridge_rate < baseline {
                     continue;
                 }
+                let Some((target_handoff, target_handoff_ms)) =
+                    handoff_capacity(&forecast, self.pool, &active, &target)
+                else {
+                    continue;
+                };
+                if target_handoff < baseline {
+                    continue;
+                }
                 selection.layouts_evaluated += 1;
                 let bridge_gain =
                     (bridge_rate - baseline) * (ready_after_ms - bridge.ready_after_ms) as f64;
                 let target_gain = (target.potential - baseline)
                     * (self.forecast.horizon_ms - ready_after_ms) as f64;
-                let gain = (bridge_gain + target_gain) / 1000.0
+                let handoff_loss = (bridge_rate - bridge_handoff).max(0.0)
+                    * bridge_handoff_ms.min(ready_after_ms - bridge.ready_after_ms) as f64
+                    + (target.potential - target_handoff) * target_handoff_ms as f64;
+                let gain = (bridge_gain + target_gain - handoff_loss) / 1000.0
                     - bridge.transition_loss_requests
                     - target.transition_loss_requests;
                 let devices = target.devices();

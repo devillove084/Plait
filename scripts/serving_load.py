@@ -25,15 +25,22 @@ class Load:
         self.completed = 0
         self.failed = 0
         self.in_flight = 0
+        self.checkpoint_arrivals = 0
+        self.checkpoint_in_flight = 0
 
-    def begin(self) -> None:
+    def begin(self, checkpoint: bool = False) -> None:
         with self.lock:
             self.arrivals += 1
             self.in_flight += 1
+            if checkpoint:
+                self.checkpoint_arrivals += 1
+                self.checkpoint_in_flight += 1
 
-    def finish(self, completed: bool) -> None:
+    def finish(self, completed: bool, checkpoint: bool = False) -> None:
         with self.lock:
             self.in_flight -= 1
+            if checkpoint:
+                self.checkpoint_in_flight -= 1
             if completed:
                 self.completed += 1
             else:
@@ -46,6 +53,10 @@ class Load:
                 "uptime_ms": (time.monotonic_ns() - self.started) // 1_000_000,
                 "arrivals": self.arrivals, "completed": self.completed,
                 "failed": self.failed, "in_flight": self.in_flight,
+                "checkpoints": {
+                    "arrivals": self.checkpoint_arrivals,
+                    "in_flight": self.checkpoint_in_flight,
+                },
             }
 
 

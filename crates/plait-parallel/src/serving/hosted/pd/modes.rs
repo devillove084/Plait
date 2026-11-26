@@ -13,7 +13,7 @@ use serde::Deserialize;
 use super::super::super::valid_rate;
 use super::{
     Endpoint, EndpointContext, HostedLinkPolicy, HostedPdPool, HostedPool, LinkEvidence, Search,
-    ServingForecast, rate,
+    ServingForecast, handoff_capacity, rate,
 };
 
 #[derive(Deserialize)]
@@ -108,7 +108,7 @@ fn plan(
     let device_cost = modes.map_or(0.0, |modes| modes.device_cost_requests_per_second);
     let mode_loss = modes.map_or(0.0, |modes| modes.mode_change_loss_requests);
     let aggregate_checkpoints = modes.is_some_and(|modes| modes.aggregate_stream_checkpoints);
-    // Validate the contract. Fresh store evidence is required only for split traffic.
+    // The chosen endpoints determine whether the store must have fresh evidence.
     pool.validate(model, 0)?;
     if !snapshot.managed
         || !forecast.paths.is_empty()
@@ -129,6 +129,8 @@ fn plan(
         },
         store_host: pool.store_host(&snapshot.split.inventory).ok(),
         kv_bytes: pool.kv_bytes_per_request,
+        checkpoint: pool.observed_checkpoint_traffic(forecast),
+        aggregate_checkpoints,
     };
     let mut active = BTreeMap::new();
     let mut routes: BTreeSet<_> = snapshot
@@ -177,7 +179,10 @@ fn plan(
                     ServingRole::Aggregated,
                     ranks.get(&version)?,
                     slot,
-                    context,
+                    EndpointContext {
+                        aggregate_checkpoints: snapshot.aggregate_kv.contains_key(&version),
+                        ..context
+                    },
                 )
             })
             .ok_or("active aggregate route lacks current capacity or directed links")?;
@@ -224,6 +229,13 @@ fn plan(
         if targets == routes || layout.potential < baseline {
             continue;
         }
+        let Some((handoff_rate, handoff_ms)) = handoff_capacity(forecast, pool, &active, &layout)
+        else {
+            continue;
+        };
+        if handoff_rate < baseline {
+            continue;
+        }
         let moves = layout.ready_after_ms;
         let new_versions: BTreeSet<_> = targets.iter().flat_map(|route| route.groups()).collect();
         let removed: u64 = active
@@ -239,11 +251,13 @@ fn plan(
         let saved_device_seconds = (removed as f64
             * forecast
                 .horizon_ms
-                .saturating_sub(moves.saturating_add(drain_ms)) as f64
+                .saturating_sub(moves.saturating_add(drain_ms.max(handoff_ms)))
+                as f64
             - added as f64 * forecast.horizon_ms as f64)
             / 1000.0;
         let mut gain = (layout.potential - baseline) * (forecast.horizon_ms - moves) as f64
             / 1000.0
+            - (layout.potential - handoff_rate) * handoff_ms as f64 / 1000.0
             + saved_device_seconds * device_cost
             - layout.transition_loss_requests;
         if !routes.is_empty() && mode != shape(&targets) {
@@ -378,8 +392,9 @@ fn shape(routes: &BTreeSet<HostedRoute>) -> (bool, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::serving::CheckpointLoad;
     use crate::serving::SloProfile;
-    use crate::serving::hosted::pd::{Layout, RoleSlot, Traffic};
+    use crate::serving::hosted::pd::{CheckpointTraffic, Layout, RoleSlot, Traffic};
     use plait_core::DeviceId;
     use plait_core::serving::{
         ActiveGroup, GroupPhase, GroupResources, HostMemory, HostResources, HostedAddress,
@@ -485,6 +500,7 @@ mod tests {
             block_size: 128,
         };
         let pool = HostedPdPool {
+            checkpoint_traffic: None,
             kv,
             kv_bytes_per_request: 100,
             store_bytes_per_second: 1600,
@@ -547,6 +563,7 @@ mod tests {
 
     fn forecast(demand_rps: f64) -> ServingForecast {
         ServingForecast {
+            checkpoints: None,
             model: "checkpoint".into(),
             now_ms: 1000,
             demand_rps,
@@ -672,6 +689,115 @@ mod tests {
 
         modes.drain_ms = 9999;
         assert!(plan(&split, 1.0, &modes, &links).is_none());
+
+        modes.drain_ms = 100;
+        let mut pool = pool;
+        pool.checkpoint_traffic = Some(CheckpointTraffic {
+            write_bytes_per_stream: 200,
+            read_bytes_per_stream: 200,
+            minimum_fraction_bps: 0,
+            handoff_window_ms: 1000,
+        });
+        let mut links = links;
+        links.insert((d, a), sample(a, 10_000));
+        let mut load = forecast(1.0);
+        load.checkpoints = Some(CheckpointLoad {
+            fraction: 1.0,
+            in_flight: 1,
+        });
+        let select = |load: &ServingForecast| {
+            plan_hosted_serving("model", &split, load, &pool, &modes, policy, &links).unwrap()
+        };
+        assert!(matches!(
+            select(&load),
+            Some(ServingAction::PrepareHostedServing { plan, .. })
+                if matches!(plan.routes.as_slice(), [HostedRoute::Aggregated(_)])
+        ));
+        load.checkpoints.as_mut().unwrap().in_flight = 5;
+        assert!(select(&load).is_none());
+    }
+
+    #[test]
+    fn checkpoint_overlap_uses_the_shared_store_and_peak_target_port() {
+        let (_, mut pool, _) = fixture();
+        let [store, source, target, remote] = [1, 2, 3, 4].map(node);
+        let links = BTreeMap::from([
+            ((store, source), sample(source, 1000)),
+            ((source, store), sample(store, 1000)),
+            ((store, target), sample(target, 700)),
+            ((target, store), sample(store, 1000)),
+            ((store, remote), sample(remote, 1000)),
+            ((remote, store), sample(store, 1000)),
+        ]);
+        pool.checkpoint_traffic = Some(CheckpointTraffic {
+            write_bytes_per_stream: 100,
+            read_bytes_per_stream: 200,
+            minimum_fraction_bps: 5000,
+            handoff_window_ms: 1000,
+        });
+        pool.store_bytes_per_second = 2000;
+        let mut forecast = forecast(20.0);
+        forecast.checkpoints = Some(CheckpointLoad {
+            fraction: 0.2,
+            in_flight: 3,
+        });
+        let context = EndpointContext {
+            evidence: LinkEvidence {
+                policy: HostedLinkPolicy {
+                    max_sample_age_ms: 100,
+                    bytes_per_rank_pair: 100,
+                },
+                now_ms: forecast.now_ms,
+                links: &links,
+            },
+            store_host: Some(store),
+            kv_bytes: 100,
+            checkpoint: pool.observed_checkpoint_traffic(&forecast),
+            aggregate_checkpoints: true,
+        };
+        let aggregate = |host| {
+            context
+                .endpoint(
+                    GroupVersion {
+                        group: GroupId(host),
+                        epoch: 1,
+                    },
+                    ServingRole::Aggregated,
+                    SloProfile {
+                        rps: 50.0,
+                        valid_until_ms: 5000,
+                    },
+                    &BTreeMap::from([(host, 1)]),
+                    None,
+                )
+                .unwrap()
+        };
+        let mut layout = Layout::default();
+        layout.add(aggregate(target));
+        layout.add(aggregate(remote));
+        let active = BTreeMap::from([(GroupId(source), aggregate(source))]);
+        layout.potential = rate(&forecast, &pool, forecast.now_ms, layout.shares()).unwrap();
+        // Both paths share the store's egress port. It permits 700 B/s,
+        // and each normal request needs 100 weighted bytes on that port.
+        assert_eq!(layout.potential, 7.0);
+        // All three resumes may reach the slower target. They reserve 600 B/s
+        // of the store's 700 B/s port, leaving 100 B/s for new traffic.
+        assert_eq!(
+            handoff_capacity(&forecast, &pool, &active, &layout),
+            Some((1.0, 1000))
+        );
+        pool.store_bytes_per_second = 800;
+        assert_eq!(handoff_capacity(&forecast, &pool, &active, &layout), None);
+        pool.store_bytes_per_second = 2000;
+        forecast.checkpoints.as_mut().unwrap().in_flight = 4;
+        assert_eq!(handoff_capacity(&forecast, &pool, &active, &layout), None);
+        forecast.checkpoints.as_mut().unwrap().in_flight = 0;
+        assert_eq!(
+            handoff_capacity(&forecast, &pool, &active, &layout),
+            Some((layout.potential, 0))
+        );
+        pool.store_valid_until_ms = forecast.now_ms;
+        assert!(rate(&forecast, &pool, forecast.now_ms, layout.shares()).is_none());
     }
 
     #[test]
@@ -695,6 +821,7 @@ mod tests {
                 evidence.add(&mut traffic, a, b, bytes).unwrap();
             }
             Endpoint {
+                checkpoint: None,
                 version: GroupVersion {
                     group: GroupId(node(i)),
                     epoch: 1,

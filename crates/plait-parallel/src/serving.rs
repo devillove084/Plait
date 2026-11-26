@@ -48,6 +48,8 @@ pub struct KvPath {
 pub struct ServingForecast {
     pub model: String,
     pub demand_rps: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoints: Option<CheckpointLoad>,
     pub now_ms: u64,
     pub horizon_ms: u64,
     pub minimum_gain_requests: f64,
@@ -56,6 +58,12 @@ pub struct ServingForecast {
     pub link_bytes_per_second: BTreeMap<String, u64>,
     /// Routes in the caller's allocation priority, highest first.
     pub paths: Vec<KvPath>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CheckpointLoad {
+    pub fraction: f64,
+    pub in_flight: u64,
 }
 
 /// One additive placement or a replacement that can prepare alongside its incumbent.
@@ -167,6 +175,9 @@ impl ServingForecast {
     fn validate(&self) -> Result<(), &'static str> {
         if self.model.is_empty()
             || !valid_rate(self.demand_rps)
+            || self
+                .checkpoints
+                .is_some_and(|load| !(0.0..=1.0).contains(&load.fraction))
             || !valid_rate(self.minimum_gain_requests)
             || self.horizon_ms == 0
             || !valid_rate(self.horizon_requests())
@@ -432,6 +443,7 @@ mod tests {
                 .collect(),
         };
         let mut input = ServingForecast {
+            checkpoints: None,
             model: "test-model".into(),
             demand_rps: 90.0,
             now_ms: 10,
