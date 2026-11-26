@@ -4,9 +4,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use plait_core::serving::{
     GroupId, GroupPhase, GroupPlan, GroupVersion, GroupView, HostMemory, HostedActivation,
-    HostedPdKv, HostedPdLaunch, HostedPdPlacement, HostedPdStage, HostedRecipe, PdRoute,
-    RouteDirectory, RouteSetId, ServingAction, ServingEndpoint, ServingLookup, ServingOperation,
-    ServingResources, ServingRole, ServingView, W4GroupLayout, WorkerDemand, WorkerGrant,
+    HostedPdKv, HostedPdLaunch, HostedPdPlacement, HostedPdStage, HostedRecipe, HostedRoute,
+    HostedRouteDirectory, HostedServingPlan, PdRoute, RouteSetId, ServingAction, ServingEndpoint,
+    ServingLookup, ServingOperation, ServingResources, ServingRole, ServingView, W4GroupLayout,
+    WorkerDemand, WorkerGrant,
 };
 use plait_core::{DeviceId, NodeId, OpId};
 use plait_node::{Client, discover_voters};
@@ -96,6 +97,17 @@ enum Request {
         paths: Vec<PdRoute>,
     },
     HostedPdPending {
+        model: String,
+    },
+    PrepareHostedServing {
+        id: OpId,
+        model: String,
+        expected_revision: u64,
+        kv: Option<HostedPdKv>,
+        placements: Vec<HostedPdPlacementInput>,
+        routes: Vec<HostedRoute>,
+    },
+    HostedServingPending {
         model: String,
     },
     PrepareHostedPdTransition {
@@ -216,12 +228,27 @@ struct HostedPdPlacementInput {
 
 impl HostedPdPlacementInput {
     fn placement(self, kv: &HostedPdKv) -> io::Result<HostedPdPlacement> {
+        self.hosted_placement(Some(kv))
+    }
+
+    fn hosted_placement(self, kv: Option<&HostedPdKv>) -> io::Result<HostedPdPlacement> {
         let mut plan: GroupPlan = self.plan.try_into()?;
-        let pd = HostedPdLaunch {
-            role: plan.role,
-            kv: kv.clone(),
+        plan.launch_digest = if plan.role == ServingRole::Aggregated {
+            self.recipe.launch_digest()
+        } else {
+            HostedPdLaunch {
+                role: plan.role,
+                kv: kv
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "split serving requires a KV contract",
+                        )
+                    })?
+                    .clone(),
+            }
+            .launch_digest(&self.recipe)
         };
-        plan.launch_digest = pd.launch_digest(&self.recipe);
         Ok(HostedPdPlacement {
             group: self.group,
             expected_epoch: self.expected_epoch,
@@ -432,6 +459,37 @@ async fn handle(
             let lookup = ServingLookup::HostedPdPending(RouteSetId::for_model(&model));
             let ServingView::HostedPdPending(intent) = query(client, peers, lookup).await? else {
                 return Err(io::Error::other("expected pending hosted P/D intent"));
+            };
+            Ok(json!({ "pending": intent }))
+        }
+        Request::PrepareHostedServing {
+            id,
+            model,
+            expected_revision,
+            kv,
+            placements,
+            routes,
+        } => {
+            let placements = placements
+                .into_iter()
+                .map(|input| input.hosted_placement(kv.as_ref()))
+                .collect::<io::Result<_>>()?;
+            let action = ServingAction::PrepareHostedServing {
+                model,
+                expected_revision,
+                plan: HostedServingPlan {
+                    kv,
+                    placements,
+                    routes,
+                },
+            };
+            execute(client, peers, ServingOperation { id, action }).await
+        }
+        Request::HostedServingPending { model } => {
+            let lookup = ServingLookup::HostedServingPending(RouteSetId::for_model(&model));
+            let ServingView::HostedServingPending(intent) = query(client, peers, lookup).await?
+            else {
+                return Err(io::Error::other("expected pending hosted serving intent"));
             };
             Ok(json!({ "pending": intent }))
         }
@@ -678,9 +736,10 @@ async fn replan_w4(
     Ok(json!({ "selection": selection, "result": result }))
 }
 
-fn directory_json(directory: RouteDirectory) -> Value {
+fn directory_json(directory: HostedRouteDirectory) -> Value {
     let version = |value: GroupVersion| format!("{}@{}", value.group.0.to_hex(), value.epoch);
     let paths: Vec<_> = directory
+        .split
         .paths
         .into_iter()
         .map(|path| {
@@ -698,7 +757,19 @@ fn directory_json(directory: RouteDirectory) -> Value {
             })
         })
         .collect();
-    json!({ "model": directory.model, "revision": directory.revision, "paths": paths })
+    let mut output = json!({ "model": directory.split.model, "revision": directory.split.revision, "paths": paths });
+    if !directory.aggregated.is_empty() {
+        output["aggregated"] = json!(
+            directory
+                .aggregated
+                .into_iter()
+                .map(|(group, http)| {
+                    json!({ "url": format!("http://{http}"), "version": version(group) })
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+    output
 }
 
 async fn query_routes(
@@ -706,26 +777,26 @@ async fn query_routes(
     peers: impl Iterator<Item = NodeId>,
     model: &str,
     minimum_revision: u64,
-) -> io::Result<Option<RouteDirectory>> {
-    let lookup = ServingLookup::Routes(RouteSetId::for_model(model));
+) -> io::Result<Option<HostedRouteDirectory>> {
+    let lookup = ServingLookup::HostedRoutes(RouteSetId::for_model(model));
     let mut last_error = None;
     let mut unanswered_revision = false;
     for node in peers {
         match tokio::time::timeout(Duration::from_secs(2), client.query_serving(node, lookup)).await
         {
-            Ok(Ok(ServingView::Routes(Some(directory)))) => {
-                if directory.model != model {
+            Ok(Ok(ServingView::HostedRoutes(Some(directory)))) => {
+                if directory.split.model != model {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "directory model mismatch",
                     ));
                 }
-                if directory.revision >= minimum_revision {
+                if directory.split.revision >= minimum_revision {
                     return Ok(Some(directory));
                 }
                 unanswered_revision = true;
             }
-            Ok(Ok(ServingView::Routes(None))) => unanswered_revision = true,
+            Ok(Ok(ServingView::HostedRoutes(None))) => unanswered_revision = true,
             Ok(Ok(_)) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,

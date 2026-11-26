@@ -27,6 +27,7 @@ tlc -deadlock -config specs/PlaitHostedAssignment.cfg specs/PlaitHostedAssignmen
 tlc -deadlock -config specs/PlaitHostedLinkEvidence.cfg specs/PlaitHostedLinkEvidence.tla
 tlc -deadlock -config specs/PlaitHostedPool.cfg specs/PlaitHostedPool.tla
 tlc -deadlock -config specs/PlaitHostedPd.cfg specs/PlaitHostedPd.tla
+tlc -deadlock -config specs/PlaitHostedServingModes.cfg specs/PlaitHostedServingModes.tla
 tlc -deadlock -config specs/PlaitHostedPdBudget.cfg specs/PlaitHostedPdBudget.tla
 tlc -deadlock -config specs/PlaitHostedPipelinePlacement.cfg specs/PlaitHostedPipelinePlacement.tla
 tlc -deadlock -config specs/PlaitHostedPdScale.cfg specs/PlaitHostedPdScale.tla

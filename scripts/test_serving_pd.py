@@ -10,7 +10,9 @@ import tempfile
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from itertools import product
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -114,6 +116,9 @@ class LaunchTest(unittest.TestCase):
         self.assertEqual(host_command(command, spec, host, 0, [1]),
                          ["vllm", "serve", "/local/model", "--tensor-parallel-size", "1"])
         self.assertIn("--distributed-executor-backend", host_command(command, spec, host, 0, [2]))
+        aggregate = resident_spec(recipe, profile)
+        self.assertEqual(host_command(command, aggregate, host, 0, [1]),
+                         ["vllm", "serve", "/local/model", "--tensor-parallel-size", "1"])
         with self.assertRaisesRegex(ValueError, "supplies the KV connector and block size"):
             resident_spec(recipe, {**profile, "args": ["--block_size=256"]}, pd=True)
 
@@ -502,8 +507,8 @@ class HandoffTest(unittest.TestCase):
         self.assertEqual(decoded[0]["kv_transfer_params"]["plait_handoff"]["store"], store)
 
     def test_plait_pd_replay_matches_the_existing_stream_before_emitting_a_suffix(self):
-        for mismatched in (False, True):
-            with self.subTest(mismatched=mismatched):
+        for mismatched, aggregated in product((False, True), repeat=2):
+            with self.subTest(mismatched=mismatched, aggregated=aggregated):
                 tickets = []
 
                 def prefill(body):
@@ -528,7 +533,10 @@ class HandoffTest(unittest.TestCase):
                     return "text/event-stream", chunk("first", "a", [8], [4])
 
                 def new_decode(body):
-                    self.assertEqual(body["kv_transfer_params"]["plait_handoff"]["ticket"], tickets[-1])
+                    if aggregated:
+                        self.assertNotIn("kv_transfer_params", body)
+                    else:
+                        self.assertEqual(body["kv_transfer_params"]["plait_handoff"]["ticket"], tickets[-1])
                     prefix = "x" if mismatched else "a"
                     stream = chunk("second", prefix + "b", [8, 9], [4])
                     stream += chunk("second", "", [], terminal=True) + b"data: [DONE]\n\n"
@@ -536,11 +544,13 @@ class HandoffTest(unittest.TestCase):
 
                 p_port, gate = self.group("prefill", PREFILL, prefill)
                 old_port, _ = self.group("decode", DECODE, old_decode)
-                new_port, _ = self.group("decode", SPARE, new_decode)
+                role = "aggregated" if aggregated else "decode"
+                new_port, _ = self.group(role, SPARE, new_decode)
                 source = Endpoint("127.0.0.1", p_port, PREFILL, "prefill")
-                old_path, new_path = [ROUTER["Route"](source, Endpoint("127.0.0.1", port, version, "decode"),
-                                                      "127.0.0.1", 9100)
-                                      for port, version in ((old_port, DECODE), (new_port, SPARE))]
+                old_path = ROUTER["Route"](source, Endpoint("127.0.0.1", old_port, DECODE, "decode"),
+                                           "127.0.0.1", 9100)
+                replacement = Endpoint("127.0.0.1", new_port, SPARE, role)
+                new_path = replacement if aggregated else ROUTER["Route"](source, replacement, "127.0.0.1", 9100)
                 directory = SimpleNamespace(routes=Mock(side_effect=[("test", [old_path]), ("test", [new_path])]))
                 router = self.start(ROUTER["server"]("127.0.0.1", 0, directory, 2, kv_transport="plait"))
                 status, headers, body = self.request(router, COMPLETIONS, {
@@ -558,8 +568,54 @@ class HandoffTest(unittest.TestCase):
                 self.assertEqual("".join(choice["text"] for choice in choices), "a" if mismatched else "ab")
                 self.assertEqual(data.count(b"[DONE]"), 0 if mismatched else 1)
                 self.assertEqual("error" in frames[-1], mismatched)
-                self.assertEqual(len(set(tickets)), 2)
+                self.assertEqual(len(set(tickets)), 1 if aggregated else 2)
                 self.assertTrue(gate.drained())
+
+    def test_aggregate_request_finishes_while_split_routes_accept_new_requests(self):
+        admitted, finish = threading.Event(), threading.Event()
+        stream = b'data: {"choices": []}\n\ndata: [DONE]\n\n'
+
+        def aggregate(body):
+            self.assertNotIn("kv_transfer_params", body)
+            admitted.set()
+            self.assertTrue(finish.wait(5))
+            return "text/event-stream", stream
+
+        def prefill(body):
+            ticket = body["kv_transfer_params"]["plait_handoff"]["ticket"]
+            receipt = {"ticket": ticket, "store": "127.0.0.1:9100",
+                       "prompt_sha256": "c" * 64, "cached_tokens": 128}
+            return "application/json", json.dumps({"kv_transfer_params": {"plait_handoff": receipt}}).encode()
+
+        agg_port, gate = self.group("aggregated", SPARE, aggregate)
+        p_port, _ = self.group("prefill", PREFILL, prefill)
+        d_port, _ = self.group("decode", DECODE, lambda _: ("application/json", b'{"split":true}'))
+        aggregate_document = {"model": "test", "paths": [], "aggregated": [
+            {"url": f"http://127.0.0.1:{agg_port}", "version": SPARE},
+        ]}
+        split_document = {"model": "test", "paths": [{
+            "prefill": {"url": f"http://127.0.0.1:{p_port}", "version": PREFILL,
+                        "kv_host": "127.0.0.1", "kv_port": 9100},
+            "decode": {"url": f"http://127.0.0.1:{d_port}", "version": DECODE},
+        }]}
+        directory = SimpleNamespace(routes=Mock(side_effect=[
+            ROUTER["parse_directory"](aggregate_document), ROUTER["parse_directory"](split_document),
+        ]))
+        router = self.start(ROUTER["server"]("127.0.0.1", 0, directory, 5, kv_transport="plait"))
+        body = {"model": "test", "prompt": [1], "max_tokens": 2}
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            first = executor.submit(self.request, router, COMPLETIONS, {**body, "stream": True})
+            try:
+                self.assertTrue(admitted.wait(2))
+                gate.close()
+                self.assertFalse(gate.drained())
+                status, _, data = self.request(router, COMPLETIONS, body)
+                self.assertEqual((status, json.loads(data)), (200, {"split": True}))
+            finally:
+                finish.set()
+            status, _, data = first.result(timeout=2)
+            self.assertEqual((status, data), (200, stream))
+        self.assertTrue(gate.drained())
 
     def test_load_counts_valid_arrivals_when_routes_are_unavailable(self):
         directory = Mock()

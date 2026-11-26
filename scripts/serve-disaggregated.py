@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Route OpenAI completions through versioned vLLM P/D groups."""
+"""Route OpenAI completions through versioned vLLM groups."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ import uuid
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Union
 
 from serving_group import (
     DIRECTORY_POLL_SECONDS, DIRECTORY_READ_TTL, HANDOFF_HEADER, HTTP_ERRORS,
@@ -63,19 +64,25 @@ class Route:
         return cls(prefill, decode, str(host), port)
 
 
+Destination = Union[Endpoint, Route]
+
+
 class Directory:
     def __init__(self, path: Path) -> None:
         self.path = path
 
-    def routes(self) -> tuple[str, list[Route]]:
+    def routes(self) -> tuple[str, list[Destination]]:
         return parse_directory(json.loads(self.path.read_text()))
 
 
-def parse_directory(document: dict) -> tuple[str, list[Route]]:
+def parse_directory(document: dict) -> tuple[str, list[Destination]]:
     model = document["model"]
     if not isinstance(model, str) or not model:
         raise ValueError("route directory requires a model")
-    return model, [Route.parse(item) for item in document["paths"]]
+    return model, [
+        *(Route.parse(item) for item in document["paths"]),
+        *(Endpoint.parse(item, "aggregated") for item in document.get("aggregated", [])),
+    ]
 
 
 class ControlDirectory:
@@ -84,7 +91,7 @@ class ControlDirectory:
         self.control = control
         self.lock = threading.Lock()
         self.revision = 0
-        self.paths: list[Route] = []
+        self.paths: list[Destination] = []
         self.until = 0.0
 
     def refresh(self) -> None:
@@ -114,7 +121,7 @@ class ControlDirectory:
             self.paths = routes
             self.until = sent + DIRECTORY_READ_TTL
 
-    def routes(self) -> tuple[str, list[Route]]:
+    def routes(self) -> tuple[str, list[Destination]]:
         with self.lock:
             if time.monotonic() >= self.until:
                 raise ValueError("routing directory is unavailable or expired")
@@ -243,7 +250,7 @@ def server(
             elif self.path == "/health" and routes:
                 self.write_json(200, {})
             elif self.path == "/health":
-                self.fail(503, "no P/D routes are configured")
+                self.fail(503, "no serving routes are configured")
             else:
                 self.fail(404, "unknown endpoint")
 
@@ -293,7 +300,7 @@ def server(
             finally:
                 load.finish(completed)
 
-        def route_request(self, routes: list[Route], body: dict, replay: CompletionReplay | None = None) -> bool:
+        def route_request(self, routes: list[Destination], body: dict, replay: CompletionReplay | None = None) -> bool:
             deadline = time.monotonic() + timeout
             if routes:
                 start = next(next_path) % len(routes)
@@ -304,17 +311,33 @@ def server(
                 budget = deadline - time.monotonic()
                 if budget <= 0:
                     break
-                if not endpoint_ready(route.decode, budget):
+                endpoint = route.decode if isinstance(route, Route) else route
+                if not endpoint_ready(endpoint, budget):
                     continue
                 try:
-                    completed = self.try_route(route, body, deadline)
+                    if isinstance(route, Route):
+                        completed = self.try_route(route, body, deadline)
+                    else:
+                        completed = self.try_aggregated(endpoint, body, deadline)
                     if completed is not None:
                         return completed
                 except (OSError, http.client.HTTPException, UpstreamError) as error:
                     self.fail(502, str(error))
                     return False
-            self.fail(503, "no P/D route accepted the request")
+            self.fail(503, "no serving route accepted the request")
             return False
+
+        def try_aggregated(self, endpoint: Endpoint, body: dict, deadline: float) -> bool | None:
+            budget = deadline - time.monotonic()
+            if budget <= 0:
+                return None
+            with contextlib.closing(endpoint.connect(budget)) as connection:
+                with request_engine(connection, endpoint, self.path, body, uuid.uuid4().hex) as response:
+                    if admission_rejected(response):
+                        return None
+                    if any(response.getheader(key) != value for key, value in endpoint.headers().items()):
+                        raise UpstreamError("response does not match the admitted aggregate group")
+                    return self.write_decode(response)
 
         def try_route(self, route: Route, body: dict, deadline: float) -> bool | None:
             try:
@@ -342,71 +365,78 @@ def server(
                         release_transfer(route.prefill, transfer.token)
             return completed
 
-        def route_replay(self, routes: list[Route], replay: CompletionReplay, deadline: float) -> bool:
-            failed_decodes = set()
+        def route_replay(self, routes: list[Destination], replay: CompletionReplay, deadline: float) -> bool:
+            failed_generators = set()
             while time.monotonic() < deadline:
                 tried_prefills = set()
                 for route in routes:
                     budget = deadline - time.monotonic()
                     if budget <= 0:
                         break
-                    if route.decode.version in failed_decodes or route.prefill.version in tried_prefills:
+                    endpoint = route.decode if isinstance(route, Route) else route
+                    if endpoint.version in failed_generators:
                         continue
-                    if not endpoint_ready(route.decode, min(1.0, budget)):
+                    if not endpoint_ready(endpoint, min(1.0, budget)):
                         continue
+                    transfer = None
+                    if isinstance(route, Route):
+                        if route.prefill.version in tried_prefills:
+                            continue
+                        try:
+                            transfer = request_prefill(route, self.path, replay.request, deadline, True)
+                        except PrefillError as error:
+                            if not replay.started:
+                                self.write_json(error.status, error.body)
+                                return False
+                        except (*HTTP_ERRORS, UpstreamError):
+                            pass
+                        if transfer is None:
+                            tried_prefills.add(route.prefill.version)
+                            continue
                     try:
-                        transfer = request_prefill(route, self.path, replay.request, deadline, True)
-                    except PrefillError as error:
-                        if not replay.started:
-                            self.write_json(error.status, error.body)
-                            return False
-                        tried_prefills.add(route.prefill.version)
-                        continue
-                    except (*HTTP_ERRORS, UpstreamError):
-                        tried_prefills.add(route.prefill.version)
-                        continue
-                    if transfer is None:
-                        tried_prefills.add(route.prefill.version)
-                        continue
-                    try:
-                        completed = self.replay_decode(route.decode, transfer, deadline, replay)
+                        completed = self.replay_generation(endpoint, transfer, deadline, replay)
                         if completed is not None:
                             return completed
                     except (*HTTP_ERRORS, UpstreamError, UpstreamInterrupted):
-                        failed_decodes.add(route.decode.version)
+                        failed_generators.add(endpoint.version)
                     except ReplayMismatch as error:
                         self.fail_replay(502, str(error), replay)
                         return False
                     finally:
                         # Plait stored the prompt pages independently of this handoff lease.
-                        release_transfer(route.prefill, transfer.token)
+                        if isinstance(route, Route) and transfer is not None:
+                            release_transfer(route.prefill, transfer.token)
                 time.sleep(min(DIRECTORY_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
                 routes = []
                 with contextlib.suppress(OSError, ValueError, KeyError, TypeError, AttributeError):
                     model, current = directory.routes()
                     if model == replay.model:
                         routes = current
-            self.fail_replay(503, "no P/D replacement accepted the completion before its deadline", replay)
+            self.fail_replay(503, "no serving replacement accepted the completion before its deadline", replay)
             return False
 
-        def replay_decode(self, decode: Endpoint, transfer: Transfer, deadline: float, replay: CompletionReplay) -> bool | None:
+        def replay_generation(self, endpoint: Endpoint, transfer: Transfer | None, deadline: float, replay: CompletionReplay) -> bool | None:
             budget = deadline - time.monotonic()
             if budget <= 0:
                 return None
-            with contextlib.closing(decode.connect(budget)) as connection:
-                payload = {**replay.request, "kv_transfer_params": transfer.params}
-                with request_engine(connection, decode, self.path, payload, transfer.request_id) as response:
+            with contextlib.closing(endpoint.connect(budget)) as connection:
+                payload = dict(replay.request)
+                request_id = uuid.uuid4().hex
+                if transfer is not None:
+                    payload["kv_transfer_params"] = transfer.params
+                    request_id = transfer.request_id
+                with request_engine(connection, endpoint, self.path, payload, request_id) as response:
                     if admission_rejected(response):
                         return None
-                    headers = decode.headers()
+                    headers = endpoint.headers()
                     if any(response.getheader(key) != value for key, value in headers.items()):
-                        raise ReplayMismatch("upstream response does not match the admitted Decode group")
+                        raise ReplayMismatch("upstream response does not match the admitted serving group")
                     if response.status != 200 or not response.getheader("Content-Type", "").startswith("text/event-stream"):
                         if replay.started:
                             raise UpstreamInterrupted
                         if response.status != 200:
                             return self.write_decode(response)
-                        raise ReplayMismatch("Decode did not return a completion stream")
+                        raise ReplayMismatch("engine did not return a completion stream")
                     try:
                         if not replay.started:
                             self.send_response(200)
@@ -457,11 +487,11 @@ def server(
                 return False
             return response.status == 200 and done and not failed
 
-        def read_directory(self) -> tuple[str, list[Route]] | None:
+        def read_directory(self) -> tuple[str, list[Destination]] | None:
             try:
                 return directory.routes()
             except (OSError, ValueError, KeyError, TypeError, AttributeError):
-                self.fail(503, "P/D route configuration is unavailable")
+                self.fail(503, "serving route configuration is unavailable")
                 return None
 
         def write_json(self, status: int, body: dict) -> None:

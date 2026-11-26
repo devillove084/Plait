@@ -145,6 +145,7 @@ impl ServingState {
                 revision: bridge_revision,
                 paths: bridge.paths.clone(),
                 hosted_kv: Some(kv.clone()),
+                aggregated: Vec::new(),
             },
         );
         preview.prepare_hosted_pd(

@@ -2,13 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use plait_core::OpId;
 use plait_core::serving::{
-    GroupPhase, GroupVersion, HostedPdInstance, HostedPdIntent, HostedPdKv, HostedPdLaunch,
-    HostedPdPlacement, HostedPdPlanning, HostedPdReconfiguration, HostedPdRecovery,
-    HostedPdRelease, HostedPortUse, PdRoute, RouteSetId, ServingError, ServingOutcome,
-    ServingResult, ServingRole,
+    GroupPhase, GroupVersion, HostedPdInstance, HostedPdIntent, HostedPdKv, HostedPdPlacement,
+    HostedPdPlanning, HostedPdReconfiguration, HostedPdRecovery, HostedPdRelease, HostedPortUse,
+    PdRoute, RouteSetId, ServingError, ServingOutcome, ServingResult, ServingRole,
 };
 
-use super::{Reservations, RouteSet, ServingState};
+use super::{RouteSet, ServingState};
 
 enum Resolution {
     Wait,
@@ -36,7 +35,9 @@ impl ServingState {
             return Err(ServingError::HostedPdInProgress { staged });
         }
         if model.is_empty()
-            || current.is_some_and(|directory| directory.model != model)
+            || current.is_some_and(|directory| {
+                directory.model != model || !directory.aggregated.is_empty()
+            })
             || (paths.is_empty() && current.is_none_or(|directory| directory.hosted_kv.is_none()))
             || paths.iter().copied().collect::<BTreeSet<_>>().len() != paths.len()
         {
@@ -58,56 +59,19 @@ impl ServingState {
             return Err(ServingError::InvalidDirectory);
         }
 
-        let mut reservations = Reservations::default();
-        let mut occupied: Vec<_> = self
-            .hosted_recipes
-            .values()
-            .map(HostedPortUse::from)
-            .chain(self.deferred_pd_ports())
-            .collect();
-        let mut prepared = BTreeMap::new();
-        for placement in placements {
-            let active = self
-                .groups
-                .get(&placement.group)
-                .and_then(|history| history.active);
-            if active != placement.expected_active
-                || active.is_some_and(|epoch| {
-                    !previous_groups.contains(&GroupVersion {
-                        group: placement.group,
-                        epoch,
-                    })
-                })
-            {
-                return Err(ServingError::ActiveEpochChanged { current: active });
-            }
-            let launch = HostedPdLaunch {
-                role: placement.plan.role,
-                kv: kv.clone(),
-            };
-            launch.validate(&placement.recipe, &placement.plan)?;
-            if placement.recipe.api_model != model {
-                return Err(ServingError::InvalidEndpoint);
-            }
-            for host in &placement.recipe.hosts {
-                self.check_hosted_inventory(host, &placement.plan, &placement.recipe.profile)?;
-            }
-            let ports = HostedPortUse::from(&placement.recipe);
-            if occupied.iter().any(|&other| other.conflicts(ports)) {
-                return Err(ServingError::HostedPortsInUse(ports.host));
-            }
-            occupied.push(ports);
-            let view = self.reserve_group(
-                placement.group,
-                placement.expected_epoch,
-                &placement.plan,
-                &mut reservations,
-            )?;
-            if !recipients.contains(&view.version) || prepared.contains_key(&view.version) {
-                return Err(ServingError::InvalidPlan);
-            }
-            prepared.insert(view.version, (view, &placement.recipe, launch));
+        if placements
+            .iter()
+            .any(|placement| placement.plan.role == ServingRole::Aggregated)
+        {
+            return Err(ServingError::InvalidPlan);
         }
+        let (prepared, reservations) = self.reserve_hosted_route_groups(
+            model,
+            Some(kv),
+            placements,
+            &previous_groups,
+            &recipients,
+        )?;
 
         let mut model_identity = None;
         for path in paths {
@@ -115,25 +79,17 @@ impl ServingState {
                 (path.prefill, ServingRole::Prefill),
                 (path.decode, ServingRole::Decode),
             ] {
-                let matches = if let Some((view, _, _)) = prepared.get(&version) {
-                    (view.plan.role == role).then_some(&view.plan.model)
-                } else {
-                    self.group(version)
-                        .filter(|view| {
-                            view.phase == GroupPhase::Active
-                                && view.plan.role == role
-                                && previous_groups.contains(&version)
-                                && self
-                                    .hosted_pd_launches
-                                    .get(&version)
-                                    .is_some_and(|launch| &launch.kv == kv)
-                                && self.hosted_recipes[&version].api_model == model
-                        })
-                        .map(|view| &view.plan.model)
-                };
-                let Some(identity) = matches else {
+                let Some(view) = self.hosted_route_target(
+                    version,
+                    role,
+                    model,
+                    Some(kv),
+                    &previous_groups,
+                    &prepared,
+                ) else {
                     return Err(ServingError::InvalidRoute(*path));
                 };
+                let identity = &view.plan.model;
                 if model_identity
                     .replace(identity)
                     .is_some_and(|previous| previous != identity)
@@ -151,17 +107,10 @@ impl ServingState {
             prepared: prepared.keys().copied().collect(),
             hosts: prepared
                 .values()
-                .flat_map(|(view, _, _)| view.plan.hosts.keys().copied())
+                .flat_map(|group| group.view.plan.hosts.keys().copied())
                 .collect(),
         };
-        let mut views = Vec::new();
-        for (version, (view, recipe, launch)) in prepared {
-            views.push(view);
-            self.hosted_recipes.insert(version, recipe.clone());
-            self.hosted_pool_versions.insert(version);
-            self.hosted_pd_launches.insert(version, launch);
-        }
-        self.install_groups(views, reservations);
+        self.install_hosted_route_groups(prepared, reservations);
         self.hosted_pd_intents.insert(key, intent);
         Ok(ServingOutcome::HostedPdStaged { revision })
     }
@@ -196,7 +145,9 @@ impl ServingState {
             .collect();
         HostedPdPlanning {
             revision: directory.map_or(0, |directory| directory.revision),
-            managed: directory.is_none_or(|directory| directory.hosted_kv.is_some()),
+            managed: directory.is_none_or(|directory| {
+                directory.hosted_kv.is_some() && directory.aggregated.is_empty()
+            }),
             pending: self.pending_hosted_pd_id(key),
             active,
             paths: self.routes(key).map_or_else(Vec::new, |directory| {
@@ -222,6 +173,9 @@ impl ServingState {
 
     pub(crate) fn hosted_pd_recovery(&self, key: RouteSetId) -> Option<HostedPdRecovery> {
         let directory = self.routes.get(&key)?;
+        if !directory.aggregated.is_empty() {
+            return None;
+        }
         let kv = directory.hosted_kv.clone()?;
         let checkpoint = self
             .group(directory.paths.first()?.prefill)?
@@ -291,6 +245,11 @@ impl ServingState {
                     .get(&key)
                     .map(|transition| transition.staged)
             })
+            .or_else(|| {
+                self.hosted_serving_intents
+                    .get(&key)
+                    .map(|intent| intent.staged)
+            })
     }
 
     pub(super) fn hosted_pd_can_resolve(&self, intent: &HostedPdIntent) -> bool {
@@ -339,6 +298,7 @@ impl ServingState {
                         revision,
                         paths: intent.paths.clone(),
                         hosted_kv,
+                        aggregated: Vec::new(),
                     },
                 );
                 for &removed in
@@ -359,7 +319,7 @@ impl ServingState {
         Ok(result)
     }
 
-    fn cancel_hosted_pd_candidate(&mut self, version: GroupVersion) {
+    pub(super) fn cancel_hosted_pd_candidate(&mut self, version: GroupVersion) {
         if self
             .group(version)
             .is_some_and(|view| matches!(view.phase, GroupPhase::Preparing | GroupPhase::Ready))
@@ -395,32 +355,10 @@ impl ServingState {
         let Some(next_revision) = revision.checked_add(1) else {
             return Resolution::Cancel;
         };
-        let mut waiting = false;
-        for version in route_versions(&intent.paths) {
-            let Some(view) = self.group(version) else {
-                return Resolution::Cancel;
-            };
-            if intent.prepared.contains(&version) {
-                let Some(recipe) = self.hosted_recipes.get(&version) else {
-                    return Resolution::Cancel;
-                };
-                if recipe.hosts.iter().any(|host| {
-                    self.check_hosted_inventory(host, &view.plan, &recipe.profile)
-                        .is_err()
-                }) {
-                    return Resolution::Cancel;
-                }
-                match view.phase {
-                    GroupPhase::Preparing => waiting = true,
-                    GroupPhase::Ready if self.check_activation(version).is_ok() => {}
-                    _ => return Resolution::Cancel,
-                }
-            } else if view.phase != GroupPhase::Active {
-                return Resolution::Cancel;
-            }
-        }
-        if waiting {
-            return Resolution::Wait;
+        match self.hosted_route_candidates_ready(route_versions(&intent.paths), &intent.prepared) {
+            None => return Resolution::Cancel,
+            Some(false) => return Resolution::Wait,
+            Some(true) => {}
         }
         let eligible = |view: &plait_core::serving::GroupView| {
             view.phase == GroupPhase::Active || intent.prepared.contains(&view.version)
@@ -451,7 +389,9 @@ mod tests {
     use plait_core::{DeviceId, NodeId};
 
     use super::*;
-    use plait_core::serving::{HostedPdStage, HostedPdTransitionPhase};
+    use plait_core::serving::{
+        HostedPdLaunch, HostedPdStage, HostedPdTransitionPhase, HostedRoute, HostedServingPlan,
+    };
 
     fn kv() -> HostedPdKv {
         HostedPdKv {
@@ -520,7 +460,11 @@ mod tests {
                 model: "checkpoint".into(),
                 tensor_parallel: 1,
                 pipeline_parallel: 1,
-                launch_digest: HostedPdLaunch { role, kv: kv() }.launch_digest(&recipe),
+                launch_digest: if role == ServingRole::Aggregated {
+                    recipe.launch_digest()
+                } else {
+                    HostedPdLaunch { role, kv: kv() }.launch_digest(&recipe)
+                },
                 hosts: BTreeMap::from([(
                     host_id,
                     HostMemory {
@@ -564,6 +508,115 @@ mod tests {
         state
             .host_launch_ready(group, host, host, Some(&endpoint))
             .unwrap();
+    }
+
+    #[test]
+    fn hosted_route_cutover_waits_for_both_roles_and_keeps_the_previous_revision_on_failure() {
+        let mut state = ServingState::default();
+        let aggregate = placement(&mut state, 10, 1, 0, ServingRole::Aggregated);
+        let prefill = placement(&mut state, 11, 2, 0, ServingRole::Prefill);
+        let decode = placement(&mut state, 12, 3, 0, ServingRole::Decode);
+        let standby = placement(&mut state, 13, 4, 0, ServingRole::Aggregated);
+        let key = RouteSetId::for_model("served");
+        let agg_version = version(&aggregate);
+        let agg = HostedRoute::Aggregated(agg_version);
+        let pd = PdRoute {
+            prefill: version(&prefill),
+            decode: version(&decode),
+        };
+        let split = HostedRoute::Split(pd);
+        let stage = |state: &mut ServingState, revision, placements, routes, kv| {
+            state.prepare_hosted_serving(
+                OpId::new(key.0, revision + 1),
+                "served",
+                revision,
+                &HostedServingPlan {
+                    kv,
+                    placements,
+                    routes,
+                },
+            )
+        };
+        stage(&mut state, 0, vec![aggregate.clone()], vec![agg], None).unwrap();
+        ready(&mut state, &aggregate);
+        assert_eq!(
+            state.apply(&ServingOperation {
+                id: OpId::new(key.0, 90),
+                action: ServingAction::Activate(agg_version)
+            }),
+            Err(ServingError::InvalidDirectory)
+        );
+        assert!(state.hosted_routes(key).is_none());
+        let first = state.hosted_serving_work().pop().unwrap();
+        assert_eq!(
+            state.resolve_hosted_serving(&first, false),
+            Ok(ServingOutcome::RoutesPublished { revision: 1 })
+        );
+
+        stage(
+            &mut state,
+            1,
+            vec![prefill.clone(), decode.clone()],
+            vec![agg, split],
+            Some(kv()),
+        )
+        .unwrap();
+        ready(&mut state, &prefill);
+        assert!(state.hosted_serving_work().is_empty());
+        let pending = state.hosted_serving_pending(key).unwrap();
+        assert_eq!(
+            state.resolve_hosted_serving(&pending, false),
+            Err(ServingError::InvalidDirectory)
+        );
+        let incumbent = state.hosted_routes(key).unwrap();
+        assert_eq!(incumbent.split.revision, 1);
+        assert!(incumbent.split.paths.is_empty());
+        assert_eq!(incumbent.aggregated[0].0, agg_version);
+        ready(&mut state, &decode);
+        assert_eq!(
+            state.resolve_hosted_serving(&pending, false),
+            Ok(ServingOutcome::RoutesPublished { revision: 2 })
+        );
+        let mixed = state.hosted_routes(key).unwrap();
+        assert_eq!(mixed.split.paths[0].route, pd);
+        assert_eq!(mixed.aggregated, incumbent.aggregated);
+        assert!(!state.hosted_pd_planning(key).managed);
+        assert_eq!(
+            state.prepare_hosted_pd(OpId::new(key.0, 91), "served", 2, &kv(), &[], &[pd]),
+            Err(ServingError::InvalidDirectory)
+        );
+
+        stage(&mut state, 2, vec![], vec![split], Some(kv())).unwrap();
+        let drained = state.hosted_serving_work().pop().unwrap();
+        assert_eq!(
+            state.resolve_hosted_serving(&drained, false),
+            Ok(ServingOutcome::RoutesPublished { revision: 3 })
+        );
+        assert_eq!(
+            state.group(agg_version).unwrap().phase,
+            GroupPhase::Draining
+        );
+        assert!(state.hosted_pd_planning(key).managed);
+        let split_only = state.hosted_routes(key).unwrap();
+        assert!(split_only.aggregated.is_empty());
+        stage(
+            &mut state,
+            3,
+            vec![standby.clone()],
+            vec![HostedRoute::Aggregated(version(&standby))],
+            None,
+        )
+        .unwrap();
+        state
+            .quiesce(version(&standby), GroupPhase::Revoked)
+            .unwrap();
+        let failed = state.hosted_serving_work().pop().unwrap();
+        assert_eq!(
+            state.resolve_hosted_serving(&failed, false),
+            Ok(ServingOutcome::HostedServingCancelled)
+        );
+        assert_eq!(state.hosted_routes(key), Some(split_only));
+        assert_eq!(state.group(pd.decode).unwrap().phase, GroupPhase::Active);
     }
 
     #[test]

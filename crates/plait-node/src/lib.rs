@@ -280,6 +280,18 @@ impl NodeState {
                         }
                         if now >= self.next_hosted_pd_scan {
                             self.next_hosted_pd_scan = now + 1000;
+                            for intent in self.replica.machine().serving_hosted_work() {
+                                self.propose(
+                                    Command::Serving(Box::new(ServingOperation {
+                                        id: OpId::new(NodeId::random(), 1),
+                                        action: ServingAction::ResolveHostedServing {
+                                            intent,
+                                            cancel: false,
+                                        },
+                                    })),
+                                    now,
+                                );
+                            }
                             for intent in self.replica.machine().serving_hosted_pd_work() {
                                 self.propose(
                                     Command::Serving(Box::new(ServingOperation {
@@ -507,6 +519,12 @@ impl NodeState {
                     }
                     ServingLookup::HostedPdPending(key) => {
                         ServingView::HostedPdPending(runtime.serving_hosted_pd_pending(key))
+                    }
+                    ServingLookup::HostedRoutes(key) => {
+                        ServingView::HostedRoutes(runtime.serving_hosted_routes(key))
+                    }
+                    ServingLookup::HostedServingPending(key) => {
+                        ServingView::HostedServingPending(runtime.serving_hosted_pending(key))
                     }
                     ServingLookup::HostedPdPlanning(key) => {
                         ServingView::HostedPdPlanning(runtime.serving_hosted_pd_planning(key))

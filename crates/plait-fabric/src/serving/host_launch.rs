@@ -169,6 +169,15 @@ impl ServingState {
         if incumbent != expected_active {
             return Err(ServingError::ActiveEpochChanged { current: incumbent });
         }
+        if let Some(epoch) = incumbent
+            && self.routes.values().any(|directory| {
+                directory
+                    .aggregated
+                    .contains(&GroupVersion { group, epoch })
+            })
+        {
+            return Err(ServingError::InvalidDirectory);
+        }
         let api_model = if let Some(epoch) = incumbent {
             let view = self
                 .group(GroupVersion { group, epoch })
@@ -234,6 +243,7 @@ impl ServingState {
     pub(super) fn require_unhosted(&self, version: GroupVersion) -> Result<(), ServingError> {
         if self.host_launches.contains_key(&version)
             || self.hosted_switches.contains_key(&version)
+            || self.hosted_recipes.contains_key(&version)
             || self.hosted_pd_launches.contains_key(&version)
         {
             return Err(ServingError::LaunchOwnerMismatch);

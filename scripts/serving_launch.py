@@ -42,7 +42,7 @@ def resident_spec(recipe: dict, engine: dict, *, pd: bool = False) -> dict:
     return validate_spec({
         "api_host": api_host, "master_addr": hosts[api_host]["address"],
         "master_port": recipe["master_port"], "hosts": hosts,
-    }, allow_single=pd)
+    }, allow_single=True)
 
 
 def validate_spec(spec: dict, *, allow_single: bool = False) -> dict:

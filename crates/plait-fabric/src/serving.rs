@@ -19,6 +19,7 @@ mod host;
 mod host_launch;
 mod hosted_pd;
 mod hosted_pd_transition;
+mod hosted_serving;
 use decoder::{DecoderState, RecoveryPolicy};
 use host_launch::{HostLaunch, HostedSwitch};
 
@@ -54,6 +55,7 @@ struct RouteSet {
     revision: u64,
     paths: Vec<PdRoute>,
     hosted_kv: Option<HostedPdKv>,
+    aggregated: Vec<GroupVersion>,
 }
 
 #[derive(Clone, Copy)]
@@ -85,6 +87,7 @@ pub(crate) struct ServingState {
     hosted_pool_versions: BTreeSet<GroupVersion>,
     hosted_pd_launches: BTreeMap<GroupVersion, HostedPdLaunch>,
     hosted_pd_intents: BTreeMap<RouteSetId, HostedPdIntent>,
+    hosted_serving_intents: BTreeMap<RouteSetId, plait_core::serving::HostedServingIntent>,
     hosted_pd_transitions: BTreeMap<RouteSetId, HostedPdTransition>,
     hosted_pd_transition_status: BTreeMap<RouteSetId, HostedPdTransitionStatus>,
     hosted_inventories: BTreeMap<NodeId, HostedInventory>,
@@ -283,6 +286,14 @@ impl ServingState {
                     return Err(ServingError::InvalidDirectory);
                 }
                 self.resolve_hosted_pd(intent, *cancel)
+            }
+            ServingAction::PrepareHostedServing {
+                model,
+                expected_revision,
+                plan,
+            } => self.prepare_hosted_serving(operation.id, model, *expected_revision, plan),
+            ServingAction::ResolveHostedServing { intent, cancel } => {
+                self.resolve_hosted_serving(intent, *cancel)
             }
             ServingAction::PrepareHostedPdTransition {
                 model,
@@ -808,7 +819,12 @@ impl ServingState {
                 shard,
             } => self.worker_ready_at(*grant, *launch_digest, *addr, Some(*shard)),
             ServingAction::Activate(version) => {
-                if self.hosted_pd_launches.contains_key(version) {
+                if self.hosted_pd_launches.contains_key(version)
+                    || self
+                        .hosted_serving_intents
+                        .values()
+                        .any(|intent| intent.prepared.contains(version))
+                {
                     return Err(ServingError::InvalidDirectory);
                 }
                 self.activate(*version)
@@ -1275,7 +1291,10 @@ impl ServingState {
     ) -> ServingResult {
         let id = RouteSetId::for_model(model);
         let previous = self.routes.get(&id);
-        if previous.is_some_and(|directory| directory.hosted_kv.is_some())
+        if self.hosted_serving_intents.contains_key(&id)
+            || previous.is_some_and(|directory| {
+                directory.hosted_kv.is_some() || !directory.aggregated.is_empty()
+            })
             || activate.is_some_and(|version| self.hosted_pd_launches.contains_key(&version))
             || paths
                 .iter()
@@ -1319,6 +1338,7 @@ impl ServingState {
                 revision,
                 paths: paths.to_vec(),
                 hosted_kv: None,
+                aggregated: Vec::new(),
             },
         );
         Ok(ServingOutcome::RoutesPublished { revision })

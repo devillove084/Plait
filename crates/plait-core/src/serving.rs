@@ -100,6 +100,14 @@ impl HostedRecipe {
         Ok(())
     }
 
+    pub fn validate_aggregated_route(&self, plan: &GroupPlan) -> Result<(), ServingError> {
+        self.validate_topology(plan, 1)?;
+        if plan.role != ServingRole::Aggregated || self.launch_digest() != plan.launch_digest {
+            return Err(ServingError::InvalidPlan);
+        }
+        Ok(())
+    }
+
     fn validate_topology(&self, plan: &GroupPlan, min_hosts: usize) -> Result<(), ServingError> {
         let hosts: BTreeSet<_> = self.hosts.iter().map(|host| host.host).collect();
         let ports = BTreeSet::from([self.master_port, self.http_port, self.backend_port]);
@@ -572,6 +580,46 @@ pub struct RouteDirectory {
     pub model: String,
     pub revision: u64,
     pub paths: Vec<ResolvedPdRoute>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum HostedRoute {
+    Aggregated(GroupVersion),
+    Split(PdRoute),
+}
+
+impl HostedRoute {
+    pub fn groups(self) -> impl Iterator<Item = GroupVersion> {
+        let (first, second) = match self {
+            Self::Aggregated(group) => (group, None),
+            Self::Split(path) => (path.prefill, Some(path.decode)),
+        };
+        std::iter::once(first).chain(second)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedServingPlan {
+    pub kv: Option<HostedPdKv>,
+    pub placements: Vec<HostedPdPlacement>,
+    pub routes: Vec<HostedRoute>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedServingIntent {
+    pub staged: OpId,
+    pub model: String,
+    pub expected_revision: u64,
+    pub previous: Vec<HostedRoute>,
+    pub routes: Vec<HostedRoute>,
+    pub prepared: BTreeSet<GroupVersion>,
+    pub hosts: BTreeSet<NodeId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedRouteDirectory {
+    pub split: RouteDirectory,
+    pub aggregated: Vec<(GroupVersion, SocketAddr)>,
 }
 
 /// Committed resources visible on one replica at the time of the query.
@@ -1072,6 +1120,15 @@ pub enum ServingAction {
         target: HostedPdStage,
         request_sha256: Option<[u8; 32]>,
     },
+    PrepareHostedServing {
+        model: String,
+        expected_revision: u64,
+        plan: HostedServingPlan,
+    },
+    ResolveHostedServing {
+        intent: HostedServingIntent,
+        cancel: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1153,6 +1210,10 @@ pub enum ServingOutcome {
         revision: u64,
     },
     HostedPdCancelled,
+    HostedServingStaged {
+        revision: u64,
+    },
+    HostedServingCancelled,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1240,6 +1301,8 @@ pub enum ServingLookup {
     HostedPdTransition(RouteSetId),
     HostedPdReconfiguration(RouteSetId),
     HostedPdRecovery(RouteSetId),
+    HostedRoutes(RouteSetId),
+    HostedServingPending(RouteSetId),
 }
 
 /// A replica's locally applied state. A missing result may indicate replication lag.
@@ -1271,6 +1334,8 @@ pub enum ServingView {
     HostedPdTransition(Option<HostedPdTransitionStatus>),
     HostedPdReconfiguration(HostedPdReconfiguration),
     HostedPdRecovery(Option<HostedPdRecovery>),
+    HostedRoutes(Option<HostedRouteDirectory>),
+    HostedServingPending(Option<HostedServingIntent>),
 }
 
 impl ServingOperation {
@@ -1322,6 +1387,29 @@ impl ServingOperation {
             }
             ServingAction::ResolveHostedPd { intent, .. } => {
                 hosted_pd_intent_keys(&mut keys, intent);
+            }
+            ServingAction::PrepareHostedServing { model, plan, .. } => {
+                keys.insert(Key::ServingRoutes(RouteSetId::for_model(model)));
+                hosted_pd_stage_keys(&mut keys, &plan.placements, &[]);
+                keys.extend(
+                    plan.routes
+                        .iter()
+                        .flat_map(|route| route.groups())
+                        .map(|version| Key::ServingGroup(version.group)),
+                );
+            }
+            ServingAction::ResolveHostedServing { intent, .. } => {
+                keys.insert(Key::ServingRoutes(RouteSetId::for_model(&intent.model)));
+                keys.extend(
+                    intent
+                        .previous
+                        .iter()
+                        .chain(&intent.routes)
+                        .flat_map(|route| route.groups())
+                        .chain(intent.prepared.iter().copied())
+                        .map(|version| Key::ServingGroup(version.group)),
+                );
+                keys.extend(intent.hosts.iter().copied().map(Key::HostMemory));
             }
             ServingAction::PrepareHostedPdTransition {
                 model,

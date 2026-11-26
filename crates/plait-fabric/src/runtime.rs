@@ -6,9 +6,9 @@ use plait_core::serving::{
     DecoderReplayPage, DecoderRouteWork, DecoderSwitch, ExecutionHostLiveness, GroupVersion,
     GroupView, HostedAssignment, HostedManagedAssignment, HostedPdIntent, HostedPdPlanning,
     HostedPdReconfiguration, HostedPdRecovery, HostedPdTransitionStatus, HostedPlanning,
-    HostedProbeEndpoint, ResidentOwner, RouteDirectory, RouteSetId, ServingAction,
-    ServingOperation, ServingReceipt, ServingResources, ServingResult, W4DrainStatus,
-    WorkerDispatch, WorkerGrant,
+    HostedProbeEndpoint, HostedRouteDirectory, HostedServingIntent, ResidentOwner, RouteDirectory,
+    RouteSetId, ServingAction, ServingOperation, ServingReceipt, ServingResources, ServingResult,
+    W4DrainStatus, WorkerDispatch, WorkerGrant,
 };
 use plait_core::{
     AcceleratorKind, Command, ComputeTask, DeviceId, DeviceProfile, FuseKind, MembershipChange,
@@ -133,6 +133,18 @@ impl Runtime {
 
     pub fn serving_hosted_pd_pending(&self, key: RouteSetId) -> Option<HostedPdIntent> {
         self.serving.hosted_pd_pending(key)
+    }
+
+    pub fn serving_hosted_routes(&self, key: RouteSetId) -> Option<HostedRouteDirectory> {
+        self.serving.hosted_routes(key)
+    }
+
+    pub fn serving_hosted_pending(&self, key: RouteSetId) -> Option<HostedServingIntent> {
+        self.serving.hosted_serving_pending(key)
+    }
+
+    pub fn serving_hosted_work(&self) -> Vec<HostedServingIntent> {
+        self.serving.hosted_serving_work()
     }
 
     pub fn serving_hosted_pd_planning(&self, key: RouteSetId) -> HostedPdPlanning {
