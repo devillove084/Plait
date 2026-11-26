@@ -164,7 +164,8 @@ errors=0
 ```
 
 `crates/plait-nccl` provides a PyO3 NCCL-compatible communicator for vLLM.
-The vLLM fork uses peer transport for TP when `VLLM_USE_PLAIT=1` is set.
+The vLLM fork uses peer transport for TP collectives and PP activations when
+`VLLM_USE_PLAIT=1` is set.
 Each worker exchanges endpoint metadata over Gloo and sends tensors directly
 to its peers. [Peer transport and startup](docs/rankless-nccl.md)
 
@@ -242,13 +243,14 @@ release the result after the matching completion has executed in the control pla
 | [Hosted P/D role transition](specs/PlaitHostedPdTransition.tla) | The replacement route becomes live before the old group retires. The target acquires the retired device only after release and becomes visible only after readiness. |
 | [Hosted P/D reconfiguration](specs/PlaitHostedPdReconfigure.tla) | A bridge preserves the incumbent rate. The projected gain pays for the transition. Commit checks the directory and declared release capability. |
 | [Hosted P/D recovery](specs/PlaitHostedPdRecovery.tla) | A spare can restore a failed slot without ingress traffic. Cutover preserves healthy epochs, checks readiness and directory revision, and leaves old grants subject to release proof. |
+| [Hosted pipeline rollout](specs/PlaitHostedPipeline.tla) | Both pipeline lanes deliver activations for the admitted epoch. The next version waits for all workers, and the old version retires after its requests drain. |
 | [Serving ingress](specs/PlaitServingIngress.tla) | One admission per ordinary forwarded request, monotonic route refresh, and output pinned to the admitted epoch while the old gate drains. |
 | [Completion replay and KV resume](specs/PlaitCompletionReplay.tla) | Visible positions are preserved. Each KV resume sends the latest checkpoint and requires a matching acknowledgment and prefix before publishing a suffix. |
 | [KV publication](specs/PlaitKvPublication.tla) | All heads must come from one write attempt before a page becomes readable. A consumer reads its requested head range, and a complete page stays immutable. |
 | [Prefill to Decode handoff](specs/PlaitKvHandoff.tla) | The receipt matches the request context. Decode emits output after loading the required pages, including when the shared store can reset between admission and load. |
 | [P/D stream replay](specs/PlaitPdStreamReplay.tla) | A failed Decode version is excluded. Each attempt releases its own handoff, and suffix output follows a checked prefix. |
 
-TLC 2.19 passes all 44 configurations. The ordered publication configuration
+TLC 2.19 passes all 45 configurations. The ordered publication configuration
 explores 70,968 distinct states. Run the suite with `tlc` on your `PATH`.
 
 ```sh

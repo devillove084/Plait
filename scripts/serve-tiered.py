@@ -108,9 +108,9 @@ def parse_args() -> argparse.Namespace:
                 raise ValueError("invalid hosted launch record")
             bootstrap = json.loads(payload)
             args.bootstrap = bootstrap
+            args.release_driver = bootstrap["engine"].get("release_driver")
             pd = bootstrap.get("pd")
             if pd is not None:
-                args.release_driver = bootstrap["engine"].get("release_driver")
                 if pd["role"] not in ("Prefill", "Decode"):
                     raise ValueError("invalid committed P/D role")
                 args.role = pd["role"].lower()

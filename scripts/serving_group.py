@@ -474,19 +474,20 @@ def run(
         view = inspect_group(control, version)
         if not view or view["phase"] != "Preparing":
             raise ControlError("expected a prepared execution group")
+        pp = view["pipeline_parallel"]
         if (
             view["version"] != version
             or view["role"] != args.role.capitalize()
             or view["model"] != args.model
             or view["tensor_parallel"] != args.tp
-            or view["pipeline_parallel"] != 1
+            or (pp != 1 and (not hosted or args.role != "aggregated"))
             or view["launch_digest"] != launch_digest
         ):
             raise ControlError("the native launch configuration differs from the committed plan")
         grants = view["grants"]
         workers = [grant["device"] for grant in grants]
-        if len(grants) != args.tp:
-            raise ControlError("the number of grants differs from tensor parallel size")
+        if len(grants) != args.tp * pp:
+            raise ControlError("the number of grants differs from TP times PP")
         device_env = "CUDA_VISIBLE_DEVICES"
         child_env = env.copy()
         if hosted:
@@ -494,6 +495,8 @@ def run(
                 node_rank, layout, grants = serving_launch.placement(host_launch_spec, grants, host_id)
             except ValueError as error:
                 raise ControlError(str(error)) from error
+            if pp > 1:
+                command = [*command, "--pipeline-parallel-size", str(pp)]
             command = serving_launch.host_command(command, host_launch_spec, host_id, node_rank, layout)
             child_env.update(config.get("env", {}))
             for mask in serving_launch.DEVICE_MASKS:

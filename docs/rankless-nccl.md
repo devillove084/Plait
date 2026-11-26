@@ -46,15 +46,33 @@ vLLM rendezvous endpoint before creating workers. Conflicting layouts
 fail startup. Workers that can share memory with the control worker
 use shared-memory response queues. Other workers use socket queues.
 
-The explicit layout applies to one TP group with DP, PP, and prefill
-context parallel sizes of one. The counts describe workers per host.
-The model's tensor-partitioning rules determine each worker's shard.
-The placement is fixed for the lifetime of that vLLM process group.
+The counts describe workers per host and sum to `TP × PP`. Each pipeline
+stage owns a consecutive set of TP workers in global worker order. The
+model's tensor-partitioning rules determine the shards within a stage.
+Use DP, PCP and DCP sizes of one with EP disabled. The layout is fixed for
+the lifetime of that vLLM process group.
+
+### Split model layers across hosts
+
+For two stages using two devices each, start the same model with
+`--tensor-parallel-size 2 --pipeline-parallel-size 2 --plait-tp-layout 2 2`
+and the `mp` executor. The first host runs the first stage. Set
+`VLLM_PP_LAYER_PARTITION` on both hosts to override the layer split. For a
+28-layer model, `10,18` assigns ten layers to the first stage and eighteen
+to the next. Each host must use the same worker counts, sizes and layer
+partition. Set its device backend and mask locally.
+
+Pipeline stages send device tensors through Plait's point-to-point links.
+The receiver allocates them on its own device and reconstructs any TP
+slices within its stage. Gloo carries tensor descriptors and CPU data.
+The peer transport stages sends through host memory before the source
+tensor can be reused. The receiving stage waits for its activation copy
+before forwarding. This path requires eager execution.
 
 ### Start a committed group on several hosts
 
 Run `scripts/serve-tiered.py` with `--host-launch-spec` to derive the
-TP placement from a committed `GroupPlan`. Give each host the same
+placement from a committed `GroupPlan`. Give each host the same
 JSON document. The keys under `hosts` are the plan's host IDs.
 
 ```json
@@ -114,9 +132,11 @@ plait-node serving --listen "$CONTROL_REPLY_ADDR" --peer "$VOTER_ID@$VOTER_ADDR"
 `plan`, and `activation`. Use the latest known epoch as `expected_epoch`.
 For an initial group, use epoch zero and a null `expected_active`. Group
 and operation origin IDs are 16-byte arrays. A plan supplies the model,
-role `Aggregated`, TP size, PP size of one, launch digest, and
+role `Aggregated`, TP and PP sizes, launch digest, and
 device and host reservations. Represent the device and host maps as
-arrays of key/value pairs. Launch each planned host as described above.
+arrays of key/value pairs. Reserve one device per worker, for a total of
+`TP × PP`. When PP is greater than one, each host must run the Plait fork
+with pipeline support. Launch each planned host as described above.
 
 `replan_hosted` takes `id`, `forecast`, `candidates`, and `activation`.
 Each candidate supplies `group`, `expected_epoch`, `plan`, `capacity`,
@@ -196,7 +216,7 @@ A restarted supervisor uses the same local lock and revokes a claim
 left without a live launcher. Use a profile's optional `verify_release`
 executable to attest device release before its grants can be reused.
 
-For managed P/D with dedicated accelerator devices and Plait TCP, a
+For managed groups with dedicated accelerator devices and Plait TCP, a
 profile can use the built-in driver process check instead of an external
 verifier. Set `release_driver` and the matching `PLAIT_NCCL_BACKEND` in
 the engine profile.

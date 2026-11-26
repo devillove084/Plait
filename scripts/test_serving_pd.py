@@ -158,7 +158,7 @@ class LaunchTest(unittest.TestCase):
         args = SimpleNamespace(
             control_bin="plait-node", control_listen=None, control_peer=[],
             group_id=group, group_epoch=3, host_id=host, role="aggregated", model="model",
-            tp=3, backend_port=9000, startup_timeout=1, verify_release=None,
+            tp=2, backend_port=9000, startup_timeout=1, verify_release=None,
         )
         spec = {
             "api_host": head, "master_addr": "192.0.2.1", "master_port": 9008,
@@ -171,10 +171,10 @@ class LaunchTest(unittest.TestCase):
         control = Mock()
         control.request.return_value = {"group": {
             "phase": "Preparing", "version": version, "role": "Aggregated", "model": "model",
-            "tensor_parallel": 3, "pipeline_parallel": 1, "launch_digest": digest,
+            "tensor_parallel": 2, "pipeline_parallel": 2, "launch_digest": digest,
             "grants": [
                 {"device": {"node": list(bytes.fromhex(node)), "ordinal": ordinal}}
-                for node, ordinal in ((host, 6), (head, 1), (host, 2))
+                for node, ordinal in ((host, 6), (head, 1), (host, 2), (host, 8))
             ],
         }}
         probe = Mock()
@@ -221,9 +221,10 @@ class LaunchTest(unittest.TestCase):
                 proxy.assert_not_called()
                 probe.assert_not_called()
                 command = process.call_args.args[0]
-                self.assertEqual(command[command.index("--plait-tp-layout") + 1 :], ["1", "2", "--headless"])
+                self.assertEqual(command[command.index("--plait-tp-layout") + 1 :], ["1", "3", "--headless"])
+                self.assertEqual(command[command.index("--pipeline-parallel-size") + 1], "2")
                 child_env = process.call_args.kwargs["env"]
-                self.assertEqual(child_env["ASCEND_RT_VISIBLE_DEVICES"], "2,6")
+                self.assertEqual(child_env["ASCEND_RT_VISIBLE_DEVICES"], "2,6,8")
                 self.assertNotIn("CUDA_VISIBLE_DEVICES", child_env)
 
     def test_host_release_uses_the_committed_order_and_full_worker_set(self):

@@ -161,7 +161,6 @@ impl ServingState {
         activation: HostedActivation,
     ) -> ServingResult {
         if plan.role != ServingRole::Aggregated
-            || plan.pipeline_parallel != 1
             || (activation == HostedActivation::OnRevocation && expected_active.is_none())
         {
             return Err(ServingError::InvalidPlan);
