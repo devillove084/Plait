@@ -31,6 +31,59 @@ COMPLETIONS = "/v1/completions"
 
 
 class LaunchTest(unittest.TestCase):
+    def test_amd_kfd_release_uses_the_device_identity_captured_before_launch(self):
+        group, host = "a" * 32, "b" * 32
+        node = list(bytes.fromhex(host))
+        version = {"group": list(bytes.fromhex(group)), "epoch": 7}
+        grants = [{"version": version, "device": {"node": node, "ordinal": 1},
+                   "incarnation": 1, "fence": 2}]
+        monitor = {"driver": "amd_kfd", "program": "/vendor/amd-smi"}
+        args = SimpleNamespace(
+            control_bin="plait-node", control_listen=None, control_peer=[], group_id=group,
+            group_epoch=7, host_id=host, role="decode", model="model", tp=1, port_base=8000,
+            backend_port=9000, proxy_host="127.0.0.1", kv_lease_seconds=30, startup_timeout=1,
+            drain_timeout=1, verify_release=None, release_driver=monitor,
+        )
+        spec = {"api_host": host, "master_addr": "192.0.2.2", "master_port": 9008,
+                "hosts": {host: {"address": "192.0.2.2", "argv": ["vllm"],
+                                 "model_path": "/model", "device_env": "HIP_VISIBLE_DEVICES"}}}
+        digest = [2] * 32
+        control = Mock()
+        control.request.return_value = {"group": {"phase": "Preparing", "version": version,
+            "role": "Decode", "model": "model", "tensor_parallel": 1, "pipeline_parallel": 1,
+            "launch_digest": digest, "grants": grants}}
+        control.execute.return_value = {"Ok": {"Group": {"phase": "Preparing"}}}
+        identities = [{"hip": 1, "management": 7, "kfd": 30, "node": 3,
+                       "render": 129, "bdf": "0000:02:00.0"}]
+        proof_record = {"monitor": monitor, "host": node, "version": version, "grants": grants}
+        calls = []
+
+        def verify(argv, *, input, env, **_kwargs):
+            self.assertNotIn("HIP_VISIBLE_DEVICES", env)
+            action = argv[-1]
+            calls.append(action)
+            if action == "capture-host-release":
+                process.assert_not_called()
+                self.assertEqual(json.loads(input), proof_record)
+                return SimpleNamespace(stdout=json.dumps(identities))
+            stopped.assert_called_once()
+            self.assertEqual(json.loads(input), {**proof_record, "identities": identities})
+            return SimpleNamespace(returncode=0)
+
+        with (
+            patch("serving_group.Control", return_value=control), patch("serving_group.group_proxy"),
+            patch("serving_group.check_backend_port"), patch("serving_group.subprocess.run", side_effect=verify),
+            patch("serving_group.subprocess.Popen") as process,
+            patch("serving_group.stop_process_group", return_value=True) as stopped,
+            patch("serving_group.record_host_stop") as retire,
+        ):
+            process.return_value.poll.return_value = 0
+            run(args, ["vllm", "serve", "model"], digest, {"HIP_VISIBLE_DEVICES": "5"},
+                lambda _: True, lambda: False, host_launch_spec=spec)
+        self.assertEqual(calls, ["capture-host-release", "verify-host-release"])
+        self.assertEqual(process.call_args.kwargs["env"]["HIP_VISIBLE_DEVICES"], "1")
+        retire.assert_called_once()
+
     def test_backend_probe_accepts_a_drained_port_and_rejects_an_active_listener(self):
         with socket.socket() as listener:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

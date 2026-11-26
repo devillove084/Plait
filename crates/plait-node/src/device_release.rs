@@ -11,11 +11,14 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tokio::time::{Instant, sleep, timeout_at};
 
+mod amd_kfd;
+
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Driver {
     Nvidia,
     Amd,
+    AmdKfd,
     Ppu,
     Ascend,
 }
@@ -31,37 +34,49 @@ impl ReleaseDriver {
     pub(crate) fn backend(&self) -> &'static str {
         match self.driver {
             Driver::Nvidia => "cuda",
-            Driver::Amd => "rocm",
+            Driver::Amd | Driver::AmdKfd => "rocm",
             Driver::Ppu => "ppu",
             Driver::Ascend => "huawei",
         }
     }
 
     pub(crate) fn available(&self) -> bool {
-        cfg!(target_os = "linux") && self.program.is_absolute() && is_executable(&self.program)
+        cfg!(target_os = "linux")
+            && self.program.is_absolute()
+            && is_executable(&self.program)
+            && (!matches!(self.driver, Driver::AmdKfd) || amd_kfd::available())
+    }
+
+    pub(crate) fn supports_mask(&self, device_env: &str) -> bool {
+        !matches!(self.driver, Driver::AmdKfd)
+            || matches!(device_env, "CUDA_VISIBLE_DEVICES" | "HIP_VISIBLE_DEVICES")
     }
 
     async fn idle(&self, ordinal: u32, deadline: Instant) -> io::Result<bool> {
-        let mut query = Command::new(&self.program);
-        query.kill_on_drop(true).env("LC_ALL", "C");
         let index = ordinal.to_string();
-        match self.driver {
-            Driver::Nvidia | Driver::Ppu => query.args([
+        let args = match self.driver {
+            Driver::Nvidia | Driver::Ppu => &[
                 "-i",
                 &index,
                 "--query-compute-apps=pid",
                 "--format=csv,noheader,nounits",
-            ]),
-            Driver::Amd => query.args(["process", "--gpu", &index, "--json"]),
-            Driver::Ascend => query.args(["info", "-t", "proc-mem", "-i", &index, "-p", "0"]),
+            ][..],
+            Driver::Amd => &["process", "--gpu", &index, "--json"],
+            Driver::Ascend => &["info", "-t", "proc-mem", "-i", &index, "-p", "0"],
+            Driver::AmdKfd => unreachable!("AMD KFD release checks the entire local grant set"),
         };
+        self.driver
+            .idle_output(ordinal, &self.query(args, deadline).await?)
+    }
+
+    async fn query(&self, args: &[&str], deadline: Instant) -> io::Result<Vec<u8>> {
+        let mut query = Command::new(&self.program);
+        query.kill_on_drop(true).env("LC_ALL", "C").args(args);
         let output = timeout_at(deadline, query.output()).await??;
         if !output.status.success() || !output.stderr.iter().all(u8::is_ascii_whitespace) {
-            return Err(io::Error::other(format!(
-                "driver query failed for device {ordinal}"
-            )));
+            return Err(io::Error::other("accelerator driver query failed"));
         }
-        self.driver.idle_output(ordinal, &output.stdout)
+        Ok(output.stdout)
     }
 }
 
@@ -125,6 +140,7 @@ impl Driver {
                 }
                 Ok(rows.next() == Some("No process in device.") && rows.next().is_none())
             }
+            Self::AmdKfd => unreachable!("AMD KFD release uses the kernel process table"),
         }
     }
 }
@@ -136,6 +152,8 @@ struct ReleaseRequest {
     host: NodeId,
     version: GroupVersion,
     grants: Vec<WorkerGrant>,
+    #[serde(default)]
+    identities: Vec<amd_kfd::Identity>,
 }
 
 impl ReleaseRequest {
@@ -158,25 +176,62 @@ impl ReleaseRequest {
     }
 }
 
-pub(crate) async fn run(
-    mut args: impl Iterator<Item = String>,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn request(mut args: impl Iterator<Item = String>) -> io::Result<ReleaseRequest> {
     if args.next().is_some() {
-        return Err("verify-host-release expects a local grant record on stdin".into());
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected a local grant record on stdin",
+        ));
     }
     let mut input = Vec::new();
     io::Read::take(io::stdin().lock(), 65_537).read_until(b'\n', &mut input)?;
     if input.len() > 65_536 || !input.ends_with(b"\n") {
-        return Err("invalid release request length".into());
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid release request length",
+        ));
     }
-    let request: ReleaseRequest = serde_json::from_slice(&input)?;
+    Ok(serde_json::from_slice(&input)?)
+}
+
+pub(crate) async fn capture(
+    args: impl Iterator<Item = String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request = request(args)?;
+    let devices = request.devices()?;
+    if !matches!(request.monitor.driver, Driver::AmdKfd) || !request.identities.is_empty() {
+        return Err("expected an AMD KFD device capture request".into());
+    }
+    let identities = amd_kfd::capture(
+        &request.monitor,
+        &devices,
+        Instant::now() + Duration::from_secs(20),
+    )
+    .await?;
+    serde_json::to_writer(io::stdout().lock(), &identities)?;
+    Ok(())
+}
+
+pub(crate) async fn run(
+    args: impl Iterator<Item = String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request = request(args)?;
     let devices = request.devices()?;
     let deadline = Instant::now() + Duration::from_secs(20);
+    let kfd = matches!(request.monitor.driver, Driver::AmdKfd);
+    if !kfd && !request.identities.is_empty() {
+        return Err("unexpected release identity record".into());
+    }
     loop {
-        let mut idle = true;
-        for &ordinal in &devices {
-            idle &= request.monitor.idle(ordinal, deadline).await?;
-        }
+        let idle = if kfd {
+            amd_kfd::idle(&request.monitor, &devices, &request.identities, deadline).await?
+        } else {
+            let mut idle = true;
+            for &ordinal in &devices {
+                idle &= request.monitor.idle(ordinal, deadline).await?;
+            }
+            idle
+        };
         if idle {
             return Ok(());
         }

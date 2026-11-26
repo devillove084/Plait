@@ -462,6 +462,8 @@ def run(
     drain_until = None
     ready_pipe = None
     release_driver = getattr(args, "release_driver", None)
+    release_request = None
+    release_env = None
 
     def change(name: str, **fields: object) -> str:
         return expect_phase(control.execute(
@@ -502,6 +504,18 @@ def run(
             if release_driver is not None:
                 for transport in ("PLAIT_NCCL_SHM", "PLAIT_NCCL_IPC", "PLAIT_NCCL_KERNEL"):
                     child_env[transport] = "0"
+                release_request = {"monitor": release_driver, "host": host,
+                                   "version": version, "grants": grants}
+                release_env = {key: value for key, value in child_env.items()
+                               if key not in serving_launch.DEVICE_MASKS}
+                if release_driver["driver"] == "amd_kfd":
+                    capture = subprocess.run(
+                        [args.control_bin, "capture-host-release"],
+                        input=json.dumps(release_request) + "\n",
+                        env=release_env, text=True, stdout=subprocess.PIPE,
+                        timeout=25, check=True,
+                    )
+                    release_request["identities"] = json.loads(capture.stdout)
         elif any(grant["device"]["node"] != host for grant in grants):
             raise ControlError("all grants must belong to the local host")
         elif len({grant["device"]["ordinal"] for grant in grants}) != args.tp:
@@ -615,14 +629,12 @@ def run(
             if claimed and exited and gate.drained():
                 if process is None:
                     released = True
-                elif release_driver is not None:
+                elif release_request is not None:
                     try:
                         proof = subprocess.run(
                             [args.control_bin, "verify-host-release"],
-                            input=json.dumps({"monitor": release_driver, "host": host,
-                                              "version": version, "grants": grants}) + "\n",
-                            env={key: value for key, value in child_env.items()
-                                 if key not in serving_launch.DEVICE_MASKS},
+                            input=json.dumps(release_request) + "\n",
+                            env=release_env,
                             text=True,
                             timeout=30,
                             check=False,

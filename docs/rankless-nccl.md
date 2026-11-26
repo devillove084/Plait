@@ -212,6 +212,7 @@ the engine profile.
 | --- | --- | --- |
 | `nvidia` | `cuda` | `nvidia-smi` |
 | `amd` | `rocm` | `amd-smi` |
+| `amd_kfd` | `rocm` | `amd-smi` with Linux KFD sysfs |
 | `ppu` | `ppu` | `ppu-smi` |
 | `ascend` | `huawei` | `npu-smi` |
 
@@ -225,6 +226,17 @@ Every local grant must return a clear process report. Busy devices,
 unsupported reports, and timeouts leave the grants protected. Use
 `verify_release` for profiles that rely on another release procedure,
 such as device resets or transport-specific cleanup.
+
+Use `amd_kfd` for a ROCm whole-device profile on a host where AMD SMI
+returns the same process list for multiple cards. Use `CUDA_VISIBLE_DEVICES`
+or `HIP_VISIBLE_DEVICES` as the profile's `device_env`. The launcher
+captures the HIP-to-KFD mapping before starting vLLM. After drain, it
+checks that the mapping still matches AMD SMI and kernel topology. KFD
+queue IDs and per-device VRAM counters must be clear on the granted
+devices. Work on another device can keep running. The verifier requires
+a complete KFD process view and reconciles the PIDs reported by AMD SMI.
+Partitioned identities, changed mappings and missing process data keep
+the grants protected. The `amd` mode remains available on older hosts.
 
 ### Replan with measured host links
 

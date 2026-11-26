@@ -18,6 +18,7 @@ tlc -deadlock -config specs/PlaitAsyncReductionExpired.cfg specs/PlaitAsyncReduc
 tlc -deadlock -config specs/PlaitAsyncReductionFailed.cfg specs/PlaitAsyncReduction.tla
 tlc -deadlock -config specs/PlaitResidentReclaim.cfg specs/PlaitResidentReclaim.tla
 tlc -deadlock -config specs/PlaitResidentReclaimVerified.cfg specs/PlaitResidentReclaim.tla
+tlc -deadlock -config specs/PlaitKfdRelease.cfg specs/PlaitKfdRelease.tla
 tlc -deadlock -config specs/PlaitEpochAdmission.cfg specs/PlaitEpochAdmission.tla
 tlc -deadlock -config specs/PlaitHostLaunch.cfg specs/PlaitHostLaunch.tla
 tlc -deadlock -config specs/PlaitHostRollout.cfg specs/PlaitHostLaunch.tla

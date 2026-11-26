@@ -94,12 +94,13 @@ pub(crate) async fn run(
     for profile in config.profiles.values() {
         if let Some(driver) = &profile.release_driver
             && (profile.verify_release.is_some()
+                || !driver.supports_mask(&profile.device_env)
                 || profile.env.get("PLAIT_NCCL_BACKEND").map(String::as_str)
                     != Some(driver.backend()))
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "release_driver requires its matching PLAIT_NCCL_BACKEND and a single release verifier",
+                "release_driver requires its matching backend, device mask, and a single release verifier",
             ));
         }
     }

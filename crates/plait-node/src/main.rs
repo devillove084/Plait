@@ -130,6 +130,7 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         }
         "serving" => serving_cli::run(args).await,
         "verify-host-release" => device_release::run(args).await,
+        "capture-host-release" => device_release::capture(args).await,
         "kv-store" => kv_store::run(args).await,
         "tensor" => tensor_cli::run(args).await,
         "run" => {
