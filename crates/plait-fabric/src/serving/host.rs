@@ -110,6 +110,7 @@ impl ServingState {
             },
         );
         self.hosted_inventories.remove(&host);
+        self.hosted_release_profiles.remove(&host);
         Ok(ServingOutcome::ExecutionHostOnline)
     }
 

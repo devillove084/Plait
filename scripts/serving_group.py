@@ -378,6 +378,14 @@ def inspect_group(control: Control, version: dict) -> dict:
     return control.request({"request": "inspect", "version": version})["group"]
 
 
+def check_backend_port(port: int) -> None:
+    with socket.socket() as listener:
+        # Match the HTTP backend's bind behavior after an earlier group has drained.
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", port))
+        listener.listen(1)
+
+
 def api_host_stopped(view: dict, api_host: str) -> bool:
     return sum(bytes(device["node"]).hex() == api_host for device in view["stopped"]) == sum(
         bytes(grant["device"]["node"]).hex() == api_host for grant in view["grants"]
@@ -500,8 +508,7 @@ def run(
                 args.port_base, args.backend_port, gate, version_tag,
                 bind=args.proxy_host, role=args.role, kv_lease=args.kv_lease_seconds,
             )
-            with socket.socket() as port_check:
-                port_check.bind(("127.0.0.1", args.backend_port))
+            check_backend_port(args.backend_port)
         phase = change(
             "ClaimHostLaunch" if hosted else "ClaimLaunch", host=host, launch_digest=launch_digest,
         )

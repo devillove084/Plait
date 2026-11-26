@@ -1,11 +1,14 @@
 use std::{collections::BTreeSet, io};
 
 use plait_core::serving::{
-    RouteSetId, ServingAction, ServingError, ServingLookup, ServingOperation, ServingView,
+    HostedPdReconfiguration, RouteSetId, ServingAction, ServingError, ServingLookup,
+    ServingOperation, ServingView,
 };
 use plait_core::{NodeId, OpId};
 use plait_node::Client;
-use plait_parallel::serving::{HostedLinkPolicy, HostedPdPool, ServingForecast, plan_hosted_pd};
+use plait_parallel::serving::{
+    HostedLinkPolicy, HostedPdPool, ServingForecast, plan_hosted_pd_with_releases,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -49,14 +52,23 @@ pub(super) async fn replan(
     if let Some(previous) = replay(client, peers.clone(), id, request_sha256).await? {
         return Ok(previous);
     }
-    let view = query(
-        client,
-        peers.clone(),
-        ServingLookup::HostedPdPlanning(RouteSetId::for_model(&model)),
-    )
-    .await?;
-    let ServingView::HostedPdPlanning(snapshot) = view else {
-        return Err(io::Error::other("expected a hosted P/D planning snapshot"));
+    let key = RouteSetId::for_model(&model);
+    let lookup = if pool.can_reconfigure() {
+        ServingLookup::HostedPdReconfiguration(key)
+    } else {
+        ServingLookup::HostedPdPlanning(key)
+    };
+    let view = query(client, peers.clone(), lookup).await?;
+    let HostedPdReconfiguration {
+        planning: snapshot,
+        releases,
+    } = match view {
+        ServingView::HostedPdPlanning(planning) => HostedPdReconfiguration {
+            planning,
+            releases: Vec::new(),
+        },
+        ServingView::HostedPdReconfiguration(snapshot) => snapshot,
+        _ => return Err(io::Error::other("expected a hosted P/D planning snapshot")),
     };
     if snapshot.revision != expected_revision {
         let result: Result<(), _> = Err(ServingError::StaleDirectory {
@@ -77,20 +89,21 @@ pub(super) async fn replan(
     let links =
         hosted_probe::collect(probe_endpoints(client, peers.clone()).await?, Some(&hosts)).await;
     forecast.now_ms = hosted_probe::now_ms()?;
-    let selection = plan_hosted_pd(&model, &snapshot, &forecast, &pool, link_policy, &links)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let selection = plan_hosted_pd_with_releases(
+        &model,
+        &snapshot,
+        &forecast,
+        &pool,
+        link_policy,
+        &links,
+        &releases,
+    )
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let mut reply = json!({ "selection": selection, "result": null });
     if let Some(decision) = selection.selected {
         let operation = ServingOperation {
             id,
-            action: ServingAction::PreparePlannedHostedPd {
-                model,
-                expected_revision,
-                kv: pool.kv,
-                placements: decision.placements,
-                paths: decision.paths,
-                request_sha256,
-            },
+            action: decision.into_action(model, expected_revision, pool.kv, Some(request_sha256)),
         };
         let result = apply(client, peers.clone(), &operation).await?;
         if result == Err(ServingError::OperationIdReused)
@@ -117,12 +130,12 @@ async fn replay(
     let Some(receipt) = receipt else {
         return Ok(None);
     };
-    if let ServingAction::PreparePlannedHostedPd {
-        request_sha256: prior,
-        ..
-    } = receipt.operation.action
-        && prior == request_sha256
-    {
+    let prior = match receipt.operation.action {
+        ServingAction::PreparePlannedHostedPd { request_sha256, .. } => Some(request_sha256),
+        ServingAction::PreparePlannedHostedPdTransition { request_sha256, .. } => request_sha256,
+        _ => None,
+    };
+    if prior == Some(request_sha256) {
         return Ok(Some(json!({ "replayed": true, "result": receipt.result })));
     }
     Err(io::Error::new(

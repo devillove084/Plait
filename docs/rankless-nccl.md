@@ -520,6 +520,34 @@ for the expected traffic during drain and target warm-up. Hosted vLLM
 completes existing requests on the old process; the target serves newly
 admitted work after cutover.
 
+### Let the planner choose a two-stage transition
+
+Add `"reconfigure": { "drain_ms": 12000 }` to the hosted P/D pool to
+enable two-stage planning. `drain_ms` is an estimate from bridge publication
+to release of its displaced groups. The control plane still waits for the
+actual release records. The `ready_after_ms` in each size profile estimates
+group startup. Slot IDs may have one Prefill and one Decode profile. A
+published layout selects at most one role and version for each ID.
+
+Each resident advertises the engine profiles that have a configured,
+executable `verify_release`. Planning can reclaim a group's resources only
+when every participating host advertises that profile. Submission checks
+the current directory revision and release capability again before staging.
+
+The planner estimates the bridge on currently available devices. It then
+checks target layouts against a projected ledger that includes the bridge's
+reservations and credits only the displaced groups' memory, devices and
+ports. Bridge capacity must cover the incumbent rate during the estimated
+drain and target startup. The score counts requests completed over the
+remaining window in both layouts and subtracts both transition costs.
+Two-stage changes compete with ordinary changes in the same scoring pass.
+
+`replan_hosted_pd` reports the bridge paths, new placements, release
+versions and estimated target readiness when it selects a transition.
+`pd_scaling` submits the same plan after the full intent remains stable
+across the configured observation windows. Keep the incumbent and target
+profiles calibrated for this model and load.
+
 ### Reuse prompt KV across TP layouts
 
 Start a shared store on the engine network. It keeps completed pages in

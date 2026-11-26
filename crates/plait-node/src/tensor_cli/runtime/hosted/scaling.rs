@@ -7,12 +7,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use plait_core::serving::{
-    GroupPhase, HostedPdPlacement, HostedPdPlanning, PdRoute, RouteSetId, ServingAction,
+    GroupPhase, HostedPdPlanning, HostedPdReconfiguration, RouteSetId, ServingAction,
     ServingLookup, ServingOperation, ServingOutcome, ServingView,
 };
 use plait_core::{NodeId, OpId};
 use plait_parallel::serving::{
-    GroupProfile, HostedLinkPolicy, HostedPdPool, ServingForecast, plan_hosted_pd,
+    GroupProfile, HostedLinkPolicy, HostedPdPool, ServingForecast, plan_hosted_pd_with_releases,
 };
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -105,11 +105,7 @@ impl Counters {
 
 type Cohort = BTreeMap<SocketAddr, Counters>;
 
-#[derive(PartialEq, Eq)]
-struct Proposal {
-    paths: Vec<PdRoute>,
-    placements: Vec<HostedPdPlacement>,
-}
+type Proposal = ServingAction;
 
 #[derive(Default)]
 struct Evidence {
@@ -176,13 +172,7 @@ impl Evidence {
             *windows = windows.saturating_add(1);
             return *windows >= required;
         }
-        self.proposal = Some((
-            Proposal {
-                paths: proposal.paths.clone(),
-                placements: proposal.placements.clone(),
-            },
-            1,
-        ));
+        self.proposal = Some((proposal.clone(), 1));
         required == 1
     }
 
@@ -230,18 +220,24 @@ async fn run_model(policy: Policy, peers: ControlPeers) -> io::Result<()> {
         tokio::time::sleep(Duration::from_millis(window_ms)).await;
     };
     let mut evidence = Evidence::default();
+    let key = RouteSetId::for_model(&model);
+    let lookup = if pool.can_reconfigure() {
+        ServingLookup::HostedPdReconfiguration(key)
+    } else {
+        ServingLookup::HostedPdPlanning(key)
+    };
     let mut tick = tokio::time::interval(Duration::from_millis(window_ms));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
         let input = async {
-            let ServingView::HostedPdPlanning(snapshot) = control
-                .query(ServingLookup::HostedPdPlanning(RouteSetId::for_model(
-                    &model,
-                )))
-                .await?
-            else {
-                return Err(io::Error::other("expected hosted P/D planning state"));
+            let snapshot = match control.query(lookup).await? {
+                ServingView::HostedPdPlanning(planning) => HostedPdReconfiguration {
+                    planning,
+                    releases: Vec::new(),
+                },
+                ServingView::HostedPdReconfiguration(snapshot) => snapshot,
+                _ => return Err(io::Error::other("expected hosted P/D planning state")),
             };
             let samples = sample_cohort(&ingress, &model).await?;
             Ok((snapshot, samples))
@@ -257,8 +253,8 @@ async fn run_model(policy: Policy, peers: ControlPeers) -> io::Result<()> {
         };
         let observed_at = Instant::now();
         let Some(demand_rps) = evidence.observe(
-            snapshot.revision,
-            snapshot.pending.is_some(),
+            snapshot.planning.revision,
+            snapshot.planning.pending.is_some(),
             samples,
             observed_at,
             window_ms,
@@ -279,7 +275,7 @@ async fn run_model(policy: Policy, peers: ControlPeers) -> io::Result<()> {
             link_policy,
         )
         .await;
-        let (revision, proposal) = match planned {
+        let proposal = match planned {
             Ok(Some(choice)) => choice,
             Ok(None) => {
                 evidence.proposal = None;
@@ -302,13 +298,7 @@ async fn run_model(policy: Policy, peers: ControlPeers) -> io::Result<()> {
         evidence.reset();
         let operation = ServingOperation {
             id: OpId::new(NodeId::random(), 1),
-            action: ServingAction::PrepareHostedPd {
-                model: model.clone(),
-                expected_revision: revision,
-                kv: pool.kv.clone(),
-                placements: proposal.placements,
-                paths: proposal.paths,
-            },
+            action: proposal,
         };
         match control.apply(&operation).await {
             Ok(Ok(ServingOutcome::HostedPdStaged { revision })) => {
@@ -328,10 +318,14 @@ async fn decide(
     demand_rps: f64,
     horizon_ms: u64,
     minimum_gain_requests: f64,
-    snapshot: HostedPdPlanning,
+    snapshot: HostedPdReconfiguration,
     pool: Arc<HostedPdPool>,
     link_policy: HostedLinkPolicy,
-) -> io::Result<Option<(u64, Proposal)>> {
+) -> io::Result<Option<Proposal>> {
+    let HostedPdReconfiguration {
+        planning: snapshot,
+        releases,
+    } = snapshot;
     let groups = current_profiles(control, &snapshot, &pool).await?;
     let ServingView::HostedProbeEndpoints(endpoints) =
         control.query(ServingLookup::HostedProbeEndpoints).await?
@@ -357,17 +351,19 @@ async fn decide(
     };
     let model = model.to_owned();
     tokio::task::spawn_blocking(move || {
-        let selection = plan_hosted_pd(&model, &snapshot, &forecast, &pool, link_policy, &links)
-            .map_err(io::Error::other)?;
-        Ok(selection.selected.map(|selected| {
-            (
-                snapshot.revision,
-                Proposal {
-                    paths: selected.paths,
-                    placements: selected.placements,
-                },
-            )
-        }))
+        let selection = plan_hosted_pd_with_releases(
+            &model,
+            &snapshot,
+            &forecast,
+            &pool,
+            link_policy,
+            &links,
+            &releases,
+        )
+        .map_err(io::Error::other)?;
+        Ok(selection
+            .selected
+            .map(|selected| selected.into_action(model, snapshot.revision, pool.kv.clone(), None)))
     })
     .await
     .map_err(io::Error::other)?
@@ -458,7 +454,7 @@ async fn read_counters(addr: SocketAddr) -> io::Result<Counters> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plait_core::serving::{GroupId, GroupVersion};
+    use plait_core::serving::{GroupId, GroupVersion, HostedPdKv, PdRoute};
 
     fn sample(session: u8, uptime_ms: u64, arrivals: u64, in_flight: u64) -> Cohort {
         BTreeMap::from([(
@@ -480,7 +476,14 @@ mod tests {
             group: GroupId(NodeId::from_bytes([id; 16])),
             epoch: 1,
         };
-        Proposal {
+        ServingAction::PrepareHostedPd {
+            model: "model".into(),
+            expected_revision: 0,
+            kv: HostedPdKv {
+                store: "192.0.2.1:8000".parse().unwrap(),
+                namespace: "weights".into(),
+                block_size: 128,
+            },
             paths: vec![PdRoute {
                 prefill: version(1),
                 decode: version(number),

@@ -91,18 +91,41 @@ pub(crate) async fn run(
     let policies = std::mem::take(&mut config.pd_scaling);
     tokio::fs::create_dir_all(&config.lock_dir).await?;
     let lock = lock_device(&config.lock_dir.join("host-supervisor.lock"))?;
-    let pulse = ServingAction::AdvertiseHostedInventory {
-        inventory: HostedInventory {
-            host,
-            address: config.listen.ip(),
-            profiles: config.profiles.keys().cloned().collect(),
-            devices: config
-                .devices
-                .iter()
-                .map(|device| (device.ordinal, device.incarnation))
-                .collect(),
-        },
-        supervisor_lock: lock_identity(&lock)?,
+    let inventory = HostedInventory {
+        host,
+        address: config.listen.ip(),
+        profiles: config.profiles.keys().cloned().collect(),
+        devices: config
+            .devices
+            .iter()
+            .map(|device| (device.ordinal, device.incarnation))
+            .collect(),
+    };
+    let supervisor_lock = lock_identity(&lock)?;
+    let release_profiles: BTreeSet<_> = config
+        .profiles
+        .iter()
+        .filter(|(_, profile)| {
+            use std::os::unix::fs::PermissionsExt;
+            profile.verify_release.as_ref().is_some_and(|path| {
+                std::fs::metadata(path).is_ok_and(|metadata| {
+                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                })
+            })
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    let pulse = if release_profiles.is_empty() {
+        ServingAction::AdvertiseHostedInventory {
+            inventory,
+            supervisor_lock,
+        }
+    } else {
+        ServingAction::AdvertiseHostedInventoryWithRelease {
+            inventory,
+            supervisor_lock,
+            release_profiles,
+        }
     };
     let peers: Vec<_> = peers
         .into_iter()

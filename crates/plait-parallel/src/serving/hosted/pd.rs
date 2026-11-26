@@ -4,13 +4,17 @@ use std::net::IpAddr;
 use plait_core::NodeId;
 use plait_core::serving::{
     GroupId, GroupVersion, HostedLinkSample, HostedPdKv, HostedPdPlacement, HostedPdPlanning,
-    HostedPlanning, HostedPortUse, PdRoute, ServingResources, ServingRole,
+    HostedPdRelease, HostedPdStage, HostedPlanning, HostedPortUse, PdRoute, ServingAction,
+    ServingResources, ServingRole,
 };
 use serde::{Deserialize, Serialize};
 
 use super::super::{ServingForecast, SloProfile, validate_placement};
 use super::pool::{HostedPool, generate_layouts};
 use super::{HostedLinkPolicy, LinkEvidence, Traffic};
+
+mod reconfigure;
+use reconfigure::Reconfiguration;
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -23,6 +27,8 @@ pub struct HostedPdPool {
     slots: Vec<RoleSlot>,
     #[serde(default)]
     allow_scale_down: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reconfigure: Option<Reconfiguration>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -45,6 +51,54 @@ pub struct HostedPdDecision {
     pub steady_rps: f64,
     pub gain_requests: f64,
     pub devices: u64,
+    bridge: Option<Bridge>,
+}
+
+struct Bridge {
+    stage: HostedPdStage,
+    release: Vec<HostedPdRelease>,
+    rate: f64,
+    target_ready_after_ms: u64,
+}
+
+impl HostedPdDecision {
+    pub fn into_action(
+        self,
+        model: String,
+        expected_revision: u64,
+        kv: HostedPdKv,
+        request_sha256: Option<[u8; 32]>,
+    ) -> ServingAction {
+        match (self.bridge, request_sha256) {
+            (Some(bridge), request_sha256) => ServingAction::PreparePlannedHostedPdTransition {
+                model,
+                expected_revision,
+                kv,
+                bridge: bridge.stage,
+                release: bridge.release,
+                target: HostedPdStage {
+                    paths: self.paths,
+                    placements: self.placements,
+                },
+                request_sha256,
+            },
+            (None, Some(request_sha256)) => ServingAction::PreparePlannedHostedPd {
+                model,
+                expected_revision,
+                kv,
+                paths: self.paths,
+                placements: self.placements,
+                request_sha256,
+            },
+            (None, None) => ServingAction::PrepareHostedPd {
+                model,
+                expected_revision,
+                kv,
+                paths: self.paths,
+                placements: self.placements,
+            },
+        }
+    }
 }
 
 impl Serialize for HostedPdDecision {
@@ -65,22 +119,42 @@ impl Serialize for HostedPdDecision {
             steady_rps: f64,
             gain_requests: f64,
             devices: u64,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            bridge: Option<BridgeSummary<'a>>,
+        }
+        #[derive(Serialize)]
+        struct BridgeSummary<'a> {
+            paths: &'a [PdRoute],
+            placements: Vec<Placement<'a>>,
+            release: Vec<GroupVersion>,
+            steady_rps: f64,
+            target_ready_after_ms: u64,
+        }
+        fn placement(placement: &HostedPdPlacement) -> Placement<'_> {
+            Placement {
+                group: placement.group,
+                role: placement.plan.role,
+                workers: placement.plan.workers.keys().copied().collect(),
+                recipe: &placement.recipe,
+            }
         }
         Decision {
             paths: &self.paths,
-            placements: self
-                .placements
-                .iter()
-                .map(|placement| Placement {
-                    group: placement.group,
-                    role: placement.plan.role,
-                    workers: placement.plan.workers.keys().copied().collect(),
-                    recipe: &placement.recipe,
-                })
-                .collect(),
+            placements: self.placements.iter().map(placement).collect(),
             steady_rps: self.steady_rps,
             gain_requests: self.gain_requests,
             devices: self.devices,
+            bridge: self.bridge.as_ref().map(|bridge| BridgeSummary {
+                paths: &bridge.stage.paths,
+                placements: bridge.stage.placements.iter().map(placement).collect(),
+                release: bridge
+                    .release
+                    .iter()
+                    .map(|release| release.version)
+                    .collect(),
+                steady_rps: bridge.rate,
+                target_ready_after_ms: bridge.target_ready_after_ms,
+            }),
         }
         .serialize(serializer)
     }
@@ -115,6 +189,18 @@ pub fn plan_hosted_pd(
     pool: &HostedPdPool,
     policy: HostedLinkPolicy,
     links: &BTreeMap<(NodeId, NodeId), HostedLinkSample>,
+) -> Result<HostedPdSelection, &'static str> {
+    plan_hosted_pd_with_releases(model, snapshot, forecast, pool, policy, links, &[])
+}
+
+pub fn plan_hosted_pd_with_releases(
+    model: &str,
+    snapshot: &HostedPdPlanning,
+    forecast: &ServingForecast,
+    pool: &HostedPdPool,
+    policy: HostedLinkPolicy,
+    links: &BTreeMap<(NodeId, NodeId), HostedLinkSample>,
+    releases: &[HostedPdRelease],
 ) -> Result<HostedPdSelection, &'static str> {
     forecast.validate()?;
     policy.validate()?;
@@ -180,81 +266,13 @@ pub fn plan_hosted_pd(
     if snapshot.pending.is_some() {
         return Ok(selection);
     }
-    let mut slots: Vec<_> = pool.slots.iter().collect();
-    slots.sort_by_key(|slot| slot.role == ServingRole::Decode);
-    let mut beam = Beam::from([((0, 0), vec![Layout::default()])]);
-    for slot in slots {
-        let group = slot.pool.group();
-        let history = snapshot
-            .resources
-            .groups
-            .iter()
-            .find(|entry| entry.latest.group == group);
-        let expected_active = history
-            .and_then(|entry| entry.active.as_ref())
-            .map(|entry| entry.version);
-        if expected_active
-            .is_some_and(|version| !snapshot.active.iter().any(|entry| entry.version == version))
-        {
-            return Err("hosted P/D slot is active in another deployment");
-        }
-        let mut next = beam.clone();
-        for layout in beam.values().flatten() {
-            if let Some(retained) = active.get(&group).filter(|entry| entry.role == slot.role) {
-                let mut trial = layout.clone();
-                trial.add(retained.clone());
-                retain(&mut next, trial, forecast, pool);
-            }
-            let (resources, inventory) = available(snapshot, layout);
-            for (candidate, recipe) in generate_layouts(
-                &resources,
-                &inventory,
-                forecast,
-                &slot.pool,
-                policy,
-                links,
-                Some((slot.role, &pool.kv)),
-            )? {
-                let Ok(version) = validate_placement(
-                    &resources,
-                    &forecast.model,
-                    group,
-                    candidate.expected_epoch,
-                    &candidate.plan,
-                ) else {
-                    continue;
-                };
-                let mut ranks = BTreeMap::new();
-                for device in candidate.plan.workers.keys() {
-                    *ranks.entry(device.node).or_default() += 1;
-                }
-                let Some(endpoint) = endpoint(
-                    version,
-                    slot.role,
-                    candidate.capacity,
-                    &ranks,
-                    evidence,
-                    store_host,
-                    pool.kv_bytes_per_request,
-                ) else {
-                    continue;
-                };
-                let mut trial = layout.clone();
-                trial.ready_after_ms = trial.ready_after_ms.max(candidate.ready_after_ms);
-                trial.transition_loss_requests += candidate.transition_loss_requests;
-                trial.placements.push(HostedPdPlacement {
-                    group,
-                    expected_epoch: candidate.expected_epoch,
-                    expected_active: expected_active.map(|version| version.epoch),
-                    plan: candidate.plan,
-                    recipe,
-                });
-                trial.add(endpoint);
-                retain(&mut next, trial, forecast, pool);
-            }
-        }
-        beam = next;
-    }
+    let search = Search {
+        forecast,
+        pool,
+        evidence,
+        store_host,
+    };
+    let layouts = search.layouts(snapshot, &active)?;
 
     let incumbent: BTreeSet<_> = snapshot.paths.iter().copied().collect();
     let current_devices: u64 = snapshot
@@ -262,11 +280,7 @@ pub fn plan_hosted_pd(
         .iter()
         .flat_map(|entry| entry.ranks.values())
         .sum();
-    for layout in beam
-        .into_iter()
-        .filter(|((p, d), _)| *p != 0 && *d != 0)
-        .flat_map(|(_, layouts)| layouts)
-    {
+    for layout in &layouts {
         let paths = layout.paths();
         if layout.placements.is_empty()
             && paths.iter().copied().collect::<BTreeSet<_>>() == incumbent
@@ -292,17 +306,143 @@ pub fn plan_hosted_pd(
         {
             selection.selected = Some(HostedPdDecision {
                 paths,
-                placements: layout.placements,
+                placements: layout.placements.clone(),
                 steady_rps: layout.potential,
                 gain_requests: gain,
                 devices,
+                bridge: None,
             });
         }
+    }
+    if let Some(policy) = pool.reconfigure
+        && !releases.is_empty()
+        && snapshot.revision.checked_add(2).is_some()
+    {
+        search.reconfigure(snapshot, &layouts, releases, policy, &mut selection)?;
     }
     Ok(selection)
 }
 
+struct Search<'a> {
+    forecast: &'a ServingForecast,
+    pool: &'a HostedPdPool,
+    evidence: LinkEvidence<'a>,
+    store_host: NodeId,
+}
+
+impl Search<'_> {
+    fn layout_rate(&self, layout: &Layout, at: u64) -> Option<f64> {
+        rate(self.forecast, self.pool, at, layout.shares())
+    }
+
+    fn layouts(
+        &self,
+        snapshot: &HostedPdPlanning,
+        active: &BTreeMap<GroupId, Endpoint>,
+    ) -> Result<Vec<Layout>, &'static str> {
+        let Search {
+            forecast,
+            pool,
+            evidence,
+            store_host,
+        } = *self;
+        let mut slots: Vec<_> = pool.slots.iter().collect();
+        slots.sort_by_key(|slot| slot.role == ServingRole::Decode);
+        let mut beam = Beam::from([((0, 0), vec![Layout::default()])]);
+        for slot in slots {
+            let group = slot.pool.group();
+            let history = snapshot
+                .resources
+                .groups
+                .iter()
+                .find(|entry| entry.latest.group == group);
+            let expected_active = history
+                .and_then(|entry| entry.active.as_ref())
+                .map(|entry| entry.version);
+            if expected_active.is_some_and(|version| {
+                active
+                    .get(&group)
+                    .is_none_or(|entry| entry.version != version)
+            }) {
+                return Err("hosted P/D slot is active in another deployment");
+            }
+            let mut next = beam.clone();
+            for layout in beam.values().flatten() {
+                if layout
+                    .endpoints
+                    .iter()
+                    .any(|entry| entry.version.group == group)
+                {
+                    continue;
+                }
+                if let Some(retained) = active.get(&group).filter(|entry| entry.role == slot.role) {
+                    let mut trial = layout.clone();
+                    trial.add(retained.clone());
+                    retain(&mut next, trial, forecast, pool);
+                }
+                let (resources, inventory) = available(snapshot, layout);
+                for (candidate, recipe) in generate_layouts(
+                    &resources,
+                    &inventory,
+                    forecast,
+                    &slot.pool,
+                    evidence.policy,
+                    evidence.links,
+                    Some((slot.role, &pool.kv)),
+                )? {
+                    let Ok(version) = validate_placement(
+                        &resources,
+                        &forecast.model,
+                        group,
+                        candidate.expected_epoch,
+                        &candidate.plan,
+                    ) else {
+                        continue;
+                    };
+                    let mut ranks = BTreeMap::new();
+                    for device in candidate.plan.workers.keys() {
+                        *ranks.entry(device.node).or_default() += 1;
+                    }
+                    let Some(endpoint) = endpoint(
+                        version,
+                        slot.role,
+                        candidate.capacity,
+                        &ranks,
+                        evidence,
+                        store_host,
+                        pool.kv_bytes_per_request,
+                    ) else {
+                        continue;
+                    };
+                    let mut trial = layout.clone();
+                    trial.ready_after_ms = trial.ready_after_ms.max(candidate.ready_after_ms);
+                    trial.transition_loss_requests += candidate.transition_loss_requests;
+                    trial.placements.push(HostedPdPlacement {
+                        group,
+                        expected_epoch: candidate.expected_epoch,
+                        expected_active: expected_active.map(|version| version.epoch),
+                        plan: candidate.plan,
+                        recipe,
+                    });
+                    trial.add(endpoint);
+                    retain(&mut next, trial, forecast, pool);
+                }
+            }
+            beam = next;
+        }
+        Ok(beam
+            .into_iter()
+            .filter(|((p, d), _)| *p != 0 && *d != 0)
+            .flat_map(|(_, layouts)| layouts)
+            .collect())
+    }
+}
+
 impl HostedPdPool {
+    pub fn can_reconfigure(&self) -> bool {
+        self.reconfigure.is_some()
+    }
+
     pub fn calibrated_capacity(
         &self,
         group: GroupId,
@@ -334,7 +474,7 @@ impl HostedPdPool {
             slot.pool.validate(true)?;
             if slot.role == ServingRole::Aggregated
                 || slot.pool.api_model() != model
-                || !groups.insert(slot.pool.group())
+                || !groups.insert((slot.pool.group(), slot.role == ServingRole::Decode))
             {
                 return Err("hosted P/D requires distinct role slots with the deployment alias");
             }
@@ -431,6 +571,17 @@ fn rate<'a>(
 }
 
 impl Layout {
+    fn shares(&self) -> impl Iterator<Item = (&Endpoint, f64)> {
+        self.endpoints.iter().map(|entry| {
+            let count = if entry.role == ServingRole::Prefill {
+                self.roles.0
+            } else {
+                self.roles.1
+            };
+            (entry, 1.0 / count as f64)
+        })
+    }
+
     fn add(&mut self, endpoint: Endpoint) {
         if endpoint.role == ServingRole::Prefill {
             self.roles.0 += 1;
@@ -466,18 +617,10 @@ fn retain(beam: &mut Beam, mut layout: Layout, forecast: &ServingForecast, pool:
     {
         return;
     }
-    let shares = layout.endpoints.iter().map(|entry| {
-        let count = if entry.role == ServingRole::Prefill {
-            layout.roles.0
-        } else {
-            layout.roles.1
-        };
-        (entry, 1.0 / count as f64)
-    });
     let Some(at) = forecast.now_ms.checked_add(layout.ready_after_ms) else {
         return;
     };
-    let Some(potential) = rate(forecast, pool, at, shares) else {
+    let Some(potential) = rate(forecast, pool, at, layout.shares()) else {
         return;
     };
     layout.potential = potential;
@@ -524,8 +667,12 @@ fn available(snapshot: &HostedPdPlanning, layout: &Layout) -> (ServingResources,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::serving::GroupProfile;
     use plait_core::DeviceId;
-    use plait_core::serving::{HostMemory, HostResources, HostedInventory, WorkerResources};
+    use plait_core::serving::{
+        ActiveGroup, GroupPhase, GroupResources, HostMemory, HostResources, HostedInventory,
+        HostedPdInstance, WorkerGrant, WorkerResources,
+    };
 
     fn node(id: u8) -> NodeId {
         NodeId::from_bytes([id; 16])
@@ -539,6 +686,204 @@ mod tests {
             bytes_per_second,
             rtt_ns: 10,
         }
+    }
+
+    #[test]
+    fn reconfiguration_preserves_bridge_capacity_and_scores_reusing_a_live_group() {
+        let [store, retiring, incoming] = [1, 2, 3].map(node);
+        let roles = [ServingRole::Prefill, ServingRole::Decode];
+        let version = |id| GroupVersion {
+            group: GroupId(node(id)),
+            epoch: 1,
+        };
+        let (p, d, next) = (version(7), version(8), version(9));
+        let ports = |host| HostedPortUse {
+            host,
+            ports: [20000, 20001, 20002],
+        };
+        let cap = |rps| SloProfile {
+            rps,
+            valid_until_ms: 10_000,
+        };
+        let budget = HostMemory {
+            bytes: 24,
+            pinned_bytes: 3,
+        };
+        let kv = HostedPdKv {
+            store: "192.0.2.1:7952".parse().unwrap(),
+            namespace: "weights".into(),
+            block_size: 128,
+        };
+        let inventory = HostedPlanning {
+            hosts: [
+                (store, &["prefill"][..], 1),
+                (retiring, &["decode", "reclaimed"], 2),
+                (incoming, &["replacement"], 1),
+            ]
+            .into_iter()
+            .map(|(host, profiles, cards)| HostedInventory {
+                host,
+                address: std::net::Ipv4Addr::new(192, 0, 2, host.as_bytes()[0]).into(),
+                profiles: profiles.iter().map(|profile| (*profile).into()).collect(),
+                devices: (0..cards).map(|ordinal| (ordinal, 1)).collect(),
+            })
+            .collect(),
+            occupied: vec![ports(store), ports(retiring)],
+        };
+        let resources = ServingResources {
+            hosts: [store, retiring, incoming]
+                .map(|host| HostResources {
+                    host,
+                    capacity: budget,
+                    reserved: if host == incoming {
+                        HostMemory::default()
+                    } else {
+                        budget
+                    },
+                })
+                .into(),
+            workers: [
+                (store, 0, Some(p)),
+                (retiring, 0, Some(d)),
+                (retiring, 1, Some(d)),
+                (incoming, 0, None),
+            ]
+            .into_iter()
+            .map(|(host, ordinal, active)| {
+                let device = DeviceId::new(host, ordinal);
+                WorkerResources {
+                    device,
+                    incarnation: 1,
+                    device_bytes: 32,
+                    grant: active.map(|version| WorkerGrant {
+                        version,
+                        device,
+                        incarnation: 1,
+                        fence: 1,
+                    }),
+                }
+            })
+            .collect(),
+            groups: [p, d]
+                .into_iter()
+                .zip(roles)
+                .map(|(version, role)| GroupResources {
+                    latest: version,
+                    phase: GroupPhase::Active,
+                    active: Some(ActiveGroup {
+                        version,
+                        role,
+                        model: "weights".into(),
+                    }),
+                })
+                .collect(),
+        };
+        let snapshot = HostedPdPlanning {
+            revision: 1,
+            pending: None,
+            managed: true,
+            active: [(p, store, 1), (d, retiring, 2)]
+                .into_iter()
+                .zip(roles)
+                .map(|((version, host, ranks), role)| HostedPdInstance {
+                    version,
+                    role,
+                    model: "weights".into(),
+                    kv: kv.clone(),
+                    ranks: BTreeMap::from([(host, ranks)]),
+                })
+                .collect(),
+            paths: vec![PdRoute {
+                prefill: p,
+                decode: d,
+            }],
+            inventory,
+            resources,
+        };
+        let forecast = ServingForecast {
+            model: "weights".into(),
+            demand_rps: 20.0,
+            now_ms: 1000,
+            horizon_ms: 2000,
+            minimum_gain_requests: 1.0,
+            groups: vec![
+                GroupProfile {
+                    version: p,
+                    capacity: cap(10.0),
+                },
+                GroupProfile {
+                    version: d,
+                    capacity: cap(30.0),
+                },
+            ],
+            paths: Vec::new(),
+            link_bytes_per_second: BTreeMap::new(),
+        };
+        let slot = |version: GroupVersion, role, profile, tp, rps| RoleSlot {
+            role,
+            pool: HostedPool::fixture(version.group, profile, "api").with_capacity(tp, rps),
+        };
+        let mut pool = HostedPdPool {
+            kv,
+            kv_bytes_per_request: 100,
+            store_bytes_per_second: 200_000,
+            store_valid_until_ms: 10_000,
+            slots: vec![
+                slot(p, roles[0], "prefill", 1, 10.0),
+                slot(d, roles[0], "reclaimed", 2, 10.0),
+                slot(d, roles[1], "decode", 2, 30.0),
+                slot(next, roles[1], "replacement", 1, 30.0),
+            ],
+            allow_scale_down: false,
+            reconfigure: Some(Reconfiguration { drain_ms: 100 }),
+        };
+        let policy = HostedLinkPolicy {
+            bytes_per_rank_pair: 10,
+            max_sample_age_ms: 10_000,
+        };
+        let links = BTreeMap::from([
+            ((store, retiring), sample(retiring, 100_000)),
+            ((retiring, store), sample(store, 100_000)),
+            ((store, incoming), sample(incoming, 100_000)),
+        ]);
+        let release = [HostedPdRelease {
+            version: d,
+            ports: ports(retiring),
+            hosts: BTreeMap::from([(retiring, budget)]),
+        }];
+        let decide = |pool: &HostedPdPool, release: &[HostedPdRelease]| {
+            plan_hosted_pd_with_releases("api", &snapshot, &forecast, pool, policy, &links, release)
+                .unwrap()
+        };
+        assert!(decide(&pool, &[]).selected.is_none());
+        let result = decide(&pool, &release);
+        assert_eq!(result.baseline_rps, 10.0);
+        let choice = result.selected.unwrap();
+        assert_eq!(choice.steady_rps, 20.0);
+        assert_eq!(choice.gain_requests, 18.8);
+        let bridge = choice.bridge.unwrap();
+        assert_eq!(bridge.rate, 10.0);
+        assert_eq!(
+            bridge.stage.paths,
+            vec![PdRoute {
+                prefill: p,
+                decode: next
+            }]
+        );
+        assert_eq!(bridge.release, release);
+        let converted = &choice.placements[0];
+        assert_eq!(converted.group, d.group);
+        assert_eq!(converted.expected_epoch, d.epoch);
+        assert_eq!(converted.expected_active, None);
+        assert_eq!(converted.plan.role, ServingRole::Prefill);
+        assert_eq!(converted.plan.tensor_parallel, 2);
+        assert_eq!(converted.plan.hosts, release[0].hosts);
+
+        pool.reconfigure = Some(Reconfiguration { drain_ms: 1999 });
+        assert!(decide(&pool, &release).selected.is_none());
+        pool.reconfigure = Some(Reconfiguration { drain_ms: 100 });
+        pool.slots[3] = slot(next, roles[1], "replacement", 1, 9.0);
+        assert!(decide(&pool, &release).selected.is_none());
     }
 
     #[test]
@@ -617,6 +962,7 @@ mod tests {
                 slot(9, ServingRole::Decode, "decode"),
             ],
             allow_scale_down: false,
+            reconfigure: None,
         };
         let policy = HostedLinkPolicy {
             bytes_per_rank_pair: 10,

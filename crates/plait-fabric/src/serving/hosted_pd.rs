@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use plait_core::OpId;
 use plait_core::serving::{
     GroupPhase, GroupVersion, HostedPdInstance, HostedPdIntent, HostedPdKv, HostedPdLaunch,
-    HostedPdPlacement, HostedPdPlanning, HostedPortUse, PdRoute, RouteSetId, ServingError,
-    ServingOutcome, ServingResult, ServingRole,
+    HostedPdPlacement, HostedPdPlanning, HostedPdReconfiguration, HostedPdRelease, HostedPortUse,
+    PdRoute, RouteSetId, ServingError, ServingOutcome, ServingResult, ServingRole,
 };
 
 use super::{Reservations, RouteSet, ServingState};
@@ -204,6 +204,43 @@ impl ServingState {
             resources: self.resources(),
             inventory: self.hosted_planning(),
         }
+    }
+
+    pub(crate) fn hosted_pd_reconfiguration(&self, key: RouteSetId) -> HostedPdReconfiguration {
+        let planning = self.hosted_pd_planning(key);
+        let releases = self
+            .routes
+            .get(&key)
+            .filter(|directory| directory.hosted && directory.paths == planning.paths)
+            .into_iter()
+            .flat_map(|directory| route_versions(&directory.paths))
+            .filter_map(|version| self.hosted_pd_release(version))
+            .collect();
+        HostedPdReconfiguration { planning, releases }
+    }
+
+    pub(super) fn hosted_pd_release(&self, version: GroupVersion) -> Option<HostedPdRelease> {
+        let view = self
+            .group(version)
+            .filter(|view| view.phase == GroupPhase::Active)?;
+        self.hosted_pd_launches.get(&version)?;
+        let recipe = self.hosted_recipes.get(&version)?;
+        for host in &recipe.hosts {
+            self.check_hosted_inventory(host, &view.plan, &recipe.profile)
+                .ok()?;
+            if !self
+                .hosted_release_profiles
+                .get(&host.host)
+                .is_some_and(|profiles| profiles.contains(&recipe.profile))
+            {
+                return None;
+            }
+        }
+        Some(HostedPdRelease {
+            version,
+            hosts: view.plan.hosts.clone(),
+            ports: HostedPortUse::from(recipe),
+        })
     }
 
     pub(crate) fn hosted_pd_work(&self) -> Vec<HostedPdIntent> {
@@ -707,9 +744,49 @@ mod tests {
         assert!(state.group(version(&replacement)).is_none());
         assert_eq!(state.routes(key).unwrap().paths[0].route, initial);
 
+        let host = decode.recipe.api_host;
+        let inventory = state.hosted_inventories[&host].clone();
+        assert!(state.hosted_pd_reconfiguration(key).releases.is_empty());
         state
-            .prepare_hosted_pd_transition(id(3), "served", 1, &kv(), &bridge, &release, &target)
+            .apply(&ServingOperation {
+                id: id(20),
+                action: ServingAction::AdvertiseHostedInventoryWithRelease {
+                    inventory: inventory.clone(),
+                    supervisor_lock: [5, 6],
+                    release_profiles: BTreeSet::from([decode.recipe.profile.clone()]),
+                },
+            })
             .unwrap();
+        let releases = state.hosted_pd_reconfiguration(key).releases;
+        assert_eq!(
+            releases
+                .iter()
+                .map(|release| release.version)
+                .collect::<BTreeSet<_>>(),
+            release
+        );
+        let operation = ServingOperation {
+            id: id(3),
+            action: ServingAction::PreparePlannedHostedPdTransition {
+                model: "served".into(),
+                expected_revision: 1,
+                kv: kv(),
+                bridge,
+                target,
+                release: releases,
+                request_sha256: None,
+            },
+        };
+        let mut stale = state.clone();
+        stale
+            .advertise_hosted_inventory(&inventory, id(21), [5, 6])
+            .unwrap();
+        assert_eq!(stale.apply(&operation), Err(ServingError::InvalidPlan));
+        assert!(stale.hosted_pd_pending(key).is_none());
+        assert_eq!(
+            state.apply(&operation),
+            Ok(ServingOutcome::HostedPdStaged { revision: 1 })
+        );
         assert_eq!(state.hosted_pd_planning(key).pending, Some(id(3)));
         assert_eq!(state.routes(key).unwrap().paths[0].route, initial);
         assert!(state.hosted_pd_transition_work().is_empty());
@@ -741,7 +818,6 @@ mod tests {
             Some(old_grant)
         );
 
-        let host = decode.recipe.api_host;
         state
             .host_launch_stopped(version(&decode), host, host)
             .unwrap();
@@ -791,7 +867,8 @@ mod tests {
         // A target failure after the bridge keeps that route live and clears
         // the transition so the model can be planned again.
         let mut lost = state.clone();
-        lost.expire_execution_host(host, OpId::new(host, 1), &BTreeSet::from([grant.version]))
+        let pulse = lost.execution_host(host).unwrap().pulse;
+        lost.expire_execution_host(host, pulse, &BTreeSet::from([grant.version]))
             .unwrap();
         assert_eq!(publish(&mut lost, 6), Ok(ServingOutcome::HostedPdCancelled));
         assert_eq!(lost.routes(key).unwrap().paths[0].route, bridge_path);

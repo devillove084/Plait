@@ -16,6 +16,7 @@ pub use decoder::{
 pub use hosted::{
     HostedLinkLimit, HostedLinkPolicy, HostedPdDecision, HostedPdPool, HostedPdSelection,
     HostedPool, generate_hosted_candidates, limit_hosted_links, plan_hosted_pd,
+    plan_hosted_pd_with_releases,
 };
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -25,7 +26,7 @@ pub struct SloProfile {
     pub valid_until_ms: u64,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct GroupProfile {
     pub version: GroupVersion,
     pub capacity: SloProfile,
@@ -33,7 +34,7 @@ pub struct GroupProfile {
 
 /// Capacity of a measured, compatible P→D route. Link IDs represent directional
 /// shared resources, including NICs and host-staging paths.
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct KvPath {
     pub prefill: GroupVersion,
     pub decode: GroupVersion,
@@ -42,7 +43,7 @@ pub struct KvPath {
     pub capacity: SloProfile,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct ServingForecast {
     pub model: String,
     pub demand_rps: f64,

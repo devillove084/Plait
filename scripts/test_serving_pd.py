@@ -5,6 +5,7 @@ import http.client
 import json
 import os
 import runpy
+import socket
 import tempfile
 import threading
 import time
@@ -16,7 +17,7 @@ from unittest.mock import Mock, patch
 
 from serving_group import (
     ADMISSION_HEADER, HANDOFF_HEADER, RELEASE_KV_PATH, VERSION_HEADER,
-    ControlError, Endpoint, Gate, group_proxy, record_host_stop, run,
+    ControlError, Endpoint, Gate, check_backend_port, group_proxy, record_host_stop, run,
 )
 from serving_launch import host_command, resident_spec
 from serving_load import Load
@@ -30,6 +31,24 @@ COMPLETIONS = "/v1/completions"
 
 
 class LaunchTest(unittest.TestCase):
+    def test_backend_probe_accepts_a_drained_port_and_rejects_an_active_listener(self):
+        with socket.socket() as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            port = listener.getsockname()[1]
+            with self.assertRaises(OSError):
+                check_backend_port(port)
+            with socket.create_connection(listener.getsockname(), timeout=2) as client:
+                with listener.accept()[0] as server:
+                    server.settimeout(2)
+                    server.shutdown(socket.SHUT_WR)
+                    self.assertEqual(client.recv(1), b"")
+                    client.shutdown(socket.SHUT_WR)
+                    self.assertEqual(server.recv(1), b"")
+
+        check_backend_port(port)
+
     def test_single_device_hosted_pd_keeps_vllm_default_executor(self):
         host = "b" * 32
         recipe = {"api_host": list(bytes.fromhex(host)), "master_port": 9010,

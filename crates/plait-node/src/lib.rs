@@ -511,6 +511,11 @@ impl NodeState {
                     ServingLookup::HostedPdPlanning(key) => {
                         ServingView::HostedPdPlanning(runtime.serving_hosted_pd_planning(key))
                     }
+                    ServingLookup::HostedPdReconfiguration(key) => {
+                        ServingView::HostedPdReconfiguration(
+                            runtime.serving_hosted_pd_reconfiguration(key),
+                        )
+                    }
                     ServingLookup::HostedPdTransition(key) => ServingView::HostedPdTransition(
                         runtime.serving_hosted_pd_transition_status(key),
                     ),

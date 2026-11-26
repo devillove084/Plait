@@ -88,6 +88,7 @@ pub(crate) struct ServingState {
     hosted_pd_transitions: BTreeMap<RouteSetId, HostedPdTransition>,
     hosted_pd_transition_status: BTreeMap<RouteSetId, HostedPdTransitionStatus>,
     hosted_inventories: BTreeMap<NodeId, HostedInventory>,
+    hosted_release_profiles: BTreeMap<NodeId, BTreeSet<String>>,
     hosted_probes: BTreeMap<NodeId, HostedProbeEndpoint>,
     execution_hosts: BTreeMap<NodeId, ExecutionHostLiveness>,
     decoder: DecoderState,
@@ -238,6 +239,20 @@ impl ServingState {
                 inventory,
                 supervisor_lock,
             } => self.advertise_hosted_inventory(inventory, operation.id, *supervisor_lock),
+            ServingAction::AdvertiseHostedInventoryWithRelease {
+                inventory,
+                supervisor_lock,
+                release_profiles,
+            } => {
+                if !release_profiles.is_subset(&inventory.profiles) {
+                    return Err(ServingError::InvalidPlan);
+                }
+                let result =
+                    self.advertise_hosted_inventory(inventory, operation.id, *supervisor_lock)?;
+                self.hosted_release_profiles
+                    .insert(inventory.host, release_profiles.clone());
+                Ok(result)
+            }
             ServingAction::PrepareHostedPd {
                 model,
                 expected_revision,
@@ -285,6 +300,33 @@ impl ServingState {
                 release,
                 target,
             ),
+            ServingAction::PreparePlannedHostedPdTransition {
+                model,
+                expected_revision,
+                kv,
+                bridge,
+                release,
+                target,
+                ..
+            } => {
+                let mut versions = BTreeSet::new();
+                for retiring in release {
+                    if self.hosted_pd_release(retiring.version).as_ref() != Some(retiring)
+                        || !versions.insert(retiring.version)
+                    {
+                        return Err(ServingError::InvalidPlan);
+                    }
+                }
+                self.prepare_hosted_pd_transition(
+                    operation.id,
+                    model,
+                    *expected_revision,
+                    kv,
+                    bridge,
+                    &versions,
+                    target,
+                )
+            }
             ServingAction::ResolveHostedPdTransition { transition, intent } => {
                 self.resolve_hosted_pd_transition(transition, intent)
             }

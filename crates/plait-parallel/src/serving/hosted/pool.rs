@@ -249,6 +249,12 @@ impl HostedPool {
             }],
         }
     }
+
+    pub(super) fn with_capacity(mut self, tp: u32, rps: f64) -> Self {
+        self.sizes[0].tensor_parallel = tp;
+        self.sizes[0].capacity.rps = rps;
+        self
+    }
 }
 
 fn available_hosts(

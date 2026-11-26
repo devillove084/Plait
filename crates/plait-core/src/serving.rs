@@ -280,6 +280,19 @@ pub struct HostedPdPlanning {
     pub inventory: HostedPlanning,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedPdRelease {
+    pub version: GroupVersion,
+    pub hosts: BTreeMap<NodeId, HostMemory>,
+    pub ports: HostedPortUse,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedPdReconfiguration {
+    pub planning: HostedPdPlanning,
+    pub releases: Vec<HostedPdRelease>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedProbeEndpoint {
     pub host: NodeId,
@@ -1017,6 +1030,20 @@ pub enum ServingAction {
         intent: HostedPdIntent,
     },
     AdvanceHostedPdTransition(HostedPdTransition),
+    AdvertiseHostedInventoryWithRelease {
+        inventory: HostedInventory,
+        supervisor_lock: [u64; 2],
+        release_profiles: BTreeSet<String>,
+    },
+    PreparePlannedHostedPdTransition {
+        model: String,
+        expected_revision: u64,
+        kv: HostedPdKv,
+        bridge: HostedPdStage,
+        release: Vec<HostedPdRelease>,
+        target: HostedPdStage,
+        request_sha256: Option<[u8; 32]>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1183,6 +1210,7 @@ pub enum ServingLookup {
     HostedPdPending(RouteSetId),
     HostedPdPlanning(RouteSetId),
     HostedPdTransition(RouteSetId),
+    HostedPdReconfiguration(RouteSetId),
 }
 
 /// A replica's locally applied state. A missing result may indicate replication lag.
@@ -1212,6 +1240,7 @@ pub enum ServingView {
     HostedPdPending(Option<HostedPdIntent>),
     HostedPdPlanning(HostedPdPlanning),
     HostedPdTransition(Option<HostedPdTransitionStatus>),
+    HostedPdReconfiguration(HostedPdReconfiguration),
 }
 
 impl ServingOperation {
@@ -1225,7 +1254,8 @@ impl ServingOperation {
             ServingAction::RegisterHostedProbe(endpoint) => {
                 keys.insert(Key::HostMemory(endpoint.host));
             }
-            ServingAction::AdvertiseHostedInventory { inventory, .. } => {
+            ServingAction::AdvertiseHostedInventory { inventory, .. }
+            | ServingAction::AdvertiseHostedInventoryWithRelease { inventory, .. } => {
                 keys.insert(Key::HostMemory(inventory.host));
                 keys.extend(
                     inventory
@@ -1278,6 +1308,21 @@ impl ServingOperation {
                         .iter()
                         .map(|version| Key::ServingGroup(version.group)),
                 );
+            }
+            ServingAction::PreparePlannedHostedPdTransition {
+                model,
+                bridge,
+                release,
+                target,
+                ..
+            } => {
+                keys.insert(Key::ServingRoutes(RouteSetId::for_model(model)));
+                hosted_pd_stage_keys(&mut keys, &bridge.placements, &bridge.paths);
+                hosted_pd_stage_keys(&mut keys, &target.placements, &target.paths);
+                for retired in release {
+                    keys.insert(Key::ServingGroup(retired.version.group));
+                    keys.extend(retired.hosts.keys().copied().map(Key::HostMemory));
+                }
             }
             ServingAction::AdvanceHostedPdTransition(transition)
             | ServingAction::ResolveHostedPdTransition { transition, .. } => {
