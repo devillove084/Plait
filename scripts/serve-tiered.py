@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import serving_group
+import serving_launch
 
 
 SHUTDOWN_GRACE = 20.0
@@ -76,16 +77,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--group-id", help="hex ID of one committed group")
     parser.add_argument("--group-epoch", type=int)
     parser.add_argument("--host-id", help="hex ID of the host recorded in the plan")
+    parser.add_argument("--host-launch-spec", type=Path, help="shared JSON spec for a managed multi-host TP group")
     parser.add_argument("--control-bin", default="plait-node")
     parser.add_argument("--control-peer", action="append", default=[])
-    parser.add_argument("--control-listen", default="127.0.0.1:0")
+    parser.add_argument("--control-listen", help="local address and port for control replies")
     parser.add_argument("--backend-port", type=int, help="private native vLLM port")
-    parser.add_argument("--proxy-host", default="127.0.0.1", help="bind address of the managed HTTP proxy")
+    parser.add_argument("--proxy-host", help="bind address of the managed HTTP proxy")
     parser.add_argument("--advertise-http", help="managed P/D proxy address and port visible to the router")
     parser.add_argument("--drain-timeout", type=float, default=30.0)
     parser.add_argument("--verify-release", help="local executable that verifies the worker grants are released")
     parser.add_argument("--print-launch-digest", action="store_true")
     args = parser.parse_args()
+    if args.host_launch_spec is not None:
+        if not (args.group_id or args.print_launch_digest):
+            parser.error("--host-launch-spec requires a managed launch or --print-launch-digest")
+        if args.vllm is not None or args.no_enforce_eager:
+            parser.error("the hosted launch defines each vLLM command and requires eager mode")
+        if args.advertise_http is None:
+            parser.error("hosted launches require --advertise-http")
+        try:
+            args.host_launch_spec = serving_launch.load_spec(args.host_launch_spec)
+        except (OSError, ValueError) as error:
+            parser.error(f"invalid --host-launch-spec: {error}")
+    if args.proxy_host is None:
+        spec = args.host_launch_spec
+        args.proxy_host = "127.0.0.1" if spec is None else spec["hosts"][spec["api_host"]]["address"]
     if args.replicas < 1 or args.tp < 1:
         parser.error("--replicas and --tp must be positive")
     if args.gpu_start < 0 or not (0 < args.port_base <= 65536 - args.replicas):
@@ -128,8 +144,11 @@ def parse_args() -> argparse.Namespace:
     elif args.kv_host is not None or args.kv_port is not None:
         parser.error("--kv-host and --kv-port require a prefill or decode role")
     if args.advertise_http is not None:
-        if args.role == "aggregated" or not (args.group_id or args.print_launch_digest):
-            parser.error("--advertise-http requires a managed prefill or decode group")
+        if (
+            (args.role == "aggregated" and args.host_launch_spec is None)
+            or not (args.group_id or args.print_launch_digest)
+        ):
+            parser.error("--advertise-http requires a hosted or managed P/D group")
         try:
             origin = urllib.parse.urlsplit("http://" + args.advertise_http)
             host = ipaddress.ip_address(origin.hostname or "")
@@ -139,8 +158,13 @@ def parse_args() -> argparse.Namespace:
             ):
                 raise ValueError("not a usable endpoint")
             args.advertise_http = f"[{host}]:{origin.port}" if host.version == 6 else f"{host}:{origin.port}"
+            if args.host_launch_spec is not None and (
+                origin.port != args.port_base
+                or args.host_launch_spec["master_port"] in (args.port_base, args.backend_port, args.kv_port)
+            ):
+                raise ValueError("the advertised port must match --port-base and the rendezvous port must be distinct")
         except ValueError:
-            parser.error("--advertise-http must be an IP address and port")
+            parser.error("--advertise-http must be an IP address and valid proxy port")
     if args.group_id:
         if not (args.group_epoch and args.group_epoch > 0 and args.control_peer and args.host_id):
             parser.error("--group-id requires --group-epoch, --host-id, and --control-peer")
@@ -172,7 +196,10 @@ def native_command(args: argparse.Namespace, vllm: str, port: int) -> list[str]:
     if args.plait_w4a16_library is not None:
         command.extend(("--quantization", "plait-w4a16", "--dtype", "half"))
     if args.attention_backend is not None:
-        command.extend(("--attention-backend", args.attention_backend))
+        if args.host_launch_spec is not None:
+            command.extend(("--attention-config", json.dumps({"backend": args.attention_backend})))
+        else:
+            command.extend(("--attention-backend", args.attention_backend))
     if args.role != "aggregated":
         config = {
             "kv_connector": "NixlConnector",
@@ -196,7 +223,13 @@ def engine_environment(args: argparse.Namespace) -> dict[str, str]:
     return environment
 
 
-def launch_digest(command: list[str], engine_env: dict[str, str], endpoint: dict | None) -> bytes:
+def launch_digest(
+    command: list[str], engine_env: dict[str, str], endpoint: dict | None,
+    host_launch_spec: dict | None = None,
+) -> bytes:
+    if host_launch_spec is not None:
+        spec = ["plait-vllm-hosted-v1", command, engine_env, endpoint, host_launch_spec]
+        return hashlib.sha256(json.dumps(spec, sort_keys=True, separators=(",", ":")).encode()).digest()
     spec = [command, engine_env] if engine_env else command
     if endpoint is not None:
         spec = [spec, endpoint]
@@ -293,7 +326,7 @@ def supervise(
 
 def main() -> int:
     args = parse_args()
-    vllm = args.vllm or shutil.which("vllm")
+    vllm = "vllm" if args.host_launch_spec is not None else args.vllm or shutil.which("vllm")
     if not vllm:
         print("vllm executable not found; pass --vllm", file=sys.stderr)
         return 2
@@ -307,7 +340,7 @@ def main() -> int:
         }
     if args.print_launch_digest:
         command = native_command(args, vllm, args.backend_port)
-        print(launch_digest(command, engine_env, endpoint).hex())
+        print(launch_digest(command, engine_env, endpoint, args.host_launch_spec).hex())
         return 0
     replicas: dict[int, Replica] = {}
     stopping: dict[int, tuple[Replica, float]] = {}
@@ -325,9 +358,10 @@ def main() -> int:
     try:
         if args.group_id:
             command = native_command(args, vllm, args.backend_port)
-            digest = list(launch_digest(command, engine_env, endpoint))
+            digest = list(launch_digest(command, engine_env, endpoint, args.host_launch_spec))
             return serving_group.run(
                 args, command, digest, base_env, health, lambda: stop_requested, endpoint=endpoint,
+                host_launch_spec=args.host_launch_spec,
             )
         for replica in range(args.replicas):
             if stop_requested:

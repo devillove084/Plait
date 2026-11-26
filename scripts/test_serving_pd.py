@@ -3,6 +3,7 @@
 import contextlib
 import http.client
 import json
+import os
 import runpy
 import tempfile
 import threading
@@ -14,7 +15,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from serving_group import (
-    ADMISSION_HEADER, HANDOFF_HEADER, RELEASE_KV_PATH, VERSION_HEADER, Gate, group_proxy, run,
+    ADMISSION_HEADER, HANDOFF_HEADER, RELEASE_KV_PATH, VERSION_HEADER,
+    ControlError, Gate, group_proxy, record_host_stop, run,
 )
 
 
@@ -58,6 +60,96 @@ class LaunchTest(unittest.TestCase):
         self.assertEqual(claim["version"], version)
         self.assertEqual(process.call_args.kwargs["env"]["PLAIT_TP_GROUP_VERSION"], f"{group}@7")
         self.assertEqual(env["PLAIT_TP_GROUP_VERSION"], f"{group}@6")
+
+    def test_follower_uses_local_grants_and_reports_readiness_from_its_child(self):
+        group, host, head = "a" * 32, "b" * 32, "c" * 32
+        version = {"group": list(bytes.fromhex(group)), "epoch": 3}
+        digest = [2] * 32
+        args = SimpleNamespace(
+            control_bin="plait-node", control_listen=None, control_peer=[],
+            group_id=group, group_epoch=3, host_id=host, role="aggregated", model="model",
+            tp=3, backend_port=9000, startup_timeout=1, verify_release=None,
+        )
+        spec = {
+            "api_host": head, "master_addr": "192.0.2.1", "master_port": 9008,
+            "hosts": {
+                head: {"address": "192.0.2.1"},
+                host: {"address": "192.0.2.2", "argv": ["vllm"], "model_path": "/local/model",
+                       "device_env": "ASCEND_RT_VISIBLE_DEVICES"},
+            },
+        }
+        control = Mock()
+        control.request.return_value = {"group": {
+            "phase": "Preparing", "version": version, "role": "Aggregated", "model": "model",
+            "tensor_parallel": 3, "pipeline_parallel": 1, "launch_digest": digest,
+            "grants": [
+                {"device": {"node": list(bytes.fromhex(node)), "ordinal": ordinal}}
+                for node, ordinal in ((host, 6), (head, 1), (host, 2))
+            ],
+        }}
+        probe = Mock()
+        stopped = False
+
+        def execute(action, **_kwargs):
+            nonlocal stopped
+            if "ObserveHostLaunch" in action:
+                stopped = True
+            return {"Ok": {"Group": {"phase": "Preparing"}}}
+
+        control.execute.side_effect = execute
+        child = Mock()
+        child.poll.return_value = None
+
+        def start(_command, *, pass_fds, **_kwargs):
+            os.write(pass_fds[0], signal)
+            return child
+
+        for signal in (b"x", b"1"):
+            with (
+                self.subTest(signal=signal),
+                patch("serving_group.Control", return_value=control) as factory,
+                patch("serving_group.group_proxy") as proxy,
+                patch("serving_group.subprocess.Popen", side_effect=start) as process,
+                patch("serving_group.stop_process_group", return_value=True),
+                patch("serving_group.time.sleep"),
+            ):
+                control.execute.reset_mock()
+                def call():
+                    return run(
+                        args, ["vllm", "serve", "model"], digest, {"CUDA_VISIBLE_DEVICES": "0"},
+                        probe, lambda: stopped, host_launch_spec=spec,
+                    )
+                if signal == b"x":
+                    with self.assertRaisesRegex(ControlError, "readiness pipe"):
+                        call()
+                else:
+                    self.assertEqual(call(), 0)
+                calls = [next(iter(item.args[0])) for item in control.execute.call_args_list]
+                self.assertEqual(calls[0], "ClaimHostLaunch")
+                self.assertEqual("HostLaunchReady" in calls, signal == b"1")
+                factory.assert_called_once_with("plait-node", [], "192.0.2.2:0")
+                proxy.assert_not_called()
+                probe.assert_not_called()
+                command = process.call_args.args[0]
+                self.assertEqual(command[command.index("--plait-tp-layout") + 1 :], ["1", "2", "--headless"])
+                child_env = process.call_args.kwargs["env"]
+                self.assertEqual(child_env["ASCEND_RT_VISIBLE_DEVICES"], "2,6")
+                self.assertNotIn("CUDA_VISIBLE_DEVICES", child_env)
+
+    def test_host_release_uses_the_committed_order_and_full_worker_set(self):
+        control = Mock()
+        control.execute.side_effect = [
+            {"Err": "WorkersStillRunning"},
+            {"Ok": {"Group": {"phase": "Draining"}}},
+            {"Err": "WorkersStillRunning"},
+        ]
+        identity = {"version": {"group": [1] * 16, "epoch": 1}, "host": [2] * 16}
+        workers = [{"node": [ordinal] * 16, "ordinal": 0} for ordinal in (2, 3)]
+        with patch("serving_group.time.sleep"):
+            record_host_stop(control, identity, workers, 0)
+        actions = [call.args[0] for call in control.execute.call_args_list]
+        self.assertEqual(actions[:2], [{"HostLaunchStopped": identity}] * 2)
+        self.assertEqual(actions[2], {"Retire": {"version": identity["version"], "workers": workers}})
 
 
 class CalibrationTest(unittest.TestCase):
@@ -158,7 +250,8 @@ class HandoffTest(unittest.TestCase):
     def test_drain_keeps_export_alive_until_versioned_release(self):
         port, gate = self.group("prefill", PREFILL, lambda _: ("application/json", b"{}"))
         headers = {VERSION_HEADER: PREFILL, HANDOFF_HEADER: TOKEN}
-        self.assertEqual(self.request(port, COMPLETIONS, {}, headers)[0], 200)
+        status, fields, _ = self.request(port, COMPLETIONS, {}, headers)
+        self.assertEqual((status, fields[VERSION_HEADER]), (200, PREFILL))
         gate.close()
         self.assertFalse(gate.drained())
         status, fields, _ = self.request(port, COMPLETIONS, {}, headers)

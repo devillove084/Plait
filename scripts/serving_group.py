@@ -1,4 +1,4 @@
-"""Run one committed, host-local native vLLM group behind an admission proxy."""
+"""Run a committed native vLLM group behind an admission proxy."""
 
 from __future__ import annotations
 
@@ -17,6 +17,8 @@ import time
 import uuid
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import serving_launch
 
 
 ADMISSION_SECONDS = 4.0
@@ -255,6 +257,8 @@ def group_proxy(
                     # The native P response exports blocks that D has yet to read.
                     gate.hold_transfer(transfer, kv_lease)
                 self.send_response(response.status, response.reason)
+                self.send_header(VERSION_HEADER, version)
+                self.send_header(ROLE_HEADER, role)
                 for key, value in response.getheaders():
                     if key.lower() not in HOP_HEADERS and key.lower() not in PRIVATE_HEADERS:
                         self.send_header(key, value)
@@ -311,6 +315,40 @@ def stop_process_group(process: subprocess.Popen, grace: float) -> bool:
     return False
 
 
+def inspect_group(control: Control, version: dict) -> dict:
+    return control.request({"request": "inspect", "version": version})["group"]
+
+
+def api_host_stopped(view: dict, api_host: str) -> bool:
+    return sum(bytes(device["node"]).hex() == api_host for device in view["stopped"]) == sum(
+        bytes(grant["device"]["node"]).hex() == api_host for grant in view["grants"]
+    )
+
+
+def record_host_stop(
+    control: Control, identity: dict, workers: list[dict], drain_timeout: float,
+) -> None:
+    version = identity["version"]
+    deadline = time.monotonic() + drain_timeout + 50
+    while True:
+        result = control.execute({"HostLaunchStopped": identity})
+        if result.get("Err") != "WorkersStillRunning":
+            break
+        if time.monotonic() >= deadline:
+            raise ControlError("timed out waiting for the API host to release its grants")
+        time.sleep(POLL_SECONDS)
+    try:
+        expect_phase(result)
+    except Rejected:
+        if inspect_group(control, version)["phase"] == "Retired":
+            return
+        raise
+    result = control.execute({"Retire": {"version": version, "workers": workers}})
+    if result.get("Err") in ("WorkersStillRunning", {"InvalidPhase": "Retired"}):
+        return
+    expect_phase(result)
+
+
 def run(
     args: argparse.Namespace,
     command: list[str],
@@ -320,12 +358,28 @@ def run(
     should_stop: Callable[[], bool],
     *,
     endpoint: dict | None = None,
+    host_launch_spec: dict | None = None,
 ) -> int:
-    control = Control(args.control_bin, args.control_peer, args.control_listen)
     version = {"group": list(bytes.fromhex(args.group_id)), "epoch": args.group_epoch}
     version_tag = f"{args.group_id.lower()}@{args.group_epoch}"
     host = list(bytes.fromhex(args.host_id))
+    host_id = bytes(host).hex()
+    hosted = host_launch_spec is not None
+    api_host = host_launch_spec["api_host"] if hosted else host_id
+    follower = host_id != api_host
+    config = None
+    listen = args.control_listen
+    if hosted:
+        config = host_launch_spec["hosts"].get(host_id)
+        if config is None:
+            raise ControlError("this host is absent from --host-launch-spec")
+        address = config["address"]
+        if listen is None:
+            listen = f"[{address}]:0" if ":" in address else f"{address}:0"
+    control = Control(args.control_bin, args.control_peer, listen or "127.0.0.1:0")
     identity = {"version": version, "holder": control.holder}
+    if hosted:
+        identity["host"] = host
     gate = Gate()
     process = None
     claimed = False
@@ -333,12 +387,15 @@ def run(
     proxy_thread = None
     phase = None
     drain_until = None
+    ready_pipe = None
 
     def change(name: str, **fields: object) -> str:
-        return expect_phase(control.execute({name: {**identity, **fields}}, retry=name != "ObserveLaunch"))
+        return expect_phase(control.execute(
+            {name: {**identity, **fields}}, retry=name not in ("ObserveLaunch", "ObserveHostLaunch"),
+        ))
 
     try:
-        view = control.request({"request": "inspect", "version": version})["group"]
+        view = inspect_group(control, version)
         if not view or view["phase"] != "Preparing":
             raise ControlError("expected a prepared execution group")
         if (
@@ -351,41 +408,84 @@ def run(
         ):
             raise ControlError("the native launch configuration differs from the committed plan")
         grants = view["grants"]
-        if len(grants) != args.tp or any(grant["device"]["node"] != host for grant in grants):
+        workers = [grant["device"] for grant in grants]
+        if len(grants) != args.tp:
+            raise ControlError("the number of grants differs from tensor parallel size")
+        device_env = "CUDA_VISIBLE_DEVICES"
+        child_env = env.copy()
+        if hosted:
+            try:
+                node_rank, layout, grants = serving_launch.placement(host_launch_spec, grants, host_id)
+            except ValueError as error:
+                raise ControlError(str(error)) from error
+            command = serving_launch.host_command(command, host_launch_spec, host_id, node_rank, layout)
+            child_env.update(config.get("env", {}))
+            for mask in serving_launch.DEVICE_MASKS:
+                child_env.pop(mask, None)
+            device_env = config["device_env"]
+            child_env["VLLM_USE_PLAIT"] = "1"
+            child_env["VLLM_HOST_IP"] = config["address"]
+        elif any(grant["device"]["node"] != host for grant in grants):
             raise ControlError("all grants must belong to the local host")
-        if len({grant["device"]["ordinal"] for grant in grants}) != args.tp:
+        elif len({grant["device"]["ordinal"] for grant in grants}) != args.tp:
             raise ControlError("duplicate device ordinal in group grants")
 
-        server = group_proxy(
-            args.port_base, args.backend_port, gate, version_tag,
-            bind=args.proxy_host, role=args.role, kv_lease=args.kv_lease_seconds,
+        if not follower:
+            server = group_proxy(
+                args.port_base, args.backend_port, gate, version_tag,
+                bind=args.proxy_host, role=args.role, kv_lease=args.kv_lease_seconds,
+            )
+            with socket.socket() as port_check:
+                port_check.bind(("127.0.0.1", args.backend_port))
+        phase = change(
+            "ClaimHostLaunch" if hosted else "ClaimLaunch", host=host, launch_digest=launch_digest,
         )
-        with socket.socket() as port_check:
-            port_check.bind(("127.0.0.1", args.backend_port))
-        phase = expect_phase(control.execute({
-            "ClaimLaunch": {**identity, "host": host, "launch_digest": launch_digest},
-        }))
         claimed = True
         if should_stop():
             return 0
         gpus = ",".join(str(grant["device"]["ordinal"]) for grant in grants)
-        child_env = {**env, "CUDA_VISIBLE_DEVICES": gpus, "PLAIT_TP_GROUP_VERSION": version_tag}
-        process = subprocess.Popen(command, env=child_env, start_new_session=True)
-        proxy_thread = threading.Thread(target=server.serve_forever, daemon=True)
-        proxy_thread.start()
+        child_env[device_env] = gpus
+        child_env["PLAIT_TP_GROUP_VERSION"] = version_tag
+        child_env.pop("VLLM_PLAIT_READY_FD", None)
+        if follower:
+            ready_pipe, ready_writer = os.pipe()
+            try:
+                child_env["VLLM_PLAIT_READY_FD"] = str(ready_writer)
+                process = subprocess.Popen(
+                    command, env=child_env, start_new_session=True, pass_fds=(ready_writer,),
+                )
+            finally:
+                os.close(ready_writer)
+        else:
+            process = subprocess.Popen(command, env=child_env, start_new_session=True)
+            proxy_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            proxy_thread.start()
         deadline = time.monotonic() + args.startup_timeout
         announced = False
         while not should_stop() and process.poll() is None:
             gate.expire_transfers()
             if drain_until is not None and (gate.drained() or time.monotonic() >= drain_until):
                 return 0
-            if not announced and probe(args.backend_port) and process.poll() is None:
-                phase = change("LaunchReady") if endpoint is None else change("LaunchReadyAt", endpoint=endpoint)
-                announced = True
+            if not announced:
+                if follower:
+                    ready = bool(select.select([ready_pipe], [], [], 0)[0])
+                    if ready:
+                        if os.read(ready_pipe, 1) != b"1":
+                            raise ControlError("vLLM follower closed its readiness pipe")
+                        os.close(ready_pipe)
+                        ready_pipe = None
+                else:
+                    ready = probe(args.backend_port)
+                if ready and process.poll() is None:
+                    if hosted:
+                        phase = change("HostLaunchReady", endpoint=None if follower else endpoint)
+                    else:
+                        phase = change("LaunchReady") if endpoint is None else change("LaunchReadyAt", endpoint=endpoint)
+                    announced = True
 
             sent = time.monotonic()
             try:
-                phase = change("ObserveLaunch")
+                phase = change("ObserveHostLaunch" if hosted else "ObserveLaunch")
             except Rejected:
                 raise
             except ControlError:
@@ -396,7 +496,7 @@ def run(
                 continue
 
             if phase == "Active":
-                if announced and process.poll() is None and probe(args.backend_port):
+                if not follower and announced and process.poll() is None and probe(args.backend_port):
                     gate.allow_until(sent + ADMISSION_SECONDS)
                 else:
                     gate.close()
@@ -404,7 +504,15 @@ def run(
                 return 1
             elif phase == "Draining":
                 gate.close()
-                if drain_until is None:
+                if follower:
+                    try:
+                        view = inspect_group(control, version)
+                    except ControlError:
+                        time.sleep(POLL_SECONDS)
+                        continue
+                    if api_host_stopped(view, api_host):
+                        return 0
+                elif drain_until is None:
                     drain_until = time.monotonic() + args.drain_timeout
 
             if not announced and time.monotonic() >= deadline:
@@ -414,15 +522,17 @@ def run(
     finally:
         try:
             gate.close(revoke=True)
+            if claimed and phase not in ("Draining", "Revoked", "Retired"):
+                with contextlib.suppress(ControlError):
+                    control.execute({"Revoke": version}, retry=False)
+            if ready_pipe is not None:
+                os.close(ready_pipe)
             if server is not None:
                 if proxy_thread is not None:
                     server.shutdown()
                     proxy_thread.join()
                 server.server_close()
             exited = process is None or stop_process_group(process, 20.0)
-            if claimed and phase not in ("Draining", "Revoked", "Retired"):
-                with contextlib.suppress(ControlError):
-                    control.execute({"Revoke": version}, retry=False)
             deadline = time.monotonic() + 1.0
             while not gate.drained() and time.monotonic() < deadline:
                 time.sleep(0.05)
@@ -442,8 +552,12 @@ def run(
                 else:
                     released = False
                 if released:
-                    change("LaunchStopped")
-                    workers = [grant["device"] for grant in grants]
-                    expect_phase(control.execute({"Retire": {"version": version, "workers": workers}}))
+                    if hosted:
+                        record_host_stop(control, identity, workers, args.drain_timeout)
+                    else:
+                        change("LaunchStopped")
+                        expect_phase(control.execute({"Retire": {"version": version, "workers": workers}}))
+                elif hosted and not follower and phase == "Draining":
+                    expect_phase(control.execute({"Revoke": version}))
         finally:
             control.close()

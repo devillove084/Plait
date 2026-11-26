@@ -51,6 +51,56 @@ context parallel sizes of one. The counts describe workers per host.
 The model's tensor-partitioning rules determine each worker's shard.
 The placement is fixed for the lifetime of that vLLM process group.
 
+### Start a committed group on several hosts
+
+Run `scripts/serve-tiered.py` with `--host-launch-spec` to derive the
+TP placement from a committed `GroupPlan`. Give each host the same
+JSON document. The keys under `hosts` are the plan's host IDs.
+
+```json
+{
+  "api_host": "00000000000000000000000000000001",
+  "master_addr": "192.0.2.10",
+  "master_port": 29500,
+  "hosts": {
+    "00000000000000000000000000000001": {
+      "address": "192.0.2.10",
+      "argv": ["/opt/runtime/bin/vllm"],
+      "model_path": "/models/engine",
+      "device_env": "CUDA_VISIBLE_DEVICES",
+      "env": {"PLAIT_NCCL_BACKEND": "cuda"}
+    },
+    "00000000000000000000000000000002": {
+      "address": "192.0.2.20",
+      "argv": ["/opt/runtime/bin/vllm"],
+      "model_path": "/models/engine",
+      "device_env": "ASCEND_RT_VISIBLE_DEVICES",
+      "env": {"PLAIT_NCCL_BACKEND": "huawei"}
+    }
+  }
+}
+```
+
+The engine recipe can include host-specific `args` and `env`. Each
+host address must be reachable by the control replicas and TP peers.
+The script supplies the device mask, tensor parallel placement, and
+peer group version from the launch claim.
+
+1. Use `--print-launch-digest` with the common model, TP size, engine
+   options, `--backend-port`, `--port-base`, `--advertise-http`, and
+   `--host-launch-spec`. Put the digest in the plan's `launch_digest`.
+2. Start the launcher on each planned host with those same options,
+   the committed `--group-id` and `--group-epoch`, its own `--host-id`,
+   and the control peer addresses. Use a vLLM fork with the hosted
+   readiness hook. The API host serves HTTP. The other hosts run headless.
+3. Activate the new version after all planned devices report `Ready`.
+   The previous version begins draining. Inference responses identify
+   the serving version in `X-Plait-Group-Version`.
+
+Use a local `--verify-release` executable on each host to authorize
+grant reuse after that host has closed its workers and transports.
+Retirement requires every host's stop confirmation.
+
 ## Execute a collective
 
 For small all-reduces, each worker sends its complete contribution to each
