@@ -204,7 +204,7 @@ def admission_rejected(response: http.client.HTTPResponse) -> bool:
     return response.status in (409, 503) and response.getheader(ADMISSION_HEADER) == "rejected"
 
 
-def probe_endpoint(endpoint: Endpoint, timeout: float) -> bool | None:
+def probe_endpoint(endpoint: Endpoint, timeout: float) -> str | None:
     """Return the ready engine's KV resume capability, or None while unavailable."""
     try:
         with contextlib.closing(endpoint.connect(min(2.0, timeout))) as connection:
@@ -212,7 +212,10 @@ def probe_endpoint(endpoint: Endpoint, timeout: float) -> bool | None:
             with connection.getresponse() as response:
                 if (response.status == 200 and response.getheader(VERSION_HEADER) == endpoint.version
                         and response.getheader(ROLE_HEADER) == endpoint.role):
-                    return response.getheader(KV_RESUME_HEADER) == "1"
+                    capability = response.getheader(KV_RESUME_HEADER)
+                    if capability in (serving_launch.GREEDY_KV_RESUME, serving_launch.SEEDED_KV_RESUME):
+                        return capability
+                    return ""
     except HTTP_ERRORS:
         pass
     return None
@@ -220,6 +223,19 @@ def probe_endpoint(endpoint: Endpoint, timeout: float) -> bool | None:
 
 def endpoint_ready(endpoint: Endpoint, timeout: float) -> bool:
     return probe_endpoint(endpoint, timeout) is not None
+
+
+def verify_seeded_sampler(port: int) -> None:
+    try:
+        with contextlib.closing(http.client.HTTPConnection("127.0.0.1", port, timeout=2)) as connection:
+            connection.request("GET", "/health")
+            with connection.getresponse() as response:
+                if (response.status == 200
+                        and response.getheader(KV_RESUME_HEADER) == serving_launch.SEEDED_KV_RESUME):
+                    return
+    except HTTP_ERRORS as error:
+        raise ControlError("cannot verify the seeded sampler on the local engine") from error
+    raise ControlError("the local engine did not advertise the configured seeded sampler")
 
 
 HOP_HEADERS = frozenset({
@@ -240,7 +256,7 @@ def handoff_token(value: str | None) -> str | None:
 def group_proxy(
     port: int, backend_port: int, gate: Gate, version: str, *,
     bind: str = "127.0.0.1", role: str = "aggregated", kv_lease: float = 0,
-    kv_resume: bool = False,
+    kv_resume: str = "",
 ) -> ThreadingHTTPServer:
     class Proxy(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -287,7 +303,7 @@ def group_proxy(
                     self.send_header(VERSION_HEADER, version)
                     self.send_header(ROLE_HEADER, role)
                     if kv_resume:
-                        self.send_header(KV_RESUME_HEADER, "1")
+                        self.send_header(KV_RESUME_HEADER, kv_resume)
                     self.end_headers()
                     return
                 self.forward(token if role == "prefill" and self.path in INFERENCE_PATHS else None)
@@ -533,11 +549,13 @@ def run(
         elif len({grant["device"]["ordinal"] for grant in grants}) != args.tp:
             raise ControlError("duplicate device ordinal in group grants")
 
+        kv_resume = ""
         if not follower:
+            kv_resume = serving_launch.kv_resume_capability(command, child_env)
             server = group_proxy(
                 args.port_base, args.backend_port, gate, version_tag,
                 bind=args.proxy_host, role=args.role, kv_lease=args.kv_lease_seconds,
-                kv_resume=serving_launch.supports_kv_resume(command, child_env),
+                kv_resume=kv_resume,
             )
             check_backend_port(args.backend_port)
         phase = change(
@@ -580,6 +598,8 @@ def run(
                 else:
                     ready = probe(args.backend_port)
                 if ready and process.poll() is None:
+                    if kv_resume == serving_launch.SEEDED_KV_RESUME:
+                        verify_seeded_sampler(args.backend_port)
                     if hosted:
                         phase = change("HostLaunchReady", endpoint=None if follower else endpoint)
                     else:

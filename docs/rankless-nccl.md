@@ -711,8 +711,8 @@ the first unmatched token. Single-stage engines continue to use
 
 ### Resume a stream from its last emitted token
 
-Use `X-Plait-Stream-Recovery: resume-kv` on the same greedy completion
-endpoint. Set `PlaitKvConnector` to produce on the source and consume on
+Use `X-Plait-Stream-Recovery: resume-kv` on the same completion endpoint.
+Set `PlaitKvConnector` to produce on the source and consume on
 the replacement. Use the V2 runner on the replacement. Set `kv_both` on
 an engine that should publish additional pages after it takes over.
 The request must carry a plain text or token-array prompt. Structured
@@ -746,9 +746,27 @@ publish pages for these requests. A destination advertises token resume when
 its launch uses a V2 Plait KV consumer. A split destination obtains a fresh
 Prefill receipt and checks every promised prompt page. Complete pages that
 include generated tokens can extend the hit, and the engine computes any
-uncovered known tokens before continuing. A destination without token resume
-matches the emitted prefix by replay. The request stays on the original
+uncovered known tokens before continuing. A greedy request can use prefix
+replay on a destination without token resume. The request stays on the original
 ingress connection in either case.
+
+#### Resume a completion with an explicit seed
+
+Set `seeded_stream_resume: true` on both resident Decode profiles and use
+the unified ingress. Use a positive `temperature` and an explicit signed
+64-bit `seed` other than `-1`. The supported engine uses the standard
+V2 FP32 sampler without speculative decoding, watermarking, or custom logits
+processors. Every host in a group must use the same profile setting. The
+launcher verifies the engine's sampler capability before declaring it ready.
+
+The engine derives sampling randomness from the request seed and absolute
+token position. The destination keeps the seed, sampling parameters, and
+committed token history. Its first choice confirms the seed and checkpoint
+length. The ingress verifies both before publishing the next token. During
+a planned change, the source keeps generating until an accepting destination
+advertises the seeded sampler capability. Different backends and layouts can
+compute different logits, so matching the seed and history gives the same
+random stream with the destination's logits.
 
 In the four-backend fault test, the source emitted six tokens before one
 of its TP4 workers was killed. The TP2 replacement reported 256 external

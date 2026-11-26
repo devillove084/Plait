@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterator
 from http.client import HTTPResponse
 
 from serving_group import HTTP_ERRORS, MAX_JSON_BYTES
+from serving_launch import SEEDED_KV_RESUME
 
 
 RECOVERY_HEADER = "X-Plait-Stream-Recovery"
@@ -52,12 +53,23 @@ def events(response: HTTPResponse) -> Iterator[bytes]:
             lines.append(line[5:].removeprefix(b" ").rstrip(b"\r\n"))
 
 
-def validated_request(body: dict) -> dict:
+def validated_request(body: dict, mode: str = RECOVERY_MODE) -> dict:
     prompt = body.get("prompt")
     options = body.get("stream_options") or {}
+    temperature = body.get("temperature")
+    seed = body.get("seed")
+    seeded = (
+        mode == RESUME_KV_MODE
+        and type(temperature) in (int, float)
+        and 0 < temperature < float("inf")
+        and type(seed) is int
+        and -(1 << 63) <= seed < (1 << 63)
+        and seed != -1
+    )
     if (
-        body.get("stream") is not True or type(body.get("temperature")) not in (int, float)
-        or body["temperature"] != 0 or body.get("n", 1) != 1
+        body.get("stream") is not True
+        or not (seeded or (type(temperature) in (int, float) and temperature == 0))
+        or body.get("n", 1) != 1
         or not (isinstance(prompt, str) or (
             isinstance(prompt, list) and prompt and all(type(token) is int for token in prompt)
         ))
@@ -66,7 +78,10 @@ def validated_request(body: dict) -> dict:
         or not isinstance(options, dict) or options.get("continuous_usage_stats")
         or body.get("kv_transfer_params")
     ):
-        raise ValueError("stream recovery requires a single greedy completion with token-addressable output")
+        raise ValueError(
+            "stream recovery requires one greedy completion or a KV resume "
+            "request with an explicit sampling seed"
+        )
     return {**body, "return_token_ids": True}
 
 
@@ -79,14 +94,15 @@ def match_prefix(values, prefix, offset: int) -> int:
 
 class CompletionReplay:
     def __init__(self, body: dict, mode: str = RECOVERY_MODE) -> None:
-        self.request = validated_request(body)
+        self.request = validated_request(body, mode)
+        self.seed = self.request.get("seed") if self.request["temperature"] > 0 else None
         if mode == RESUME_KV_MODE and (
             body.get("prompt_logprobs") is not None or body.get("structured_outputs")
             or body.get("response_format") or body.get("repetition_detection")
             or body.get("thinking_token_budget", -1) not in (None, -1)
             or body.get("prompt_embeds") or body.get("vllm_xargs")
         ):
-            raise ValueError("KV resume requires a plain greedy completion")
+            raise ValueError("KV resume requires a plain text completion")
         self.payload = json.dumps(self.request).encode()
         self.mode = mode
         self.model = body["model"]
@@ -101,14 +117,19 @@ class CompletionReplay:
         self.prompt_sent = False
 
     def attempt_payload(self) -> bytes:
-        if self.mode != RESUME_KV_MODE or not self.tokens:
+        if self.mode != RESUME_KV_MODE or (not self.tokens and self.seed is None):
             return self.payload
         return json.dumps(self.generation_request()).encode()
 
     def generation_request(self, allow_resume: bool = True) -> dict:
         request = dict(self.request)
+        params = {}
+        if self.seed is not None:
+            params["plait_sampling_mode"] = SEEDED_KV_RESUME
         if allow_resume and self.mode == RESUME_KV_MODE and self.tokens:
-            request["kv_transfer_params"] = {"plait_resume_token_ids": self.tokens.copy()}
+            params["plait_resume_token_ids"] = self.tokens.copy()
+        if params:
+            request["kv_transfer_params"] = params
         return request
 
     def drain_attempt(
@@ -149,6 +170,10 @@ class CompletionReplay:
                 raise ReplayMismatch("completion stream did not carry one token-addressable choice")
             prompt = choice.pop("prompt_token_ids", None)
             resumed_tokens = choice.pop("plait_resumed_tokens", None)
+            sampled_seed = choice.pop("plait_sampled_seed", None)
+            if first_choice and self.seed is not None:
+                if type(sampled_seed) is not int or sampled_seed != self.seed:
+                    raise ReplayMismatch("engine did not confirm the sampling seed")
             if first_choice and allow_resume and self.mode == RESUME_KV_MODE and reference_ids:
                 if type(resumed_tokens) is not int or resumed_tokens != len(reference_ids):
                     raise ReplayMismatch("replacement did not restore the emitted token checkpoint")

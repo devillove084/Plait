@@ -95,6 +95,7 @@ def parse_args() -> argparse.Namespace:
     args.bootstrap = None
     args.hosted_block_size = None
     args.stream_checkpoints = False
+    args.seeded_stream_resume = False
     args.release_driver = None
     if args.resident_hosted:
         if args.host_launch_spec or args.print_launch_digest or not args.group_id:
@@ -116,6 +117,7 @@ def parse_args() -> argparse.Namespace:
                     raise ValueError("invalid committed P/D role")
                 args.role = pd["role"].lower()
                 args.stream_checkpoints = bootstrap["engine"].get("stream_checkpoints", False)
+                args.seeded_stream_resume = bootstrap["engine"].get("seeded_stream_resume", False)
                 kv = pd["kv"]
                 args.plait_kv_namespace = kv["namespace"]
                 args.kv_host, kv_port = kv["store"].rsplit(":", 1)
@@ -278,6 +280,8 @@ def native_command(args: argparse.Namespace, vllm: str, port: int) -> list[str]:
             }
             if args.role == "decode" and args.stream_checkpoints:
                 config["kv_connector_extra_config"]["checkpoint_decode"] = True
+            if args.role == "decode" and args.seeded_stream_resume:
+                config["kv_connector_extra_config"]["seeded_resume"] = True
         command.extend(("--kv-transfer-config", json.dumps(config)))
     return command
 

@@ -20,8 +20,9 @@ from unittest.mock import Mock, patch
 from serving_group import (
     ADMISSION_HEADER, HANDOFF_HEADER, RELEASE_KV_PATH, VERSION_HEADER,
     ControlError, Endpoint, Gate, check_backend_port, group_proxy, record_host_stop, run,
+    verify_seeded_sampler,
 )
-from serving_launch import host_command, resident_spec
+from serving_launch import GREEDY_KV_RESUME, SEEDED_KV_RESUME, host_command, resident_spec
 from serving_load import Load
 from serving_replay import RECOVERY_HEADER, RECOVERY_MODE, RESUME_KV_MODE, sse
 
@@ -353,12 +354,21 @@ class HandoffTest(unittest.TestCase):
 
         return self.start(ThreadingHTTPServer(("127.0.0.1", 0), Native))
 
-    def group(self, role, version, respond, *, kv_resume=False):
+    def group(self, role, version, respond, *, kv_resume=""):
         gate = Gate()
         gate.allow_until(time.monotonic() + 30)
         port = self.start(group_proxy(0, self.backend(respond), gate, version, role=role, kv_lease=30,
                                       kv_resume=kv_resume))
         return port, gate
+
+    def test_launcher_requires_the_backend_to_confirm_seeded_sampling(self):
+        respond = Mock()
+        legacy, _ = self.group("decode", DECODE, respond, kv_resume=GREEDY_KV_RESUME)
+        seeded, _ = self.group("decode", SPARE, respond, kv_resume=SEEDED_KV_RESUME)
+        with self.assertRaises(ControlError):
+            verify_seeded_sampler(legacy)
+        verify_seeded_sampler(seeded)
+        respond.assert_not_called()
 
     def request(self, port, path, body=None, headers=None):
         with contextlib.closing(http.client.HTTPConnection("127.0.0.1", port, timeout=2)) as conn:
@@ -619,8 +629,16 @@ class HandoffTest(unittest.TestCase):
         self.assertTrue(gate.drained())
 
     def test_planned_stream_handoff_uses_only_delivered_tokens_and_checks_capability(self):
-        for capable in (True, False):
-            with self.subTest(kv_resume=capable):
+        for source_capability, target_capability in (
+            (GREEDY_KV_RESUME, GREEDY_KV_RESUME),
+            (GREEDY_KV_RESUME, ""),
+            (SEEDED_KV_RESUME, SEEDED_KV_RESUME),
+            (SEEDED_KV_RESUME, GREEDY_KV_RESUME),
+        ):
+            with self.subTest(source=source_capability, target=target_capability):
+                seeded = source_capability == SEEDED_KV_RESUME
+                can_switch = not seeded or target_capability == SEEDED_KV_RESUME
+                seed = 648 if seeded else None
                 routes = []
                 transfers = []
 
@@ -638,33 +656,42 @@ class HandoffTest(unittest.TestCase):
                     choice = {"index": 0, "text": text, "token_ids": ids, "finish_reason": finish}
                     if first:
                         choice["prompt_token_ids"] = [4]
+                        if seeded:
+                            choice["plait_sampled_seed"] = seed
                     if resumed is not None:
                         choice["plait_resumed_tokens"] = resumed
                     return sse({"id": identity, "model": "test", "choices": [choice]})
 
                 def source(body):
-                    self.assertEqual(body["kv_transfer_params"]["plait_handoff"]["ticket"], transfers[0])
-                    self.assertIs(body["kv_transfer_params"]["plait_checkpoint"], True)
+                    kv = body["kv_transfer_params"]
+                    self.assertEqual(kv["plait_handoff"]["ticket"], transfers[0])
+                    self.assertIs(kv["plait_checkpoint"], True)
+                    self.assertEqual(kv.get("plait_sampling_mode"), SEEDED_KV_RESUME if seeded else None)
+                    self.assertEqual(body.get("seed"), seed)
                     routes[:] = [target]
                     # A healthy source has already computed a different suffix.
                     return "text/event-stream", (chunk("source", [8], "a", first=True)
                         + chunk("source", [99], "x", finish="length") + b"data: [DONE]\n\n")
 
                 def replacement(body):
+                    self.assertTrue(can_switch)
                     kv = body["kv_transfer_params"]
                     self.assertEqual(kv["plait_handoff"]["ticket"], transfers[1])
                     self.assertIs(kv["plait_checkpoint"], True)
-                    if capable:
+                    self.assertEqual(kv.get("plait_sampling_mode"), SEEDED_KV_RESUME if seeded else None)
+                    self.assertEqual(body.get("seed"), seed)
+                    if target_capability:
                         self.assertEqual(kv["plait_resume_token_ids"], [8])
                     else:
                         self.assertNotIn("plait_resume_token_ids", kv)
                     return "text/event-stream", (
-                        chunk("replacement", [8, 9], "ab", first=True, resumed=1 if capable else None)
+                        chunk("replacement", [8, 9], "ab", first=True,
+                              resumed=1 if target_capability else None)
                         + chunk("replacement", [], "", finish="length") + b"data: [DONE]\n\n")
 
                 p_port, gate = self.group("prefill", PREFILL, prefill)
-                old_port, _ = self.group("decode", DECODE, source, kv_resume=True)
-                new_port, _ = self.group("decode", SPARE, replacement, kv_resume=capable)
+                old_port, _ = self.group("decode", DECODE, source, kv_resume=source_capability)
+                new_port, _ = self.group("decode", SPARE, replacement, kv_resume=target_capability)
                 prefill_endpoint = Endpoint("127.0.0.1", p_port, PREFILL, "prefill")
                 old, target = [ROUTER["Route"](prefill_endpoint, Endpoint("127.0.0.1", port, version, "decode"),
                                                 "127.0.0.1", 9100)
@@ -674,15 +701,19 @@ class HandoffTest(unittest.TestCase):
                 router = self.start(ROUTER["server"]("127.0.0.1", 0, directory, 3, kv_transport="plait"))
                 status, headers, body = self.request(router, COMPLETIONS, {
                     "model": "test", "prompt": [4], "max_tokens": 2, "stream": True,
-                    "temperature": 0, "return_token_ids": True,
+                    "temperature": 0.8 if seeded else 0, "return_token_ids": True,
+                    **({"seed": seed} if seeded else {}),
                 }, {RECOVERY_HEADER: RESUME_KV_MODE})
                 self.assertEqual((status, headers[VERSION_HEADER]), (200, DECODE))
                 frames = [line[6:] for line in body.splitlines() if line.startswith(b"data: ")]
                 self.assertEqual(frames.count(b"[DONE]"), 1)
                 frames = [json.loads(item) for item in frames if item != b"[DONE]"]
                 self.assertEqual({item["id"] for item in frames}, {"source"})
-                self.assertEqual([token for item in frames for c in item["choices"] for token in c["token_ids"]], [8, 9])
-                self.assertEqual(len(set(transfers)), 2)
+                choices = [choice for item in frames for choice in item["choices"]]
+                self.assertEqual([token for choice in choices for token in choice["token_ids"]],
+                                 [8, 9 if can_switch else 99])
+                self.assertTrue(all("plait_sampled_seed" not in choice for choice in choices))
+                self.assertEqual(len(set(transfers)), 2 if can_switch else 1)
                 self.assertTrue(gate.drained())
 
     def test_load_counts_valid_arrivals_when_routes_are_unavailable(self):

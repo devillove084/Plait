@@ -10,12 +10,14 @@ from serving_replay import RESUME_KV_MODE, CompletionReplay, ReplayMismatch, Ups
 DONE = b"data: [DONE]\n\n"
 
 
-def frame(ids, text, request_id="first", *, prompt=None, finish=None, resumed=None):
+def frame(ids, text, request_id="first", *, prompt=None, finish=None, resumed=None, seed=None):
     choice = {"index": 0, "token_ids": ids, "text": text, "finish_reason": finish}
     if prompt is not None:
         choice["prompt_token_ids"] = prompt
     if resumed is not None:
         choice["plait_resumed_tokens"] = resumed
+    if seed is not None:
+        choice["plait_sampled_seed"] = seed
     return sse({"id": request_id, "created": 10, "model": "test", "choices": [choice]})
 
 
@@ -101,6 +103,28 @@ class CompletionReplayTest(unittest.TestCase):
         for claimed in (None, 2, True):
             with self.subTest(claimed=claimed), self.assertRaises(ReplayMismatch):
                 replay.drain_attempt(io.BytesIO(frame([1, 2], "AB", prompt=[7], resumed=claimed)), out.append)
+        self.assertEqual(out, [frame([1], "A", prompt=[7])])
+
+    def test_seeded_resume_requires_a_seed_acknowledgment_before_emitting(self):
+        request = {"model": "test", "prompt": [7], "stream": True, "temperature": 0.8,
+                   "return_token_ids": True, "seed": 42}
+        with self.assertRaises(ValueError):
+            CompletionReplay(request)
+        for seed in (None, -1, True, 1 << 63, -(1 << 63) - 1):
+            with self.subTest(seed=seed), self.assertRaises(ValueError):
+                CompletionReplay({**request, "seed": seed}, RESUME_KV_MODE)
+
+        replay = CompletionReplay(request, RESUME_KV_MODE)
+        out = []
+        with self.assertRaises(ReplayMismatch):
+            replay.drain_attempt(io.BytesIO(frame([1], "A", prompt=[7])), out.append)
+        self.assertEqual(out, [])
+        with self.assertRaises(UpstreamInterrupted):
+            replay.drain_attempt(io.BytesIO(frame([1], "A", prompt=[7], seed=42)), out.append)
+        for claimed in (None, 41, True):
+            with self.subTest(claimed=claimed), self.assertRaises(ReplayMismatch):
+                replay.drain_attempt(io.BytesIO(frame([1, 2], "AB", prompt=[7],
+                                                       resumed=1, seed=claimed)), out.append)
         self.assertEqual(out, [frame([1], "A", prompt=[7])])
 
 

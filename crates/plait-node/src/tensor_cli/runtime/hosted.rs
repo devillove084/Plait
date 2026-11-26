@@ -62,6 +62,8 @@ struct EngineProfile {
     pipeline_layers: Option<Vec<u32>>,
     #[serde(default)]
     stream_checkpoints: bool,
+    #[serde(default)]
+    seeded_stream_resume: bool,
     verify_release: Option<PathBuf>,
     release_driver: Option<ReleaseDriver>,
 }

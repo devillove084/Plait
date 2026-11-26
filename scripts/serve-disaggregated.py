@@ -25,6 +25,7 @@ from serving_group import (
     Endpoint, admission_rejected, endpoint_ready, probe_endpoint,
 )
 from serving_load import Load, listen as load_listener, parse_address as parse_load_address
+from serving_launch import SEEDED_KV_RESUME
 from serving_replay import (
     RECOVERY_HEADER, RECOVERY_MODE, RESUME_KV_MODE, CompletionReplay, PlannedHandoff,
     ReplayMismatch, UpstreamInterrupted, sse,
@@ -382,8 +383,8 @@ def server(
                     endpoint = generator(route)
                     if endpoint.version in failed_generators:
                         continue
-                    can_resume = probe_endpoint(endpoint, min(1.0, budget))
-                    if can_resume is None:
+                    capability = self.probe_generation(endpoint, min(1.0, budget), replay)
+                    if capability is None:
                         continue
                     transfer = None
                     if isinstance(route, Route):
@@ -402,7 +403,7 @@ def server(
                             continue
                     try:
                         completed = self.replay_generation(
-                            endpoint, transfer, deadline, replay, failed_generators, can_resume,
+                            endpoint, transfer, deadline, replay, failed_generators, bool(capability),
                         )
                         if completed is not None:
                             return completed
@@ -432,6 +433,12 @@ def server(
                     return routes
             return []
 
+        def probe_generation(self, endpoint: Endpoint, budget: float, replay: CompletionReplay) -> str | None:
+            capability = probe_endpoint(endpoint, budget)
+            if replay.seed is not None and capability != SEEDED_KV_RESUME:
+                return None
+            return capability
+
         def replay_generation(
             self, endpoint: Endpoint, transfer: Transfer | None, deadline: float,
             replay: CompletionReplay, failed_generators: set[str], can_resume: bool,
@@ -458,7 +465,7 @@ def server(
                     if candidate.version in failed_generators:
                         continue
                     # A replacement must be accepting before the source is closed.
-                    if endpoint_ready(candidate, budget) and (
+                    if self.probe_generation(candidate, budget, replay) is not None and (
                         not isinstance(route, Route) or endpoint_ready(route.prefill, budget)
                     ):
                         return True

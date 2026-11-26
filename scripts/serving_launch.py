@@ -138,9 +138,13 @@ def host_command(
     ]
 
 
-def supports_kv_resume(command: list[str], env: dict[str, str]) -> bool:
+GREEDY_KV_RESUME = "1"
+SEEDED_KV_RESUME = "seeded-v2"
+
+
+def kv_resume_capability(command: list[str], env: dict[str, str]) -> str:
     if env.get("VLLM_USE_V2_MODEL_RUNNER") != "1":
-        return False
+        return ""
     config = None
     for index, argument in enumerate(command):
         flag, separator, value = argument.partition("=")
@@ -151,10 +155,15 @@ def supports_kv_resume(command: list[str], env: dict[str, str]) -> bool:
         elif index + 1 < len(command):
             config = command[index + 1]
     if config is None:
-        return False
+        return ""
     try:
         item = json.loads(config)
     except ValueError:
-        return False
-    return (isinstance(item, dict) and item.get("kv_connector") == "PlaitKvConnector"
-            and item.get("kv_role") in ("kv_consumer", "kv_both"))
+        return ""
+    if (not isinstance(item, dict) or item.get("kv_connector") != "PlaitKvConnector"
+            or item.get("kv_role") not in ("kv_consumer", "kv_both")):
+        return ""
+    extra = item.get("kv_connector_extra_config")
+    if isinstance(extra, dict) and extra.get("seeded_resume") is True:
+        return SEEDED_KV_RESUME
+    return GREEDY_KV_RESUME

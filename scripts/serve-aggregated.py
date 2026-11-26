@@ -113,6 +113,8 @@ def server(bind: str, port: int, directory: ActiveGroupDirectory, timeout: float
                     if recovery not in (RECOVERY_MODE, RESUME_KV_MODE) or self.path != "/v1/completions":
                         raise ValueError("unsupported stream recovery mode")
                     replay = CompletionReplay(body, recovery)
+                    if replay.seed is not None:
+                        raise ValueError("seeded KV resume requires the unified serving ingress")
             except (OSError, ValueError) as error:
                 self.fail(400, str(error))
                 return

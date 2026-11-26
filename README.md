@@ -171,8 +171,9 @@ to its peers. [Peer transport and startup](docs/rankless-nccl.md)
 
 Managed replacements reuse complete prompt KV blocks across TP sizes and PP
 layouts with the vLLM fork's `PlaitKvConnector` and `plait-node kv-store`.
-The ingress can restore a greedy stream's emitted token checkpoint and
-reuse pages from both the prompt and generated prefix.
+The ingress restores emitted token checkpoints and reuses pages from the
+prompt and generated prefix. The unified ingress supports greedy streams and
+streams with an explicit seed on the standard V2 sampler.
 [Planned stream handoff](docs/rankless-nccl.md#resume-a-stream-from-its-last-emitted-token)
 [KV setup and scope](docs/rankless-nccl.md#reuse-prompt-kv-across-tp-layouts)
 
@@ -276,7 +277,7 @@ release the result after the matching completion has executed in the control pla
 | [Hosted pipeline rollout](specs/PlaitHostedPipeline.tla) | Both pipeline lanes deliver activations for the admitted epoch. The next version waits for all workers, and the old version retires after its requests drain. |
 | [Serving ingress](specs/PlaitServingIngress.tla) | One admission per ordinary forwarded request, monotonic route refresh, and output pinned to the admitted epoch while the old gate drains. |
 | [Completion replay and KV resume](specs/PlaitCompletionReplay.tla) | Visible positions are preserved. Each KV resume sends the latest checkpoint and requires a matching acknowledgment and prefix before publishing a suffix. |
-| [Planned stream handoff](specs/PlaitPlannedStreamHandoff.tla) | A cut uses the last visible position and waits for a ready replacement. Only one attempt can publish each output position. |
+| [Planned stream handoff](specs/PlaitPlannedStreamHandoff.tla) | A cut uses the last visible position and waits for a ready replacement. A seeded request requires a compatible sampler and a seed acknowledgment before the target publishes. |
 | [KV publication](specs/PlaitKvPublication.tla) | All heads must come from one write attempt before a page becomes readable. A consumer reads its requested head range, and a complete page stays immutable. |
 | [Layered KV](specs/PlaitLayeredKv.tla) | A page publishes after one write attempt covers every layer and head. A consumer can read it with a different stage partition or a whole-head request. |
 | [Prefill to Decode handoff](specs/PlaitKvHandoff.tla) | The receipt matches the request context. Decode emits output after loading the required pages, including when the shared store can reset between admission and load. |
