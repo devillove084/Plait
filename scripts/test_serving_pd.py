@@ -10,9 +10,11 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from serving_group import (
-    ADMISSION_HEADER, HANDOFF_HEADER, RELEASE_KV_PATH, VERSION_HEADER, Gate, group_proxy,
+    ADMISSION_HEADER, HANDOFF_HEADER, RELEASE_KV_PATH, VERSION_HEADER, Gate, group_proxy, run,
 )
 
 
@@ -20,6 +22,42 @@ ROUTER = runpy.run_path(str(Path(__file__).with_name("serve-disaggregated.py")))
 PREFILL, DECODE, SPARE = (f"{number:032x}@1" for number in range(1, 4))
 TOKEN = "f" * 32
 COMPLETIONS = "/v1/completions"
+
+
+class LaunchTest(unittest.TestCase):
+    def test_child_uses_the_claimed_version_even_if_parent_has_another_epoch(self):
+        group, host = "a" * 32, "b" * 32
+        version = {"group": list(bytes.fromhex(group)), "epoch": 7}
+        digest = [2] * 32
+        args = SimpleNamespace(
+            control_bin="plait-node", control_listen="127.0.0.1:0", control_peer=[],
+            group_id=group, group_epoch=7, host_id=host, role="aggregated", model="model",
+            tp=1, port_base=8000, backend_port=9000, proxy_host="127.0.0.1",
+            kv_lease_seconds=30, startup_timeout=1, verify_release=None,
+        )
+        control = Mock()
+        control.request.return_value = {"group": {
+            "phase": "Preparing", "version": version, "role": "Aggregated", "model": "model",
+            "tensor_parallel": 1, "pipeline_parallel": 1, "launch_digest": digest,
+            "grants": [{"device": {"node": list(bytes.fromhex(host)), "ordinal": 2}}],
+        }}
+        control.execute.return_value = {"Ok": {"Group": {"phase": "Preparing"}}}
+        env = {"PLAIT_TP_GROUP_VERSION": f"{group}@6"}
+        command = ["vllm", "serve", "model"]
+        with (
+            patch("serving_group.Control", return_value=control),
+            patch("serving_group.group_proxy"),
+            patch("serving_group.socket.socket"),
+            patch("serving_group.subprocess.Popen") as process,
+            patch("serving_group.stop_process_group", return_value=True),
+        ):
+            process.return_value.poll.return_value = 0
+            run(args, command, digest, env, lambda _: True, lambda: False)
+
+        claim = control.execute.call_args_list[0].args[0]["ClaimLaunch"]
+        self.assertEqual(claim["version"], version)
+        self.assertEqual(process.call_args.kwargs["env"]["PLAIT_TP_GROUP_VERSION"], f"{group}@7")
+        self.assertEqual(env["PLAIT_TP_GROUP_VERSION"], f"{group}@6")
 
 
 class CalibrationTest(unittest.TestCase):

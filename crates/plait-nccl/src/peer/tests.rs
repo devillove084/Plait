@@ -6,6 +6,8 @@ use crate::{
 };
 use std::ffi::c_void;
 
+use plait_core::{NodeId, serving::GroupId};
+
 fn listeners(world: usize) -> (Vec<Listener>, Vec<Endpoint>) {
     let listeners: Vec<_> = (0..world)
         .map(|index| Listener::bind("127.0.0.1:0".parse().unwrap(), [index as u8; 16]).unwrap())
@@ -16,6 +18,113 @@ fn listeners(world: usize) -> (Vec<Listener>, Vec<Endpoint>) {
 
 fn groups(world: usize) -> Vec<Arc<PeerGroup>> {
     groups_with_timeout(world, Duration::from_secs(2))
+}
+
+#[test]
+fn mismatched_group_epochs_cannot_connect_with_the_same_endpoint_manifest() {
+    let group = GroupId(NodeId::derive("peer epoch"));
+    let old = GroupVersion { group, epoch: 1 };
+    let new = GroupVersion { group, epoch: 2 };
+    let address = "127.0.0.1:0".parse().unwrap();
+    let left = Listener::bind_in_epoch(address, [9; 16], old).unwrap();
+    let right = Listener::bind_in_epoch(address, [10; 16], new).unwrap();
+    let members = vec![left.endpoint(), right.endpoint()];
+    let other_members = members.clone();
+    let timeout = Duration::from_secs(2);
+    thread::scope(|scope| {
+        let peer = scope.spawn(move || left.connect(0, members, timeout).is_err());
+        assert!(right.connect(1, other_members, timeout).is_err());
+        assert!(peer.join().unwrap());
+    });
+}
+
+#[test]
+fn allreduce_bounds_the_replicated_exchange_and_keeps_the_same_fold() {
+    let op = Collective::AllReduce(DataType::Float32, ReduceOp::Sum);
+    assert!(use_replicated_exchange(op, TWO_RANK_REPLICATED_LIMIT, 2));
+    assert!(!use_replicated_exchange(
+        op,
+        TWO_RANK_REPLICATED_LIMIT + 4,
+        2
+    ));
+    assert!(use_replicated_exchange(
+        op,
+        REPLICATED_BYTES_PER_RANK / 4,
+        5
+    ));
+    assert!(!use_replicated_exchange(
+        op,
+        REPLICATED_BYTES_PER_RANK / 4 + 4,
+        5
+    ));
+    assert!(!use_replicated_exchange(
+        Collective::ReduceScatter(DataType::Float32, ReduceOp::Sum),
+        4,
+        4
+    ));
+
+    thread::scope(|scope| {
+        for (slot, group) in groups(4).into_iter().enumerate() {
+            scope.spawn(move || {
+                assert!(group.execute(op, &[]).unwrap().is_empty());
+                // Sorting contributions by their arrival round would produce
+                // different results on some slots with this input.
+                let input = [1e20f32, -1e20, 1.0, 2.0][slot].to_ne_bytes();
+                for count in [2048, 8192] {
+                    let result = group.execute(op, &input.repeat(count)).unwrap();
+                    assert_eq!(result, 3.0f32.to_ne_bytes().repeat(count));
+                }
+            });
+        }
+    });
+}
+
+#[test]
+fn replicated_exchange_drains_two_writers_with_small_send_buffers() {
+    use std::os::fd::AsRawFd;
+
+    let group = groups(2);
+    for (slot, peer) in group.iter().enumerate() {
+        let capacity: libc::c_int = 16 * 1024;
+        let fd = peer.link(1 - slot).collective.as_raw_fd();
+        // The fd is live and capacity is a valid integer socket option.
+        let result = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&capacity as *const libc::c_int).cast(),
+                std::mem::size_of_val(&capacity) as libc::socklen_t,
+            )
+        };
+        assert_eq!(result, 0);
+    }
+    thread::scope(|scope| {
+        for (slot, peer) in group.into_iter().enumerate() {
+            scope.spawn(move || {
+                let value = slot as u8 + 1;
+                let result = peer
+                    .execute(
+                        Collective::AllReduce(DataType::Uint8, ReduceOp::Sum),
+                        &vec![value; TWO_RANK_REPLICATED_LIMIT],
+                    )
+                    .unwrap();
+                assert_eq!(result, vec![3; TWO_RANK_REPLICATED_LIMIT]);
+                if slot == 1 {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                // A following sharded op uses the restored blocking lane.
+                assert_eq!(
+                    peer.execute(
+                        Collective::ReduceScatter(DataType::Uint8, ReduceOp::Sum),
+                        &[value, value],
+                    )
+                    .unwrap(),
+                    [3]
+                );
+            });
+        }
+    });
 }
 
 fn groups_with_timeout(world: usize, timeout: Duration) -> Vec<Arc<PeerGroup>> {

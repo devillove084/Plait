@@ -4,7 +4,7 @@
 \* Tensor chunks contain one integer each to model ownership and materialization.
 EXTENDS Naturals
 
-CONSTANTS World, LoseSlotZero
+CONSTANTS World, LoseSlotZero, ReplicatedGroups
 VARIABLES local, lost, aborted
 
 Groups == {1, 2}
@@ -30,9 +30,10 @@ Input(group, source, shard) == 100 * group + 10 * source + shard
 Expected(group, shard) ==
     World * (100 * group + shard) + 5 * World * (World - 1)
 
-Initial(group, slot) == [phase |-> "Scatter", round |-> 0,
+Initial(group, slot) == [phase |-> IF group \in ReplicatedGroups THEN "Replicated" ELSE "Scatter", round |-> 0,
     seen |-> {slot}, sum |-> Input(group, slot, slot),
-    gathered |-> [shard \in Slots |-> 0]]
+    gathered |-> [shard \in Slots |->
+        IF group \in ReplicatedGroups THEN Input(group, slot, shard) ELSE 0]]
 
 Init ==
     /\ local = [g \in Groups |-> [slot \in Slots |-> Initial(g, slot)]]
@@ -44,14 +45,18 @@ Running(g, slot) == g \notin aborted /\ Alive(g, slot)
 InRound(state) == state.phase # "Done" /\ state.round < Pivot
 
 Receive(state, peer, payload) ==
-    IF state.phase = "Scatter"
-    THEN [state EXCEPT !.seen = @ \cup {peer}, !.sum = @ + payload, !.round = @ + 1]
-    ELSE [state EXCEPT !.seen = @ \cup {peer}, !.gathered[peer] = payload, !.round = @ + 1]
+    CASE state.phase = "Scatter" ->
+        [state EXCEPT !.seen = @ \cup {peer}, !.sum = @ + payload, !.round = @ + 1]
+      [] state.phase = "Replicated" ->
+        [state EXCEPT !.seen = @ \cup {peer}, !.round = @ + 1,
+            !.gathered = [shard \in Slots |-> state.gathered[shard] + payload[shard]]]
+      [] OTHER ->
+        [state EXCEPT !.seen = @ \cup {peer}, !.gathered[peer] = payload, !.round = @ + 1]
 
 Payload(g, sender, receiver) ==
-    IF local[g][sender].phase = "Scatter"
-    THEN Input(g, sender, receiver)
-    ELSE local[g][sender].sum
+    CASE local[g][sender].phase = "Scatter" -> Input(g, sender, receiver)
+      [] local[g][sender].phase = "Replicated" -> [shard \in Slots |-> Input(g, sender, shard)]
+      [] OTHER -> local[g][sender].sum
 
 Exchange(g, a, b) ==
     /\ a < b
@@ -81,7 +86,7 @@ BeginGather(g, slot) ==
 
 Finish(g, slot) ==
     /\ Running(g, slot)
-    /\ local[g][slot].phase = "Gather" /\ local[g][slot].round = Pivot
+    /\ local[g][slot].phase \in {"Gather", "Replicated"} /\ local[g][slot].round = Pivot
     /\ local' = [local EXCEPT ![g][slot].phase = "Done"]
     /\ UNCHANGED <<lost, aborted>>
 
@@ -108,10 +113,12 @@ Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
 MaterializedShards ==
     \A g \in Groups, slot \in Slots :
         LET state == local[g][slot]
-        IN /\ state.phase # "Scatter" => state.sum = Expected(g, slot)
-           /\ state.phase # "Scatter" =>
+        IN /\ g \notin ReplicatedGroups /\ state.phase # "Scatter" => state.sum = Expected(g, slot)
+           /\ g \notin ReplicatedGroups /\ state.phase # "Scatter" =>
                \A shard \in state.seen : state.gathered[shard] = Expected(g, shard)
-           /\ state.phase = "Done" => state.seen = Slots
+           /\ state.phase = "Done" =>
+               /\ state.seen = Slots
+               /\ \A shard \in Slots : state.gathered[shard] = Expected(g, shard)
 
 IsolatedFailure == aborted \subseteq {First}
 AllDone(g) == \A slot \in Slots : local[g][slot].phase = "Done"

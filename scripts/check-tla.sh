@@ -26,3 +26,4 @@ tlc -deadlock -config specs/PlaitW4OperatorsCheck.cfg specs/PlaitW4OperatorsChec
 tlc -deadlock -config specs/PlaitOrderedPublication.cfg specs/PlaitOrderedPublication.tla
 tlc -deadlock -config specs/PlaitPeerCollective.cfg specs/PlaitPeerCollective.tla
 tlc -deadlock -config specs/PlaitPeerCollectiveOdd.cfg specs/PlaitPeerCollective.tla
+tlc -deadlock -config specs/PlaitPeerCollectiveReplicatedLoss.cfg specs/PlaitPeerCollective.tla

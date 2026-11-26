@@ -449,6 +449,7 @@ dependencies = [
  "libc",
  "libloading 0.8.9",
  "plait-collective",
+ "plait-core",
  "pyo3",
  "sha2",
 ]

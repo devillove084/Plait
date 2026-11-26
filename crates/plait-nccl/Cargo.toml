@@ -16,6 +16,7 @@ python = ["pyo3"]
 
 [dependencies]
 cudarc.workspace = true
+plait-core.workspace = true
 plait-collective.workspace = true
 half = "2"
 libc = "0.2"

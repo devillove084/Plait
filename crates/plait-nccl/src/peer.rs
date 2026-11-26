@@ -1,5 +1,5 @@
-//! Fixed-membership host transport. Every participant owns its listener and
-//! one reduction shard. Slot numbers determine tensor layout and wire order.
+//! Fixed-membership host transport. Every participant owns its listener.
+//! Slot numbers determine tensor layout, reduction order, and wire order.
 
 use std::collections::HashSet;
 use std::io::{self, Read, Write};
@@ -11,12 +11,18 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use plait_core::serving::GroupVersion;
 use sha2::{Digest, Sha256};
 
 use crate::{DataType, ReduceOp, reduce_bytes, reduce_fp8_to_f32};
 
+mod frame;
+
 const COLLECTIVE_LANE: u8 = 0;
 const DIRECT_LANE: u8 = 1;
+const REPLICATED_EXCHANGE: u8 = 2;
+const REPLICATED_BYTES_PER_RANK: usize = 64 * 1024;
+const TWO_RANK_REPLICATED_LIMIT: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Endpoint {
@@ -27,10 +33,33 @@ pub struct Endpoint {
 pub struct Listener {
     socket: TcpListener,
     endpoint: Endpoint,
+    version: Option<GroupVersion>,
 }
 
 impl Listener {
     pub fn bind(address: SocketAddr, ticket: [u8; 16]) -> io::Result<Self> {
+        Self::bind_scoped(address, ticket, None)
+    }
+
+    pub fn bind_in_epoch(
+        address: SocketAddr,
+        ticket: [u8; 16],
+        version: GroupVersion,
+    ) -> io::Result<Self> {
+        if version.epoch == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "group epoch must be positive",
+            ));
+        }
+        Self::bind_scoped(address, ticket, Some(version))
+    }
+
+    fn bind_scoped(
+        address: SocketAddr,
+        ticket: [u8; 16],
+        version: Option<GroupVersion>,
+    ) -> io::Result<Self> {
         let socket = TcpListener::bind(address)?;
         let endpoint = Endpoint {
             address: socket.local_addr()?,
@@ -42,7 +71,11 @@ impl Listener {
             ));
         }
         socket.set_nonblocking(true)?;
-        Ok(Self { socket, endpoint })
+        Ok(Self {
+            socket,
+            endpoint,
+            version,
+        })
     }
 
     pub fn endpoint(&self) -> Endpoint {
@@ -79,41 +112,20 @@ impl Listener {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| io::Error::other("invalid peer bootstrap timeout"))?;
-        let manifest = manifest_digest(&members);
+        let bootstrap = Bootstrap {
+            slot,
+            timeout,
+            deadline,
+            manifest: manifest_digest(self.version, &members),
+        };
         let mut connections = (0..members.len()).map(|_| [None, None]).collect::<Vec<_>>();
-        for _ in 0..slot * 2 {
-            let mut stream = accept(&self.socket, deadline)?;
-            configure(&stream, remaining(deadline)?)?;
-            let mut hello = [0; 45];
-            stream.read_exact(&mut hello)?;
-            let source = u32::from_le_bytes(hello[4..8].try_into().unwrap()) as usize;
-            let lane = hello[44];
-            if source >= slot
-                || lane > DIRECT_LANE
-                || connections[source][lane as usize].is_some()
-                || hello != greeting(&manifest, source, slot, lane)
-            {
-                return Err(io::Error::other("wrong peer group greeting"));
-            }
-            stream.write_all(&greeting(&manifest, slot, source, lane))?;
-            configure(&stream, timeout)?;
-            connections[source][lane as usize] = Some(stream);
-        }
-        for (target, pair) in connections.iter_mut().enumerate().skip(slot + 1) {
-            for lane in [COLLECTIVE_LANE, DIRECT_LANE] {
-                let mut stream =
-                    TcpStream::connect_timeout(&members[target].address, remaining(deadline)?)?;
-                configure(&stream, remaining(deadline)?)?;
-                stream.write_all(&greeting(&manifest, slot, target, lane))?;
-                let mut reply = [0; 45];
-                stream.read_exact(&mut reply)?;
-                if reply != greeting(&manifest, target, slot, lane) {
-                    return Err(io::Error::other("wrong peer group acknowledgement"));
-                }
-                configure(&stream, timeout)?;
-                pair[lane as usize] = Some(stream);
-            }
-        }
+        let (incoming, local_and_outgoing) = connections.split_at_mut(slot);
+        thread::scope(|scope| {
+            let inbound = scope.spawn(|| bootstrap.accept_lower(&self.socket, incoming));
+            let dialed = bootstrap.dial_higher(&members[slot + 1..], &mut local_and_outgoing[1..]);
+            let accepted = inbound.join().expect("peer bootstrap listener panicked");
+            dialed.and(accepted)
+        })?;
         let mut links = Vec::with_capacity(members.len());
         for [collective, direct] in connections {
             let link = match (collective, direct) {
@@ -131,9 +143,63 @@ impl Listener {
         Ok(Arc::new(PeerGroup {
             slot,
             links,
+            timeout,
             sequence: Mutex::new(0),
             failed: AtomicBool::new(false),
         }))
+    }
+}
+
+type WireLanes = [Option<TcpStream>; 2];
+
+struct Bootstrap {
+    slot: usize,
+    timeout: Duration,
+    deadline: Instant,
+    manifest: [u8; 32],
+}
+
+impl Bootstrap {
+    fn accept_lower(&self, listener: &TcpListener, incoming: &mut [WireLanes]) -> io::Result<()> {
+        for _ in 0..self.slot * 2 {
+            let mut stream = accept(listener, self.deadline)?;
+            configure(&stream, remaining(self.deadline)?)?;
+            let mut hello = [0; 45];
+            stream.read_exact(&mut hello)?;
+            let source = u32::from_le_bytes(hello[4..8].try_into().unwrap()) as usize;
+            let lane = hello[44];
+            if source >= self.slot
+                || lane > DIRECT_LANE
+                || incoming[source][lane as usize].is_some()
+                || hello != greeting(&self.manifest, source, self.slot, lane)
+            {
+                return Err(io::Error::other("wrong peer group greeting"));
+            }
+            stream.write_all(&greeting(&self.manifest, self.slot, source, lane))?;
+            configure(&stream, self.timeout)?;
+            incoming[source][lane as usize] = Some(stream);
+        }
+        Ok(())
+    }
+
+    fn dial_higher(&self, members: &[Endpoint], outgoing: &mut [WireLanes]) -> io::Result<()> {
+        for (offset, (member, pair)) in members.iter().zip(outgoing).enumerate() {
+            let target = self.slot + 1 + offset;
+            for lane in [COLLECTIVE_LANE, DIRECT_LANE] {
+                let mut stream =
+                    TcpStream::connect_timeout(&member.address, remaining(self.deadline)?)?;
+                configure(&stream, remaining(self.deadline)?)?;
+                stream.write_all(&greeting(&self.manifest, self.slot, target, lane))?;
+                let mut reply = [0; 45];
+                stream.read_exact(&mut reply)?;
+                if reply != greeting(&self.manifest, target, self.slot, lane) {
+                    return Err(io::Error::other("wrong peer group acknowledgement"));
+                }
+                configure(&stream, self.timeout)?;
+                pair[lane as usize] = Some(stream);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -168,8 +234,16 @@ fn configure(stream: &TcpStream, timeout: Duration) -> io::Result<()> {
     stream.set_write_timeout(Some(timeout))
 }
 
-fn manifest_digest(members: &[Endpoint]) -> [u8; 32] {
+fn manifest_digest(version: Option<GroupVersion>, members: &[Endpoint]) -> [u8; 32] {
     let mut digest = Sha256::new();
+    match version {
+        Some(version) => {
+            digest.update([1]);
+            digest.update(version.group.0.as_bytes());
+            digest.update(version.epoch.to_le_bytes());
+        }
+        None => digest.update([0]),
+    }
     for member in members {
         match member.address {
             SocketAddr::V4(address) => {
@@ -190,7 +264,7 @@ fn manifest_digest(members: &[Endpoint]) -> [u8; 32] {
 
 fn greeting(manifest: &[u8; 32], source: usize, target: usize, lane: u8) -> [u8; 45] {
     let mut bytes = [0; 45];
-    bytes[..4].copy_from_slice(b"PLP1");
+    bytes[..4].copy_from_slice(b"PLP2");
     bytes[4..8].copy_from_slice(&(source as u32).to_le_bytes());
     bytes[8..12].copy_from_slice(&(target as u32).to_le_bytes());
     bytes[12..44].copy_from_slice(manifest);
@@ -242,11 +316,36 @@ impl Collective {
         header[20..].copy_from_slice(&[kind, dtype as u8, op as u8, stage]);
         header
     }
+
+    fn reduce(self, inputs: &[Vec<u8>]) -> Vec<u8> {
+        let (_, dtype, op, _) = self.wire();
+        if matches!(self, Collective::AllReduceFp8ToF32) {
+            reduce_fp8_to_f32(inputs)
+        } else {
+            reduce_bytes(op, dtype, inputs)
+        }
+    }
+}
+
+fn use_replicated_exchange(collective: Collective, bytes: usize, world: usize) -> bool {
+    if !matches!(
+        collective,
+        Collective::AllReduce(..) | Collective::AllReduceFp8ToF32
+    ) {
+        return false;
+    }
+    match world {
+        // One exchange of the complete input moves no more bytes than two
+        // shard rounds for two ranks. Bound the replicated host reduction.
+        2 => bytes <= TWO_RANK_REPLICATED_LIMIT,
+        _ => bytes.saturating_mul(world - 1) <= REPLICATED_BYTES_PER_RANK,
+    }
 }
 
 pub(crate) struct PeerGroup {
     slot: usize,
     links: Vec<Option<Link>>,
+    timeout: Duration,
     sequence: Mutex<u64>,
     failed: AtomicBool,
 }
@@ -298,11 +397,11 @@ impl PeerGroup {
         let stream = &self.link(peer).collective;
         // Order complete frames so large writes cannot block each other.
         if self.slot < peer {
-            write_frame(stream, header, outgoing)?;
-            read_frame(stream, peer, header, incoming)
+            frame::write(stream, header, outgoing)?;
+            frame::read(stream, peer, header, incoming)
         } else {
-            read_frame(stream, peer, header, incoming)?;
-            write_frame(stream, header, outgoing)
+            frame::read(stream, peer, header, incoming)?;
+            frame::write(stream, header, outgoing)
         }
     }
 
@@ -337,6 +436,22 @@ impl PeerGroup {
                 "unsupported host reduction",
             ));
         }
+        if use_replicated_exchange(collective, bytes, world) {
+            let header = collective.header(sequence, bytes, REPLICATED_EXCHANGE);
+            let mut inputs = vec![vec![0; bytes]; world];
+            inputs[self.slot].copy_from_slice(input);
+            for peer in self.partners() {
+                frame::exchange_duplex(
+                    &self.link(peer).collective,
+                    peer,
+                    &header,
+                    input,
+                    &mut inputs[peer],
+                    self.timeout,
+                )?;
+            }
+            return Ok(collective.reduce(&inputs));
+        }
         match collective {
             Collective::AllReduce(..)
             | Collective::ReduceScatter(..)
@@ -345,11 +460,7 @@ impl PeerGroup {
                 let own = ranges[self.slot].clone();
                 let inputs = self.contributions(&header, input, &ranges)?;
                 let fp8 = matches!(collective, Collective::AllReduceFp8ToF32);
-                let reduced = if fp8 {
-                    reduce_fp8_to_f32(&inputs)
-                } else {
-                    reduce_bytes(op, dtype, &inputs)
-                };
+                let reduced = collective.reduce(&inputs);
                 if matches!(collective, Collective::ReduceScatter(..)) {
                     return Ok(reduced);
                 }
@@ -439,7 +550,7 @@ impl PeerGroup {
         let link = self.link(peer);
         let mut queue = link.direct_write.lock().unwrap();
         if queue.is_none() {
-            let mut stream = link.direct.try_clone()?;
+            let stream = link.direct.try_clone()?;
             let group = Arc::downgrade(self);
             let (send, recv) = sync_channel::<DirectMessage>(8);
             // An NCCL caller can enqueue a send before posting its receive.
@@ -448,9 +559,7 @@ impl PeerGroup {
                 .name("plait-peer-send".to_owned())
                 .spawn(move || {
                     while let Ok(DirectMessage { dtype, payload }) = recv.recv() {
-                        if stream
-                            .write_all(&direct_header(dtype, payload.len()))
-                            .and_then(|()| stream.write_all(&payload))
+                        if frame::write(&stream, &direct_header(dtype, payload.len()), &payload)
                             .is_err()
                         {
                             if let Some(group) = group.upgrade() {
@@ -506,44 +615,11 @@ impl Drop for PeerGroup {
     }
 }
 
-fn write_frame(mut stream: &TcpStream, header: &[u8; 24], data: &[u8]) -> io::Result<()> {
-    stream.write_all(header)?;
-    stream.write_all(data)
-}
-
-fn read_frame(
-    mut stream: &TcpStream,
-    peer: usize,
-    expected: &[u8; 24],
-    data: &mut [u8],
-) -> io::Result<()> {
-    let mut incoming = [0; 24];
-    stream.read_exact(&mut incoming)?;
-    if incoming != *expected {
-        return Err(io::Error::other(format!(
-            "peer {peer} submitted a different collective descriptor, expected {}, received {}",
-            describe(expected),
-            describe(&incoming)
-        )));
-    }
-    stream.read_exact(data)
-}
-
 fn direct_header(dtype: DataType, bytes: usize) -> [u8; 9] {
     let mut header = [0; 9];
     header[0] = dtype as u8;
     header[1..].copy_from_slice(&(bytes as u64).to_le_bytes());
     header
-}
-
-fn describe(header: &[u8; 24]) -> String {
-    let sequence = u64::from_le_bytes(header[..8].try_into().unwrap());
-    let bytes = u64::from_le_bytes(header[8..16].try_into().unwrap());
-    let endpoint = u32::from_le_bytes(header[16..20].try_into().unwrap());
-    let [kind, dtype, op, stage] = header[20..].try_into().unwrap();
-    format!(
-        "[seq {sequence}, bytes {bytes}, op {kind}/{op}, dtype {dtype}, endpoint {endpoint}, stage {stage}]"
-    )
 }
 
 fn shard_ranges(bytes: usize, width: usize, world: usize) -> Vec<Range<usize>> {

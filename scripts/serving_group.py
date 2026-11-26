@@ -323,6 +323,7 @@ def run(
 ) -> int:
     control = Control(args.control_bin, args.control_peer, args.control_listen)
     version = {"group": list(bytes.fromhex(args.group_id)), "epoch": args.group_epoch}
+    version_tag = f"{args.group_id.lower()}@{args.group_epoch}"
     host = list(bytes.fromhex(args.host_id))
     identity = {"version": version, "holder": control.holder}
     gate = Gate()
@@ -356,7 +357,7 @@ def run(
             raise ControlError("duplicate device ordinal in group grants")
 
         server = group_proxy(
-            args.port_base, args.backend_port, gate, f"{args.group_id.lower()}@{args.group_epoch}",
+            args.port_base, args.backend_port, gate, version_tag,
             bind=args.proxy_host, role=args.role, kv_lease=args.kv_lease_seconds,
         )
         with socket.socket() as port_check:
@@ -368,8 +369,8 @@ def run(
         if should_stop():
             return 0
         gpus = ",".join(str(grant["device"]["ordinal"]) for grant in grants)
-        env["CUDA_VISIBLE_DEVICES"] = gpus
-        process = subprocess.Popen(command, env=env, start_new_session=True)
+        child_env = {**env, "CUDA_VISIBLE_DEVICES": gpus, "PLAIT_TP_GROUP_VERSION": version_tag}
+        process = subprocess.Popen(command, env=child_env, start_new_session=True)
         proxy_thread = threading.Thread(target=server.serve_forever, daemon=True)
         proxy_thread.start()
         deadline = time.monotonic() + args.startup_timeout

@@ -2411,13 +2411,31 @@ struct PyPeerListener(Option<PeerListener>);
 #[pymethods]
 impl PyPeerListener {
     #[new]
-    fn new(address: &str, ticket: [u8; 16]) -> PyResult<Self> {
+    #[pyo3(signature = (address, ticket, version=None))]
+    fn new(address: &str, ticket: [u8; 16], version: Option<&str>) -> PyResult<Self> {
         let address = address.parse().map_err(|error: std::net::AddrParseError| {
             pyo3::exceptions::PyValueError::new_err(error.to_string())
         })?;
-        let listener = PeerListener::bind(address, ticket)
-            .map_err(|error| pyo3::exceptions::PyOSError::new_err(error.to_string()))?;
-        Ok(Self(Some(listener)))
+        let listener = match version {
+            None => PeerListener::bind(address, ticket),
+            Some(version) => {
+                use plait_core::NodeId;
+                use plait_core::serving::{GroupId, GroupVersion};
+
+                let version_error = || {
+                    pyo3::exceptions::PyValueError::new_err(
+                        "expected a group version in the form <hex id>@<epoch>",
+                    )
+                };
+                let (group, epoch) = version.split_once('@').ok_or_else(version_error)?;
+                let group = GroupId(NodeId::from_hex(group).map_err(|_| version_error())?);
+                let epoch = epoch.parse::<u64>().map_err(|_| version_error())?;
+                PeerListener::bind_in_epoch(address, ticket, GroupVersion { group, epoch })
+            }
+        };
+        listener
+            .map(|listener| Self(Some(listener)))
+            .map_err(|error| pyo3::exceptions::PyOSError::new_err(error.to_string()))
     }
 
     fn endpoint(&self) -> PyResult<String> {

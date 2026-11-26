@@ -21,19 +21,30 @@ its digest, the slots at both ends, and the wire lane. A restarted worker
 has a new ticket. Slot numbers keep the vLLM tensor layout and determine the
 pairing order. Every participant uses the same startup protocol.
 
+The managed launcher sets `PLAIT_TP_GROUP_VERSION` from its committed launch
+claim. Plait includes the group ID and epoch in the manifest digest. Peers
+with different group versions fail the handshake. A managed replacement
+and its predecessor can hold separate communicators at the same time.
+
 ## Execute a collective
 
-In all-reduce, the workers divide the tensor into contiguous shards and
-assign one shard to each slot. In each round a worker exchanges directly
-with one partner. It receives that partner's contribution to its own shard
-and sends its contribution to the partner's shard. It reduces the received
-values in slot order and exchanges the completed shard with its peers.
-Reduce-scatter stops after the first exchange and reduction. All-gather
-exchanges complete input shards in slot order. Broadcast and reduce use the
-source or destination specified by that call.
+For small all-reduces, each worker sends its complete contribution to each
+peer and reduces the received values in slot order. A worker advances the
+send and receive on each link independently under one deadline. The planner
+uses this path up to 1 MiB of input for two workers. For larger groups it caps
+the replicated traffic per worker at 64 KiB.
 
-Before consuming a payload, each receiver checks the collective sequence,
-operation, dtype, size, and stage. The point-to-point lane is separate.
+Larger all-reduces divide the tensor into contiguous shards and assign one
+shard to each slot. In each round a worker sends its contribution to a
+partner's shard and receives that partner's contribution to its own shard.
+It reduces the received values in slot order and exchanges the completed
+shard with its peers. Reduce-scatter ends after the first phase.
+All-gather exchanges complete input shards in slot order. Broadcast and
+reduce use the source or destination specified by that call.
+
+Frame writes submit the header and payload together. Before consuming a
+payload, each receiver checks the collective sequence, operation, dtype,
+size, and stage. The point-to-point lane is separate.
 A send stages the payload and enqueues it for that peer, so opposing sends
 can be posted before either receive. The caller's stream is synchronized
 before device input is read. Collective calls return after the host exchange

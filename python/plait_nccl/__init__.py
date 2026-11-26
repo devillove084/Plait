@@ -166,7 +166,9 @@ class NCCLLibrary:
         ticket = secrets.token_bytes(16)
         listener = None
         try:
-            listener = _plait_nccl.PeerListener(address, ticket)
+            listener = _plait_nccl.PeerListener(
+                address, ticket, os.environ.get("PLAIT_TP_GROUP_VERSION")
+            )
             local = (listener.endpoint(), ticket)
         except (AttributeError, OSError, ValueError) as exc:
             local = str(exc)
