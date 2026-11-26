@@ -3,8 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use plait_core::OpId;
 use plait_core::serving::{
     GroupPhase, GroupVersion, HostedPdInstance, HostedPdIntent, HostedPdKv, HostedPdLaunch,
-    HostedPdPlacement, HostedPdPlanning, HostedPdReconfiguration, HostedPdRelease, HostedPortUse,
-    PdRoute, RouteSetId, ServingError, ServingOutcome, ServingResult, ServingRole,
+    HostedPdPlacement, HostedPdPlanning, HostedPdReconfiguration, HostedPdRecovery,
+    HostedPdRelease, HostedPortUse, PdRoute, RouteSetId, ServingError, ServingOutcome,
+    ServingResult, ServingRole,
 };
 
 use super::{Reservations, RouteSet, ServingState};
@@ -36,7 +37,7 @@ impl ServingState {
         }
         if model.is_empty()
             || current.is_some_and(|directory| directory.model != model)
-            || (paths.is_empty() && current.is_none_or(|directory| !directory.hosted))
+            || (paths.is_empty() && current.is_none_or(|directory| directory.hosted_kv.is_none()))
             || paths.iter().copied().collect::<BTreeSet<_>>().len() != paths.len()
         {
             return Err(ServingError::InvalidDirectory);
@@ -195,7 +196,7 @@ impl ServingState {
             .collect();
         HostedPdPlanning {
             revision: directory.map_or(0, |directory| directory.revision),
-            managed: directory.is_none_or(|directory| directory.hosted),
+            managed: directory.is_none_or(|directory| directory.hosted_kv.is_some()),
             pending: self.pending_hosted_pd_id(key),
             active,
             paths: self.routes(key).map_or_else(Vec::new, |directory| {
@@ -211,12 +212,40 @@ impl ServingState {
         let releases = self
             .routes
             .get(&key)
-            .filter(|directory| directory.hosted && directory.paths == planning.paths)
+            .filter(|directory| directory.hosted_kv.is_some() && directory.paths == planning.paths)
             .into_iter()
             .flat_map(|directory| route_versions(&directory.paths))
             .filter_map(|version| self.hosted_pd_release(version))
             .collect();
         HostedPdReconfiguration { planning, releases }
+    }
+
+    pub(crate) fn hosted_pd_recovery(&self, key: RouteSetId) -> Option<HostedPdRecovery> {
+        let directory = self.routes.get(&key)?;
+        let kv = directory.hosted_kv.clone()?;
+        let checkpoint = self
+            .group(directory.paths.first()?.prefill)?
+            .plan
+            .model
+            .clone();
+        let mut failed = BTreeMap::new();
+        for version in route_versions(&directory.paths) {
+            let view = self.group(version)?;
+            match view.phase {
+                GroupPhase::Active => {}
+                GroupPhase::Revoked | GroupPhase::Retired => {
+                    failed.insert(version, view.plan.role);
+                }
+                _ => return None,
+            }
+        }
+        (!failed.is_empty()).then(|| HostedPdRecovery {
+            planning: self.hosted_pd_planning(key),
+            checkpoint,
+            kv,
+            paths: directory.paths.clone(),
+            failed,
+        })
     }
 
     pub(super) fn hosted_pd_release(&self, version: GroupVersion) -> Option<HostedPdRelease> {
@@ -295,13 +324,21 @@ impl ServingState {
                     self.activate(version)
                         .expect("validated independent hosted activation");
                 }
+                let hosted_kv = intent.paths.first().map_or_else(
+                    || {
+                        self.routes
+                            .get(&key)
+                            .and_then(|directory| directory.hosted_kv.clone())
+                    },
+                    |path| Some(self.hosted_pd_launches[&path.prefill].kv.clone()),
+                );
                 self.routes.insert(
                     key,
                     RouteSet {
                         model: intent.model.clone(),
                         revision,
                         paths: intent.paths.clone(),
-                        hosted: true,
+                        hosted_kv,
                     },
                 );
                 for &removed in
@@ -527,6 +564,73 @@ mod tests {
         state
             .host_launch_ready(group, host, host, Some(&endpoint))
             .unwrap();
+    }
+
+    #[test]
+    fn hosted_pd_recovery_keeps_committed_paths_and_contract_after_retirement() {
+        let mut state = ServingState::default();
+        let p = placement(&mut state, 11, 1, 0, ServingRole::Prefill);
+        let d1 = placement(&mut state, 12, 2, 0, ServingRole::Decode);
+        let d2 = placement(&mut state, 13, 3, 0, ServingRole::Decode);
+        let paths = [&d1, &d2].map(|d| PdRoute {
+            prefill: version(&p),
+            decode: version(d),
+        });
+        let key = RouteSetId::for_model("served");
+        state
+            .prepare_hosted_pd(
+                OpId::new(key.0, 1),
+                "served",
+                0,
+                &kv(),
+                &[p.clone(), d1.clone(), d2.clone()],
+                &paths,
+            )
+            .unwrap();
+        for group in [&p, &d1, &d2] {
+            ready(&mut state, group);
+        }
+        let intent = state.hosted_pd_work().pop().unwrap();
+        state.resolve_hosted_pd(&intent, false).unwrap();
+        assert!(state.hosted_pd_recovery(key).is_none());
+
+        state.quiesce(version(&d1), GroupPhase::Revoked).unwrap();
+        let recovery = state.hosted_pd_recovery(key).unwrap();
+        assert_eq!(recovery.planning.revision, 1);
+        assert_eq!(recovery.planning.paths, [paths[1]]);
+        assert_eq!(recovery.paths, paths);
+        assert_eq!(
+            recovery.failed,
+            BTreeMap::from([(version(&d1), ServingRole::Decode)])
+        );
+        assert!(
+            recovery.planning.resources.workers.iter().any(|worker| {
+                worker.device.node == d1.recipe.api_host && worker.grant.is_some()
+            })
+        );
+
+        for group in [&p, &d1, &d2] {
+            let version = version(group);
+            if state.group(version).unwrap().phase == GroupPhase::Active {
+                state.quiesce(version, GroupPhase::Revoked).unwrap();
+            }
+            let workers = state
+                .group(version)
+                .unwrap()
+                .grants
+                .keys()
+                .copied()
+                .collect();
+            let host = group.recipe.api_host;
+            state.host_launch_stopped(version, host, host).unwrap();
+            state.retire(version, &workers).unwrap();
+        }
+        let recovery = state.hosted_pd_recovery(key).unwrap();
+        assert!(recovery.planning.paths.is_empty());
+        assert_eq!(recovery.paths, paths);
+        assert_eq!(recovery.failed.len(), 3);
+        assert_eq!(recovery.kv, kv());
+        assert_eq!(recovery.checkpoint, "checkpoint");
     }
 
     #[test]

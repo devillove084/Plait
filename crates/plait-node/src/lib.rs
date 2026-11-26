@@ -516,6 +516,9 @@ impl NodeState {
                             runtime.serving_hosted_pd_reconfiguration(key),
                         )
                     }
+                    ServingLookup::HostedPdRecovery(key) => {
+                        ServingView::HostedPdRecovery(runtime.serving_hosted_pd_recovery(key))
+                    }
                     ServingLookup::HostedPdTransition(key) => ServingView::HostedPdTransition(
                         runtime.serving_hosted_pd_transition_status(key),
                     ),

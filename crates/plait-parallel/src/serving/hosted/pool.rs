@@ -9,7 +9,7 @@ use plait_core::serving::{
 use serde::{Deserialize, Serialize};
 
 use super::super::{ServingCandidate, ServingForecast, SloProfile, valid_rate};
-use super::{HostedLinkLimit, HostedLinkPolicy, limit_hosted_ranks};
+use super::{HostedLinkLimit, HostedLinkPolicy, LinkEvidence, limit_hosted_ranks};
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -71,19 +71,23 @@ pub fn generate_hosted_candidates(
     policy: HostedLinkPolicy,
     links: &BTreeMap<(NodeId, NodeId), HostedLinkSample>,
 ) -> Result<Vec<(ServingCandidate, HostedRecipe)>, &'static str> {
-    generate_layouts(resources, planning, forecast, pool, policy, links, None)
+    let evidence = LinkEvidence {
+        policy,
+        now_ms: forecast.now_ms,
+        links,
+    };
+    generate_layouts(resources, planning, &forecast.model, pool, evidence, None)
 }
 
 pub(super) fn generate_layouts(
     resources: &ServingResources,
     planning: &HostedPlanning,
-    forecast: &ServingForecast,
+    checkpoint: &str,
     pool: &HostedPool,
-    policy: HostedLinkPolicy,
-    links: &BTreeMap<(NodeId, NodeId), HostedLinkSample>,
+    evidence: LinkEvidence<'_>,
     pd: Option<(ServingRole, &HostedPdKv)>,
 ) -> Result<Vec<(ServingCandidate, HostedRecipe)>, &'static str> {
-    policy.validate()?;
+    evidence.policy.validate()?;
     pool.validate(pd.is_some())?;
     let history = resources
         .groups
@@ -96,9 +100,9 @@ pub(super) fn generate_layouts(
         for layout in search_layouts(
             &hosts,
             size.tensor_parallel,
-            policy,
-            forecast.now_ms,
-            links,
+            evidence.policy,
+            evidence.now_ms,
+            evidence.links,
             pd.is_some(),
         ) {
             let api_host = layout.api_host.expect("layout has a host with free ports");
@@ -123,7 +127,7 @@ pub(super) fn generate_layouts(
             };
             let mut plan = GroupPlan {
                 role: pd.map_or(ServingRole::Aggregated, |(role, _)| role),
-                model: forecast.model.clone(),
+                model: checkpoint.to_owned(),
                 tensor_parallel: size.tensor_parallel,
                 pipeline_parallel: 1,
                 launch_digest: recipe.launch_digest(),

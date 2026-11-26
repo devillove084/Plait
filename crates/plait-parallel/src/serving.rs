@@ -16,7 +16,7 @@ pub use decoder::{
 pub use hosted::{
     HostedLinkLimit, HostedLinkPolicy, HostedPdDecision, HostedPdPool, HostedPdSelection,
     HostedPool, generate_hosted_candidates, limit_hosted_links, plan_hosted_pd,
-    plan_hosted_pd_with_releases,
+    plan_hosted_pd_recovery, plan_hosted_pd_with_releases,
 };
 
 #[derive(Clone, Copy, Deserialize, Serialize)]

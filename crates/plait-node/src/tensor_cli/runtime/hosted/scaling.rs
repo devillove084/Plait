@@ -1,4 +1,4 @@
-//! Drive hosted P/D planning from traffic observed at the configured ingresses.
+//! Drive hosted P/D recovery from committed group state and scaling from ingress demand.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -7,12 +7,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use plait_core::serving::{
-    GroupPhase, HostedPdPlanning, HostedPdReconfiguration, RouteSetId, ServingAction,
-    ServingLookup, ServingOperation, ServingOutcome, ServingView,
+    GroupPhase, HostedLinkSample, HostedPdPlanning, HostedPdReconfiguration, HostedPdRecovery,
+    RouteSetId, ServingAction, ServingLookup, ServingOperation, ServingOutcome, ServingView,
 };
 use plait_core::{NodeId, OpId};
 use plait_parallel::serving::{
-    GroupProfile, HostedLinkPolicy, HostedPdPool, ServingForecast, plan_hosted_pd_with_releases,
+    GroupProfile, HostedLinkPolicy, HostedPdPool, ServingForecast, plan_hosted_pd_recovery,
+    plan_hosted_pd_with_releases,
 };
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -27,7 +28,10 @@ use crate::hosted_probe;
 pub(super) struct Policy {
     model: String,
     checkpoint: String,
+    #[serde(default)]
     ingress: Vec<SocketAddr>,
+    #[serde(default)]
+    repair_on_failure: bool,
     window_ms: u64,
     stable_windows: usize,
     cooldown_ms: u64,
@@ -44,7 +48,7 @@ pub(super) fn validate(policies: &[Policy]) -> io::Result<()> {
         if policy.model.is_empty()
             || policy.checkpoint.is_empty()
             || !models.insert(&policy.model)
-            || unique.is_empty()
+            || (unique.is_empty() && !policy.repair_on_failure)
             || unique.len() != policy.ingress.len()
             || policy.ingress.iter().any(|address| {
                 address.port() == 0 || address.ip().is_unspecified() || address.ip().is_multicast()
@@ -202,6 +206,7 @@ async fn run_model(policy: Policy, peers: ControlPeers) -> io::Result<()> {
         model,
         checkpoint,
         ingress,
+        repair_on_failure,
         window_ms,
         stable_windows,
         cooldown_ms,
@@ -230,6 +235,35 @@ async fn run_model(policy: Policy, peers: ControlPeers) -> io::Result<()> {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
+        if repair_on_failure {
+            match control.query(ServingLookup::HostedPdRecovery(key)).await {
+                Ok(ServingView::HostedPdRecovery(Some(recovery))) => {
+                    evidence.reset();
+                    if let Err(error) = recover(
+                        &mut control,
+                        &model,
+                        &checkpoint,
+                        recovery,
+                        pool.clone(),
+                        link_policy,
+                    )
+                    .await
+                    {
+                        eprintln!("hosted P/D recovery for {model}: {error}");
+                    }
+                    continue;
+                }
+                Ok(ServingView::HostedPdRecovery(None)) => {}
+                other => {
+                    evidence.reset();
+                    eprintln!("reading hosted P/D recovery state for {model}: {other:?}");
+                    continue;
+                }
+            }
+        }
+        if ingress.is_empty() {
+            continue;
+        }
         let input = async {
             let snapshot = match control.query(lookup).await? {
                 ServingView::HostedPdPlanning(planning) => HostedPdReconfiguration {
@@ -311,6 +345,49 @@ async fn run_model(policy: Policy, peers: ControlPeers) -> io::Result<()> {
     }
 }
 
+async fn recover(
+    control: &mut GroupControl,
+    model: &str,
+    checkpoint: &str,
+    recovery: HostedPdRecovery,
+    pool: Arc<HostedPdPool>,
+    link_policy: HostedLinkPolicy,
+) -> io::Result<()> {
+    if recovery.planning.pending.is_some() {
+        return Ok(());
+    }
+    let links = collect_links(control, &recovery.planning).await?;
+    let now_ms = hosted_probe::now_ms()?;
+    let (alias, checkpoint) = (model.to_owned(), checkpoint.to_owned());
+    let planned = tokio::task::spawn_blocking(move || {
+        plan_hosted_pd_recovery(
+            &alias,
+            &checkpoint,
+            now_ms,
+            &recovery,
+            &pool,
+            link_policy,
+            &links,
+        )
+    })
+    .await
+    .map_err(io::Error::other)?
+    .map_err(io::Error::other)?;
+    if let Some(action) = planned {
+        let operation = ServingOperation {
+            id: OpId::new(NodeId::random(), 1),
+            action,
+        };
+        match control.apply(&operation).await? {
+            Ok(ServingOutcome::HostedPdStaged { revision }) => {
+                println!("hosted P/D recovery staged {model} at revision {revision}");
+            }
+            other => return Err(io::Error::other(format!("recovery proposal: {other:?}"))),
+        }
+    }
+    Ok(())
+}
+
 async fn decide(
     control: &mut GroupControl,
     model: &str,
@@ -327,18 +404,7 @@ async fn decide(
         releases,
     } = snapshot;
     let groups = current_profiles(control, &snapshot, &pool).await?;
-    let ServingView::HostedProbeEndpoints(endpoints) =
-        control.query(ServingLookup::HostedProbeEndpoints).await?
-    else {
-        return Err(io::Error::other("expected hosted link probes"));
-    };
-    let hosts = snapshot
-        .inventory
-        .hosts
-        .iter()
-        .map(|entry| entry.host)
-        .collect();
-    let links = hosted_probe::collect(endpoints, Some(&hosts)).await;
+    let links = collect_links(control, &snapshot).await?;
     let forecast = ServingForecast {
         model: checkpoint.to_owned(),
         demand_rps,
@@ -367,6 +433,24 @@ async fn decide(
     })
     .await
     .map_err(io::Error::other)?
+}
+
+async fn collect_links(
+    control: &mut GroupControl,
+    snapshot: &HostedPdPlanning,
+) -> io::Result<BTreeMap<(NodeId, NodeId), HostedLinkSample>> {
+    let ServingView::HostedProbeEndpoints(endpoints) =
+        control.query(ServingLookup::HostedProbeEndpoints).await?
+    else {
+        return Err(io::Error::other("expected hosted link probes"));
+    };
+    let hosts = snapshot
+        .inventory
+        .hosts
+        .iter()
+        .map(|entry| entry.host)
+        .collect();
+    Ok(hosted_probe::collect(endpoints, Some(&hosts)).await)
 }
 
 async fn current_profiles(

@@ -521,7 +521,8 @@ policy includes the following fields.
 | Field | Value |
 | --- | --- |
 | `model`, `checkpoint` | API alias and the serving plan's model identity. |
-| `ingress` | Private load listener addresses for all ingress processes serving this policy. |
+| `ingress` | Private load listener addresses for demand-based scaling. Omit for a repair-only policy. |
+| `repair_on_failure` | When enabled, restore failed roles in a committed hosted P/D directory even when no ingress is running. Defaults to `false`. |
 | `window_ms` | Interval between observations. |
 | `stable_windows` | Consecutive complete windows that must select the same plan. |
 | `cooldown_ms` | Delay after a deployment revision changes or a local attempt submits. |
@@ -540,6 +541,26 @@ the active role, launch profile, and TP size. Keep those measurements
 and the shared store budget current. The loop supplies observed demand
 to the planner and follows the normal staged rollout. Model capacity
 and startup time remain calibration inputs.
+
+### Restore a failed hosted P/D group
+
+Set `repair_on_failure` on a `pd_scaling` policy. Upgrade the voting
+nodes before enabling the policy. Each `window_ms` tick first checks for
+revoked or retired groups referenced by the committed directory. The
+policy can omit `ingress` when only recovery is needed. A failed slot
+uses the matching group ID and role in `pool.slots`. Each host advertises
+the profile names it can launch, with local settings for its own engine
+and devices. A replacement may use a different TP size from the failed
+group if the checkpoint and KV contract match.
+
+A repair preserves the paths and healthy group versions in the committed
+directory. The node stages a replacement for every failed endpoint in
+one operation. Healthy paths stay available during preparation. If no
+complete layout fits current device grants, host memory, ports and
+directed link evidence, the policy retries on a later tick. The normal
+readiness and revision checks still govern publication. Failed groups
+hold their old device grants until the regular release procedure finishes.
+To remove a slot permanently, publish a hosted directory without it.
 
 ### Change a role on an occupied device
 

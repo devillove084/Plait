@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use plait_core::serving::{
     ActiveGroup, ExecutionHostLiveness, GroupId, GroupPhase, GroupPlan, GroupResources,
     GroupVersion, GroupView, HostMemory, HostResources, HostedInventory, HostedPdIntent,
-    HostedPdLaunch, HostedPdTransition, HostedPdTransitionStatus, HostedProbeEndpoint,
+    HostedPdKv, HostedPdLaunch, HostedPdTransition, HostedPdTransitionStatus, HostedProbeEndpoint,
     HostedRecipe, PdRoute, ResidentOwner, ResolvedPdRoute, RouteDirectory, RouteSetId,
     ServingAction, ServingEndpoint, ServingError, ServingOperation, ServingOutcome, ServingReceipt,
     ServingResources, ServingResult, ServingRole, W4_MAX_ADMISSION_MS, W4DrainStatus,
@@ -53,7 +53,7 @@ struct RouteSet {
     model: String,
     revision: u64,
     paths: Vec<PdRoute>,
-    hosted: bool,
+    hosted_kv: Option<HostedPdKv>,
 }
 
 #[derive(Clone, Copy)]
@@ -1275,7 +1275,7 @@ impl ServingState {
     ) -> ServingResult {
         let id = RouteSetId::for_model(model);
         let previous = self.routes.get(&id);
-        if previous.is_some_and(|directory| directory.hosted)
+        if previous.is_some_and(|directory| directory.hosted_kv.is_some())
             || activate.is_some_and(|version| self.hosted_pd_launches.contains_key(&version))
             || paths
                 .iter()
@@ -1318,7 +1318,7 @@ impl ServingState {
                 model: model.to_owned(),
                 revision,
                 paths: paths.to_vec(),
-                hosted: false,
+                hosted_kv: None,
             },
         );
         Ok(ServingOutcome::RoutesPublished { revision })

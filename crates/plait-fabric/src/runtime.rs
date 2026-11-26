@@ -5,9 +5,10 @@ use plait_core::serving::{
     DecoderCheckpoint, DecoderClaim, DecoderDirectory, DecoderDrainStatus, DecoderFailover,
     DecoderReplayPage, DecoderRouteWork, DecoderSwitch, ExecutionHostLiveness, GroupVersion,
     GroupView, HostedAssignment, HostedManagedAssignment, HostedPdIntent, HostedPdPlanning,
-    HostedPdReconfiguration, HostedPdTransitionStatus, HostedPlanning, HostedProbeEndpoint,
-    ResidentOwner, RouteDirectory, RouteSetId, ServingAction, ServingOperation, ServingReceipt,
-    ServingResources, ServingResult, W4DrainStatus, WorkerDispatch, WorkerGrant,
+    HostedPdReconfiguration, HostedPdRecovery, HostedPdTransitionStatus, HostedPlanning,
+    HostedProbeEndpoint, ResidentOwner, RouteDirectory, RouteSetId, ServingAction,
+    ServingOperation, ServingReceipt, ServingResources, ServingResult, W4DrainStatus,
+    WorkerDispatch, WorkerGrant,
 };
 use plait_core::{
     AcceleratorKind, Command, ComputeTask, DeviceId, DeviceProfile, FuseKind, MembershipChange,
@@ -140,6 +141,10 @@ impl Runtime {
 
     pub fn serving_hosted_pd_reconfiguration(&self, key: RouteSetId) -> HostedPdReconfiguration {
         self.serving.hosted_pd_reconfiguration(key)
+    }
+
+    pub fn serving_hosted_pd_recovery(&self, key: RouteSetId) -> Option<HostedPdRecovery> {
+        self.serving.hosted_pd_recovery(key)
     }
 
     pub fn serving_hosted_pd_work(&self) -> Vec<HostedPdIntent> {

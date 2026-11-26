@@ -31,8 +31,8 @@ impl ServingState {
         if let Some(staged) = self.pending_hosted_pd_id(key) {
             return Err(ServingError::HostedPdInProgress { staged });
         }
-        let Some(current) =
-            current.filter(|directory| directory.hosted && !directory.paths.is_empty())
+        let Some(current) = current
+            .filter(|directory| directory.hosted_kv.is_some() && !directory.paths.is_empty())
         else {
             return Err(ServingError::InvalidDirectory);
         };
@@ -144,7 +144,7 @@ impl ServingState {
                 model: model.clone(),
                 revision: bridge_revision,
                 paths: bridge.paths.clone(),
-                hosted: true,
+                hosted_kv: Some(kv.clone()),
             },
         );
         preview.prepare_hosted_pd(

@@ -151,7 +151,7 @@ fn project(
     release: &[&HostedPdRelease],
     model: &str,
 ) -> Option<Projection> {
-    let (mut resources, mut inventory) = available(snapshot, bridge);
+    let (mut resources, mut inventory) = available(snapshot, &bridge.placements);
     let mut devices = BTreeSet::new();
     for retired in release {
         let position = inventory

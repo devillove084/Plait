@@ -293,6 +293,15 @@ pub struct HostedPdReconfiguration {
     pub releases: Vec<HostedPdRelease>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedPdRecovery {
+    pub planning: HostedPdPlanning,
+    pub checkpoint: String,
+    pub kv: HostedPdKv,
+    pub paths: Vec<PdRoute>,
+    pub failed: BTreeMap<GroupVersion, ServingRole>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedProbeEndpoint {
     pub host: NodeId,
@@ -1211,6 +1220,7 @@ pub enum ServingLookup {
     HostedPdPlanning(RouteSetId),
     HostedPdTransition(RouteSetId),
     HostedPdReconfiguration(RouteSetId),
+    HostedPdRecovery(RouteSetId),
 }
 
 /// A replica's locally applied state. A missing result may indicate replication lag.
@@ -1241,6 +1251,7 @@ pub enum ServingView {
     HostedPdPlanning(HostedPdPlanning),
     HostedPdTransition(Option<HostedPdTransitionStatus>),
     HostedPdReconfiguration(HostedPdReconfiguration),
+    HostedPdRecovery(Option<HostedPdRecovery>),
 }
 
 impl ServingOperation {

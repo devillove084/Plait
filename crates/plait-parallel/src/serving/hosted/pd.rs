@@ -14,7 +14,9 @@ use super::pool::{HostedPool, generate_layouts};
 use super::{HostedLinkPolicy, LinkEvidence, Traffic};
 
 mod reconfigure;
+mod recovery;
 use reconfigure::Reconfiguration;
+pub use recovery::plan_hosted_pd_recovery;
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -204,7 +206,10 @@ pub fn plan_hosted_pd_with_releases(
 ) -> Result<HostedPdSelection, &'static str> {
     forecast.validate()?;
     policy.validate()?;
-    pool.validate(model, forecast)?;
+    if !forecast.paths.is_empty() || !forecast.link_bytes_per_second.is_empty() {
+        return Err("hosted P/D requires planner-generated link profiles");
+    }
+    pool.validate(model, forecast.now_ms)?;
     if !snapshot.managed {
         return Err("hosted P/D planning requires a managed route directory");
     }
@@ -213,18 +218,7 @@ pub fn plan_hosted_pd_with_releases(
         now_ms: forecast.now_ms,
         links,
     };
-    let store = IpAddr::V4(*pool.kv.store.ip());
-    let matching: Vec<_> = snapshot
-        .inventory
-        .hosts
-        .iter()
-        .filter(|entry| entry.address == store)
-        .map(|entry| entry.host)
-        .collect();
-    let [store_host] = matching.as_slice() else {
-        return Err("the KV store address must match one registered host");
-    };
-    let store_host = *store_host;
+    let store_host = pool.store_host(&snapshot.inventory)?;
     let profiles: BTreeMap<_, _> = forecast
         .groups
         .iter()
@@ -380,14 +374,13 @@ impl Search<'_> {
                     trial.add(retained.clone());
                     retain(&mut next, trial, forecast, pool);
                 }
-                let (resources, inventory) = available(snapshot, layout);
+                let (resources, inventory) = available(snapshot, &layout.placements);
                 for (candidate, recipe) in generate_layouts(
                     &resources,
                     &inventory,
-                    forecast,
+                    &forecast.model,
                     &slot.pool,
-                    evidence.policy,
-                    evidence.links,
+                    evidence,
                     Some((slot.role, &pool.kv)),
                 )? {
                     let Ok(version) = validate_placement(
@@ -457,17 +450,24 @@ impl HostedPdPool {
         slot.pool.capacity(profile, tensor_parallel)
     }
 
-    fn validate(&self, model: &str, forecast: &ServingForecast) -> Result<(), &'static str> {
+    fn store_host(&self, inventory: &HostedPlanning) -> Result<NodeId, &'static str> {
+        let address = IpAddr::V4(*self.kv.store.ip());
+        let mut matches = inventory
+            .hosts
+            .iter()
+            .filter(|entry| entry.address == address);
+        let host = matches.next().filter(|_| matches.next().is_none());
+        host.map(|entry| entry.host)
+            .ok_or("the KV store address must match one registered host")
+    }
+
+    fn validate(&self, model: &str, now_ms: u64) -> Result<(), &'static str> {
         if model.is_empty()
             || self.kv_bytes_per_request == 0
             || self.store_bytes_per_second == 0
-            || self.store_valid_until_ms <= forecast.now_ms
-            || !forecast.paths.is_empty()
-            || !forecast.link_bytes_per_second.is_empty()
+            || self.store_valid_until_ms <= now_ms
         {
-            return Err(
-                "hosted P/D requires current store capacity and planner-generated link profiles",
-            );
+            return Err("hosted P/D requires current store capacity");
         }
         let mut groups = BTreeSet::new();
         for slot in &self.slots {
@@ -639,11 +639,14 @@ fn retain(beam: &mut Beam, mut layout: Layout, forecast: &ServingForecast, pool:
     choices.truncate(LAYOUTS_PER_SHAPE);
 }
 
-fn available(snapshot: &HostedPdPlanning, layout: &Layout) -> (ServingResources, HostedPlanning) {
+fn available(
+    snapshot: &HostedPdPlanning,
+    placements: &[HostedPdPlacement],
+) -> (ServingResources, HostedPlanning) {
     let mut resources = snapshot.resources.clone();
     let mut inventory = snapshot.inventory.clone();
     let mut used = BTreeSet::new();
-    for placement in &layout.placements {
+    for placement in placements {
         used.extend(placement.plan.workers.keys().copied());
         inventory
             .occupied
