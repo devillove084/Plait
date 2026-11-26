@@ -8,8 +8,9 @@ mod pd;
 mod pipeline;
 mod pool;
 pub use pd::{
-    HostedPdDecision, HostedPdIncumbents, HostedPdPool, HostedPdSelection, plan_hosted_pd,
-    plan_hosted_pd_recovery, plan_hosted_pd_with_assignments, plan_hosted_pd_with_releases,
+    HostedModePolicy, HostedPdDecision, HostedPdIncumbents, HostedPdPool, HostedPdSelection,
+    plan_hosted_pd, plan_hosted_pd_recovery, plan_hosted_pd_with_assignments,
+    plan_hosted_pd_with_releases, plan_hosted_serving,
 };
 pub use pool::{HostedPool, generate_hosted_candidates};
 

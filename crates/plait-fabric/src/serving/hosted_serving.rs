@@ -4,8 +4,8 @@ use plait_core::OpId;
 use plait_core::serving::{
     GroupPhase, GroupVersion, GroupView, HostedPdKv, HostedPdLaunch, HostedPdPlacement,
     HostedPortUse, HostedRecipe, HostedRoute, HostedRouteDirectory, HostedServingIntent,
-    HostedServingPlan, PdRoute, RouteSetId, ServingError, ServingOutcome, ServingResult,
-    ServingRole,
+    HostedServingPlan, HostedServingPlanning, PdRoute, RouteSetId, ServingError, ServingOutcome,
+    ServingResult, ServingRole,
 };
 
 use super::{Reservations, RouteSet, ServingState};
@@ -27,6 +27,44 @@ impl RouteSet {
 }
 
 impl ServingState {
+    pub(crate) fn hosted_serving_planning(&self, key: RouteSetId) -> HostedServingPlanning {
+        let directory = self.routes.get(&key);
+        let split = self.hosted_pd_planning(key);
+        let committed: Vec<_> = directory
+            .into_iter()
+            .flat_map(RouteSet::hosted_routes)
+            .collect();
+        let versions = route_groups(&committed);
+        let assignments = versions
+            .into_iter()
+            .filter_map(|version| {
+                let view = self
+                    .group(version)
+                    .filter(|view| view.phase == GroupPhase::Active)?;
+                let recipe = self.hosted_recipes.get(&version)?;
+                Some((
+                    version,
+                    plait_core::serving::HostedAssignment {
+                        version,
+                        model: view.plan.model.clone(),
+                        tensor_parallel: view.plan.tensor_parallel,
+                        phase: view.phase,
+                        holder: None,
+                        recipe: recipe.clone(),
+                    },
+                ))
+            })
+            .collect();
+        HostedServingPlanning {
+            managed: directory.is_none_or(|current| {
+                !current.aggregated.is_empty() || current.hosted_kv.is_some()
+            }),
+            split,
+            committed,
+            assignments,
+        }
+    }
+
     pub(crate) fn hosted_routes(&self, key: RouteSetId) -> Option<HostedRouteDirectory> {
         let directory = self.routes.get(&key)?;
         let aggregated = directory

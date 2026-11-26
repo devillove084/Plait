@@ -5,6 +5,8 @@ use plait_core::serving::{
     GroupVersion, HostedLinkSample, HostedPdPlacement, HostedPdRecovery, PdRoute, ServingAction,
 };
 
+use super::super::pool::PoolTarget;
+
 use super::{
     EndpointContext, HostedLinkPolicy, HostedPdPool, LAYOUTS_PER_SHAPE, LinkEvidence, Traffic,
     available, generate_layouts, validate_placement,
@@ -55,7 +57,7 @@ pub fn plan_hosted_pd_recovery(
     };
     let context = EndpointContext {
         evidence,
-        store_host,
+        store_host: Some(store_host),
         kv_bytes: pool.kv_bytes_per_request,
     };
     let mut layouts = vec![RecoveryLayout {
@@ -99,7 +101,7 @@ pub fn plan_hosted_pd_recovery(
                 checkpoint,
                 &slot.pool,
                 evidence,
-                Some((role, &pool.kv)),
+                PoolTarget::Split(role, &pool.kv),
             )? {
                 let Ok(version) = validate_placement(
                     &resources,

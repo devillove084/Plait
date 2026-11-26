@@ -5,17 +5,19 @@ use plait_core::NodeId;
 use plait_core::serving::{
     GroupId, GroupPhase, GroupVersion, HostedAssignment, HostedLinkSample, HostedPdInstance,
     HostedPdKv, HostedPdPlacement, HostedPdPlanning, HostedPdRelease, HostedPdStage,
-    HostedPlanning, HostedPortUse, HostedRecipe, PdRoute, ServingAction, ServingResources,
-    ServingRole,
+    HostedPlanning, HostedPortUse, HostedRecipe, HostedRoute, PdRoute, ServingAction,
+    ServingResources, ServingRole,
 };
 use serde::{Deserialize, Serialize};
 
 use super::super::{ServingCandidate, ServingForecast, SloProfile, validate_placement};
 use super::pipeline::{PipelineProfile, lower_capacity};
-use super::pool::{HostedPool, generate_layouts};
+use super::pool::{HostedPool, PoolTarget, generate_layouts};
 use super::{HostedLinkPolicy, LinkEvidence, Traffic};
 
+mod modes;
 mod reconfigure;
+pub use modes::{HostedModePolicy, plan_hosted_serving};
 mod recovery;
 use reconfigure::Reconfiguration;
 pub use recovery::plan_hosted_pd_recovery;
@@ -181,14 +183,32 @@ struct Endpoint {
 struct Layout {
     endpoints: Vec<Endpoint>,
     placements: Vec<HostedPdPlacement>,
-    roles: (usize, usize),
+    roles: Roles,
     ready_after_ms: u64,
     transition_loss_requests: f64,
     potential: f64,
 }
 
 const LAYOUTS_PER_SHAPE: usize = 8;
-type Beam = BTreeMap<(usize, usize), Vec<Layout>>;
+type Beam = BTreeMap<Roles, Vec<Layout>>;
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct Roles {
+    aggregated: usize,
+    prefill: usize,
+    decode: usize,
+}
+
+impl Roles {
+    fn complete(self) -> bool {
+        (self.prefill > 0 && self.decode > 0)
+            || (self.aggregated > 0 && self.prefill == 0 && self.decode == 0)
+    }
+
+    fn has_split(self) -> bool {
+        self.prefill > 0 && self.decode > 0
+    }
+}
 
 pub fn plan_hosted_pd(
     model: &str,
@@ -256,7 +276,7 @@ pub fn plan_hosted_pd_with_assignments(
     let store_host = pool.store_host(&snapshot.inventory)?;
     let context = EndpointContext {
         evidence,
-        store_host,
+        store_host: Some(store_host),
         kv_bytes: pool.kv_bytes_per_request,
     };
     let profiles: BTreeMap<_, _> = forecast
@@ -332,6 +352,7 @@ pub fn plan_hosted_pd_with_assignments(
         forecast,
         pool,
         context,
+        aggregate: &[],
     };
     let layouts = search.layouts(snapshot, &active)?;
 
@@ -394,6 +415,7 @@ struct Search<'a> {
     forecast: &'a ServingForecast,
     pool: &'a HostedPdPool,
     context: EndpointContext<'a>,
+    aggregate: &'a [HostedPool],
 }
 
 impl Search<'_> {
@@ -410,12 +432,21 @@ impl Search<'_> {
             forecast,
             pool,
             context,
+            aggregate,
         } = *self;
-        let mut slots: Vec<_> = pool.slots.iter().collect();
-        slots.sort_by_key(|slot| slot.role == ServingRole::Decode);
-        let mut beam = Beam::from([((0, 0), vec![Layout::default()])]);
-        for slot in slots {
-            let group = slot.pool.group();
+        let mut split: Vec<_> = pool.slots.iter().collect();
+        split.sort_by_key(|slot| slot.role == ServingRole::Decode);
+        let slots = aggregate
+            .iter()
+            .map(|slot| (ServingRole::Aggregated, slot))
+            .chain(split.into_iter().map(|slot| (slot.role, &slot.pool)));
+        let mut beam = Beam::from([(Roles::default(), vec![Layout::default()])]);
+        for (role, slot) in slots {
+            let group = slot.group();
+            let target = match role {
+                ServingRole::Aggregated => PoolTarget::RoutedAggregate,
+                role => PoolTarget::Split(role, &pool.kv),
+            };
             let history = snapshot
                 .resources
                 .groups
@@ -440,7 +471,7 @@ impl Search<'_> {
                 {
                     continue;
                 }
-                if let Some(retained) = active.get(&group).filter(|entry| entry.role == slot.role) {
+                if let Some(retained) = active.get(&group).filter(|entry| entry.role == role) {
                     let mut trial = layout.clone();
                     trial.add(retained.clone());
                     retain(&mut next, trial, forecast, pool);
@@ -450,9 +481,9 @@ impl Search<'_> {
                     &resources,
                     &inventory,
                     &forecast.model,
-                    &slot.pool,
+                    slot,
                     context.evidence,
-                    Some((slot.role, &pool.kv)),
+                    target,
                 )? {
                     let Ok(version) = validate_placement(
                         &resources,
@@ -463,8 +494,7 @@ impl Search<'_> {
                     ) else {
                         continue;
                     };
-                    let Some(endpoint) =
-                        context.candidate(version, &candidate, &recipe, &slot.pool)
+                    let Some(endpoint) = context.candidate(version, &candidate, &recipe, slot)
                     else {
                         continue;
                     };
@@ -486,7 +516,7 @@ impl Search<'_> {
         }
         Ok(beam
             .into_iter()
-            .filter(|((p, d), _)| *p != 0 && *d != 0)
+            .filter(|(roles, _)| roles.complete())
             .flat_map(|(_, layouts)| layouts)
             .collect())
     }
@@ -600,7 +630,7 @@ fn active_pipeline_parallel(
 #[derive(Clone, Copy)]
 struct EndpointContext<'a> {
     evidence: LinkEvidence<'a>,
-    store_host: NodeId,
+    store_host: Option<NodeId>,
     kv_bytes: u64,
 }
 
@@ -650,15 +680,18 @@ impl EndpointContext<'_> {
         } else {
             (self.evidence.tp_traffic(ranks).ok()?, ranks.clone())
         };
-        let total: u64 = weights.values().sum();
-        for (host, weight) in weights {
-            let bytes = self.kv_bytes as f64 * weight as f64 / total as f64;
-            let (from, to) = if role == ServingRole::Prefill {
-                (host, self.store_host)
-            } else {
-                (self.store_host, host)
-            };
-            self.evidence.add(&mut traffic, from, to, bytes).ok()?;
+        if role != ServingRole::Aggregated {
+            let store = self.store_host?;
+            let total: u64 = weights.values().sum();
+            for (host, weight) in weights {
+                let bytes = self.kv_bytes as f64 * weight as f64 / total as f64;
+                let (from, to) = if role == ServingRole::Prefill {
+                    (host, store)
+                } else {
+                    (store, host)
+                };
+                self.evidence.add(&mut traffic, from, to, bytes).ok()?;
+            }
         }
         Some(Endpoint {
             version,
@@ -705,42 +738,71 @@ fn rate<'a>(
     at: u64,
     endpoints: impl IntoIterator<Item = (&'a Endpoint, f64)>,
 ) -> Option<f64> {
-    if pool.store_valid_until_ms <= at {
-        return None;
-    }
-    let mut result = forecast
-        .demand_rps
-        .min(pool.store_bytes_per_second as f64 / (2.0 * pool.kv_bytes_per_request as f64));
+    let mut result = forecast.demand_rps;
     let mut traffic = Traffic::new();
+    let (mut writes, mut reads) = (0.0f64, 0.0f64);
     for (endpoint, share) in endpoints {
         if !endpoint.capacity.is_valid(at) {
             return None;
         }
+        match endpoint.role {
+            ServingRole::Prefill => writes += share,
+            ServingRole::Decode => reads += share,
+            ServingRole::Aggregated => {}
+        }
         result = result.min(endpoint.capacity.rps / share);
         traffic.include(&endpoint.traffic, share);
+    }
+    // A partial search layout has a virtual counterpart for its P or D.
+    let store_fraction = writes.max(reads);
+    if store_fraction > 0.0 {
+        if pool.store_valid_until_ms <= at {
+            return None;
+        }
+        result = result.min(
+            pool.store_bytes_per_second as f64
+                / (2.0 * pool.kv_bytes_per_request as f64 * store_fraction),
+        );
     }
     Some(result.min(traffic.rate_limit()))
 }
 
 impl Layout {
     fn shares(&self) -> impl Iterator<Item = (&Endpoint, f64)> {
-        self.endpoints.iter().map(|entry| {
-            let count = if entry.role == ServingRole::Prefill {
-                self.roles.0
-            } else {
-                self.roles.1
+        let p = self.roles.prefill.max(1);
+        let d = self.roles.decode.max(1);
+        let split = if self.roles.prefill > 0 || self.roles.decode > 0 {
+            p * d
+        } else {
+            0
+        };
+        let total = (self.roles.aggregated + split) as f64;
+        self.endpoints.iter().map(move |entry| {
+            let routes = match entry.role {
+                ServingRole::Prefill => d,
+                ServingRole::Decode => p,
+                ServingRole::Aggregated => 1,
             };
-            (entry, 1.0 / count as f64)
+            (entry, routes as f64 / total)
         })
     }
 
     fn add(&mut self, endpoint: Endpoint) {
-        if endpoint.role == ServingRole::Prefill {
-            self.roles.0 += 1;
-        } else {
-            self.roles.1 += 1;
+        match endpoint.role {
+            ServingRole::Prefill => self.roles.prefill += 1,
+            ServingRole::Decode => self.roles.decode += 1,
+            ServingRole::Aggregated => self.roles.aggregated += 1,
         }
         self.endpoints.push(endpoint);
+    }
+
+    fn routes(&self) -> Vec<HostedRoute> {
+        self.endpoints
+            .iter()
+            .filter(|endpoint| endpoint.role == ServingRole::Aggregated)
+            .map(|endpoint| HostedRoute::Aggregated(endpoint.version))
+            .chain(self.paths().into_iter().map(HostedRoute::Split))
+            .collect()
     }
 
     fn paths(&self) -> Vec<PdRoute> {
@@ -1173,7 +1235,7 @@ mod tests {
         };
         let source = EndpointContext {
             evidence,
-            store_host: store,
+            store_host: Some(store),
             kv_bytes: 200,
         }
         .endpoint(

@@ -143,6 +143,13 @@ impl Runtime {
         self.serving.hosted_serving_pending(key)
     }
 
+    pub fn serving_mode_planning(
+        &self,
+        key: RouteSetId,
+    ) -> plait_core::serving::HostedServingPlanning {
+        self.serving.hosted_serving_planning(key)
+    }
+
     pub fn serving_hosted_work(&self) -> Vec<HostedServingIntent> {
         self.serving.hosted_serving_work()
     }

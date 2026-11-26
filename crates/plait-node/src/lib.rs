@@ -526,6 +526,9 @@ impl NodeState {
                     ServingLookup::HostedServingPending(key) => {
                         ServingView::HostedServingPending(runtime.serving_hosted_pending(key))
                     }
+                    ServingLookup::HostedServingPlanning(key) => {
+                        ServingView::HostedServingPlanning(runtime.serving_mode_planning(key))
+                    }
                     ServingLookup::HostedPdPlanning(key) => {
                         ServingView::HostedPdPlanning(runtime.serving_hosted_pd_planning(key))
                     }

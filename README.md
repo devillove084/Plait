@@ -197,9 +197,11 @@ The managed ingress accepts aggregate vLLM routes and split Prefill/Decode
 routes under the same model alias. `prepare_hosted_serving` accepts both
 route types in one revision. The voters publish after all referenced groups
 are ready, and requests already admitted by a removed group can drain there.
-The hosted P/D planner continues to manage directories containing only split
-routes. Shape changes between aggregate and split currently take an explicit
-plan.
+Set `serving_modes` in a `pd_scaling` policy to compare aggregate, split,
+and mixed targets against observed ingress load. Configure `aggregate_slots`
+with the same pool format as the split slots. The policy scores shared NIC
+and KV-store budgets at the ingress path shares, and charges startup and drain
+against a configurable value per reclaimed device-second.
 
 For the legacy rendezvous, `PLAIT_NCCL_SHM=1` enables the host-mapped local
 path and `PLAIT_NCCL_KERNEL=1` enables the single-stream GPU allreduce path.
@@ -255,6 +257,7 @@ release the result after the matching completion has executed in the control pla
 | [Hosted pool reservations](specs/PlaitHostedPool.tla) | A placement is checked against current inventory when prepared. Competing placements cannot reserve the same devices or API ports, including while a revoked group awaits retirement. |
 | [Hosted P/D publication](specs/PlaitHostedPd.tla) | Both roles cut over in one publication after their participants report readiness. Candidate failure or a changed directory revision prevents a stale cutover. |
 | [Hosted serving modes](specs/PlaitHostedServingModes.tla) | An aggregate, a split path, or both can be published in one revision after all target groups are ready. Removed groups drain admitted requests before retiring. |
+| [Hosted mode selection](specs/PlaitHostedModeSelection.tla) | Mixed routes fit the combined port and KV-store budgets. A switch preserves the incumbent SLO rate and has positive benefit after startup and drain. |
 | [Hosted P/D budgeting](specs/PlaitHostedPdBudget.tla) | Equal path shares consume the same Prefill and directional port budgets. The model checks combined TP and KV demand on shared ports. |
 | [Hosted pipeline placement](specs/PlaitHostedPipelinePlacement.tla) | An API-first grant order assigns workers to the intended stage. A two-stage plan fits device and host memory, and the sum of TP, PP, and KV traffic fits the shared port. |
 | [Hosted P/D scaling](specs/PlaitHostedPdScale.tla) | A proposed change uses repeated observations from the current ingress session and directory revision. Publication starts a new cooldown. |
@@ -269,7 +272,7 @@ release the result after the matching completion has executed in the control pla
 | [Prefill to Decode handoff](specs/PlaitKvHandoff.tla) | The receipt matches the request context. Decode emits output after loading the required pages, including when the shared store can reset between admission and load. |
 | [P/D stream replay](specs/PlaitPdStreamReplay.tla) | A failed Decode version is excluded. Each attempt releases its own handoff, and suffix output follows a checked prefix. |
 
-TLC 2.19 passes all 48 configurations. The ordered publication configuration
+TLC 2.19 passes all 49 configurations. The ordered publication configuration
 explores 70,968 distinct states. Run the suite with `tlc` on your `PATH`.
 
 ```sh

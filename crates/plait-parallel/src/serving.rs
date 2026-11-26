@@ -14,9 +14,10 @@ pub use decoder::{
     DecoderLayoutCandidate, DecoderPlacement, DecoderSelection, select_decoder_layout,
 };
 pub use hosted::{
-    HostedLinkLimit, HostedLinkPolicy, HostedPdDecision, HostedPdIncumbents, HostedPdPool,
-    HostedPdSelection, HostedPool, generate_hosted_candidates, limit_hosted_links, plan_hosted_pd,
-    plan_hosted_pd_recovery, plan_hosted_pd_with_assignments, plan_hosted_pd_with_releases,
+    HostedLinkLimit, HostedLinkPolicy, HostedModePolicy, HostedPdDecision, HostedPdIncumbents,
+    HostedPdPool, HostedPdSelection, HostedPool, generate_hosted_candidates, limit_hosted_links,
+    plan_hosted_pd, plan_hosted_pd_recovery, plan_hosted_pd_with_assignments,
+    plan_hosted_pd_with_releases, plan_hosted_serving,
 };
 
 #[derive(Clone, Copy, Deserialize, Serialize)]

@@ -74,6 +74,22 @@ struct Layout {
 pub(super) const LAYOUTS_PER_BUCKET: usize = 16;
 type Search = BTreeMap<(u32, usize, bool), Vec<Layout>>;
 
+#[derive(Clone, Copy)]
+pub(super) enum PoolTarget<'a> {
+    LegacyAggregate,
+    RoutedAggregate,
+    Split(ServingRole, &'a HostedPdKv),
+}
+
+impl PoolTarget<'_> {
+    fn role(self) -> ServingRole {
+        match self {
+            Self::LegacyAggregate | Self::RoutedAggregate => ServingRole::Aggregated,
+            Self::Split(role, _) => role,
+        }
+    }
+}
+
 pub fn generate_hosted_candidates(
     resources: &ServingResources,
     planning: &HostedPlanning,
@@ -87,7 +103,14 @@ pub fn generate_hosted_candidates(
         now_ms: forecast.now_ms,
         links,
     };
-    generate_layouts(resources, planning, &forecast.model, pool, evidence, None)
+    generate_layouts(
+        resources,
+        planning,
+        &forecast.model,
+        pool,
+        evidence,
+        PoolTarget::LegacyAggregate,
+    )
 }
 
 pub(super) fn generate_layouts(
@@ -96,10 +119,11 @@ pub(super) fn generate_layouts(
     checkpoint: &str,
     pool: &HostedPool,
     evidence: LinkEvidence<'_>,
-    pd: Option<(ServingRole, &HostedPdKv)>,
+    target: PoolTarget<'_>,
 ) -> Result<Vec<(ServingCandidate, HostedRecipe)>, &'static str> {
     evidence.policy.validate()?;
-    pool.validate(pd.is_some())?;
+    let allow_local = !matches!(target, PoolTarget::LegacyAggregate);
+    pool.validate(allow_local)?;
     let history = resources
         .groups
         .iter()
@@ -114,7 +138,7 @@ pub(super) fn generate_layouts(
             evidence.policy,
             evidence.now_ms,
             evidence.links,
-            pd.is_some(),
+            allow_local,
         ) {
             let api_host = layout.api_host.expect("layout has a host with free ports");
             let [master_port, http_port, backend_port] = hosts[&api_host]
@@ -137,7 +161,7 @@ pub(super) fn generate_layouts(
                 prefix_caching: pool.prefix_caching,
             };
             let mut plan = GroupPlan {
-                role: pd.map_or(ServingRole::Aggregated, |(role, _)| role),
+                role: target.role(),
                 model: checkpoint.to_owned(),
                 tensor_parallel: size.tensor_parallel,
                 pipeline_parallel: 1,
@@ -160,7 +184,7 @@ pub(super) fn generate_layouts(
                         )
                     }));
             }
-            bind_launch(&mut plan, &recipe, pd)?;
+            bind_launch(&mut plan, &recipe, target)?;
             candidates.push((
                 ServingCandidate {
                     group: pool.group,
@@ -200,7 +224,7 @@ pub(super) fn generate_layouts(
                 prefix_caching: pool.prefix_caching,
             };
             let mut plan = GroupPlan {
-                role: pd.expect("pipelines are enabled only for P/D").0,
+                role: target.role(),
                 model: checkpoint.to_owned(),
                 tensor_parallel: pipeline.tensor_parallel,
                 pipeline_parallel: pipeline.stages.len() as u32,
@@ -208,7 +232,7 @@ pub(super) fn generate_layouts(
                 workers: layout.workers,
                 hosts: layout.hosts,
             };
-            bind_launch(&mut plan, &recipe, pd)?;
+            bind_launch(&mut plan, &recipe, target)?;
             candidates.push((
                 ServingCandidate {
                     group: pool.group,
@@ -228,9 +252,9 @@ pub(super) fn generate_layouts(
 fn bind_launch(
     plan: &mut GroupPlan,
     recipe: &HostedRecipe,
-    pd: Option<(ServingRole, &HostedPdKv)>,
+    target: PoolTarget<'_>,
 ) -> Result<(), &'static str> {
-    if let Some((role, kv)) = pd {
+    if let PoolTarget::Split(role, kv) = target {
         let launch = HostedPdLaunch {
             role,
             kv: kv.clone(),
@@ -241,9 +265,12 @@ fn bind_launch(
             .map_err(|_| "invalid hosted P/D pool recipe")
     } else {
         plan.launch_digest = recipe.launch_digest();
-        recipe
-            .validate(plan)
-            .map_err(|_| "invalid hosted pool recipe")
+        if matches!(target, PoolTarget::RoutedAggregate) {
+            recipe.validate_aggregated_route(plan)
+        } else {
+            recipe.validate(plan)
+        }
+        .map_err(|_| "invalid hosted pool recipe")
     }
 }
 

@@ -8,13 +8,13 @@ use std::time::{Duration, Instant};
 
 use plait_core::serving::{
     GroupPhase, GroupVersion, HostedAssignment, HostedLinkSample, HostedPdPlanning,
-    HostedPdReconfiguration, HostedPdRecovery, RouteSetId, ServingAction, ServingLookup,
-    ServingOperation, ServingOutcome, ServingView,
+    HostedPdReconfiguration, HostedPdRecovery, HostedServingPlanning, RouteSetId, ServingAction,
+    ServingLookup, ServingOperation, ServingOutcome, ServingView,
 };
 use plait_core::{NodeId, OpId};
 use plait_parallel::serving::{
-    GroupProfile, HostedLinkPolicy, HostedPdIncumbents, HostedPdPool, ServingForecast,
-    plan_hosted_pd_recovery, plan_hosted_pd_with_assignments,
+    GroupProfile, HostedLinkPolicy, HostedModePolicy, HostedPdIncumbents, HostedPdPool,
+    ServingForecast, plan_hosted_pd_recovery, plan_hosted_pd_with_assignments, plan_hosted_serving,
 };
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -39,6 +39,7 @@ pub(super) struct Policy {
     horizon_ms: u64,
     minimum_gain_requests: f64,
     pool: HostedPdPool,
+    serving_modes: Option<HostedModePolicy>,
     link_policy: HostedLinkPolicy,
 }
 
@@ -49,7 +50,7 @@ pub(super) fn validate(policies: &[Policy]) -> io::Result<()> {
         if policy.model.is_empty()
             || policy.checkpoint.is_empty()
             || !models.insert(&policy.model)
-            || (unique.is_empty() && !policy.repair_on_failure)
+            || (unique.is_empty() && (!policy.repair_on_failure || policy.serving_modes.is_some()))
             || unique.len() != policy.ingress.len()
             || policy.ingress.iter().any(|address| {
                 address.port() == 0 || address.ip().is_unspecified() || address.ip().is_multicast()
@@ -64,6 +65,11 @@ pub(super) fn validate(policies: &[Policy]) -> io::Result<()> {
                 io::ErrorKind::InvalidInput,
                 "invalid hosted P/D scaling policy",
             ));
+        }
+        if let Some(modes) = &policy.serving_modes {
+            modes
+                .validate(&policy.model)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         }
     }
     Ok(())
@@ -111,6 +117,20 @@ impl Counters {
 type Cohort = BTreeMap<SocketAddr, Counters>;
 
 type Proposal = ServingAction;
+
+enum Planning {
+    Split(HostedPdReconfiguration),
+    Modes(HostedServingPlanning),
+}
+
+impl Planning {
+    fn directory(&self) -> &HostedPdPlanning {
+        match self {
+            Self::Split(snapshot) => &snapshot.planning,
+            Self::Modes(snapshot) => &snapshot.split,
+        }
+    }
+}
 
 #[derive(Default)]
 struct Evidence {
@@ -214,9 +234,11 @@ async fn run_model(policy: Policy, peers: ControlPeers) -> io::Result<()> {
         horizon_ms,
         minimum_gain_requests,
         pool,
+        serving_modes,
         link_policy,
     } = policy;
     let pool = Arc::new(pool);
+    let serving_modes = serving_modes.map(Arc::new);
     let cooldown = Duration::from_millis(cooldown_ms);
     let mut control = loop {
         match GroupControl::connect(peers.clone()).await {
@@ -227,7 +249,9 @@ async fn run_model(policy: Policy, peers: ControlPeers) -> io::Result<()> {
     };
     let mut evidence = Evidence::default();
     let key = RouteSetId::for_model(&model);
-    let lookup = if pool.can_reconfigure() {
+    let lookup = if serving_modes.is_some() {
+        ServingLookup::HostedServingPlanning(key)
+    } else if pool.can_reconfigure() {
         ServingLookup::HostedPdReconfiguration(key)
     } else {
         ServingLookup::HostedPdPlanning(key)
@@ -267,11 +291,14 @@ async fn run_model(policy: Policy, peers: ControlPeers) -> io::Result<()> {
         }
         let input = async {
             let snapshot = match control.query(lookup).await? {
-                ServingView::HostedPdPlanning(planning) => HostedPdReconfiguration {
-                    planning,
-                    releases: Vec::new(),
-                },
-                ServingView::HostedPdReconfiguration(snapshot) => snapshot,
+                ServingView::HostedPdPlanning(planning) => {
+                    Planning::Split(HostedPdReconfiguration {
+                        planning,
+                        releases: Vec::new(),
+                    })
+                }
+                ServingView::HostedPdReconfiguration(snapshot) => Planning::Split(snapshot),
+                ServingView::HostedServingPlanning(snapshot) => Planning::Modes(snapshot),
                 _ => return Err(io::Error::other("expected hosted P/D planning state")),
             };
             let samples = sample_cohort(&ingress, &model).await?;
@@ -288,8 +315,8 @@ async fn run_model(policy: Policy, peers: ControlPeers) -> io::Result<()> {
         };
         let observed_at = Instant::now();
         let Some(demand_rps) = evidence.observe(
-            snapshot.planning.revision,
-            snapshot.planning.pending.is_some(),
+            snapshot.directory().revision,
+            snapshot.directory().pending.is_some(),
             samples,
             observed_at,
             window_ms,
@@ -298,18 +325,46 @@ async fn run_model(policy: Policy, peers: ControlPeers) -> io::Result<()> {
         ) else {
             continue;
         };
-        let planned = decide(
-            &mut control,
-            &model,
-            &checkpoint,
-            demand_rps,
-            horizon_ms,
-            minimum_gain_requests,
-            snapshot,
-            pool.clone(),
-            link_policy,
-        )
-        .await;
+        let planned = match snapshot {
+            Planning::Split(snapshot) => {
+                decide(
+                    &mut control,
+                    &model,
+                    &checkpoint,
+                    demand_rps,
+                    horizon_ms,
+                    minimum_gain_requests,
+                    snapshot,
+                    pool.clone(),
+                    link_policy,
+                )
+                .await
+            }
+            Planning::Modes(snapshot) => {
+                decide_modes(
+                    &mut control,
+                    &model,
+                    snapshot,
+                    pool.clone(),
+                    serving_modes
+                        .as_ref()
+                        .expect("mode planning was configured")
+                        .clone(),
+                    link_policy,
+                    ServingForecast {
+                        model: checkpoint.clone(),
+                        demand_rps,
+                        now_ms: 0,
+                        horizon_ms,
+                        minimum_gain_requests,
+                        groups: Vec::new(),
+                        paths: Vec::new(),
+                        link_bytes_per_second: BTreeMap::new(),
+                    },
+                )
+                .await
+            }
+        };
         let proposal = match planned {
             Ok(Some(choice)) => choice,
             Ok(None) => {
@@ -339,6 +394,11 @@ async fn run_model(policy: Policy, peers: ControlPeers) -> io::Result<()> {
             Ok(Ok(ServingOutcome::HostedPdStaged { revision })) => {
                 println!(
                     "hosted P/D staged {model} at revision {revision} with {demand_rps:.3} observed requests/s"
+                );
+            }
+            Ok(Ok(ServingOutcome::HostedServingStaged { revision })) => {
+                println!(
+                    "hosted serving plan staged {model} at revision {revision} with {demand_rps:.3} observed requests/s"
                 );
             }
             other => eprintln!("hosted P/D scaling proposal for {model}: {other:?}"),
@@ -467,6 +527,26 @@ async fn collect_links(
         .map(|entry| entry.host)
         .collect();
     Ok(hosted_probe::collect(endpoints, Some(&hosts)).await)
+}
+
+async fn decide_modes(
+    control: &mut GroupControl,
+    model: &str,
+    snapshot: HostedServingPlanning,
+    pool: Arc<HostedPdPool>,
+    modes: Arc<HostedModePolicy>,
+    policy: HostedLinkPolicy,
+    mut forecast: ServingForecast,
+) -> io::Result<Option<Proposal>> {
+    let links = collect_links(control, &snapshot.split).await?;
+    forecast.now_ms = hosted_probe::now_ms()?;
+    let model = model.to_owned();
+    tokio::task::spawn_blocking(move || {
+        plan_hosted_serving(&model, &snapshot, &forecast, &pool, &modes, policy, &links)
+            .map_err(io::Error::other)
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
 async fn active_assignments(

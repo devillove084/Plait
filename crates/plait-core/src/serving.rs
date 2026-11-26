@@ -622,6 +622,15 @@ pub struct HostedRouteDirectory {
     pub aggregated: Vec<(GroupVersion, SocketAddr)>,
 }
 
+/// Inventory and route assignments observed atomically at one replica.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedServingPlanning {
+    pub managed: bool,
+    pub split: HostedPdPlanning,
+    pub committed: Vec<HostedRoute>,
+    pub assignments: BTreeMap<GroupVersion, HostedAssignment>,
+}
+
 /// Committed resources visible on one replica at the time of the query.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServingResources {
@@ -1303,6 +1312,7 @@ pub enum ServingLookup {
     HostedPdRecovery(RouteSetId),
     HostedRoutes(RouteSetId),
     HostedServingPending(RouteSetId),
+    HostedServingPlanning(RouteSetId),
 }
 
 /// A replica's locally applied state. A missing result may indicate replication lag.
@@ -1336,6 +1346,7 @@ pub enum ServingView {
     HostedPdRecovery(Option<HostedPdRecovery>),
     HostedRoutes(Option<HostedRouteDirectory>),
     HostedServingPending(Option<HostedServingIntent>),
+    HostedServingPlanning(HostedServingPlanning),
 }
 
 impl ServingOperation {
