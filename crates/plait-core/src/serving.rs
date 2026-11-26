@@ -631,6 +631,45 @@ pub struct HostedServingPlanning {
     pub assignments: BTreeMap<GroupVersion, HostedAssignment>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ExecutionDrainTarget {
+    Host(NodeId),
+    Device(DeviceId),
+}
+
+impl ExecutionDrainTarget {
+    pub fn covers(self, device: DeviceId) -> bool {
+        match self {
+            Self::Host(host) => host == device.node,
+            Self::Device(target) => target == device,
+        }
+    }
+
+    fn key(self) -> Key {
+        match self {
+            Self::Host(host) => Key::HostMemory(host),
+            Self::Device(device) => Key::Device(device),
+        }
+    }
+}
+
+/// The compute ledger for maintenance. Other services on a host have their own lifecycle.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionDrainStatus {
+    pub target: ExecutionDrainTarget,
+    pub drain: Option<OpId>,
+    pub holders: BTreeSet<GroupVersion>,
+    pub deferred: BTreeSet<OpId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedEvacuationPlanning {
+    pub current: HostedServingPlanning,
+    pub withdrawing: BTreeSet<GroupVersion>,
+    pub drains: BTreeMap<ExecutionDrainTarget, OpId>,
+    pub releases: Vec<HostedPdRelease>,
+}
+
 /// Committed resources visible on one replica at the time of the query.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServingResources {
@@ -1138,6 +1177,23 @@ pub enum ServingAction {
         intent: HostedServingIntent,
         cancel: bool,
     },
+    BeginExecutionDrain {
+        target: ExecutionDrainTarget,
+    },
+    ConfirmExecutionDrain {
+        target: ExecutionDrainTarget,
+        drain: OpId,
+    },
+    ResumeExecutionTarget {
+        target: ExecutionDrainTarget,
+        drain: OpId,
+    },
+    PrepareHostedEvacuation {
+        model: String,
+        expected_revision: u64,
+        plan: HostedServingPlan,
+        drains: BTreeMap<ExecutionDrainTarget, OpId>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1223,6 +1279,13 @@ pub enum ServingOutcome {
         revision: u64,
     },
     HostedServingCancelled,
+    ExecutionDrainBegun {
+        drain: OpId,
+    },
+    ExecutionDrainConfirmed {
+        drain: OpId,
+    },
+    ExecutionTargetResumed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1264,6 +1327,9 @@ pub enum ServingError {
     HostedInventoryChanged(NodeId),
     HostedPortsInUse(NodeId),
     HostedPdInProgress { staged: OpId },
+    ExecutionTargetDraining(ExecutionDrainTarget),
+    ExecutionTargetInUse(ExecutionDrainTarget),
+    StaleExecutionDrain,
 }
 
 pub type ServingResult = Result<ServingOutcome, ServingError>;
@@ -1313,6 +1379,8 @@ pub enum ServingLookup {
     HostedRoutes(RouteSetId),
     HostedServingPending(RouteSetId),
     HostedServingPlanning(RouteSetId),
+    HostedEvacuationPlanning(RouteSetId),
+    ExecutionDrain(ExecutionDrainTarget),
 }
 
 /// A replica's locally applied state. A missing result may indicate replication lag.
@@ -1347,6 +1415,8 @@ pub enum ServingView {
     HostedRoutes(Option<HostedRouteDirectory>),
     HostedServingPending(Option<HostedServingIntent>),
     HostedServingPlanning(HostedServingPlanning),
+    HostedEvacuationPlanning(HostedEvacuationPlanning),
+    ExecutionDrain(ExecutionDrainStatus),
 }
 
 impl ServingOperation {
@@ -1381,6 +1451,11 @@ impl ServingOperation {
             ServingAction::RegisterWorker { device, .. } => {
                 keys.insert(Key::Device(*device));
             }
+            ServingAction::BeginExecutionDrain { target }
+            | ServingAction::ConfirmExecutionDrain { target, .. }
+            | ServingAction::ResumeExecutionTarget { target, .. } => {
+                keys.insert(target.key());
+            }
             ServingAction::PrepareHostedPd {
                 model,
                 placements,
@@ -1399,7 +1474,8 @@ impl ServingOperation {
             ServingAction::ResolveHostedPd { intent, .. } => {
                 hosted_pd_intent_keys(&mut keys, intent);
             }
-            ServingAction::PrepareHostedServing { model, plan, .. } => {
+            ServingAction::PrepareHostedServing { model, plan, .. }
+            | ServingAction::PrepareHostedEvacuation { model, plan, .. } => {
                 keys.insert(Key::ServingRoutes(RouteSetId::for_model(model)));
                 hosted_pd_stage_keys(&mut keys, &plan.placements, &[]);
                 keys.extend(
@@ -1408,6 +1484,9 @@ impl ServingOperation {
                         .flat_map(|route| route.groups())
                         .map(|version| Key::ServingGroup(version.group)),
                 );
+                if let ServingAction::PrepareHostedEvacuation { drains, .. } = &self.action {
+                    keys.extend(drains.keys().map(|target| target.key()));
+                }
             }
             ServingAction::ResolveHostedServing { intent, .. } => {
                 keys.insert(Key::ServingRoutes(RouteSetId::for_model(&intent.model)));

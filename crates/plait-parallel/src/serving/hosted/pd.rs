@@ -17,7 +17,7 @@ use super::{HostedLinkPolicy, LinkEvidence, Traffic};
 
 mod modes;
 mod reconfigure;
-pub use modes::{HostedModePolicy, plan_hosted_serving};
+pub use modes::{HostedModePolicy, plan_hosted_evacuation, plan_hosted_serving};
 mod recovery;
 use reconfigure::Reconfiguration;
 pub use recovery::plan_hosted_pd_recovery;
@@ -353,6 +353,7 @@ pub fn plan_hosted_pd_with_assignments(
         pool,
         context,
         aggregate: &[],
+        withdrawing: None,
     };
     let layouts = search.layouts(snapshot, &active)?;
 
@@ -416,6 +417,7 @@ struct Search<'a> {
     pool: &'a HostedPdPool,
     context: EndpointContext<'a>,
     aggregate: &'a [HostedPool],
+    withdrawing: Option<&'a BTreeSet<GroupVersion>>,
 }
 
 impl Search<'_> {
@@ -433,6 +435,7 @@ impl Search<'_> {
             pool,
             context,
             aggregate,
+            withdrawing,
         } = *self;
         let mut split: Vec<_> = pool.slots.iter().collect();
         split.sort_by_key(|slot| slot.role == ServingRole::Decode);
@@ -471,7 +474,10 @@ impl Search<'_> {
                 {
                     continue;
                 }
-                if let Some(retained) = active.get(&group).filter(|entry| entry.role == role) {
+                if let Some(retained) = active.get(&group).filter(|entry| {
+                    entry.role == role
+                        && !withdrawing.is_some_and(|groups| groups.contains(&entry.version))
+                }) {
                     let mut trial = layout.clone();
                     trial.add(retained.clone());
                     retain(&mut next, trial, forecast, pool);

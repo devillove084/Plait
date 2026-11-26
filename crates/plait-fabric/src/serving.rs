@@ -20,6 +20,7 @@ mod host_launch;
 mod hosted_pd;
 mod hosted_pd_transition;
 mod hosted_serving;
+mod maintenance;
 use decoder::{DecoderState, RecoveryPolicy};
 use host_launch::{HostLaunch, HostedSwitch};
 
@@ -94,6 +95,7 @@ pub(crate) struct ServingState {
     hosted_release_profiles: BTreeMap<NodeId, BTreeSet<String>>,
     hosted_probes: BTreeMap<NodeId, HostedProbeEndpoint>,
     execution_hosts: BTreeMap<NodeId, ExecutionHostLiveness>,
+    execution_drains: BTreeMap<plait_core::serving::ExecutionDrainTarget, OpId>,
     decoder: DecoderState,
 }
 
@@ -173,6 +175,9 @@ impl ServingState {
             workers: self
                 .workers
                 .iter()
+                .filter(|(device, worker)| {
+                    worker.grant.is_some() || self.execution_drain_for(**device).is_none()
+                })
                 .map(|(&device, worker)| WorkerResources {
                     device,
                     incarnation: worker.incarnation,
@@ -232,6 +237,15 @@ impl ServingState {
                 incarnation,
                 device_bytes,
             } => self.register_worker(*device, *incarnation, *device_bytes),
+            ServingAction::BeginExecutionDrain { target } => {
+                self.begin_execution_drain(*target, operation.id)
+            }
+            ServingAction::ConfirmExecutionDrain { target, drain } => {
+                self.confirm_execution_drain(*target, *drain)
+            }
+            ServingAction::ResumeExecutionTarget { target, drain } => {
+                self.resume_execution_target(*target, *drain)
+            }
             ServingAction::Prepare {
                 group,
                 expected_epoch,
@@ -292,6 +306,21 @@ impl ServingState {
                 expected_revision,
                 plan,
             } => self.prepare_hosted_serving(operation.id, model, *expected_revision, plan),
+            ServingAction::PrepareHostedEvacuation {
+                model,
+                expected_revision,
+                plan,
+                drains,
+            } => {
+                if drains.is_empty()
+                    || drains
+                        .iter()
+                        .any(|(target, drain)| self.execution_drains.get(target) != Some(drain))
+                {
+                    return Err(ServingError::StaleExecutionDrain);
+                }
+                self.prepare_hosted_serving(operation.id, model, *expected_revision, plan)
+            }
             ServingAction::ResolveHostedServing { intent, cancel } => {
                 self.resolve_hosted_serving(intent, *cancel)
             }
@@ -1026,6 +1055,9 @@ impl ServingState {
         // Build the complete set of grants and new counters before mutating any reservation.
         let mut grants = BTreeMap::new();
         for (&device, demand) in &plan.workers {
+            if let Some(target) = self.execution_drain_for(device) {
+                return Err(ServingError::ExecutionTargetDraining(target));
+            }
             let worker = self
                 .workers
                 .get(&device)

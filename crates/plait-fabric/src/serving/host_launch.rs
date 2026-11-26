@@ -28,7 +28,18 @@ pub(super) struct HostedSwitch {
 impl ServingState {
     pub(crate) fn hosted_planning(&self) -> HostedPlanning {
         HostedPlanning {
-            hosts: self.hosted_inventories.values().cloned().collect(),
+            hosts: self
+                .hosted_inventories
+                .values()
+                .cloned()
+                .map(|mut inventory| {
+                    inventory.devices.retain(|&ordinal, _| {
+                        self.execution_drain_for(DeviceId::new(inventory.host, ordinal))
+                            .is_none()
+                    });
+                    inventory
+                })
+                .collect(),
             occupied: self
                 .hosted_recipes
                 .values()

@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use plait_core::NodeId;
 use plait_core::serving::{
-    GroupId, GroupVersion, HostedAssignment, HostedLinkSample, HostedRoute, HostedServingPlan,
-    HostedServingPlanning, ServingAction, ServingRole,
+    GroupId, GroupVersion, HostedAssignment, HostedEvacuationPlanning, HostedLinkSample,
+    HostedRoute, HostedServingPlan, HostedServingPlanning, ServingAction, ServingRole,
 };
 use serde::Deserialize;
 
@@ -54,9 +54,56 @@ pub fn plan_hosted_serving(
     policy: HostedLinkPolicy,
     links: &BTreeMap<(NodeId, NodeId), HostedLinkSample>,
 ) -> Result<Option<ServingAction>, &'static str> {
+    plan(
+        model,
+        (snapshot, None),
+        forecast,
+        pool,
+        Some(modes),
+        policy,
+        links,
+    )
+}
+
+pub fn plan_hosted_evacuation(
+    model: &str,
+    snapshot: &HostedEvacuationPlanning,
+    forecast: &ServingForecast,
+    pool: &HostedPdPool,
+    modes: Option<&HostedModePolicy>,
+    policy: HostedLinkPolicy,
+    links: &BTreeMap<(NodeId, NodeId), HostedLinkSample>,
+) -> Result<Option<ServingAction>, &'static str> {
+    let maintenance = (!snapshot.withdrawing.is_empty()).then_some(snapshot);
+    plan(
+        model,
+        (&snapshot.current, maintenance),
+        forecast,
+        pool,
+        modes,
+        policy,
+        links,
+    )
+}
+
+fn plan(
+    model: &str,
+    (snapshot, maintenance): (&HostedServingPlanning, Option<&HostedEvacuationPlanning>),
+    forecast: &ServingForecast,
+    pool: &HostedPdPool,
+    modes: Option<&HostedModePolicy>,
+    policy: HostedLinkPolicy,
+    links: &BTreeMap<(NodeId, NodeId), HostedLinkSample>,
+) -> Result<Option<ServingAction>, &'static str> {
     forecast.validate()?;
     policy.validate()?;
-    modes.validate(model)?;
+    if let Some(modes) = modes {
+        modes.validate(model)?;
+    }
+    let aggregate = modes.map_or(&[][..], |modes| &modes.aggregate_slots);
+    let drain_ms = modes.map_or(0, |modes| modes.drain_ms);
+    let device_cost = modes.map_or(0.0, |modes| modes.device_cost_requests_per_second);
+    let mode_loss = modes.map_or(0.0, |modes| modes.mode_change_loss_requests);
     // Validate the contract. Fresh store evidence is required only for split traffic.
     pool.validate(model, 0)?;
     if !snapshot.managed
@@ -110,8 +157,7 @@ pub fn plan_hosted_serving(
         if assignment.model != forecast.model {
             return Err("active aggregate serving groups require the calibrated checkpoint");
         }
-        let endpoint = modes
-            .aggregate_slots
+        let endpoint = aggregate
             .iter()
             .find(|slot| slot.group() == version.group)
             .and_then(|slot| {
@@ -158,9 +204,10 @@ pub fn plan_hosted_serving(
         forecast,
         pool,
         context,
-        aggregate: &modes.aggregate_slots,
+        aggregate,
+        withdrawing: maintenance.map(|snapshot| &snapshot.withdrawing),
     };
-    let mut best: Option<(f64, u64, HostedServingPlan)> = None;
+    let mut best: Option<(usize, f64, u64, HostedServingPlan)> = None;
     for layout in search.layouts(&snapshot.split, &active)? {
         let targets: BTreeSet<_> = layout.routes().into_iter().collect();
         if targets == routes || layout.potential < baseline {
@@ -181,25 +228,35 @@ pub fn plan_hosted_serving(
         let saved_device_seconds = (removed as f64
             * forecast
                 .horizon_ms
-                .saturating_sub(moves.saturating_add(modes.drain_ms)) as f64
+                .saturating_sub(moves.saturating_add(drain_ms)) as f64
             - added as f64 * forecast.horizon_ms as f64)
             / 1000.0;
         let mut gain = (layout.potential - baseline) * (forecast.horizon_ms - moves) as f64
             / 1000.0
-            + saved_device_seconds * modes.device_cost_requests_per_second
+            + saved_device_seconds * device_cost
             - layout.transition_loss_requests;
         if !routes.is_empty() && mode != shape(&targets) {
-            gain -= modes.mode_change_loss_requests;
+            gain -= mode_loss;
         }
         let devices = layout.devices();
+        let retained = if maintenance.is_some() {
+            active
+                .values()
+                .filter(|group| new_versions.contains(&group.version))
+                .count()
+        } else {
+            0
+        };
         if gain.is_finite()
-            && gain > 0.0
-            && gain >= forecast.minimum_gain_requests
-            && best.as_ref().is_none_or(|(score, count, _)| {
-                gain > *score || (gain == *score && devices < *count)
+            && (maintenance.is_some() || (gain > 0.0 && gain >= forecast.minimum_gain_requests))
+            && best.as_ref().is_none_or(|(kept, score, count, _)| {
+                retained > *kept
+                    || (retained == *kept
+                        && (gain > *score || (gain == *score && devices < *count)))
             })
         {
             best = Some((
+                retained,
                 gain,
                 devices,
                 HostedServingPlan {
@@ -210,13 +267,24 @@ pub fn plan_hosted_serving(
             ));
         }
     }
-    Ok(
-        best.map(|(_, _, plan)| ServingAction::PrepareHostedServing {
-            model: model.to_owned(),
-            expected_revision: snapshot.split.revision,
-            plan,
-        }),
-    )
+    let expected_revision = snapshot.split.revision;
+    let action = best.map(|(_, _, _, plan)| {
+        let model = model.to_owned();
+        match maintenance {
+            Some(state) => ServingAction::PrepareHostedEvacuation {
+                model,
+                expected_revision,
+                plan,
+                drains: state.drains.clone(),
+            },
+            None => ServingAction::PrepareHostedServing {
+                model,
+                expected_revision,
+                plan,
+            },
+        }
+    });
+    Ok(action)
 }
 
 fn endpoint(
@@ -641,5 +709,99 @@ mod tests {
         );
         assert_eq!(plan.placements.len(), 2);
         assert!(plan.placements.iter().all(|item| item.group != group));
+    }
+
+    #[test]
+    fn maintenance_moves_a_live_group_with_no_economic_gain_and_waits_for_eligible_capacity() {
+        let (mut current, pool, modes) = fixture();
+        let host = node(1);
+        let group = modes.aggregate_slots[0].group();
+        let live = activate(
+            &mut current,
+            group,
+            ServingRole::Aggregated,
+            host,
+            "aggregate",
+        );
+        current.committed.push(HostedRoute::Aggregated(live));
+        let inventory = &mut current.split.inventory.hosts[0];
+        inventory.devices = BTreeMap::from([(1, 1)]);
+        let spare = DeviceId::new(host, 1);
+        current.split.resources.workers.push(WorkerResources {
+            device: spare,
+            incarnation: 1,
+            device_bytes: 64,
+            grant: None,
+        });
+        let target = plait_core::serving::ExecutionDrainTarget::Device(DeviceId::new(host, 0));
+        let drain = plait_core::OpId::new(host, 5);
+        let mut snapshot = HostedEvacuationPlanning {
+            current,
+            withdrawing: BTreeSet::from([live]),
+            drains: BTreeMap::from([(target, drain)]),
+            releases: Vec::new(),
+        };
+        let mut load = forecast(1.0);
+        load.minimum_gain_requests = 1000.0;
+        let policy = HostedLinkPolicy {
+            max_sample_age_ms: 40,
+            bytes_per_rank_pair: 100,
+        };
+        let links = BTreeMap::new();
+        assert!(
+            plan_hosted_serving(
+                "model",
+                &snapshot.current,
+                &load,
+                &pool,
+                &modes,
+                policy,
+                &links
+            )
+            .unwrap()
+            .is_none()
+        );
+        let Some(ServingAction::PrepareHostedEvacuation { plan, drains, .. }) =
+            plan_hosted_evacuation(
+                "model",
+                &snapshot,
+                &load,
+                &pool,
+                Some(&modes),
+                policy,
+                &links,
+            )
+            .unwrap()
+        else {
+            panic!("maintenance needs a replacement even with flat load");
+        };
+        assert_eq!(drains, BTreeMap::from([(target, drain)]));
+        assert_eq!(
+            plan.routes,
+            vec![HostedRoute::Aggregated(GroupVersion { group, epoch: 2 })]
+        );
+        assert_eq!(
+            plan.placements[0]
+                .plan
+                .workers
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [spare]
+        );
+        snapshot.current.split.inventory.hosts[0].devices.clear();
+        assert!(
+            plan_hosted_evacuation(
+                "model",
+                &snapshot,
+                &load,
+                &pool,
+                Some(&modes),
+                policy,
+                &links
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 }

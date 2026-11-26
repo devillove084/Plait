@@ -150,6 +150,20 @@ impl Runtime {
         self.serving.hosted_serving_planning(key)
     }
 
+    pub fn serving_hosted_evacuation(
+        &self,
+        key: RouteSetId,
+    ) -> plait_core::serving::HostedEvacuationPlanning {
+        self.serving.hosted_evacuation_planning(key)
+    }
+
+    pub fn serving_execution_drain(
+        &self,
+        target: plait_core::serving::ExecutionDrainTarget,
+    ) -> plait_core::serving::ExecutionDrainStatus {
+        self.serving.execution_drain(target)
+    }
+
     pub fn serving_hosted_work(&self) -> Vec<HostedServingIntent> {
         self.serving.hosted_serving_work()
     }

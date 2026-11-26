@@ -3,11 +3,11 @@ use std::io::{self, BufRead, Write};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use plait_core::serving::{
-    GroupId, GroupPhase, GroupPlan, GroupVersion, GroupView, HostMemory, HostedActivation,
-    HostedPdKv, HostedPdLaunch, HostedPdPlacement, HostedPdStage, HostedRecipe, HostedRoute,
-    HostedRouteDirectory, HostedServingPlan, PdRoute, RouteSetId, ServingAction, ServingEndpoint,
-    ServingLookup, ServingOperation, ServingResources, ServingRole, ServingView, W4GroupLayout,
-    WorkerDemand, WorkerGrant,
+    ExecutionDrainTarget, GroupId, GroupPhase, GroupPlan, GroupVersion, GroupView, HostMemory,
+    HostedActivation, HostedPdKv, HostedPdLaunch, HostedPdPlacement, HostedPdStage, HostedRecipe,
+    HostedRoute, HostedRouteDirectory, HostedServingPlan, PdRoute, RouteSetId, ServingAction,
+    ServingEndpoint, ServingLookup, ServingOperation, ServingResources, ServingRole, ServingView,
+    W4GroupLayout, WorkerDemand, WorkerGrant,
 };
 use plait_core::{DeviceId, NodeId, OpId};
 use plait_node::{Client, discover_voters};
@@ -77,6 +77,23 @@ enum Request {
     },
     ExecutionHost {
         host: NodeId,
+    },
+    BeginExecutionDrain {
+        id: OpId,
+        target: ExecutionDrainTarget,
+    },
+    ConfirmExecutionDrain {
+        id: OpId,
+        target: ExecutionDrainTarget,
+        drain: OpId,
+    },
+    ResumeExecutionTarget {
+        id: OpId,
+        target: ExecutionDrainTarget,
+        drain: OpId,
+    },
+    ExecutionDrain {
+        target: ExecutionDrainTarget,
     },
     Select {
         forecast: ServingForecast,
@@ -431,6 +448,47 @@ async fn handle(
         }
         Request::ReplanHosted { input } => hosted::replan(client, peers, input).await,
         Request::HostedLinks => hosted::links(client, peers).await,
+        Request::BeginExecutionDrain { id, target } => {
+            execute(
+                client,
+                peers,
+                ServingOperation {
+                    id,
+                    action: ServingAction::BeginExecutionDrain { target },
+                },
+            )
+            .await
+        }
+        Request::ConfirmExecutionDrain { id, target, drain } => {
+            execute(
+                client,
+                peers,
+                ServingOperation {
+                    id,
+                    action: ServingAction::ConfirmExecutionDrain { target, drain },
+                },
+            )
+            .await
+        }
+        Request::ResumeExecutionTarget { id, target, drain } => {
+            execute(
+                client,
+                peers,
+                ServingOperation {
+                    id,
+                    action: ServingAction::ResumeExecutionTarget { target, drain },
+                },
+            )
+            .await
+        }
+        Request::ExecutionDrain { target } => {
+            let ServingView::ExecutionDrain(status) =
+                query(client, peers, ServingLookup::ExecutionDrain(target)).await?
+            else {
+                return Err(io::Error::other("expected execution drain status"));
+            };
+            Ok(json!({ "drain": status }))
+        }
         Request::HostedPlanning => {
             Ok(json!({ "planning": hosted::planning(client, peers).await? }))
         }

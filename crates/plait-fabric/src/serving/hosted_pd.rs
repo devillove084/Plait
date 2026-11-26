@@ -160,15 +160,26 @@ impl ServingState {
 
     pub(crate) fn hosted_pd_reconfiguration(&self, key: RouteSetId) -> HostedPdReconfiguration {
         let planning = self.hosted_pd_planning(key);
-        let releases = self
-            .routes
+        let releases = self.hosted_pd_releases(key, &planning);
+        HostedPdReconfiguration { planning, releases }
+    }
+
+    pub(super) fn hosted_pd_releases(
+        &self,
+        key: RouteSetId,
+        planning: &HostedPdPlanning,
+    ) -> Vec<HostedPdRelease> {
+        self.routes
             .get(&key)
-            .filter(|directory| directory.hosted_kv.is_some() && directory.paths == planning.paths)
+            .filter(|directory| {
+                planning.managed
+                    && directory.hosted_kv.is_some()
+                    && directory.paths == planning.paths
+            })
             .into_iter()
             .flat_map(|directory| route_versions(&directory.paths))
             .filter_map(|version| self.hosted_pd_release(version))
-            .collect();
-        HostedPdReconfiguration { planning, releases }
+            .collect()
     }
 
     pub(crate) fn hosted_pd_recovery(&self, key: RouteSetId) -> Option<HostedPdRecovery> {
@@ -982,6 +993,27 @@ mod tests {
         state
             .retire(version(&decode), &BTreeSet::from([device]))
             .unwrap();
+        let mut withdrawn = state.clone();
+        let target = plait_core::serving::ExecutionDrainTarget::Device(device);
+        withdrawn.begin_execution_drain(target, id(92)).unwrap();
+        assert!(withdrawn.execution_drain(target).holders.is_empty());
+        assert_eq!(
+            withdrawn.execution_drain(target).deferred,
+            BTreeSet::from([id(3)])
+        );
+        assert_eq!(
+            withdrawn.confirm_execution_drain(target, id(92)),
+            Err(ServingError::ExecutionTargetInUse(target))
+        );
+        assert_eq!(
+            publish(&mut withdrawn, 93),
+            Ok(ServingOutcome::HostedPdCancelled)
+        );
+        assert_eq!(
+            withdrawn.confirm_execution_drain(target, id(92)),
+            Ok(ServingOutcome::ExecutionDrainConfirmed { drain: id(92) })
+        );
+        assert_eq!(withdrawn.routes(key).unwrap().paths[0].route, bridge_path);
         let rival = GroupId(NodeId::from_bytes([77; 16]));
         assert_eq!(
             state.prepare(rival, 0, &extra_prefill.plan),

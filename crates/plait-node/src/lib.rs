@@ -529,6 +529,14 @@ impl NodeState {
                     ServingLookup::HostedServingPlanning(key) => {
                         ServingView::HostedServingPlanning(runtime.serving_mode_planning(key))
                     }
+                    ServingLookup::HostedEvacuationPlanning(key) => {
+                        ServingView::HostedEvacuationPlanning(
+                            runtime.serving_hosted_evacuation(key),
+                        )
+                    }
+                    ServingLookup::ExecutionDrain(target) => {
+                        ServingView::ExecutionDrain(runtime.serving_execution_drain(target))
+                    }
                     ServingLookup::HostedPdPlanning(key) => {
                         ServingView::HostedPdPlanning(runtime.serving_hosted_pd_planning(key))
                     }
