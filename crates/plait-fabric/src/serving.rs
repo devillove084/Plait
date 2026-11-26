@@ -15,7 +15,9 @@ use plait_core::{DeviceId, NodeId, OpId};
 
 mod decoder;
 mod host;
+mod host_launch;
 use decoder::{DecoderState, RecoveryPolicy};
+use host_launch::HostLaunch;
 
 #[derive(Clone)]
 struct HostState {
@@ -73,6 +75,7 @@ pub(crate) struct ServingState {
     w4_switches: BTreeMap<GroupVersion, W4Switch>,
     w4_work: BTreeMap<GroupVersion, BTreeMap<OpId, u64>>,
     resident: BTreeMap<GroupVersion, BTreeMap<DeviceId, ResidentOwner>>,
+    host_launches: BTreeMap<GroupVersion, HostLaunch>,
     execution_hosts: BTreeMap<NodeId, ExecutionHostLiveness>,
     decoder: DecoderState,
 }
@@ -696,6 +699,28 @@ impl ServingState {
             ServingAction::LaunchStopped { version, holder } => {
                 self.launch_stopped(*version, *holder)
             }
+            ServingAction::ClaimHostLaunch {
+                version,
+                host,
+                holder,
+                launch_digest,
+            } => self.claim_host_launch(*version, *host, *holder, *launch_digest),
+            ServingAction::HostLaunchReady {
+                version,
+                host,
+                holder,
+                endpoint,
+            } => self.host_launch_ready(*version, *host, *holder, endpoint.as_ref()),
+            ServingAction::ObserveHostLaunch {
+                version,
+                host,
+                holder,
+            } => self.observe_host_launch(*version, *host, *holder),
+            ServingAction::HostLaunchStopped {
+                version,
+                host,
+                holder,
+            } => self.host_launch_stopped(*version, *host, *holder),
             ServingAction::PublishRoutes {
                 model,
                 expected_revision,
@@ -893,6 +918,7 @@ impl ServingState {
     }
 
     fn worker_ready(&mut self, grant: WorkerGrant, launch_digest: [u8; 32]) -> ServingResult {
+        self.require_unhosted(grant.version)?;
         let view = self.group_mut(grant.version)?;
         check_grant(view, grant)?;
         check_launch_owner(view, None)?;
@@ -1273,6 +1299,9 @@ impl ServingState {
     }
 
     fn worker_stopped(&mut self, grant: WorkerGrant) -> ServingResult {
+        if self.host_has_launch(grant.version, grant.device.node) {
+            return Err(ServingError::LaunchOwnerMismatch);
+        }
         let managed = self.w4_work.contains_key(&grant.version)
             || self.decoder.managed.contains(&grant.version)
             || self.resident_owner(grant).is_some();
@@ -1294,6 +1323,7 @@ impl ServingState {
         workers: &BTreeSet<DeviceId>,
     ) -> ServingResult {
         let version = grant.version;
+        self.require_unhosted(version)?;
         let view = self
             .group(version)
             .ok_or(ServingError::UnknownVersion(version))?;
@@ -1338,6 +1368,7 @@ impl ServingState {
         owner: ResidentOwner,
         launch_digest: [u8; 32],
     ) -> ServingResult {
+        self.require_unhosted(grant.version)?;
         self.require_execution_host(grant.device.node)?;
         let view = self
             .group(grant.version)
@@ -1393,6 +1424,7 @@ impl ServingState {
         holder: NodeId,
         launch_digest: [u8; 32],
     ) -> ServingResult {
+        self.require_unhosted(version)?;
         if self.w4_switches.contains_key(&version) || self.resident.contains_key(&version) {
             return Err(ServingError::InvalidPlan);
         }
@@ -1423,26 +1455,7 @@ impl ServingState {
             return Err(ServingError::InvalidPhase(view.phase));
         }
         if let Some(endpoint) = endpoint {
-            let kv_valid = endpoint.prefill_kv.is_some_and(|addr| {
-                addr.port() != 0 && !addr.ip().is_unspecified() && !addr.ip().is_multicast()
-            });
-            let wrong_kv_role = match view.plan.role {
-                ServingRole::Prefill => !kv_valid,
-                ServingRole::Decode => endpoint.prefill_kv.is_some(),
-                ServingRole::Aggregated => true,
-            };
-            if endpoint.api_model.is_empty()
-                || endpoint.http.port() == 0
-                || endpoint.http.ip().is_unspecified()
-                || endpoint.http.ip().is_multicast()
-                || wrong_kv_role
-                || view
-                    .endpoint
-                    .as_ref()
-                    .is_some_and(|previous| previous != endpoint)
-            {
-                return Err(ServingError::InvalidEndpoint);
-            }
+            check_launch_endpoint(view, endpoint)?;
             view.endpoint = Some(endpoint.clone());
         }
         view.ready.extend(view.grants.keys().copied());
@@ -1488,6 +1501,7 @@ impl ServingState {
         self.w4_switches.remove(&version);
         self.w4_work.remove(&version);
         self.resident.remove(&version);
+        self.host_launches.remove(&version);
         self.decoder.endpoints.remove(&version);
         self.decoder.managed.remove(&version);
         Ok(group_outcome(version, GroupPhase::Retired))
@@ -1520,6 +1534,29 @@ fn check_grant(view: &GroupView, grant: WorkerGrant) -> Result<(), ServingError>
 fn check_launch_owner(view: &GroupView, holder: Option<NodeId>) -> Result<(), ServingError> {
     if view.launch_owner != holder {
         return Err(ServingError::LaunchOwnerMismatch);
+    }
+    Ok(())
+}
+
+fn check_launch_endpoint(view: &GroupView, endpoint: &ServingEndpoint) -> Result<(), ServingError> {
+    let kv_valid = endpoint.prefill_kv.is_some_and(|addr| {
+        addr.port() != 0 && !addr.ip().is_unspecified() && !addr.ip().is_multicast()
+    });
+    let wrong_kv_role = match view.plan.role {
+        ServingRole::Prefill => !kv_valid,
+        ServingRole::Decode | ServingRole::Aggregated => endpoint.prefill_kv.is_some(),
+    };
+    if endpoint.api_model.is_empty()
+        || endpoint.http.port() == 0
+        || endpoint.http.ip().is_unspecified()
+        || endpoint.http.ip().is_multicast()
+        || wrong_kv_role
+        || view
+            .endpoint
+            .as_ref()
+            .is_some_and(|previous| previous != endpoint)
+    {
+        return Err(ServingError::InvalidEndpoint);
     }
     Ok(())
 }

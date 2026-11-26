@@ -192,6 +192,10 @@ impl Runtime {
         self.serving.execution_hosts()
     }
 
+    pub fn serving_execution_versions_on(&self, host: NodeId) -> BTreeSet<GroupVersion> {
+        self.serving.execution_versions_on(host)
+    }
+
     pub fn serving_resident_versions_on(&self, host: NodeId) -> BTreeSet<GroupVersion> {
         self.serving.resident_versions_on(host)
     }

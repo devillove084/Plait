@@ -192,6 +192,8 @@ struct GroupInspection {
     launch_owner: Option<NodeId>,
     endpoint: Option<ServingEndpoint>,
     grants: Vec<WorkerGrant>,
+    ready: Vec<DeviceId>,
+    stopped: Vec<DeviceId>,
 }
 
 impl From<GroupView> for GroupInspection {
@@ -207,6 +209,8 @@ impl From<GroupView> for GroupInspection {
             launch_owner: view.launch_owner,
             endpoint: view.endpoint,
             grants: view.grants.into_values().collect(),
+            ready: view.ready.into_iter().collect(),
+            stopped: view.stopped.into_iter().collect(),
         }
     }
 }

@@ -55,7 +55,7 @@ impl HostWatch {
                 action: ServingAction::ExpireExecutionHost {
                     host,
                     pulse: health.pulse,
-                    groups: runtime.serving_resident_versions_on(host),
+                    groups: runtime.serving_execution_versions_on(host),
                 },
             });
         }

@@ -625,6 +625,32 @@ pub enum ServingAction {
         owner: Option<ResidentOwner>,
         workers: BTreeSet<DeviceId>,
     },
+    /// Reserve the launch on one host of a multi-host engine.
+    ClaimHostLaunch {
+        version: GroupVersion,
+        host: NodeId,
+        holder: NodeId,
+        launch_digest: [u8; 32],
+    },
+    /// Confirm this host's workers. The HTTP host also publishes the endpoint.
+    HostLaunchReady {
+        version: GroupVersion,
+        host: NodeId,
+        holder: NodeId,
+        endpoint: Option<ServingEndpoint>,
+    },
+    ObserveHostLaunch {
+        version: GroupVersion,
+        host: NodeId,
+        holder: NodeId,
+    },
+    /// Confirm local device and transport release. A draining engine releases
+    /// its HTTP host first, after it finishes the requests it already admitted.
+    HostLaunchStopped {
+        version: GroupVersion,
+        host: NodeId,
+        holder: NodeId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -850,6 +876,9 @@ impl ServingOperation {
                     Key::HostMemory(grant.device.node),
                 ]);
             }
+            ServingAction::ClaimHostLaunch { version, host, .. } => {
+                keys.extend([Key::ServingGroup(version.group), Key::HostMemory(*host)]);
+            }
             ServingAction::Activate(version)
             | ServingAction::FinishW4 { version, .. }
             | ServingAction::CompleteW4 { version, .. }
@@ -860,7 +889,10 @@ impl ServingOperation {
             | ServingAction::LaunchReady { version, .. }
             | ServingAction::LaunchReadyAt { version, .. }
             | ServingAction::ObserveLaunch { version, .. }
-            | ServingAction::LaunchStopped { version, .. } => {
+            | ServingAction::LaunchStopped { version, .. }
+            | ServingAction::HostLaunchReady { version, .. }
+            | ServingAction::ObserveHostLaunch { version, .. }
+            | ServingAction::HostLaunchStopped { version, .. } => {
                 keys.insert(Key::ServingGroup(version.group));
             }
             ServingAction::DecoderReady { endpoint, .. }

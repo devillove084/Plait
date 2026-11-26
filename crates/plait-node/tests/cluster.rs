@@ -253,6 +253,184 @@ fn plan(device: DeviceId, incarnation: u64) -> GroupPlan {
 }
 
 #[tokio::test]
+async fn hosted_launch_switches_tp_width_after_one_control_replica_leaves() {
+    let voters = ids("hosted-launch-voter", 3);
+    let (mut nodes, addrs) = start_bootstrap(&voters).await;
+    let mut client = Client::new().await.unwrap();
+    for (id, addr) in voters.iter().zip(addrs) {
+        client.add_peer(*id, addr);
+    }
+    let [http, follower, spare] =
+        ["hosted-http", "hosted-follower", "hosted-spare"].map(NodeId::derive);
+    let [http_owner, follower_owner, spare_owner] =
+        ["owner-http", "owner-follower", "owner-spare"].map(NodeId::derive);
+    let group = GroupId(NodeId::derive("hosted-aggregate"));
+    let old = GroupVersion { group, epoch: 1 };
+    let new = GroupVersion { group, epoch: 2 };
+    let old_devices = [
+        DeviceId::new(http, 0),
+        DeviceId::new(http, 1),
+        DeviceId::new(follower, 0),
+    ];
+    let new_device = DeviceId::new(spare, 0);
+    let memory = HostMemory {
+        bytes: 64,
+        pinned_bytes: 16,
+    };
+    let make_plan = |devices: &[DeviceId]| GroupPlan {
+        role: ServingRole::Aggregated,
+        tensor_parallel: devices.len() as u32,
+        workers: devices
+            .iter()
+            .map(|&device| {
+                (
+                    device,
+                    WorkerDemand {
+                        incarnation: 1,
+                        device_bytes: 24,
+                    },
+                )
+            })
+            .collect(),
+        hosts: devices.iter().map(|device| (device.node, memory)).collect(),
+        ..plan(devices[0], 1)
+    };
+    let mut setup = vec![];
+    for host in [http, follower, spare] {
+        setup.push(ServingAction::SetHostMemory {
+            host,
+            capacity: memory,
+        });
+    }
+    for device in old_devices.into_iter().chain([new_device]) {
+        setup.push(ServingAction::RegisterWorker {
+            device,
+            incarnation: 1,
+            device_bytes: 64,
+        });
+    }
+    let claim = |version, host, holder| ServingAction::ClaimHostLaunch {
+        version,
+        host,
+        holder,
+        launch_digest: [7; 32],
+    };
+    let ready = |version, host, holder, port: Option<u16>| ServingAction::HostLaunchReady {
+        version,
+        host,
+        holder,
+        endpoint: port.map(|port| ServingEndpoint {
+            api_model: "test-model".into(),
+            http: ([127, 0, 0, 1], port).into(),
+            prefill_kv: None,
+        }),
+    };
+    let stop = |version, host, holder| ServingAction::HostLaunchStopped {
+        version,
+        host,
+        holder,
+    };
+    setup.extend([
+        ServingAction::Prepare {
+            group,
+            expected_epoch: 0,
+            plan: make_plan(&old_devices),
+        },
+        claim(old, http, http_owner),
+        claim(old, follower, follower_owner),
+        ready(old, http, http_owner, Some(8100)),
+        ready(old, follower, follower_owner, None),
+        ServingAction::Activate(old),
+    ]);
+    let mut next = 1;
+    for action in setup {
+        serving_step(&mut client, voters[0], next, action)
+            .await
+            .unwrap();
+        next += 1;
+    }
+    drop(nodes.remove(0));
+
+    for action in [
+        ServingAction::Prepare {
+            group,
+            expected_epoch: 1,
+            plan: make_plan(&[new_device]),
+        },
+        claim(new, spare, spare_owner),
+        ready(new, spare, spare_owner, Some(8200)),
+        ServingAction::Activate(new),
+    ] {
+        serving_step(&mut client, voters[1], next, action)
+            .await
+            .unwrap();
+        next += 1;
+    }
+    assert_eq!(
+        serving_step(
+            &mut client,
+            voters[2],
+            next,
+            ServingAction::ObserveGroup { group, epoch: None }
+        )
+        .await,
+        Ok(ServingOutcome::Group {
+            version: new,
+            phase: GroupPhase::Active
+        }),
+    );
+    assert_eq!(
+        serving_group(&mut client, voters[2], old).await.phase,
+        GroupPhase::Draining
+    );
+    assert_eq!(
+        serving_step(
+            &mut client,
+            voters[2],
+            next + 1,
+            stop(old, follower, follower_owner)
+        )
+        .await,
+        Err(ServingError::WorkersStillRunning),
+    );
+    serving_step(
+        &mut client,
+        voters[1],
+        next + 2,
+        stop(old, http, http_owner),
+    )
+    .await
+    .unwrap();
+    serving_step(
+        &mut client,
+        voters[2],
+        next + 3,
+        stop(old, follower, follower_owner),
+    )
+    .await
+    .unwrap();
+    serving_step(
+        &mut client,
+        voters[1],
+        next + 4,
+        ServingAction::Retire {
+            version: old,
+            workers: old_devices.into_iter().collect(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        serving_group(&mut client, voters[1], old).await.phase,
+        GroupPhase::Retired
+    );
+    assert_eq!(
+        serving_group(&mut client, voters[2], new).await.phase,
+        GroupPhase::Active
+    );
+}
+
+#[tokio::test]
 async fn route_publication_replaces_group_epoch_atomically_through_surviving_voters() {
     let ids = ids("route-publisher", 3);
     let (mut nodes, addrs) = start_bootstrap(&ids).await;
