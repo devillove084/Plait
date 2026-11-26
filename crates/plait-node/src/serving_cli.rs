@@ -11,7 +11,7 @@ use plait_core::serving::{
 use plait_core::{DeviceId, NodeId, OpId};
 use plait_node::{Client, discover_voters};
 use plait_parallel::serving::{
-    ServingCandidate, ServingForecast, SloProfile, select_serving_candidate,
+    HostedLinkPolicy, ServingCandidate, ServingForecast, SloProfile, select_serving_candidate,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -86,7 +86,9 @@ enum Request {
         candidates: Vec<hosted::Input>,
         #[serde(default)]
         activation: HostedActivation,
+        link_policy: Option<HostedLinkPolicy>,
     },
+    HostedLinks,
     ReplanW4 {
         id: OpId,
         forecast: ServingForecast,
@@ -334,7 +336,20 @@ async fn handle(
             forecast,
             candidates,
             activation,
-        } => hosted::replan(client, peers, id, forecast, candidates, activation).await,
+            link_policy,
+        } => {
+            hosted::replan(
+                client,
+                peers,
+                id,
+                forecast,
+                candidates,
+                activation,
+                link_policy,
+            )
+            .await
+        }
+        Request::HostedLinks => hosted::links(client, peers).await,
         Request::ReplanW4 {
             id,
             forecast,

@@ -5,11 +5,11 @@ use std::net::SocketAddr;
 
 use plait_core::serving::{
     ActiveGroup, ExecutionHostLiveness, GroupId, GroupPhase, GroupPlan, GroupResources,
-    GroupVersion, GroupView, HostMemory, HostResources, HostedRecipe, PdRoute, ResidentOwner,
-    ResolvedPdRoute, RouteDirectory, RouteSetId, ServingAction, ServingEndpoint, ServingError,
-    ServingOperation, ServingOutcome, ServingReceipt, ServingResources, ServingResult, ServingRole,
-    W4_MAX_ADMISSION_MS, W4DrainStatus, W4GroupLayout, W4ShardLayout, WorkerDispatch, WorkerGrant,
-    WorkerResources,
+    GroupVersion, GroupView, HostMemory, HostResources, HostedProbeEndpoint, HostedRecipe, PdRoute,
+    ResidentOwner, ResolvedPdRoute, RouteDirectory, RouteSetId, ServingAction, ServingEndpoint,
+    ServingError, ServingOperation, ServingOutcome, ServingReceipt, ServingResources,
+    ServingResult, ServingRole, W4_MAX_ADMISSION_MS, W4DrainStatus, W4GroupLayout, W4ShardLayout,
+    WorkerDispatch, WorkerGrant, WorkerResources,
 };
 use plait_core::{DeviceId, NodeId, OpId};
 
@@ -78,6 +78,7 @@ pub(crate) struct ServingState {
     host_launches: BTreeMap<GroupVersion, HostLaunch>,
     hosted_switches: BTreeMap<GroupVersion, HostedSwitch>,
     hosted_recipes: BTreeMap<GroupVersion, HostedRecipe>,
+    hosted_probes: BTreeMap<NodeId, HostedProbeEndpoint>,
     execution_hosts: BTreeMap<NodeId, ExecutionHostLiveness>,
     decoder: DecoderState,
 }
@@ -221,6 +222,7 @@ impl ServingState {
                 expected_epoch,
                 plan,
             } => self.prepare(*group, *expected_epoch, plan),
+            ServingAction::RegisterHostedProbe(endpoint) => self.register_hosted_probe(*endpoint),
             ServingAction::PrepareHostedSwitch {
                 group,
                 expected_epoch,

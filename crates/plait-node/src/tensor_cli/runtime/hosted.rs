@@ -22,10 +22,13 @@ use super::{
     ControlPeers, GroupControl, apply, lock_device, lock_identity, register, renew_execution_host,
 };
 
+mod probes;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Config {
     listen: SocketAddr,
+    probe_listen: Option<SocketAddr>,
     host_memory: HostMemory,
     lock_dir: PathBuf,
     launcher: Vec<String>,
@@ -66,6 +69,9 @@ pub(crate) async fn run(
 ) -> io::Result<()> {
     let unique: BTreeSet<_> = config.devices.iter().map(|device| device.ordinal).collect();
     if config.listen.ip().is_unspecified()
+        || config
+            .probe_listen
+            .is_some_and(|address| address.ip() != config.listen.ip())
         || config.launcher.first().is_none_or(String::is_empty)
         || config.profiles.is_empty()
         || config.devices.is_empty()
@@ -111,10 +117,26 @@ pub(crate) async fn run(
     }
     register(&mut control, pulse.clone()).await?;
     println!("plait hosted execution on {host}");
-    let heartbeat = GroupControl::connect(peer_config).await?;
+    let heartbeat = GroupControl::connect(peer_config.clone()).await?;
+    let network_probes = async {
+        if let Some(address) = config.probe_listen {
+            loop {
+                let result = match GroupControl::connect(peer_config.clone()).await {
+                    Ok(control) => probes::run(host, address, control).await,
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = result {
+                    eprintln!("hosted probe service: {error}");
+                }
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+        }
+        std::future::pending::<io::Result<()>>().await
+    };
     tokio::select! {
         result = renew_execution_host(heartbeat, pulse) => result,
         result = supervise(host, &config, &peers, &seeds, &lock, control) => result,
+        result = network_probes => result,
     }
 }
 

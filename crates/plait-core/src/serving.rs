@@ -135,6 +135,22 @@ pub struct HostedAssignment {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedProbeEndpoint {
+    pub host: NodeId,
+    pub session: NodeId,
+    pub address: SocketAddr,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedLinkSample {
+    pub target: NodeId,
+    pub target_session: NodeId,
+    pub sampled_at_ms: u64,
+    pub bytes_per_second: u64,
+    pub rtt_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerDemand {
     pub incarnation: u64,
     pub device_bytes: u64,
@@ -773,6 +789,7 @@ pub enum ServingAction {
         request_sha256: Option<[u8; 32]>,
         recipe: HostedRecipe,
     },
+    RegisterHostedProbe(HostedProbeEndpoint),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -849,6 +866,7 @@ pub enum ServingOutcome {
         revision: u64,
     },
     DecoderSwitchCancelled,
+    HostedProbeRegistered,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -925,6 +943,7 @@ pub enum ServingLookup {
     DecoderRouteWork(RouteSetId),
     DecoderAdmissionRoutes(RouteSetId),
     HostedAssignments(NodeId),
+    HostedProbeEndpoints,
 }
 
 /// A replica's locally applied state. A missing result may indicate replication lag.
@@ -948,6 +967,7 @@ pub enum ServingView {
     DecoderRouteWork(Option<DecoderRouteWork>),
     DecoderAdmissionRoutes(DecoderAdmissionRoutes),
     HostedAssignments(Vec<HostedAssignment>),
+    HostedProbeEndpoints(Vec<HostedProbeEndpoint>),
 }
 
 impl ServingOperation {
@@ -957,6 +977,9 @@ impl ServingOperation {
             ServingAction::SetHostMemory { host, .. }
             | ServingAction::PulseExecutionHost { host, .. } => {
                 keys.insert(Key::HostMemory(*host));
+            }
+            ServingAction::RegisterHostedProbe(endpoint) => {
+                keys.insert(Key::HostMemory(endpoint.host));
             }
             ServingAction::ExpireExecutionHost { host, groups, .. } => {
                 keys.insert(Key::HostMemory(*host));

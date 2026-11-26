@@ -473,6 +473,9 @@ impl NodeState {
                     ServingLookup::HostedAssignments(host) => {
                         ServingView::HostedAssignments(runtime.serving_hosted_assignments(host))
                     }
+                    ServingLookup::HostedProbeEndpoints => {
+                        ServingView::HostedProbeEndpoints(runtime.serving_hosted_probe_endpoints())
+                    }
                     ServingLookup::DecoderClaims(version) => {
                         ServingView::DecoderClaims(runtime.serving_decoder_claims(version))
                     }

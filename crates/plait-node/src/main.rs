@@ -9,6 +9,7 @@ use plait_node::{
     run_hetero_plan, run_matrix_node, run_parallel_demo, run_rdma_selftest,
 };
 
+mod hosted_probe;
 mod kv_store;
 mod serving_cli;
 mod tensor_cli;

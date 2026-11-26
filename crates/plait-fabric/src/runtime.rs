@@ -4,8 +4,9 @@ use plait_consensus::{InstanceId, StateMachine};
 use plait_core::serving::{
     DecoderCheckpoint, DecoderClaim, DecoderDirectory, DecoderDrainStatus, DecoderFailover,
     DecoderReplayPage, DecoderRouteWork, DecoderSwitch, ExecutionHostLiveness, GroupVersion,
-    GroupView, HostedAssignment, ResidentOwner, RouteDirectory, RouteSetId, ServingOperation,
-    ServingReceipt, ServingResources, ServingResult, W4DrainStatus, WorkerDispatch, WorkerGrant,
+    GroupView, HostedAssignment, HostedProbeEndpoint, ResidentOwner, RouteDirectory, RouteSetId,
+    ServingOperation, ServingReceipt, ServingResources, ServingResult, W4DrainStatus,
+    WorkerDispatch, WorkerGrant,
 };
 use plait_core::{
     AcceleratorKind, Command, ComputeTask, DeviceId, DeviceProfile, FuseKind, MembershipChange,
@@ -122,6 +123,10 @@ impl Runtime {
 
     pub fn serving_hosted_assignments(&self, host: NodeId) -> Vec<HostedAssignment> {
         self.serving.hosted_assignments(host)
+    }
+
+    pub fn serving_hosted_probe_endpoints(&self) -> Vec<HostedProbeEndpoint> {
+        self.serving.hosted_probe_endpoints()
     }
 
     pub fn serving_dispatch(&self, version: GroupVersion) -> Vec<WorkerDispatch> {

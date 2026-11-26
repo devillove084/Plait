@@ -1,14 +1,42 @@
 use std::collections::BTreeSet;
 
 use plait_core::serving::{
-    ExecutionHostLiveness, GroupPhase, GroupVersion, ServingError, ServingOutcome, ServingResult,
-    WorkerGrant,
+    ExecutionHostLiveness, GroupPhase, GroupVersion, HostedProbeEndpoint, ServingError,
+    ServingOutcome, ServingResult, WorkerGrant,
 };
 use plait_core::{DeviceId, NodeId, OpId};
 
 use super::ServingState;
 
 impl ServingState {
+    pub(super) fn register_hosted_probe(&mut self, endpoint: HostedProbeEndpoint) -> ServingResult {
+        if !self
+            .execution_host(endpoint.host)
+            .is_some_and(|state| state.online)
+        {
+            return Err(ServingError::ExecutionHostOffline(endpoint.host));
+        }
+        if endpoint.address.port() == 0
+            || endpoint.address.ip().is_unspecified()
+            || endpoint.address.ip().is_multicast()
+        {
+            return Err(ServingError::InvalidEndpoint);
+        }
+        self.hosted_probes.insert(endpoint.host, endpoint);
+        Ok(ServingOutcome::HostedProbeRegistered)
+    }
+
+    pub(crate) fn hosted_probe_endpoints(&self) -> Vec<HostedProbeEndpoint> {
+        self.hosted_probes
+            .values()
+            .filter(|endpoint| {
+                self.execution_host(endpoint.host)
+                    .is_some_and(|state| state.online)
+            })
+            .copied()
+            .collect()
+    }
+
     pub(crate) fn execution_hosts(
         &self,
     ) -> impl Iterator<Item = (NodeId, ExecutionHostLiveness)> + '_ {
@@ -115,6 +143,7 @@ impl ServingState {
             self.fail_resident_version(version)
                 .expect("affected groups checked");
         }
+        self.hosted_probes.remove(&host);
         Ok(ServingOutcome::ExecutionHostOffline)
     }
 }

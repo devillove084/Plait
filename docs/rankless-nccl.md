@@ -196,6 +196,38 @@ A restarted supervisor uses the same local lock and revokes a claim
 left without a live launcher. Use a profile's optional `verify_release`
 executable to attest device release before its grants can be reused.
 
+### Replan with measured host links
+
+Set `probe_listen` in each hosted execution configuration to an address
+reachable from the execution hosts and the planner. Use the same IP as
+`listen`. Port zero lets the node choose a port. Each node registers
+its probe endpoint with the control replicas, then samples its outgoing
+links in sequence. A probe sends 1 MiB over TCP and waits for the peer's
+acknowledgment. It also records the round-trip time of the opening
+request. Samples are kept in the source node's memory.
+
+Send `{"request":"hosted_links"}` to the serving CLI to read the current
+endpoints and directed samples. A sample carries `bytes_per_second`,
+`rtt_ns`, and `sampled_at_ms`. When a node restarts, its probe session
+changes. The planner only uses samples that match the directory's
+source and destination sessions.
+
+To apply these measurements, add a `link_policy` to `replan_hosted`.
+Supply `bytes_per_rank_pair`, the estimated bytes sent per request
+between each directed pair of TP workers, and `max_sample_age_ms`.
+For each pair of hosts, the planner multiplies the byte estimate by
+the number of sending and receiving rank pairs. It sums traffic through
+each host's send and receive port and uses the slowest measured path
+through each port as its capacity. The smallest resulting rate caps
+the candidate's supplied SLO capacity. RTT is available for diagnosis.
+
+The response includes one `link_limits` entry per candidate. A
+cross-host candidate needs fresh samples in both directions for every
+host pair. Missing or expired evidence leaves that candidate unselected.
+The measured cap describes the TCP traffic budget for the supplied
+workload estimate. Application goodput still comes from the SLO
+profiles.
+
 ### Keep one HTTP endpoint across group versions
 
 Point clients at `serve-aggregated.py`. Use the same API model alias
