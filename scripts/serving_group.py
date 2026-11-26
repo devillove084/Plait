@@ -461,6 +461,7 @@ def run(
     phase = None
     drain_until = None
     ready_pipe = None
+    release_driver = getattr(args, "release_driver", None)
 
     def change(name: str, **fields: object) -> str:
         return expect_phase(control.execute(
@@ -498,6 +499,9 @@ def run(
             device_env = config["device_env"]
             child_env["VLLM_USE_PLAIT"] = "1"
             child_env["VLLM_HOST_IP"] = config["address"]
+            if release_driver is not None:
+                for transport in ("PLAIT_NCCL_SHM", "PLAIT_NCCL_IPC", "PLAIT_NCCL_KERNEL"):
+                    child_env[transport] = "0"
         elif any(grant["device"]["node"] != host for grant in grants):
             raise ControlError("all grants must belong to the local host")
         elif len({grant["device"]["ordinal"] for grant in grants}) != args.tp:
@@ -611,6 +615,21 @@ def run(
             if claimed and exited and gate.drained():
                 if process is None:
                     released = True
+                elif release_driver is not None:
+                    try:
+                        proof = subprocess.run(
+                            [args.control_bin, "verify-host-release"],
+                            input=json.dumps({"monitor": release_driver, "host": host,
+                                              "version": version, "grants": grants}) + "\n",
+                            env={key: value for key, value in child_env.items()
+                                 if key not in serving_launch.DEVICE_MASKS},
+                            text=True,
+                            timeout=30,
+                            check=False,
+                        )
+                        released = proof.returncode == 0
+                    except (OSError, subprocess.TimeoutExpired):
+                        released = False
                 elif args.verify_release:
                     # Process-group exit alone cannot attest device and transport cleanup.
                     proof = subprocess.run(

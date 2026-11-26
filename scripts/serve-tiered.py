@@ -94,6 +94,7 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     args.bootstrap = None
     args.hosted_block_size = None
+    args.release_driver = None
     if args.resident_hosted:
         if args.host_launch_spec or args.print_launch_digest or not args.group_id:
             parser.error("expected a supervised hosted group launch")
@@ -109,6 +110,7 @@ def parse_args() -> argparse.Namespace:
             args.bootstrap = bootstrap
             pd = bootstrap.get("pd")
             if pd is not None:
+                args.release_driver = bootstrap["engine"].get("release_driver")
                 if pd["role"] not in ("Prefill", "Decode"):
                     raise ValueError("invalid committed P/D role")
                 args.role = pd["role"].lower()

@@ -9,6 +9,7 @@ use plait_node::{
     run_hetero_plan, run_matrix_node, run_parallel_demo, run_rdma_selftest,
 };
 
+mod device_release;
 mod hosted_probe;
 mod kv_store;
 mod serving_cli;
@@ -128,6 +129,7 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         "serving" => serving_cli::run(args).await,
+        "verify-host-release" => device_release::run(args).await,
         "kv-store" => kv_store::run(args).await,
         "tensor" => tensor_cli::run(args).await,
         "run" => {

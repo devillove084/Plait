@@ -196,6 +196,36 @@ A restarted supervisor uses the same local lock and revokes a claim
 left without a live launcher. Use a profile's optional `verify_release`
 executable to attest device release before its grants can be reused.
 
+For managed P/D with dedicated accelerator devices and Plait TCP, a
+profile can use the built-in driver process check instead of an external
+verifier. Set `release_driver` and the matching `PLAIT_NCCL_BACKEND` in
+the engine profile.
+
+```json
+{
+  "release_driver": { "driver": "ppu", "program": "/path/to/ppu-smi" },
+  "env": { "PLAIT_NCCL_BACKEND": "ppu" }
+}
+```
+
+| `driver` | `PLAIT_NCCL_BACKEND` | Local tool |
+| --- | --- | --- |
+| `nvidia` | `cuda` | `nvidia-smi` |
+| `amd` | `rocm` | `amd-smi` |
+| `ppu` | `ppu` | `ppu-smi` |
+| `ascend` | `huawei` | `npu-smi` |
+
+Use an absolute executable path and load its vendor libraries in the
+resident environment. The driver tool and the engine's visibility mask
+must use the same physical device numbering. The Ascend query addresses
+device IDs whose chip index is zero. The launcher uses the built-in check
+after the worker process group exits and the admission proxy drains.
+It disables the Plait shared-memory and CUDA IPC paths for these groups.
+Every local grant must return a clear process report. Busy devices,
+unsupported reports, and timeouts leave the grants protected. Use
+`verify_release` for profiles that rely on another release procedure,
+such as device resets or transport-specific cleanup.
+
 ### Replan with measured host links
 
 Set `probe_listen` in each hosted execution configuration to an address

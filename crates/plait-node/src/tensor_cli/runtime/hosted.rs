@@ -18,6 +18,8 @@ use serde_json::json;
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, Command};
 
+use crate::device_release::{ReleaseDriver, is_executable};
+
 use super::{
     ControlPeers, GroupControl, apply, lock_device, lock_identity, register, renew_execution_host,
 };
@@ -57,6 +59,7 @@ struct EngineProfile {
     #[serde(default)]
     env: BTreeMap<String, String>,
     verify_release: Option<PathBuf>,
+    release_driver: Option<ReleaseDriver>,
 }
 
 struct Launch {
@@ -88,6 +91,18 @@ pub(crate) async fn run(
         ));
     }
     scaling::validate(&config.pd_scaling)?;
+    for profile in config.profiles.values() {
+        if let Some(driver) = &profile.release_driver
+            && (profile.verify_release.is_some()
+                || profile.env.get("PLAIT_NCCL_BACKEND").map(String::as_str)
+                    != Some(driver.backend()))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "release_driver requires its matching PLAIT_NCCL_BACKEND and a single release verifier",
+            ));
+        }
+    }
     let policies = std::mem::take(&mut config.pd_scaling);
     tokio::fs::create_dir_all(&config.lock_dir).await?;
     let lock = lock_device(&config.lock_dir.join("host-supervisor.lock"))?;
@@ -106,12 +121,11 @@ pub(crate) async fn run(
         .profiles
         .iter()
         .filter(|(_, profile)| {
-            use std::os::unix::fs::PermissionsExt;
-            profile.verify_release.as_ref().is_some_and(|path| {
-                std::fs::metadata(path).is_ok_and(|metadata| {
-                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-                })
-            })
+            profile.verify_release.as_deref().is_some_and(is_executable)
+                || profile
+                    .release_driver
+                    .as_ref()
+                    .is_some_and(ReleaseDriver::available)
         })
         .map(|(name, _)| name.clone())
         .collect();
