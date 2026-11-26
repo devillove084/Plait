@@ -14,7 +14,8 @@ pub use decoder::{
     DecoderLayoutCandidate, DecoderPlacement, DecoderSelection, select_decoder_layout,
 };
 pub use hosted::{
-    HostedLinkLimit, HostedLinkPolicy, HostedPool, generate_hosted_candidates, limit_hosted_links,
+    HostedLinkLimit, HostedLinkPolicy, HostedPdDecision, HostedPdPool, HostedPdSelection,
+    HostedPool, generate_hosted_candidates, limit_hosted_links, plan_hosted_pd,
 };
 
 #[derive(Clone, Copy, Deserialize, Serialize)]

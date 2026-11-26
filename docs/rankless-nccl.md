@@ -404,8 +404,44 @@ the new paths. For an explicit cancellation, send `ResolveHostedPd`
 with the returned `intent` and `cancel: true` through `execute`, using
 a fresh operation ID. Claims remain reserved until the existing stop
 and retirement protocol confirms release. This API takes explicit
-placements. Automatic candidate generation currently covers aggregated
-TP groups.
+placements.
+
+### Plan Prefill and Decode placements together
+
+Send `replan_hosted_pd` with `id`, the API alias `model`,
+`expected_revision`, `forecast`, `link_policy`, and `pool`. Use the
+checkpoint identity as `forecast.model` and supply a current capacity
+entry for every group on an existing path. Leave the forecast's
+`paths` and `link_bytes_per_second` empty. The planner derives them from
+the registered layouts and current link samples.
+
+The pool supplies the following fields.
+
+| Field | Value |
+| --- | --- |
+| `kv` | Store address, namespace and block size used by the managed P/D deployment. The store address must match one registered host. |
+| `kv_bytes_per_request` | Estimated bytes written by Prefill and read by Decode for the request class being planned. |
+| `store_bytes_per_second`, `store_valid_until_ms` | Calibrated aggregate read and write budget and its Unix millisecond deadline. |
+| `slots` | Each entry has a `role` of `Prefill` or `Decode` and a `pool` with the hosted pool fields described above. Give each slot a stable group ID and supported TP sizes. A P/D slot can use TP1 or local TP. The planner chooses which slots to populate. |
+| `allow_scale_down` | With `true`, a layout can remove groups when it serves the forecast demand at the baseline rate with fewer devices. It must use already-active groups. |
+
+Placement checks account for live grants, host and pinned memory,
+ports and installed profiles. The search can retain an active group or
+prepare its replacement alongside it. It keeps a bounded set of layouts
+for each Prefill and Decode replica count.
+
+The estimate follows the ingress's round-robin path allocation. The
+planner charges Prefill-to-store writes, store-to-Decode reads, and
+cross-host TP traffic to their directed ports. Workers contribute to
+KV traffic in proportion to their share of the TP group. Paths sharing
+a port consume the same budget. Capacity and startup estimates are
+supplied per role and TP size. Re-run the command with refreshed inputs
+to make another planning decision.
+
+The response's `selection` reports the baseline and any preferred
+layout. A selected layout is submitted through managed P/D staging.
+The voters recheck route and resource versions when applying it. Retry
+an ambiguous submission using the same operation ID and request.
 
 ### Reuse prompt KV across TP layouts
 

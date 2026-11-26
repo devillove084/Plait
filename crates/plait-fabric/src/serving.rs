@@ -240,6 +240,14 @@ impl ServingState {
                 kv,
                 placements,
                 paths,
+            }
+            | ServingAction::PreparePlannedHostedPd {
+                model,
+                expected_revision,
+                kv,
+                placements,
+                paths,
+                ..
             } => self.prepare_hosted_pd(
                 operation.id,
                 model,

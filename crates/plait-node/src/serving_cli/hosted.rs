@@ -273,7 +273,7 @@ pub(super) async fn links(
     Ok(json!({ "endpoints": endpoints, "samples": samples }))
 }
 
-async fn probe_endpoints(
+pub(super) async fn probe_endpoints(
     client: &mut Client,
     peers: impl Iterator<Item = NodeId>,
 ) -> io::Result<Vec<HostedProbeEndpoint>> {

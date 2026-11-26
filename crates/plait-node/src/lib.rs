@@ -498,6 +498,9 @@ impl NodeState {
                     ServingLookup::HostedPdPending(key) => {
                         ServingView::HostedPdPending(runtime.serving_hosted_pd_pending(key))
                     }
+                    ServingLookup::HostedPdPlanning(key) => {
+                        ServingView::HostedPdPlanning(runtime.serving_hosted_pd_planning(key))
+                    }
                     ServingLookup::HostedProbeEndpoints => {
                         ServingView::HostedProbeEndpoints(runtime.serving_hosted_probe_endpoints())
                     }

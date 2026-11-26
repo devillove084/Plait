@@ -2,8 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use plait_core::NodeId;
 use plait_core::serving::{
-    GroupId, GroupPlan, HostMemory, HostedAddress, HostedLinkSample, HostedPlanning, HostedPortUse,
-    HostedRecipe, ServingResources, ServingRole, WorkerDemand, WorkerResources,
+    GroupId, GroupPlan, HostMemory, HostedAddress, HostedLinkSample, HostedPdKv, HostedPdLaunch,
+    HostedPlanning, HostedPortUse, HostedRecipe, ServingResources, ServingRole, WorkerDemand,
+    WorkerResources,
 };
 use serde::{Deserialize, Serialize};
 
@@ -70,8 +71,20 @@ pub fn generate_hosted_candidates(
     policy: HostedLinkPolicy,
     links: &BTreeMap<(NodeId, NodeId), HostedLinkSample>,
 ) -> Result<Vec<(ServingCandidate, HostedRecipe)>, &'static str> {
+    generate_layouts(resources, planning, forecast, pool, policy, links, None)
+}
+
+pub(super) fn generate_layouts(
+    resources: &ServingResources,
+    planning: &HostedPlanning,
+    forecast: &ServingForecast,
+    pool: &HostedPool,
+    policy: HostedLinkPolicy,
+    links: &BTreeMap<(NodeId, NodeId), HostedLinkSample>,
+    pd: Option<(ServingRole, &HostedPdKv)>,
+) -> Result<Vec<(ServingCandidate, HostedRecipe)>, &'static str> {
     policy.validate()?;
-    pool.validate()?;
+    pool.validate(pd.is_some())?;
     let history = resources
         .groups
         .iter()
@@ -80,7 +93,14 @@ pub fn generate_hosted_candidates(
     let mut candidates = Vec::new();
     for size in &pool.sizes {
         let hosts = available_hosts(resources, planning, pool, size);
-        for layout in search_layouts(&hosts, size.tensor_parallel, policy, forecast.now_ms, links) {
+        for layout in search_layouts(
+            &hosts,
+            size.tensor_parallel,
+            policy,
+            forecast.now_ms,
+            links,
+            pd.is_some(),
+        ) {
             let api_host = layout.api_host.expect("layout has a host with free ports");
             let [master_port, http_port, backend_port] = hosts[&api_host]
                 .ports
@@ -102,7 +122,7 @@ pub fn generate_hosted_candidates(
                 prefix_caching: pool.prefix_caching,
             };
             let mut plan = GroupPlan {
-                role: ServingRole::Aggregated,
+                role: pd.map_or(ServingRole::Aggregated, |(role, _)| role),
                 model: forecast.model.clone(),
                 tensor_parallel: size.tensor_parallel,
                 pipeline_parallel: 1,
@@ -125,9 +145,20 @@ pub fn generate_hosted_candidates(
                         )
                     }));
             }
-            recipe
-                .validate(&plan)
-                .map_err(|_| "invalid hosted pool recipe")?;
+            if let Some((role, kv)) = pd {
+                let launch = HostedPdLaunch {
+                    role,
+                    kv: kv.clone(),
+                };
+                plan.launch_digest = launch.launch_digest(&recipe);
+                launch
+                    .validate(&recipe, &plan)
+                    .map_err(|_| "invalid hosted P/D pool recipe")?;
+            } else {
+                recipe
+                    .validate(&plan)
+                    .map_err(|_| "invalid hosted pool recipe")?;
+            }
             candidates.push((
                 ServingCandidate {
                     group: pool.group,
@@ -145,7 +176,15 @@ pub fn generate_hosted_candidates(
 }
 
 impl HostedPool {
-    fn validate(&self) -> Result<(), &'static str> {
+    pub(super) fn group(&self) -> GroupId {
+        self.group
+    }
+
+    pub(super) fn api_model(&self) -> &str {
+        &self.api_model
+    }
+
+    pub(super) fn validate(&self, allow_local: bool) -> Result<(), &'static str> {
         let end = u32::from(self.ports.first) + u32::from(self.ports.count);
         if self.ports.first == 0 || self.ports.count < 3 || end > u32::from(u16::MAX) + 1 {
             return Err("hosted pool requires a port range with at least three valid ports");
@@ -153,7 +192,7 @@ impl HostedPool {
         let mut degrees = BTreeSet::new();
         if self.sizes.is_empty()
             || self.sizes.iter().any(|size| {
-                size.tensor_parallel < 2
+                size.tensor_parallel < if allow_local { 1 } else { 2 }
                     || !degrees.insert(size.tensor_parallel)
                     || size.device_bytes == 0
                     || size.host_base.pinned_bytes > size.host_base.bytes
@@ -162,9 +201,43 @@ impl HostedPool {
                     || !valid_rate(size.transition_loss_requests)
             })
         {
-            return Err("hosted pool requires distinct multi-host TP sizes and valid budgets");
+            return Err("hosted pool requires distinct supported TP sizes and valid budgets");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl HostedPool {
+    pub(super) fn fixture(group: GroupId, profile: &str, api_model: &str) -> Self {
+        let memory = HostMemory {
+            bytes: 8,
+            pinned_bytes: 1,
+        };
+        Self {
+            group,
+            profile: profile.into(),
+            api_model: api_model.into(),
+            max_model_len: 1024,
+            gpu_memory_bps: 8000,
+            prefix_caching: false,
+            ports: PortRange {
+                first: 20000,
+                count: 6,
+            },
+            sizes: vec![SizeProfile {
+                tensor_parallel: 1,
+                device_bytes: 8,
+                host_base: memory,
+                host_per_worker: memory,
+                capacity: SloProfile {
+                    rps: 50.0,
+                    valid_until_ms: 5000,
+                },
+                ready_after_ms: 10,
+                transition_loss_requests: 0.0,
+            }],
+        }
     }
 }
 
@@ -263,6 +336,7 @@ fn search_layouts(
     policy: HostedLinkPolicy,
     now: u64,
     links: &BTreeMap<(NodeId, NodeId), HostedLinkSample>,
+    allow_local: bool,
 ) -> Vec<Layout> {
     let mut search = Search::from([(
         (0, 0, false),
@@ -309,9 +383,17 @@ fn search_layouts(
         }
         search = next;
     }
-    search
+    let mut layouts = search
         .remove(&(tensor_parallel, 2, true))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if allow_local {
+        layouts.extend(
+            search
+                .remove(&(tensor_parallel, 1, true))
+                .unwrap_or_default(),
+        );
+    }
+    layouts
 }
 
 #[cfg(test)]

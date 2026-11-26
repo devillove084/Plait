@@ -4,9 +4,10 @@ use plait_consensus::{InstanceId, StateMachine};
 use plait_core::serving::{
     DecoderCheckpoint, DecoderClaim, DecoderDirectory, DecoderDrainStatus, DecoderFailover,
     DecoderReplayPage, DecoderRouteWork, DecoderSwitch, ExecutionHostLiveness, GroupVersion,
-    GroupView, HostedAssignment, HostedManagedAssignment, HostedPdIntent, HostedPlanning,
-    HostedProbeEndpoint, ResidentOwner, RouteDirectory, RouteSetId, ServingOperation,
-    ServingReceipt, ServingResources, ServingResult, W4DrainStatus, WorkerDispatch, WorkerGrant,
+    GroupView, HostedAssignment, HostedManagedAssignment, HostedPdIntent, HostedPdPlanning,
+    HostedPlanning, HostedProbeEndpoint, ResidentOwner, RouteDirectory, RouteSetId,
+    ServingOperation, ServingReceipt, ServingResources, ServingResult, W4DrainStatus,
+    WorkerDispatch, WorkerGrant,
 };
 use plait_core::{
     AcceleratorKind, Command, ComputeTask, DeviceId, DeviceProfile, FuseKind, MembershipChange,
@@ -131,6 +132,10 @@ impl Runtime {
 
     pub fn serving_hosted_pd_pending(&self, key: RouteSetId) -> Option<HostedPdIntent> {
         self.serving.hosted_pd_pending(key)
+    }
+
+    pub fn serving_hosted_pd_planning(&self, key: RouteSetId) -> HostedPdPlanning {
+        self.serving.hosted_pd_planning(key)
     }
 
     pub fn serving_hosted_pd_work(&self) -> Vec<HostedPdIntent> {

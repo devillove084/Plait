@@ -2,8 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use plait_core::OpId;
 use plait_core::serving::{
-    GroupPhase, GroupVersion, HostedPdIntent, HostedPdKv, HostedPdLaunch, HostedPdPlacement,
-    HostedPortUse, PdRoute, RouteSetId, ServingError, ServingOutcome, ServingResult, ServingRole,
+    GroupPhase, GroupVersion, HostedPdInstance, HostedPdIntent, HostedPdKv, HostedPdLaunch,
+    HostedPdPlacement, HostedPdPlanning, HostedPortUse, PdRoute, RouteSetId, ServingError,
+    ServingOutcome, ServingResult, ServingRole,
 };
 
 use super::{Reservations, RouteSet, ServingState};
@@ -167,6 +168,43 @@ impl ServingState {
 
     pub(crate) fn hosted_pd_pending(&self, key: RouteSetId) -> Option<HostedPdIntent> {
         self.hosted_pd_intents.get(&key).cloned()
+    }
+
+    pub(crate) fn hosted_pd_planning(&self, key: RouteSetId) -> HostedPdPlanning {
+        let directory = self.routes.get(&key);
+        let active = directory
+            .into_iter()
+            .flat_map(|directory| route_versions(&directory.paths))
+            .filter_map(|version| {
+                let view = self.group(version)?;
+                let launch = self.hosted_pd_launches.get(&version)?;
+                if view.phase != GroupPhase::Active {
+                    return None;
+                }
+                let mut ranks = BTreeMap::new();
+                for device in view.grants.keys() {
+                    *ranks.entry(device.node).or_default() += 1;
+                }
+                Some(HostedPdInstance {
+                    version,
+                    model: view.plan.model.clone(),
+                    role: launch.role,
+                    kv: launch.kv.clone(),
+                    ranks,
+                })
+            })
+            .collect();
+        HostedPdPlanning {
+            revision: directory.map_or(0, |directory| directory.revision),
+            managed: directory.is_none_or(|directory| directory.hosted),
+            pending: self.hosted_pd_intents.get(&key).map(|intent| intent.staged),
+            active,
+            paths: self.routes(key).map_or_else(Vec::new, |directory| {
+                directory.paths.into_iter().map(|path| path.route).collect()
+            }),
+            resources: self.resources(),
+            inventory: self.hosted_planning(),
+        }
     }
 
     pub(crate) fn hosted_pd_work(&self) -> Vec<HostedPdIntent> {

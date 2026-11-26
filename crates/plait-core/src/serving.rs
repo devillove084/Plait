@@ -226,6 +226,26 @@ pub struct HostedPdIntent {
     pub hosts: BTreeSet<NodeId>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedPdInstance {
+    pub version: GroupVersion,
+    pub model: String,
+    pub role: ServingRole,
+    pub kv: HostedPdKv,
+    pub ranks: BTreeMap<NodeId, u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedPdPlanning {
+    pub revision: u64,
+    pub managed: bool,
+    pub pending: Option<OpId>,
+    pub active: Vec<HostedPdInstance>,
+    pub paths: Vec<PdRoute>,
+    pub resources: ServingResources,
+    pub inventory: HostedPlanning,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedProbeEndpoint {
     pub host: NodeId,
@@ -942,6 +962,14 @@ pub enum ServingAction {
         intent: HostedPdIntent,
         cancel: bool,
     },
+    PreparePlannedHostedPd {
+        model: String,
+        expected_revision: u64,
+        kv: HostedPdKv,
+        placements: Vec<HostedPdPlacement>,
+        paths: Vec<PdRoute>,
+        request_sha256: [u8; 32],
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1106,6 +1134,7 @@ pub enum ServingLookup {
     HostedPlanning,
     HostedManagedAssignments(NodeId),
     HostedPdPending(RouteSetId),
+    HostedPdPlanning(RouteSetId),
 }
 
 /// A replica's locally applied state. A missing result may indicate replication lag.
@@ -1133,6 +1162,7 @@ pub enum ServingView {
     HostedPlanning(HostedPlanning),
     HostedManagedAssignments(Vec<HostedManagedAssignment>),
     HostedPdPending(Option<HostedPdIntent>),
+    HostedPdPlanning(HostedPdPlanning),
 }
 
 impl ServingOperation {
@@ -1167,6 +1197,12 @@ impl ServingOperation {
                 keys.insert(Key::Device(*device));
             }
             ServingAction::PrepareHostedPd {
+                model,
+                placements,
+                paths,
+                ..
+            }
+            | ServingAction::PreparePlannedHostedPd {
                 model,
                 placements,
                 paths,

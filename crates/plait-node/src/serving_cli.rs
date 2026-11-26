@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 mod hosted;
+mod hosted_pd;
 mod replanning;
 
 #[derive(Deserialize)]
@@ -96,6 +97,10 @@ enum Request {
     },
     HostedPdPending {
         model: String,
+    },
+    ReplanHostedPd {
+        #[serde(flatten)]
+        input: hosted_pd::Replan,
     },
     ReplanW4 {
         id: OpId,
@@ -395,6 +400,7 @@ async fn handle(
             };
             Ok(json!({ "pending": intent }))
         }
+        Request::ReplanHostedPd { input } => hosted_pd::replan(client, peers, input).await,
         Request::ReplanW4 {
             id,
             forecast,
