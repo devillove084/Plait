@@ -113,10 +113,12 @@ def parse_args() -> argparse.Namespace:
             args.release_driver = bootstrap["engine"].get("release_driver")
             pd = bootstrap.get("pd")
             if pd is not None:
-                if pd["role"] not in ("Prefill", "Decode"):
-                    raise ValueError("invalid committed P/D role")
+                if pd["role"] not in ("Aggregated", "Prefill", "Decode"):
+                    raise ValueError("invalid committed KV role")
                 args.role = pd["role"].lower()
-                args.stream_checkpoints = bootstrap["engine"].get("stream_checkpoints", False)
+                args.stream_checkpoints = (
+                    args.role == "aggregated" or bootstrap["engine"].get("stream_checkpoints", False)
+                )
                 args.seeded_stream_resume = bootstrap["engine"].get("seeded_stream_resume", False)
                 kv = pd["kv"]
                 args.plait_kv_namespace = kv["namespace"]
@@ -175,16 +177,16 @@ def parse_args() -> argparse.Namespace:
             args.backend_port and 0 < args.backend_port < 65536 and args.backend_port != args.port_base
         ):
             parser.error("group launches require one replica and a distinct --backend-port")
-    if args.role != "aggregated":
+    if args.role != "aggregated" or args.plait_kv_namespace is not None:
         try:
             host = ipaddress.IPv4Address(args.kv_host)
             if host.is_unspecified or host.is_multicast:
                 raise ValueError("not a unicast address")
             args.kv_host = str(host)
         except ValueError:
-            parser.error("prefill and decode require an explicit --kv-host IPv4 address")
+            parser.error("the KV connector needs a unicast IPv4 address")
         if args.replicas != 1 or args.kv_port is None or not (0 < args.kv_port < 65536):
-            parser.error("prefill and decode need one replica and a valid --kv-port")
+            parser.error("the KV connector needs one replica and a valid --kv-port")
         if args.kv_lease_seconds < 1:
             parser.error("the KV handoff lease must be positive")
         if args.plait_kv_namespace is None and args.kv_port in (args.port_base, args.backend_port):
@@ -258,7 +260,7 @@ def native_command(args: argparse.Namespace, vllm: str, port: int) -> list[str]:
             command.extend(("--attention-config", json.dumps({"backend": args.attention_backend})))
         else:
             command.extend(("--attention-backend", args.attention_backend))
-    if args.role != "aggregated":
+    if args.role != "aggregated" or args.plait_kv_namespace is not None:
         role = "kv_producer" if args.role == "prefill" else "kv_consumer"
         if args.plait_kv_namespace is None:
             config = {
@@ -278,9 +280,11 @@ def native_command(args: argparse.Namespace, vllm: str, port: int) -> list[str]:
                     "namespace": args.plait_kv_namespace,
                 },
             }
-            if args.role == "decode" and args.stream_checkpoints:
+            if args.role == "aggregated":
+                config["kv_connector_extra_config"]["checkpoint_only"] = True
+            if args.role != "prefill" and args.stream_checkpoints:
                 config["kv_connector_extra_config"]["checkpoint_decode"] = True
-            if args.role == "decode" and args.seeded_stream_resume:
+            if args.role != "prefill" and args.seeded_stream_resume:
                 config["kv_connector_extra_config"]["seeded_resume"] = True
         command.extend(("--kv-transfer-config", json.dumps(config)))
     return command

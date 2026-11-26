@@ -474,7 +474,7 @@ def server(
             with contextlib.closing(endpoint.connect(budget)) as connection:
                 payload = replay.generation_request(can_resume)
                 kv = payload.get("kv_transfer_params", {})
-                if replay.mode == RESUME_KV_MODE:
+                if replay.mode == RESUME_KV_MODE and (can_resume or transfer is not None):
                     kv["plait_checkpoint"] = True
                 if transfer is not None:
                     kv.update(transfer.params)

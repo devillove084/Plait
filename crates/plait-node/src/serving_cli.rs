@@ -241,6 +241,8 @@ struct HostedPdPlacementInput {
     expected_active: Option<u64>,
     plan: NativePlanInput,
     recipe: HostedRecipe,
+    #[serde(default)]
+    aggregate_stream_checkpoints: bool,
 }
 
 impl HostedPdPlacementInput {
@@ -250,22 +252,29 @@ impl HostedPdPlacementInput {
 
     fn hosted_placement(self, kv: Option<&HostedPdKv>) -> io::Result<HostedPdPlacement> {
         let mut plan: GroupPlan = self.plan.try_into()?;
-        plan.launch_digest = if plan.role == ServingRole::Aggregated {
-            self.recipe.launch_digest()
-        } else {
-            HostedPdLaunch {
-                role: plan.role,
-                kv: kv
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "split serving requires a KV contract",
-                        )
-                    })?
-                    .clone(),
-            }
-            .launch_digest(&self.recipe)
-        };
+        if self.aggregate_stream_checkpoints && plan.role != ServingRole::Aggregated {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "aggregate stream checkpoints require an aggregate placement",
+            ));
+        }
+        plan.launch_digest =
+            if plan.role == ServingRole::Aggregated && !self.aggregate_stream_checkpoints {
+                self.recipe.launch_digest()
+            } else {
+                HostedPdLaunch {
+                    role: plan.role,
+                    kv: kv
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "the placement requires a KV contract",
+                            )
+                        })?
+                        .clone(),
+                }
+                .launch_digest(&self.recipe)
+            };
         Ok(HostedPdPlacement {
             group: self.group,
             expected_epoch: self.expected_epoch,

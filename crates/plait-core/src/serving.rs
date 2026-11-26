@@ -202,7 +202,6 @@ impl HostedPdLaunch {
     pub fn validate(&self, recipe: &HostedRecipe, plan: &GroupPlan) -> Result<(), ServingError> {
         recipe.validate_topology(plan, 1)?;
         if plan.role != self.role
-            || plan.role == ServingRole::Aggregated
             || self.kv.store.port() == 0
             || self.kv.store.ip().is_unspecified()
             || self.kv.store.ip().is_multicast()
@@ -629,6 +628,7 @@ pub struct HostedServingPlanning {
     pub split: HostedPdPlanning,
     pub committed: Vec<HostedRoute>,
     pub assignments: BTreeMap<GroupVersion, HostedAssignment>,
+    pub aggregate_kv: BTreeMap<GroupVersion, HostedPdKv>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

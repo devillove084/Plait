@@ -35,7 +35,7 @@ impl ServingState {
             .flat_map(RouteSet::hosted_routes)
             .collect();
         let versions = route_groups(&committed);
-        let assignments = versions
+        let assignments: BTreeMap<_, _> = versions
             .into_iter()
             .filter_map(|version| {
                 let view = self
@@ -55,6 +55,13 @@ impl ServingState {
                 ))
             })
             .collect();
+        let aggregate_kv = assignments
+            .keys()
+            .filter_map(|version| {
+                let launch = self.hosted_pd_launches.get(version)?;
+                (launch.role == ServingRole::Aggregated).then(|| (*version, launch.kv.clone()))
+            })
+            .collect();
         HostedServingPlanning {
             managed: directory.is_none_or(|current| {
                 !current.aggregated.is_empty() || current.hosted_kv.is_some()
@@ -62,6 +69,7 @@ impl ServingState {
             split,
             committed,
             assignments,
+            aggregate_kv,
         }
     }
 
@@ -111,7 +119,7 @@ impl ServingState {
             .any(|route| matches!(route, HostedRoute::Split(_)));
         if model.is_empty()
             || plan.routes.is_empty()
-            || has_split != plan.kv.is_some()
+            || (has_split && plan.kv.is_none())
             || directory.is_some_and(|current| {
                 current.model != model
                     || (current.aggregated.is_empty() && current.hosted_kv.is_none())
@@ -145,6 +153,17 @@ impl ServingState {
             &previous_groups,
             &targets,
         )?;
+        if !has_split
+            && plan.kv.is_some()
+            && !targets.iter().any(|version| {
+                prepared.get(version).map_or_else(
+                    || self.hosted_pd_launches.contains_key(version),
+                    |group| group.launch.is_some(),
+                )
+            })
+        {
+            return Err(ServingError::InvalidDirectory);
+        }
         let previous_model = previous_groups
             .iter()
             .next()
@@ -206,14 +225,9 @@ impl ServingState {
         }
         let view = self.group(version)?;
         let recipe = self.hosted_recipes.get(&version)?;
-        let matches_kv = match role {
-            ServingRole::Aggregated => !self.hosted_pd_launches.contains_key(&version),
-            _ => {
-                self.hosted_pd_launches
-                    .get(&version)
-                    .map(|launch| &launch.kv)
-                    == kv
-            }
+        let matches_kv = match self.hosted_pd_launches.get(&version) {
+            Some(launch) => Some(&launch.kv) == kv,
+            None => role == ServingRole::Aggregated,
         };
         (previous.contains(&version)
             && view.phase == GroupPhase::Active
@@ -254,7 +268,11 @@ impl ServingState {
             {
                 return Err(ServingError::ActiveEpochChanged { current: active });
             }
-            let launch = if placement.plan.role == ServingRole::Aggregated {
+            // Mixed plans may retain the original aggregate launch format.
+            // The digest distinguishes it from a launch bound to shared KV.
+            let legacy_aggregate = placement.plan.role == ServingRole::Aggregated
+                && placement.plan.launch_digest == placement.recipe.launch_digest();
+            let launch = if legacy_aggregate {
                 placement
                     .recipe
                     .validate_aggregated_route(&placement.plan)?;

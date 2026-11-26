@@ -34,7 +34,7 @@ def resident_spec(recipe: dict, engine: dict, *, pd: bool = False) -> dict:
         arg.split("=", 1)[0].replace("_", "-") in {"--kv-transfer-config", "--block-size"}
         for arg in program["args"]
     ):
-        raise ValueError("the hosted P/D plan supplies the KV connector and block size")
+        raise ValueError("the hosted plan supplies the KV connector and block size")
     hosts = {
         bytes(entry["host"]).hex(): {**program, "address": entry["address"]}
         for entry in recipe["hosts"]

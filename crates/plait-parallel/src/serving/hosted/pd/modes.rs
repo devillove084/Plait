@@ -5,7 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use plait_core::NodeId;
 use plait_core::serving::{
     GroupId, GroupVersion, HostedAssignment, HostedEvacuationPlanning, HostedLinkSample,
-    HostedRoute, HostedServingPlan, HostedServingPlanning, ServingAction, ServingRole,
+    HostedPdLaunch, HostedRoute, HostedServingPlan, HostedServingPlanning, ServingAction,
+    ServingRole,
 };
 use serde::Deserialize;
 
@@ -19,6 +20,8 @@ use super::{
 #[serde(deny_unknown_fields)]
 pub struct HostedModePolicy {
     aggregate_slots: Vec<HostedPool>,
+    #[serde(default)]
+    aggregate_stream_checkpoints: bool,
     /// Value of reclaiming one device-second, expressed in requests.
     device_cost_requests_per_second: f64,
     mode_change_loss_requests: f64,
@@ -104,6 +107,7 @@ fn plan(
     let drain_ms = modes.map_or(0, |modes| modes.drain_ms);
     let device_cost = modes.map_or(0.0, |modes| modes.device_cost_requests_per_second);
     let mode_loss = modes.map_or(0.0, |modes| modes.mode_change_loss_requests);
+    let aggregate_checkpoints = modes.is_some_and(|modes| modes.aggregate_stream_checkpoints);
     // Validate the contract. Fresh store evidence is required only for split traffic.
     pool.validate(model, 0)?;
     if !snapshot.managed
@@ -157,6 +161,13 @@ fn plan(
         if assignment.model != forecast.model {
             return Err("active aggregate serving groups require the calibrated checkpoint");
         }
+        if snapshot
+            .aggregate_kv
+            .get(&version)
+            .is_some_and(|kv| kv != &pool.kv)
+        {
+            return Err("active aggregate checkpoints require the configured KV contract");
+        }
         let endpoint = aggregate
             .iter()
             .find(|slot| slot.group() == version.group)
@@ -208,7 +219,7 @@ fn plan(
         withdrawing: maintenance.map(|snapshot| &snapshot.withdrawing),
     };
     let mut best: Option<(usize, f64, u64, HostedServingPlan)> = None;
-    for layout in search.layouts(&snapshot.split, &active)? {
+    for mut layout in search.layouts(&snapshot.split, &active)? {
         let targets: BTreeSet<_> = layout.routes().into_iter().collect();
         if targets == routes || layout.potential < baseline {
             continue;
@@ -255,12 +266,28 @@ fn plan(
                         && (gain > *score || (gain == *score && devices < *count)))
             })
         {
+            let mut needs_contract = layout.roles.has_split()
+                || new_versions
+                    .iter()
+                    .any(|version| snapshot.aggregate_kv.contains_key(version));
+            if aggregate_checkpoints {
+                for placement in &mut layout.placements {
+                    if placement.plan.role == ServingRole::Aggregated {
+                        let launch = HostedPdLaunch {
+                            role: ServingRole::Aggregated,
+                            kv: pool.kv.clone(),
+                        };
+                        placement.plan.launch_digest = launch.launch_digest(&placement.recipe);
+                        needs_contract = true;
+                    }
+                }
+            }
             best = Some((
                 retained,
                 gain,
                 devices,
                 HostedServingPlan {
-                    kv: layout.roles.has_split().then(|| pool.kv.clone()),
+                    kv: needs_contract.then(|| pool.kv.clone()),
                     placements: layout.placements,
                     routes: targets.into_iter().collect(),
                 },
@@ -446,6 +473,7 @@ mod tests {
             },
             committed: Vec::new(),
             assignments: BTreeMap::new(),
+            aggregate_kv: BTreeMap::new(),
         };
         let slot = |group, role, profile| RoleSlot {
             role,
@@ -472,6 +500,7 @@ mod tests {
             aggregate_slots: vec![
                 HostedPool::fixture(groups[0], "aggregate", "model").with_capacity(1, 2.0),
             ],
+            aggregate_stream_checkpoints: false,
             device_cost_requests_per_second: 0.25,
             mode_change_loss_requests: 0.1,
             drain_ms: 100,
@@ -623,6 +652,23 @@ mod tests {
         assert_eq!(low.placements.len(), 1);
         assert!(low.kv.is_none());
         assert!(plan(&split, 8.0, &modes, &links).is_none());
+
+        modes.aggregate_stream_checkpoints = true;
+        let Some(ServingAction::PrepareHostedServing { plan: low, .. }) =
+            plan(&split, 1.0, &modes, &links)
+        else {
+            panic!("expected checkpoint-enabled aggregation");
+        };
+        assert_eq!(low.kv.as_ref(), Some(&pool.kv));
+        let placement = &low.placements[0];
+        assert_eq!(
+            placement.plan.launch_digest,
+            HostedPdLaunch {
+                role: ServingRole::Aggregated,
+                kv: pool.kv.clone(),
+            }
+            .launch_digest(&placement.recipe)
+        );
 
         modes.drain_ms = 9999;
         assert!(plan(&split, 1.0, &modes, &links).is_none());

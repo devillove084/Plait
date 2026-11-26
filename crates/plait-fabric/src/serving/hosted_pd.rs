@@ -631,6 +631,100 @@ mod tests {
     }
 
     #[test]
+    fn checkpointed_aggregate_retains_its_committed_contract_across_mode_changes() {
+        let mut state = ServingState::default();
+        let mut aggregate = placement(&mut state, 10, 1, 0, ServingRole::Aggregated);
+        let prefill = placement(&mut state, 11, 2, 0, ServingRole::Prefill);
+        let decode = placement(&mut state, 12, 3, 0, ServingRole::Decode);
+        let contract = kv();
+        let launch = HostedPdLaunch {
+            role: ServingRole::Aggregated,
+            kv: contract.clone(),
+        };
+        let agg_version = version(&aggregate);
+        let agg = HostedRoute::Aggregated(agg_version);
+        let split = HostedRoute::Split(PdRoute {
+            prefill: version(&prefill),
+            decode: version(&decode),
+        });
+        let key = RouteSetId::for_model("served");
+        let stage = |state: &mut ServingState, revision, placements, routes, kv| {
+            state.prepare_hosted_serving(
+                OpId::new(key.0, revision + 1),
+                "served",
+                revision,
+                &HostedServingPlan {
+                    kv,
+                    placements,
+                    routes,
+                },
+            )
+        };
+        assert_eq!(
+            stage(
+                &mut state,
+                0,
+                vec![aggregate.clone()],
+                vec![agg],
+                Some(contract.clone())
+            ),
+            Err(ServingError::InvalidDirectory)
+        );
+        aggregate.plan.launch_digest = launch.launch_digest(&aggregate.recipe);
+        assert_eq!(
+            stage(&mut state, 0, vec![aggregate.clone()], vec![agg], None),
+            Err(ServingError::InvalidPlan)
+        );
+        stage(
+            &mut state,
+            0,
+            vec![aggregate.clone()],
+            vec![agg],
+            Some(contract.clone()),
+        )
+        .unwrap();
+        assert_eq!(state.hosted_pd_launches[&agg_version], launch);
+        ready(&mut state, &aggregate);
+        let intent = state.hosted_serving_work().pop().unwrap();
+        state.resolve_hosted_serving(&intent, false).unwrap();
+
+        let mismatch = HostedPdKv {
+            namespace: "other".into(),
+            ..contract.clone()
+        };
+        assert_eq!(
+            stage(&mut state, 1, vec![], vec![agg], Some(mismatch)),
+            Err(ServingError::InvalidDirectory)
+        );
+        assert_eq!(
+            state
+                .hosted_serving_planning(key)
+                .aggregate_kv
+                .get(&agg_version),
+            Some(&contract)
+        );
+        stage(
+            &mut state,
+            1,
+            vec![prefill.clone(), decode.clone()],
+            vec![agg, split],
+            Some(contract.clone()),
+        )
+        .unwrap();
+        ready(&mut state, &prefill);
+        ready(&mut state, &decode);
+        let intent = state.hosted_serving_work().pop().unwrap();
+        state.resolve_hosted_serving(&intent, false).unwrap();
+        stage(&mut state, 2, vec![], vec![agg], Some(contract)).unwrap();
+        let intent = state.hosted_serving_work().pop().unwrap();
+        state.resolve_hosted_serving(&intent, false).unwrap();
+        assert_eq!(state.hosted_pd_launches[&agg_version], launch);
+        let directory = state.hosted_routes(key).unwrap();
+        assert!(directory.split.paths.is_empty());
+        assert_eq!(directory.aggregated[0].0, agg_version);
+    }
+
+    #[test]
     fn hosted_pd_recovery_keeps_committed_paths_and_contract_after_retirement() {
         let mut state = ServingState::default();
         let p = placement(&mut state, 11, 1, 0, ServingRole::Prefill);

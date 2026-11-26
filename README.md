@@ -204,6 +204,10 @@ and mixed targets against observed ingress load. Configure `aggregate_slots`
 with the same pool format as the split slots. The policy scores shared NIC
 and KV-store budgets at the ingress path shares, and charges startup and drain
 against a configurable value per reclaimed device-second.
+Enable `aggregate_stream_checkpoints` to launch aggregate replacements with
+the same KV contract as split groups. The unified ingress can then hand off
+an active completion across both serving shapes.
+[Aggregate and split checkpoint setup](docs/rankless-nccl.md#share-checkpoints-between-aggregate-and-split-routes)
 
 `begin_execution_drain` withdraws one device or a whole execution host from
 new placements. The hosted planner can move affected groups at the incumbent
@@ -266,6 +270,7 @@ release the result after the matching completion has executed in the control pla
 | [Hosted pool reservations](specs/PlaitHostedPool.tla) | A placement is checked against current inventory when prepared. Competing placements cannot reserve the same devices or API ports, including while a revoked group awaits retirement. |
 | [Hosted P/D publication](specs/PlaitHostedPd.tla) | Both roles cut over in one publication after their participants report readiness. Candidate failure or a changed directory revision prevents a stale cutover. |
 | [Hosted serving modes](specs/PlaitHostedServingModes.tla) | An aggregate, a split path, or both can be published in one revision after all target groups are ready. Removed groups drain admitted requests before retiring. |
+| [Hosted checkpoint contract](specs/PlaitHostedCheckpointContract.tla) | A published route agrees with the KV contract of each participating group. A retained group version keeps its launch binding as the directory changes serving shapes. |
 | [Hosted mode selection](specs/PlaitHostedModeSelection.tla) | Mixed routes fit the combined port and KV-store budgets. A switch preserves the incumbent SLO rate and has positive benefit after startup and drain. |
 | [Execution maintenance](specs/PlaitExecutionMaintenance.tla) | A new grant avoids a withdrawn target, a separate device keeps its group, and confirmation waits for both grants and deferred holds to release. |
 | [Hosted P/D budgeting](specs/PlaitHostedPdBudget.tla) | Equal path shares consume the same Prefill and directional port budgets. The model checks combined TP and KV demand on shared ports. |

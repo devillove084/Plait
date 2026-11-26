@@ -774,6 +774,28 @@ hits for a 254-token prompt. The client received all 16 output tokens on
 the original SSE connection. Token IDs, text, and usage matched a cold
 run on the replacement.
 
+#### Share checkpoints between aggregate and split routes
+
+Use one `kv` contract in `prepare_hosted_serving` and set
+`aggregate_stream_checkpoints: true` on each new aggregate placement that
+should participate. For automatic placement, set the same flag under
+`pd_scaling.serving_modes`. The committed binding fixes the store, namespace,
+and block size for the group's lifetime. Use the same model checkpoint and
+KV dtype in the installed engine profiles. Set `stream_checkpoints: true`
+on Decode profiles to export generated pages from split routes.
+
+An aggregate consumes and publishes shared pages for requests using
+`X-Plait-Stream-Recovery: resume-kv`. Its ordinary requests keep their
+local KV path. Enable `seeded_stream_resume` across the generating profiles
+to carry a positive-temperature request with an explicit seed. During a
+switch into split serving, the ingress still obtains the target Prefill's
+KV receipt. During a switch into aggregation, the engine looks up the
+original prompt and committed output history directly. Both can import
+complete pages from the old layout and compute the remaining known tokens.
+Calibrate SLO capacity under the intended fraction of checkpointing streams.
+The mode selector budgets steady-state split handoffs. Checkpoint export
+and import consume additional store and link capacity during these requests.
+
 ## Execute a collective
 
 For small all-reduces, each worker sends its complete contribution to each
