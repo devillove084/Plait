@@ -21,6 +21,7 @@ from serving_group import (
 )
 from serving_launch import host_command, resident_spec
 from serving_load import Load
+from serving_replay import RECOVERY_HEADER, RECOVERY_MODE, sse
 
 
 ROUTER = runpy.run_path(str(Path(__file__).with_name("serve-disaggregated.py")))
@@ -498,6 +499,66 @@ class HandoffTest(unittest.TestCase):
         store = "127.0.0.1:9100"
         self.assertEqual(self.request(router_port, COMPLETIONS, payload)[0], 200)
         self.assertEqual(decoded[0]["kv_transfer_params"]["plait_handoff"]["store"], store)
+
+    def test_plait_pd_replay_matches_the_existing_stream_before_emitting_a_suffix(self):
+        for mismatched in (False, True):
+            with self.subTest(mismatched=mismatched):
+                tickets = []
+
+                def prefill(body):
+                    ticket = body["kv_transfer_params"]["plait_handoff"]["ticket"]
+                    tickets.append(ticket)
+                    receipt = {"ticket": ticket, "store": "127.0.0.1:9100",
+                               "prompt_sha256": "c" * 64, "cached_tokens": 128}
+                    return "application/json", json.dumps({
+                        "kv_transfer_params": {"plait_handoff": receipt},
+                    }).encode()
+
+                def chunk(identity, text, ids, prompt=None, terminal=False):
+                    choice = {"index": 0, "text": text, "token_ids": ids,
+                              "finish_reason": "length" if terminal else None}
+                    if prompt is not None:
+                        choice["prompt_token_ids"] = prompt
+                    return sse({"id": identity, "model": "test", "choices": [choice]})
+
+                def old_decode(body):
+                    self.assertTrue(body["return_token_ids"])
+                    self.assertEqual(body["kv_transfer_params"]["plait_handoff"]["ticket"], tickets[-1])
+                    return "text/event-stream", chunk("first", "a", [8], [4])
+
+                def new_decode(body):
+                    self.assertEqual(body["kv_transfer_params"]["plait_handoff"]["ticket"], tickets[-1])
+                    prefix = "x" if mismatched else "a"
+                    stream = chunk("second", prefix + "b", [8, 9], [4])
+                    stream += chunk("second", "", [], terminal=True) + b"data: [DONE]\n\n"
+                    return "text/event-stream", stream
+
+                p_port, gate = self.group("prefill", PREFILL, prefill)
+                old_port, _ = self.group("decode", DECODE, old_decode)
+                new_port, _ = self.group("decode", SPARE, new_decode)
+                source = Endpoint("127.0.0.1", p_port, PREFILL, "prefill")
+                old_path, new_path = [ROUTER["Route"](source, Endpoint("127.0.0.1", port, version, "decode"),
+                                                      "127.0.0.1", 9100)
+                                      for port, version in ((old_port, DECODE), (new_port, SPARE))]
+                directory = SimpleNamespace(routes=Mock(side_effect=[("test", [old_path]), ("test", [new_path])]))
+                router = self.start(ROUTER["server"]("127.0.0.1", 0, directory, 2, kv_transport="plait"))
+                status, headers, body = self.request(router, COMPLETIONS, {
+                    "model": "test", "prompt": [4], "max_tokens": 2, "stream": True,
+                    "temperature": 0, "return_token_ids": True,
+                }, {RECOVERY_HEADER: RECOVERY_MODE})
+                self.assertEqual((status, headers[VERSION_HEADER], headers[RECOVERY_HEADER]),
+                                 (200, DECODE, RECOVERY_MODE))
+                data = [line[6:] for line in body.splitlines() if line.startswith(b"data: ")]
+                frames = [json.loads(line) for line in data if line != b"[DONE]"]
+                choices = [choice for frame in frames for choice in frame.get("choices", [])]
+                self.assertEqual({frame["id"] for frame in frames if "id" in frame}, {"first"})
+                self.assertEqual([token for choice in choices for token in choice["token_ids"]],
+                                 [8] if mismatched else [8, 9])
+                self.assertEqual("".join(choice["text"] for choice in choices), "a" if mismatched else "ab")
+                self.assertEqual(data.count(b"[DONE]"), 0 if mismatched else 1)
+                self.assertEqual("error" in frames[-1], mismatched)
+                self.assertEqual(len(set(tickets)), 2)
+                self.assertTrue(gate.drained())
 
     def test_load_counts_valid_arrivals_when_routes_are_unavailable(self):
         directory = Mock()

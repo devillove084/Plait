@@ -410,6 +410,26 @@ lookup and recomputation behavior.
 This path uses the bounded, in-memory Plait KV store and supports the
 eager, dense FP16 and BF16 attention layouts described below.
 
+### Recover a P/D completion after Decode disconnects
+
+With `serve-disaggregated.py --kv-transport plait`, send
+`X-Plait-Stream-Recovery: replay-prefix` on `POST /v1/completions`. Use
+`stream: true`, `temperature: 0`, and one token-addressable text completion.
+
+If the admitted Decode disconnects, the ingress keeps the HTTP stream open
+and excludes that Decode version. It uses an already live alternative or
+waits for the route directory to publish one. The replacement attempt
+obtains a fresh Prefill handoff, reads the prompt pages through the Plait
+store, and generates from the start of the completion. The ingress checks
+the token IDs and text already emitted before forwarding the suffix. It
+keeps the original completion ID and emits one terminal marker on success.
+
+The ingress releases each completed handoff lease after its Decode attempt.
+When matching fails or the request deadline expires, an in-progress stream
+receives a recovery error. Replay keeps state in the live ingress and uses
+an available Prefill/Decode path. It regenerates the emitted prefix with
+the replacement engine.
+
 ### Start and publish a managed Prefill and Decode deployment
 
 Install the model profile on each resident execution host. The plan

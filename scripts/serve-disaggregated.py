@@ -24,9 +24,25 @@ from serving_group import (
     Endpoint, admission_rejected, endpoint_ready,
 )
 from serving_load import Load, listen as load_listener, parse_address as parse_load_address
+from serving_replay import (
+    RECOVERY_HEADER, RECOVERY_MODE, CompletionReplay, ReplayMismatch, UpstreamInterrupted, sse,
+)
 
 class UpstreamError(RuntimeError):
     pass
+
+
+class PrefillError(UpstreamError):
+    def __init__(self, status: int, body: dict) -> None:
+        self.status = status
+        self.body = body
+
+
+@dataclass(frozen=True)
+class Transfer:
+    request_id: str
+    token: str
+    params: dict
 
 
 @dataclass(frozen=True)
@@ -192,6 +208,24 @@ def request_engine(
     return connection.getresponse()
 
 
+def request_prefill(route: Route, path: str, body: dict, deadline: float, use_plait: bool) -> Transfer | None:
+    request_id, token = uuid.uuid4().hex, uuid.uuid4().hex
+    ticket = token if use_plait else None
+    budget = max(0.001, deadline - time.monotonic())
+    with contextlib.closing(route.prefill.connect(budget)) as connection:
+        with request_engine(connection, route.prefill, path, prefill_payload(body, ticket), request_id, token) as response:
+            if admission_rejected(response):
+                return None
+            if response.status != 200:
+                raise PrefillError(response.status, read_json(response))
+            try:
+                params = transfer_descriptor(read_json(response), route, ticket)
+            except UpstreamError:
+                release_transfer(route.prefill, token)
+                raise
+    return Transfer(request_id, token, params)
+
+
 def server(
     bind: str, port: int, directory: Directory | ControlDirectory, timeout: float,
     kv_transport: str = "nixl", load: Load | None = None,
@@ -235,13 +269,19 @@ def server(
                     raise ValueError("expected the configured model and one completion")
                 if isinstance(prompt, list) and any(type(token) is not int for token in prompt):
                     raise ValueError("batched prompts need separate P/D requests")
+                recovery = self.headers.get(RECOVERY_HEADER)
+                replay = None
+                if recovery is not None:
+                    if recovery != RECOVERY_MODE or kv_transport != "plait" or self.path != "/v1/completions":
+                        raise ValueError("P/D replay requires Plait KV and a text completion")
+                    replay = CompletionReplay(body, recovery)
                 body.pop("kv_transfer_params", None)
             except (OSError, ValueError) as error:
                 self.fail(400, str(error))
                 return
 
             if load is None:
-                self.route_request(routes, body)
+                self.route_request(routes, body, replay)
                 return
             load.begin()
             completed = False
@@ -249,15 +289,17 @@ def server(
                 config = self.read_directory()
                 if config is not None:
                     _, routes = config
-                    completed = self.route_request(routes, body)
+                    completed = self.route_request(routes, body, replay)
             finally:
                 load.finish(completed)
 
-        def route_request(self, routes: list[Route], body: dict) -> bool:
+        def route_request(self, routes: list[Route], body: dict, replay: CompletionReplay | None = None) -> bool:
             deadline = time.monotonic() + timeout
             if routes:
                 start = next(next_path) % len(routes)
                 routes = routes[start:] + routes[:start]
+            if replay is not None:
+                return self.route_replay(routes, replay, deadline)
             for route in routes:
                 budget = deadline - time.monotonic()
                 if budget <= 0:
@@ -275,39 +317,116 @@ def server(
             return False
 
         def try_route(self, route: Route, body: dict, deadline: float) -> bool | None:
-            request_id, token = uuid.uuid4().hex, uuid.uuid4().hex
-            plait_ticket = token if kv_transport == "plait" else None
-            budget = max(0.001, deadline - time.monotonic())
-            with contextlib.closing(route.prefill.connect(budget)) as connection:
-                with request_engine(
-                    connection, route.prefill, self.path, prefill_payload(body, plait_ticket), request_id, token,
-                ) as response:
-                    if admission_rejected(response):
-                        return None
-                    if response.status != 200:
-                        self.write_json(response.status, read_json(response))
-                        return False
-                    try:
-                        params = transfer_descriptor(read_json(response), route, plait_ticket)
-                    except UpstreamError:
-                        release_transfer(route.prefill, token)
-                        raise
+            try:
+                transfer = request_prefill(route, self.path, body, deadline, kv_transport == "plait")
+            except PrefillError as error:
+                self.write_json(error.status, error.body)
+                return False
+            if transfer is None:
+                return None
 
             budget = deadline - time.monotonic()
             if budget <= 0:
-                release_transfer(route.prefill, token)
+                release_transfer(route.prefill, transfer.token)
                 raise UpstreamError("request deadline elapsed before decode")
             with contextlib.closing(route.decode.connect(budget)) as connection:
                 with request_engine(
-                    connection, route.decode, self.path, {**body, "kv_transfer_params": params}, request_id,
+                    connection, route.decode, self.path,
+                    {**body, "kv_transfer_params": transfer.params}, transfer.request_id,
                 ) as response:
                     if admission_rejected(response):
-                        release_transfer(route.prefill, token)
+                        release_transfer(route.prefill, transfer.token)
                         return None
                     completed = self.write_decode(response)
                     if completed:
-                        release_transfer(route.prefill, token)
+                        release_transfer(route.prefill, transfer.token)
             return completed
+
+        def route_replay(self, routes: list[Route], replay: CompletionReplay, deadline: float) -> bool:
+            failed_decodes = set()
+            while time.monotonic() < deadline:
+                tried_prefills = set()
+                for route in routes:
+                    budget = deadline - time.monotonic()
+                    if budget <= 0:
+                        break
+                    if route.decode.version in failed_decodes or route.prefill.version in tried_prefills:
+                        continue
+                    if not endpoint_ready(route.decode, min(1.0, budget)):
+                        continue
+                    try:
+                        transfer = request_prefill(route, self.path, replay.request, deadline, True)
+                    except PrefillError as error:
+                        if not replay.started:
+                            self.write_json(error.status, error.body)
+                            return False
+                        tried_prefills.add(route.prefill.version)
+                        continue
+                    except (*HTTP_ERRORS, UpstreamError):
+                        tried_prefills.add(route.prefill.version)
+                        continue
+                    if transfer is None:
+                        tried_prefills.add(route.prefill.version)
+                        continue
+                    try:
+                        completed = self.replay_decode(route.decode, transfer, deadline, replay)
+                        if completed is not None:
+                            return completed
+                    except (*HTTP_ERRORS, UpstreamError, UpstreamInterrupted):
+                        failed_decodes.add(route.decode.version)
+                    except ReplayMismatch as error:
+                        self.fail_replay(502, str(error), replay)
+                        return False
+                    finally:
+                        # Plait stored the prompt pages independently of this handoff lease.
+                        release_transfer(route.prefill, transfer.token)
+                time.sleep(min(DIRECTORY_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+                routes = []
+                with contextlib.suppress(OSError, ValueError, KeyError, TypeError, AttributeError):
+                    model, current = directory.routes()
+                    if model == replay.model:
+                        routes = current
+            self.fail_replay(503, "no P/D replacement accepted the completion before its deadline", replay)
+            return False
+
+        def replay_decode(self, decode: Endpoint, transfer: Transfer, deadline: float, replay: CompletionReplay) -> bool | None:
+            budget = deadline - time.monotonic()
+            if budget <= 0:
+                return None
+            with contextlib.closing(decode.connect(budget)) as connection:
+                payload = {**replay.request, "kv_transfer_params": transfer.params}
+                with request_engine(connection, decode, self.path, payload, transfer.request_id) as response:
+                    if admission_rejected(response):
+                        return None
+                    headers = decode.headers()
+                    if any(response.getheader(key) != value for key, value in headers.items()):
+                        raise ReplayMismatch("upstream response does not match the admitted Decode group")
+                    if response.status != 200 or not response.getheader("Content-Type", "").startswith("text/event-stream"):
+                        if replay.started:
+                            raise UpstreamInterrupted
+                        if response.status != 200:
+                            return self.write_decode(response)
+                        raise ReplayMismatch("Decode did not return a completion stream")
+                    try:
+                        if not replay.started:
+                            self.send_response(200)
+                            self.send_header("Content-Type", "text/event-stream")
+                            self.send_header(RECOVERY_HEADER, replay.mode)
+                            for key, value in headers.items():
+                                self.send_header(key, value)
+                            self.end_headers()
+                            replay.started = True
+                        replay.drain_attempt(response, self.wfile.write)
+                    except HTTP_ERRORS:
+                        return False
+                    return True
+
+        def fail_replay(self, status: int, message: str, replay: CompletionReplay) -> None:
+            if replay.started:
+                with contextlib.suppress(*HTTP_ERRORS):
+                    self.wfile.write(sse({"error": {"message": message, "type": "plait_recovery_error"}}))
+            else:
+                self.fail(status, message)
 
         def write_decode(self, response: http.client.HTTPResponse) -> bool:
             content_type = response.getheader("Content-Type", "")

@@ -36,6 +36,7 @@ tlc -deadlock -config specs/PlaitCompletionReplay.cfg specs/PlaitCompletionRepla
 tlc -deadlock -config specs/PlaitCompletionKvResume.cfg specs/PlaitCompletionReplay.tla
 tlc -deadlock -config specs/PlaitKvPublication.cfg specs/PlaitKvPublication.tla
 tlc -deadlock -config specs/PlaitKvHandoff.cfg specs/PlaitKvHandoff.tla
+tlc -deadlock -config specs/PlaitPdStreamReplay.cfg specs/PlaitPdStreamReplay.tla
 tlc -deadlock -config specs/PlaitKernelPrimitivesCheck.cfg specs/PlaitKernelPrimitivesCheck.tla
 tlc -deadlock -config specs/PlaitW4A4Check.cfg specs/PlaitW4A4Check.tla
 tlc -deadlock -config specs/PlaitW4OperatorsCheck.cfg specs/PlaitW4OperatorsCheck.tla
