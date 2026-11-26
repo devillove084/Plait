@@ -168,6 +168,10 @@ The vLLM fork uses peer transport for TP when `VLLM_USE_PLAIT=1` is set.
 Each worker exchanges endpoint metadata over Gloo and sends tensors directly
 to its peers. [Peer transport and startup](docs/rankless-nccl.md)
 
+Managed replacements can reuse complete prompt KV blocks across TP sizes
+with the vLLM fork's `PlaitKvConnector` and `plait-node kv-store`.
+[KV setup and scope](docs/rankless-nccl.md#reuse-prompt-kv-across-tp-layouts)
+
 For the legacy rendezvous, `PLAIT_NCCL_SHM=1` enables the host-mapped local
 path and `PLAIT_NCCL_KERNEL=1` enables the single-stream GPU allreduce path.
 `plait_nccl.kernel_config(device, quantization)` returns a vLLM `KernelConfig`
@@ -217,8 +221,9 @@ release the result after the matching completion has executed in the control pla
 | [Peer collectives](specs/PlaitPeerCollective.tla) | Round pairing, replicated and sharded reduction, and completion of an independent communicator when a participant in another group is lost. |
 | [Serving ingress](specs/PlaitServingIngress.tla) | One admission per ordinary forwarded request, monotonic route refresh, and output pinned to the admitted epoch while the old gate drains. |
 | [Completion replay](specs/PlaitCompletionReplay.tla) | Previously visible token positions are kept, replacement output is checked before use, and a mismatched or short replay cannot publish a suffix. |
+| [KV publication](specs/PlaitKvPublication.tla) | All heads must come from one write attempt before a page becomes readable. A consumer reads its requested head range, and a complete page stays immutable. |
 
-TLC 2.19 passes all 28 configurations. The ordered publication configuration
+TLC 2.19 passes all 29 configurations. The ordered publication configuration
 explores 70,968 distinct states. Run the suite with `tlc` on your `PATH`.
 
 ```sh

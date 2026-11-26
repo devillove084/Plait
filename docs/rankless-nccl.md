@@ -147,6 +147,48 @@ Recovery retains the visible prefix in the running ingress process and
 rebuilds KV by recomputation on the replacement. The same connection
 must remain open throughout recovery.
 
+### Reuse prompt KV across TP layouts
+
+Start a shared store on the engine network. It keeps completed pages in
+memory, independent of either vLLM process group.
+
+```sh
+plait-node kv-store --listen 192.0.2.10:7952 --capacity-bytes 268435456
+```
+
+Pass the same model namespace, KV dtype, and logical block size to both
+engines. Choose a namespace that identifies the same model weights,
+position encoding, and compatible attention arithmetic. Use
+`--enforce-eager` and `--disable-hybrid-kv-cache-manager` with the connector.
+The two engines can use different TP sizes if each evenly partitions the
+model's KV heads. This path supports dense full-attention FP16 and BF16 KV.
+
+```sh
+--kv-transfer-config '{
+  "kv_connector": "PlaitKvConnector",
+  "kv_role": "kv_producer",
+  "kv_connector_extra_config": {
+    "address": "192.0.2.10:7952",
+    "namespace": "model-revision-fp16"
+  }
+}'
+```
+
+Set `kv_role` to `kv_consumer` on the destination, or `kv_both` for an engine
+that reads and writes. Each producer writes its global head range for a
+completed block. The store publishes a block after one write attempt has
+covered all its heads. The destination looks up contiguous full prefix
+blocks, then loads its own head range into the local attention layout before
+the forward pass. The first unmatched token and subsequent tokens run through
+the usual engine path.
+
+A managed TP4 group on CUDA, ROCm, and PPU HGGC populated two 128-token
+blocks. After activation, its TP2 replacement on CUDA and Ascend CANN
+reported 256 external prefix hits. The replacement's output token IDs and
+text matched its cold run, which reported zero external hits. The transfer
+uses host staging over TCP. The stream-recovery mode above still replays
+from the original prompt, and the cache starts empty after a store restart.
+
 ## Execute a collective
 
 For small all-reduces, each worker sends its complete contribution to each

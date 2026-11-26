@@ -22,6 +22,7 @@ tlc -deadlock -config specs/PlaitEpochAdmission.cfg specs/PlaitEpochAdmission.tl
 tlc -deadlock -config specs/PlaitHostLaunch.cfg specs/PlaitHostLaunch.tla
 tlc -deadlock -config specs/PlaitServingIngress.cfg specs/PlaitServingIngress.tla
 tlc -deadlock -config specs/PlaitCompletionReplay.cfg specs/PlaitCompletionReplay.tla
+tlc -deadlock -config specs/PlaitKvPublication.cfg specs/PlaitKvPublication.tla
 tlc -deadlock -config specs/PlaitKernelPrimitivesCheck.cfg specs/PlaitKernelPrimitivesCheck.tla
 tlc -deadlock -config specs/PlaitW4A4Check.cfg specs/PlaitW4A4Check.tla
 tlc -deadlock -config specs/PlaitW4OperatorsCheck.cfg specs/PlaitW4OperatorsCheck.tla

@@ -9,6 +9,7 @@ use plait_node::{
     run_hetero_plan, run_matrix_node, run_parallel_demo, run_rdma_selftest,
 };
 
+mod kv_store;
 mod serving_cli;
 mod tensor_cli;
 
@@ -126,6 +127,7 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         "serving" => serving_cli::run(args).await,
+        "kv-store" => kv_store::run(args).await,
         "tensor" => tensor_cli::run(args).await,
         "run" => {
             let mut listen = "127.0.0.1:7001".to_owned();
@@ -229,7 +231,7 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         other => Err(format!(
-            "unknown command {other}; expected run, serving, tensor, demo, dsa, parallel, rdma-selftest, devices, hetero, gpu-demo, gpu-bench, gpu-rdma, or id"
+            "unknown command {other}; expected run, serving, kv-store, tensor, demo, dsa, parallel, rdma-selftest, devices, hetero, gpu-demo, gpu-bench, gpu-rdma, or id"
         )
         .into()),
     }
