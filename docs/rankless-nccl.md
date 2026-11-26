@@ -366,9 +366,46 @@ configuration. Ordinary untagged requests retain the external cache
 lookup and recomputation behavior.
 
 This path uses the bounded, in-memory Plait KV store and supports the
-eager, dense FP16 and BF16 attention layouts described below. Configure
-the two groups and publish the route separately. The resident pool
-planner currently launches aggregated groups.
+eager, dense FP16 and BF16 attention layouts described below.
+
+### Start and publish a managed Prefill and Decode deployment
+
+Install the model profile on each resident execution host. The plan
+supplies the KV connector and block size for both roles. Keep those
+options out of the profile's `args`. Set the model namespace to an
+identifier shared by profiles with compatible weights and KV data.
+
+Send `prepare_hosted_pd` to the serving CLI. The request supplies these
+fields.
+
+| Field | Value |
+| --- | --- |
+| `id` | Operation identity. Retry an ambiguous response with the same ID and inputs. |
+| `model` | API alias used by the router and all endpoint recipes. |
+| `expected_revision` | Current route directory revision. Use zero for the initial publication. |
+| `kv` | Shared `store` as an IPv4 address and port, `namespace`, and `block_size`. |
+| `placements` | New groups with `group`, `expected_epoch`, `expected_active`, `plan`, and `recipe`. Use role `Prefill` or `Decode` and PP size one. The CLI computes the launch digest. A group may use one host or multiple hosts. |
+| `paths` | Complete desired path list. Each entry names its `prefill` and `decode` group versions. Include any existing versions the deployment is keeping. |
+
+The voters reserve all new groups in one operation. Each resident host
+starts the groups assigned to its device grants. A voter proposes
+publication after every new group is Ready. The publication operation
+checks the staged revision, current host inventories, group readiness
+and endpoints. It activates the new groups and publishes the complete
+path list together. It drains versions removed from all paths. A
+retained Prefill can serve an additional Decode without a restart.
+To shrink capacity, submit a smaller path list with an empty
+`placements` list.
+
+Use `{"request":"hosted_pd_pending","model":"model"}` to inspect a staged
+intent. The intent survives a voter restart. A failed candidate or
+changed placement inventory cancels its proposal without publishing
+the new paths. For an explicit cancellation, send `ResolveHostedPd`
+with the returned `intent` and `cancel: true` through `execute`, using
+a fresh operation ID. Claims remain reserved until the existing stop
+and retirement protocol confirms release. This API takes explicit
+placements. Automatic candidate generation currently covers aggregated
+TP groups.
 
 ### Reuse prompt KV across TP layouts
 

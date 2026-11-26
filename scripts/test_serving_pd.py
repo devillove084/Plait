@@ -18,6 +18,7 @@ from serving_group import (
     ADMISSION_HEADER, HANDOFF_HEADER, RELEASE_KV_PATH, VERSION_HEADER,
     ControlError, Endpoint, Gate, group_proxy, record_host_stop, run,
 )
+from serving_launch import host_command, resident_spec
 
 
 ROUTER = runpy.run_path(str(Path(__file__).with_name("serve-disaggregated.py")))
@@ -28,6 +29,20 @@ COMPLETIONS = "/v1/completions"
 
 
 class LaunchTest(unittest.TestCase):
+    def test_single_device_hosted_pd_keeps_vllm_default_executor(self):
+        host = "b" * 32
+        recipe = {"api_host": list(bytes.fromhex(host)), "master_port": 9010,
+                  "hosts": [{"host": list(bytes.fromhex(host)), "address": "192.0.2.1"}]}
+        profile = {"argv": ["vllm"], "model_path": "/local/model",
+                   "device_env": "CUDA_VISIBLE_DEVICES", "args": [], "env": {}}
+        spec = resident_spec(recipe, profile, pd=True)
+        command = ["vllm", "serve", "model", "--tensor-parallel-size", "1"]
+        self.assertEqual(host_command(command, spec, host, 0, [1]),
+                         ["vllm", "serve", "/local/model", "--tensor-parallel-size", "1"])
+        self.assertIn("--distributed-executor-backend", host_command(command, spec, host, 0, [2]))
+        with self.assertRaisesRegex(ValueError, "supplies the KV connector and block size"):
+            resident_spec(recipe, {**profile, "args": ["--block_size=256"]}, pd=True)
+
     def test_child_uses_the_claimed_version_even_if_parent_has_another_epoch(self):
         group, host = "a" * 32, "b" * 32
         version = {"group": list(bytes.fromhex(group)), "epoch": 7}

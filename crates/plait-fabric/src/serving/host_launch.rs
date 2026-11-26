@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
 use plait_core::serving::{
     GroupId, GroupPhase, GroupPlan, GroupVersion, HostedActivation, HostedAddress,
-    HostedAssignment, HostedPlanning, HostedPortUse, HostedRecipe, ServingEndpoint, ServingError,
-    ServingOutcome, ServingResult, ServingRole,
+    HostedAssignment, HostedManagedAssignment, HostedPlanning, HostedPortUse, HostedRecipe,
+    ServingEndpoint, ServingError, ServingOutcome, ServingResult, ServingRole,
 };
 use plait_core::{DeviceId, NodeId};
 
@@ -80,7 +80,7 @@ impl ServingState {
         Ok(result)
     }
 
-    fn check_hosted_inventory(
+    pub(super) fn check_hosted_inventory(
         &self,
         address: &HostedAddress,
         plan: &GroupPlan,
@@ -107,6 +107,13 @@ impl ServingState {
     }
 
     pub(crate) fn hosted_assignments(&self, host: NodeId) -> Vec<HostedAssignment> {
+        self.hosted_managed_assignments(host)
+            .into_iter()
+            .filter_map(|found| found.pd.is_none().then_some(found.assignment))
+            .collect()
+    }
+
+    pub(crate) fn hosted_managed_assignments(&self, host: NodeId) -> Vec<HostedManagedAssignment> {
         let versions: BTreeSet<_> = self
             .workers
             .range(DeviceId::new(host, 0)..=DeviceId::new(host, u32::MAX))
@@ -124,17 +131,20 @@ impl ServingState {
                         | GroupPhase::Active
                         | GroupPhase::Draining
                 )
-                .then(|| HostedAssignment {
-                    version,
-                    model: view.plan.model.clone(),
-                    tensor_parallel: view.plan.tensor_parallel,
-                    phase: view.phase,
-                    holder: self
-                        .host_launches
-                        .get(&version)
-                        .and_then(|launch| launch.owners.get(&host))
-                        .copied(),
-                    recipe: recipe.clone(),
+                .then(|| HostedManagedAssignment {
+                    pd: self.hosted_pd_launches.get(&version).cloned(),
+                    assignment: HostedAssignment {
+                        version,
+                        model: view.plan.model.clone(),
+                        tensor_parallel: view.plan.tensor_parallel,
+                        phase: view.phase,
+                        holder: self
+                            .host_launches
+                            .get(&version)
+                            .and_then(|launch| launch.owners.get(&host))
+                            .copied(),
+                        recipe: recipe.clone(),
+                    },
                 })
             })
             .collect()
@@ -221,7 +231,9 @@ impl ServingState {
     }
 
     pub(super) fn require_unhosted(&self, version: GroupVersion) -> Result<(), ServingError> {
-        if self.host_launches.contains_key(&version) || self.hosted_switches.contains_key(&version)
+        if self.host_launches.contains_key(&version)
+            || self.hosted_switches.contains_key(&version)
+            || self.hosted_pd_launches.contains_key(&version)
         {
             return Err(ServingError::LaunchOwnerMismatch);
         }
@@ -336,6 +348,12 @@ impl ServingState {
                 return Err(ServingError::InvalidEndpoint);
             }
             check_launch_endpoint(view, endpoint)?;
+            if let Some(pd) = self.hosted_pd_launches.get(&version)
+                && view.plan.role == ServingRole::Prefill
+                && endpoint.prefill_kv != Some(pd.kv.store)
+            {
+                return Err(ServingError::InvalidEndpoint);
+            }
         }
         if matches!(view.phase, GroupPhase::Active | GroupPhase::Draining) {
             return Ok(group_outcome(version, view.phase));
@@ -568,6 +586,9 @@ mod tests {
         assert_eq!(assignment.recipe, recipe);
         assert_eq!(assignment.holder, None);
         assert_eq!(assignment.tensor_parallel, 2);
+        let managed = &state.hosted_managed_assignments(api)[0];
+        assert_eq!(&managed.assignment, assignment);
+        assert_eq!(managed.launch_digest(), recipe.launch_digest());
         assert!(state.hosted_assignments(spare).is_empty());
         for host in [api, follower] {
             state

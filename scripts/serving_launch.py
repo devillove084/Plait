@@ -26,10 +26,15 @@ def load_spec(path: Path) -> dict:
     return validate_spec(json.loads(path.read_text()))
 
 
-def resident_spec(recipe: dict, engine: dict) -> dict:
+def resident_spec(recipe: dict, engine: dict, *, pd: bool = False) -> dict:
     """Project the committed topology onto the installed local engine profile."""
     api_host = bytes(recipe["api_host"]).hex()
     program = {key: engine[key] for key in ("argv", "model_path", "device_env", "args", "env")}
+    if pd and any(
+        arg.split("=", 1)[0].replace("_", "-") in {"--kv-transfer-config", "--block-size"}
+        for arg in program["args"]
+    ):
+        raise ValueError("the hosted P/D plan supplies the KV connector and block size")
     hosts = {
         bytes(entry["host"]).hex(): {**program, "address": entry["address"]}
         for entry in recipe["hosts"]
@@ -37,10 +42,10 @@ def resident_spec(recipe: dict, engine: dict) -> dict:
     return validate_spec({
         "api_host": api_host, "master_addr": hosts[api_host]["address"],
         "master_port": recipe["master_port"], "hosts": hosts,
-    })
+    }, allow_single=pd)
 
 
-def validate_spec(spec: dict) -> dict:
+def validate_spec(spec: dict, *, allow_single: bool = False) -> dict:
     if not isinstance(spec, dict) or set(spec) != {
         "api_host", "master_addr", "master_port", "hosts",
     }:
@@ -50,10 +55,10 @@ def validate_spec(spec: dict) -> dict:
         raise ValueError("master_port must be a valid TCP port")
     hosts = spec["hosts"]
     if (
-        not isinstance(hosts, dict) or len(hosts) < 2
+        not isinstance(hosts, dict) or len(hosts) < (1 if allow_single else 2)
         or not isinstance(spec["api_host"], str) or spec["api_host"] not in hosts
     ):
-        raise ValueError("expected at least two hosts, including api_host")
+        raise ValueError("invalid launch hosts or missing api_host")
     for host, config in hosts.items():
         if not re.fullmatch("[0-9a-f]{32}", host):
             raise ValueError("host IDs must be lowercase hexadecimal identifiers")
@@ -116,9 +121,16 @@ def host_command(
     command: list[str], spec: dict, host: str, node_rank: int, layout: list[int],
 ) -> list[str]:
     config = spec["hosts"][host]
-    return [
+    command = [
         *config["argv"], "serve", config["model_path"], *command[3:], *config.get("args", []),
-        "--distributed-executor-backend", "mp",
+    ]
+    if layout == [1]:
+        return command
+    command.extend(("--distributed-executor-backend", "mp"))
+    if len(layout) == 1:
+        return command
+    return [
+        *command,
         "--nnodes", str(len(layout)), "--node-rank", str(node_rank),
         "--master-addr", spec["master_addr"], "--master-port", str(spec["master_port"]),
         "--plait-tp-layout", *map(str, layout),

@@ -4,9 +4,9 @@ use plait_consensus::{InstanceId, StateMachine};
 use plait_core::serving::{
     DecoderCheckpoint, DecoderClaim, DecoderDirectory, DecoderDrainStatus, DecoderFailover,
     DecoderReplayPage, DecoderRouteWork, DecoderSwitch, ExecutionHostLiveness, GroupVersion,
-    GroupView, HostedAssignment, HostedPlanning, HostedProbeEndpoint, ResidentOwner,
-    RouteDirectory, RouteSetId, ServingOperation, ServingReceipt, ServingResources, ServingResult,
-    W4DrainStatus, WorkerDispatch, WorkerGrant,
+    GroupView, HostedAssignment, HostedManagedAssignment, HostedPdIntent, HostedPlanning,
+    HostedProbeEndpoint, ResidentOwner, RouteDirectory, RouteSetId, ServingOperation,
+    ServingReceipt, ServingResources, ServingResult, W4DrainStatus, WorkerDispatch, WorkerGrant,
 };
 use plait_core::{
     AcceleratorKind, Command, ComputeTask, DeviceId, DeviceProfile, FuseKind, MembershipChange,
@@ -123,6 +123,18 @@ impl Runtime {
 
     pub fn serving_hosted_assignments(&self, host: NodeId) -> Vec<HostedAssignment> {
         self.serving.hosted_assignments(host)
+    }
+
+    pub fn serving_hosted_managed_assignments(&self, host: NodeId) -> Vec<HostedManagedAssignment> {
+        self.serving.hosted_managed_assignments(host)
+    }
+
+    pub fn serving_hosted_pd_pending(&self, key: RouteSetId) -> Option<HostedPdIntent> {
+        self.serving.hosted_pd_pending(key)
+    }
+
+    pub fn serving_hosted_pd_work(&self) -> Vec<HostedPdIntent> {
+        self.serving.hosted_pd_work()
     }
 
     pub fn serving_hosted_probe_endpoints(&self) -> Vec<HostedProbeEndpoint> {

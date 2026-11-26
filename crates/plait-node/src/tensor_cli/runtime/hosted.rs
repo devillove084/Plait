@@ -9,7 +9,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use plait_core::serving::{
-    GroupPhase, GroupVersion, HostMemory, HostedAssignment, HostedInventory, ServingAction,
+    GroupPhase, GroupVersion, HostMemory, HostedInventory, HostedManagedAssignment, ServingAction,
     ServingLookup, ServingView,
 };
 use plait_core::{DeviceId, NodeId};
@@ -176,15 +176,19 @@ async fn supervise(
         for version in stopped {
             running.remove(&version);
         }
-        let assignments = match control.query(ServingLookup::HostedAssignments(host)).await {
-            Ok(ServingView::HostedAssignments(assignments)) => assignments,
+        let assignments = match control
+            .query(ServingLookup::HostedManagedAssignments(host))
+            .await
+        {
+            Ok(ServingView::HostedManagedAssignments(assignments)) => assignments,
             Ok(_) => return Err(io::Error::other("expected hosted assignments")),
             Err(error) => {
                 eprintln!("hosted assignment lookup: {error}");
                 continue;
             }
         };
-        for assignment in assignments {
+        for deployment in assignments {
+            let assignment = &deployment.assignment;
             let version = assignment.version;
             if running.contains_key(&version) {
                 continue;
@@ -221,7 +225,7 @@ async fn supervise(
                     version,
                     host,
                     holder,
-                    launch_digest: assignment.recipe.launch_digest(),
+                    launch_digest: deployment.launch_digest(),
                 },
             )
             .await
@@ -237,7 +241,7 @@ async fn supervise(
                 holder,
                 config,
                 profile,
-                &assignment,
+                &deployment,
                 peers,
                 seeds,
                 lock,
@@ -264,11 +268,12 @@ async fn launch(
     holder: NodeId,
     config: &Config,
     profile: &EngineProfile,
-    assignment: &HostedAssignment,
+    deployment: &HostedManagedAssignment,
     peers: &[String],
     seeds: &[SocketAddr],
     lock: &File,
 ) -> io::Result<Launch> {
+    let assignment = &deployment.assignment;
     let recipe = &assignment.recipe;
     let version = assignment.version;
     let mut command = Command::new(&config.launcher[0]);
@@ -322,8 +327,8 @@ async fn launch(
     }
     hold_lock(&mut command, lock)?;
     let mut bootstrap = serde_json::to_vec(&json!({
-        "holder": holder, "launch_digest": recipe.launch_digest(),
-        "recipe": recipe, "engine": profile,
+        "holder": holder, "launch_digest": deployment.launch_digest(),
+        "recipe": recipe, "engine": profile, "pd": deployment.pd,
     }))?;
     bootstrap.push(b'\n');
     if bootstrap.len() > 65_536 {

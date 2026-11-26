@@ -93,6 +93,14 @@ impl HostedRecipe {
     }
 
     pub fn validate(&self, plan: &GroupPlan) -> Result<(), ServingError> {
+        self.validate_topology(plan, 2)?;
+        if self.launch_digest() != plan.launch_digest {
+            return Err(ServingError::InvalidPlan);
+        }
+        Ok(())
+    }
+
+    fn validate_topology(&self, plan: &GroupPlan, min_hosts: usize) -> Result<(), ServingError> {
         let hosts: BTreeSet<_> = self.hosts.iter().map(|host| host.host).collect();
         let ports = BTreeSet::from([self.master_port, self.http_port, self.backend_port]);
         if self.profile.is_empty()
@@ -104,7 +112,7 @@ impl HostedRecipe {
             || self.api_model.is_empty()
             || self.api_model.len() > 256
             || self.api_model.contains('\0')
-            || hosts.len() < 2
+            || hosts.len() < min_hosts
             || hosts.len() != self.hosts.len()
             || !hosts.contains(&self.api_host)
             || !hosts.iter().eq(plan.hosts.keys())
@@ -116,7 +124,6 @@ impl HostedRecipe {
             || ports.contains(&0)
             || self.max_model_len == 0
             || !(1..=10_000).contains(&self.gpu_memory_bps)
-            || self.launch_digest() != plan.launch_digest
         {
             return Err(ServingError::InvalidPlan);
         }
@@ -132,6 +139,91 @@ pub struct HostedAssignment {
     pub phase: GroupPhase,
     pub holder: Option<NodeId>,
     pub recipe: HostedRecipe,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedPdKv {
+    pub store: SocketAddrV4,
+    pub namespace: String,
+    pub block_size: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedPdLaunch {
+    pub role: ServingRole,
+    pub kv: HostedPdKv,
+}
+
+impl HostedPdLaunch {
+    pub fn launch_digest(&self, recipe: &HostedRecipe) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(b"plait-hosted-pd-v1");
+        hash.update(recipe.launch_digest());
+        hash.update([match self.role {
+            ServingRole::Prefill => 1,
+            ServingRole::Decode => 2,
+            ServingRole::Aggregated => 0,
+        }]);
+        hash.update(self.kv.store.ip().octets());
+        hash.update(self.kv.store.port().to_le_bytes());
+        hash.update(self.kv.block_size.to_le_bytes());
+        hash.update(self.kv.namespace.as_bytes());
+        hash.finalize().into()
+    }
+
+    pub fn validate(&self, recipe: &HostedRecipe, plan: &GroupPlan) -> Result<(), ServingError> {
+        recipe.validate_topology(plan, 1)?;
+        if plan.role != self.role
+            || plan.role == ServingRole::Aggregated
+            || plan.pipeline_parallel != 1
+            || self.kv.store.port() == 0
+            || self.kv.store.ip().is_unspecified()
+            || self.kv.store.ip().is_multicast()
+            || self.kv.namespace.is_empty()
+            || self.kv.namespace.len() > 256
+            || self.kv.namespace.contains('\0')
+            || self.kv.block_size == 0
+            || self.launch_digest(recipe) != plan.launch_digest
+        {
+            return Err(ServingError::InvalidPlan);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedManagedAssignment {
+    pub assignment: HostedAssignment,
+    pub pd: Option<HostedPdLaunch>,
+}
+
+impl HostedManagedAssignment {
+    pub fn launch_digest(&self) -> [u8; 32] {
+        let recipe = &self.assignment.recipe;
+        self.pd
+            .as_ref()
+            .map_or_else(|| recipe.launch_digest(), |pd| pd.launch_digest(recipe))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedPdPlacement {
+    pub group: GroupId,
+    pub expected_epoch: u64,
+    pub expected_active: Option<u64>,
+    pub plan: GroupPlan,
+    pub recipe: HostedRecipe,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedPdIntent {
+    pub staged: OpId,
+    pub model: String,
+    pub expected_revision: u64,
+    pub previous: Vec<PdRoute>,
+    pub paths: Vec<PdRoute>,
+    pub prepared: BTreeSet<GroupVersion>,
+    pub hosts: BTreeSet<NodeId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -839,6 +931,17 @@ pub enum ServingAction {
         request_sha256: [u8; 32],
         recipe: HostedRecipe,
     },
+    PrepareHostedPd {
+        model: String,
+        expected_revision: u64,
+        kv: HostedPdKv,
+        placements: Vec<HostedPdPlacement>,
+        paths: Vec<PdRoute>,
+    },
+    ResolveHostedPd {
+        intent: HostedPdIntent,
+        cancel: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -916,6 +1019,10 @@ pub enum ServingOutcome {
     },
     DecoderSwitchCancelled,
     HostedProbeRegistered,
+    HostedPdStaged {
+        revision: u64,
+    },
+    HostedPdCancelled,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -956,6 +1063,7 @@ pub enum ServingError {
     DecoderSwitchInProgress { staged: OpId },
     HostedInventoryChanged(NodeId),
     HostedPortsInUse(NodeId),
+    HostedPdInProgress { staged: OpId },
 }
 
 pub type ServingResult = Result<ServingOutcome, ServingError>;
@@ -996,6 +1104,8 @@ pub enum ServingLookup {
     HostedAssignments(NodeId),
     HostedProbeEndpoints,
     HostedPlanning,
+    HostedManagedAssignments(NodeId),
+    HostedPdPending(RouteSetId),
 }
 
 /// A replica's locally applied state. A missing result may indicate replication lag.
@@ -1021,6 +1131,8 @@ pub enum ServingView {
     HostedAssignments(Vec<HostedAssignment>),
     HostedProbeEndpoints(Vec<HostedProbeEndpoint>),
     HostedPlanning(HostedPlanning),
+    HostedManagedAssignments(Vec<HostedManagedAssignment>),
+    HostedPdPending(Option<HostedPdIntent>),
 }
 
 impl ServingOperation {
@@ -1053,6 +1165,42 @@ impl ServingOperation {
             }
             ServingAction::RegisterWorker { device, .. } => {
                 keys.insert(Key::Device(*device));
+            }
+            ServingAction::PrepareHostedPd {
+                model,
+                placements,
+                paths,
+                ..
+            } => {
+                keys.insert(Key::ServingRoutes(RouteSetId::for_model(model)));
+                for placement in placements {
+                    keys.insert(Key::ServingGroup(placement.group));
+                    keys.insert(Key::HostMemory(placement.recipe.api_host));
+                    keys.extend(placement.plan.workers.keys().copied().map(Key::Device));
+                    keys.extend(placement.plan.hosts.keys().copied().map(Key::HostMemory));
+                }
+                for path in paths {
+                    keys.extend([
+                        Key::ServingGroup(path.prefill.group),
+                        Key::ServingGroup(path.decode.group),
+                    ]);
+                }
+            }
+            ServingAction::ResolveHostedPd { intent, .. } => {
+                keys.insert(Key::ServingRoutes(RouteSetId::for_model(&intent.model)));
+                for path in intent.paths.iter().chain(&intent.previous) {
+                    keys.extend([
+                        Key::ServingGroup(path.prefill.group),
+                        Key::ServingGroup(path.decode.group),
+                    ]);
+                }
+                keys.extend(
+                    intent
+                        .prepared
+                        .iter()
+                        .map(|version| Key::ServingGroup(version.group)),
+                );
+                keys.extend(intent.hosts.iter().copied().map(Key::HostMemory));
             }
             ServingAction::Prepare { group, plan, .. }
             | ServingAction::PrepareW4Switch { group, plan, .. }

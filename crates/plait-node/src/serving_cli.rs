@@ -4,9 +4,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use plait_core::serving::{
     GroupId, GroupPhase, GroupPlan, GroupVersion, GroupView, HostMemory, HostedActivation,
-    HostedRecipe, RouteDirectory, RouteSetId, ServingAction, ServingEndpoint, ServingLookup,
-    ServingOperation, ServingResources, ServingRole, ServingView, W4GroupLayout, WorkerDemand,
-    WorkerGrant,
+    HostedPdKv, HostedPdLaunch, HostedPdPlacement, HostedRecipe, PdRoute, RouteDirectory,
+    RouteSetId, ServingAction, ServingEndpoint, ServingLookup, ServingOperation, ServingResources,
+    ServingRole, ServingView, W4GroupLayout, WorkerDemand, WorkerGrant,
 };
 use plait_core::{DeviceId, NodeId, OpId};
 use plait_node::{Client, discover_voters};
@@ -86,6 +86,17 @@ enum Request {
     },
     HostedLinks,
     HostedPlanning,
+    PrepareHostedPd {
+        id: OpId,
+        model: String,
+        expected_revision: u64,
+        kv: HostedPdKv,
+        placements: Vec<HostedPdPlacementInput>,
+        paths: Vec<PdRoute>,
+    },
+    HostedPdPending {
+        model: String,
+    },
     ReplanW4 {
         id: OpId,
         forecast: ServingForecast,
@@ -175,6 +186,15 @@ struct NativePlanInput {
     launch_digest: [u8; 32],
     workers: Vec<(DeviceId, WorkerDemand)>,
     hosts: Vec<(NodeId, HostMemory)>,
+}
+
+#[derive(Deserialize)]
+struct HostedPdPlacementInput {
+    group: GroupId,
+    expected_epoch: u64,
+    expected_active: Option<u64>,
+    plan: NativePlanInput,
+    recipe: HostedRecipe,
 }
 
 impl TryFrom<NativePlanInput> for GroupPlan {
@@ -332,6 +352,48 @@ async fn handle(
         Request::HostedLinks => hosted::links(client, peers).await,
         Request::HostedPlanning => {
             Ok(json!({ "planning": hosted::planning(client, peers).await? }))
+        }
+        Request::PrepareHostedPd {
+            id,
+            model,
+            expected_revision,
+            kv,
+            placements,
+            paths,
+        } => {
+            let placements = placements
+                .into_iter()
+                .map(|input| {
+                    let mut plan: GroupPlan = input.plan.try_into()?;
+                    let pd = HostedPdLaunch {
+                        role: plan.role,
+                        kv: kv.clone(),
+                    };
+                    plan.launch_digest = pd.launch_digest(&input.recipe);
+                    Ok(HostedPdPlacement {
+                        group: input.group,
+                        expected_epoch: input.expected_epoch,
+                        expected_active: input.expected_active,
+                        plan,
+                        recipe: input.recipe,
+                    })
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            let action = ServingAction::PrepareHostedPd {
+                model,
+                expected_revision,
+                kv,
+                placements,
+                paths,
+            };
+            execute(client, peers, ServingOperation { id, action }).await
+        }
+        Request::HostedPdPending { model } => {
+            let lookup = ServingLookup::HostedPdPending(RouteSetId::for_model(&model));
+            let ServingView::HostedPdPending(intent) = query(client, peers, lookup).await? else {
+                return Err(io::Error::other("expected pending hosted P/D intent"));
+            };
+            Ok(json!({ "pending": intent }))
         }
         Request::ReplanW4 {
             id,

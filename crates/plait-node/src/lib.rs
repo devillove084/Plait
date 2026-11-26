@@ -180,6 +180,7 @@ impl RunningNode {
             started: Instant::now(),
             observations: BTreeMap::new(),
             execution_hosts: execution_host::HostWatch::default(),
+            next_hosted_pd_scan: 0,
         };
         let handle = tokio::spawn(state.run(task_stop));
         Self {
@@ -234,6 +235,7 @@ struct NodeState {
     started: Instant,
     observations: BTreeMap<(NodeId, u64), PendingObservation>,
     execution_hosts: execution_host::HostWatch,
+    next_hosted_pd_scan: u64,
 }
 
 impl NodeState {
@@ -275,6 +277,21 @@ impl NodeState {
                             .expirations(self.replica.machine(), now)
                         {
                             self.propose(Command::Serving(Box::new(operation)), now);
+                        }
+                        if now >= self.next_hosted_pd_scan {
+                            self.next_hosted_pd_scan = now + 1000;
+                            for intent in self.replica.machine().serving_hosted_pd_work() {
+                                self.propose(
+                                    Command::Serving(Box::new(ServingOperation {
+                                        id: OpId::new(NodeId::random(), 1),
+                                        action: ServingAction::ResolveHostedPd {
+                                            intent,
+                                            cancel: false,
+                                        },
+                                    })),
+                                    now,
+                                );
+                            }
                         }
                     }
                     self.maybe_register_devices(now);
@@ -472,6 +489,14 @@ impl NodeState {
                     }
                     ServingLookup::HostedAssignments(host) => {
                         ServingView::HostedAssignments(runtime.serving_hosted_assignments(host))
+                    }
+                    ServingLookup::HostedManagedAssignments(host) => {
+                        ServingView::HostedManagedAssignments(
+                            runtime.serving_hosted_managed_assignments(host),
+                        )
+                    }
+                    ServingLookup::HostedPdPending(key) => {
+                        ServingView::HostedPdPending(runtime.serving_hosted_pd_pending(key))
                     }
                     ServingLookup::HostedProbeEndpoints => {
                         ServingView::HostedProbeEndpoints(runtime.serving_hosted_probe_endpoints())

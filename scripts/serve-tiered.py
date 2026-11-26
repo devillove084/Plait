@@ -93,6 +93,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--print-launch-digest", action="store_true")
     args = parser.parse_args()
     args.bootstrap = None
+    args.hosted_block_size = None
     if args.resident_hosted:
         if args.host_launch_spec or args.print_launch_digest or not args.group_id:
             parser.error("expected a supervised hosted group launch")
@@ -106,7 +107,21 @@ def parse_args() -> argparse.Namespace:
                 raise ValueError("invalid hosted launch record")
             bootstrap = json.loads(payload)
             args.bootstrap = bootstrap
-            args.host_launch_spec = serving_launch.resident_spec(bootstrap["recipe"], bootstrap["engine"])
+            pd = bootstrap.get("pd")
+            if pd is not None:
+                if pd["role"] not in ("Prefill", "Decode"):
+                    raise ValueError("invalid committed P/D role")
+                args.role = pd["role"].lower()
+                kv = pd["kv"]
+                args.plait_kv_namespace = kv["namespace"]
+                args.kv_host, kv_port = kv["store"].rsplit(":", 1)
+                args.kv_port = int(kv_port)
+                args.hosted_block_size = kv["block_size"]
+                if type(args.hosted_block_size) is not int or args.hosted_block_size <= 0:
+                    raise ValueError("invalid committed KV block size")
+            args.host_launch_spec = serving_launch.resident_spec(
+                bootstrap["recipe"], bootstrap["engine"], pd=pd is not None,
+            )
             group_api = args.host_launch_spec["master_addr"]
             address = ipaddress.ip_address(group_api)
             args.advertise_http = f"[{address}]:{args.port_base}" if address.version == 6 else f"{address}:{args.port_base}"
@@ -226,6 +241,8 @@ def native_command(args: argparse.Namespace, vllm: str, port: int) -> list[str]:
         command.append("--enforce-eager")
     if args.no_prefix_caching:
         command.append("--no-enable-prefix-caching")
+    if args.hosted_block_size is not None:
+        command.extend(("--block-size", str(args.hosted_block_size)))
     if args.kernel_config is not None:
         command.extend(("--kernel-config", args.kernel_config))
     if args.plait_w4a16_library is not None:
@@ -399,7 +416,7 @@ def main() -> int:
 
     def watch_parent() -> None:
         try:
-            sys.stdin.buffer.read(1)
+            os.read(sys.stdin.fileno(), 1)
         finally:
             parent_closed.set()
 

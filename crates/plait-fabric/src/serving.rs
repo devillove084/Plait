@@ -5,17 +5,19 @@ use std::net::SocketAddr;
 
 use plait_core::serving::{
     ActiveGroup, ExecutionHostLiveness, GroupId, GroupPhase, GroupPlan, GroupResources,
-    GroupVersion, GroupView, HostMemory, HostResources, HostedInventory, HostedProbeEndpoint,
-    HostedRecipe, PdRoute, ResidentOwner, ResolvedPdRoute, RouteDirectory, RouteSetId,
-    ServingAction, ServingEndpoint, ServingError, ServingOperation, ServingOutcome, ServingReceipt,
-    ServingResources, ServingResult, ServingRole, W4_MAX_ADMISSION_MS, W4DrainStatus,
-    W4GroupLayout, W4ShardLayout, WorkerDispatch, WorkerGrant, WorkerResources,
+    GroupVersion, GroupView, HostMemory, HostResources, HostedInventory, HostedPdIntent,
+    HostedPdLaunch, HostedProbeEndpoint, HostedRecipe, PdRoute, ResidentOwner, ResolvedPdRoute,
+    RouteDirectory, RouteSetId, ServingAction, ServingEndpoint, ServingError, ServingOperation,
+    ServingOutcome, ServingReceipt, ServingResources, ServingResult, ServingRole,
+    W4_MAX_ADMISSION_MS, W4DrainStatus, W4GroupLayout, W4ShardLayout, WorkerDispatch, WorkerGrant,
+    WorkerResources,
 };
 use plait_core::{DeviceId, NodeId, OpId};
 
 mod decoder;
 mod host;
 mod host_launch;
+mod hosted_pd;
 use decoder::{DecoderState, RecoveryPolicy};
 use host_launch::{HostLaunch, HostedSwitch};
 
@@ -50,6 +52,7 @@ struct RouteSet {
     model: String,
     revision: u64,
     paths: Vec<PdRoute>,
+    hosted: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -79,6 +82,8 @@ pub(crate) struct ServingState {
     hosted_switches: BTreeMap<GroupVersion, HostedSwitch>,
     hosted_recipes: BTreeMap<GroupVersion, HostedRecipe>,
     hosted_pool_versions: BTreeSet<GroupVersion>,
+    hosted_pd_launches: BTreeMap<GroupVersion, HostedPdLaunch>,
+    hosted_pd_intents: BTreeMap<RouteSetId, HostedPdIntent>,
     hosted_inventories: BTreeMap<NodeId, HostedInventory>,
     hosted_probes: BTreeMap<NodeId, HostedProbeEndpoint>,
     execution_hosts: BTreeMap<NodeId, ExecutionHostLiveness>,
@@ -229,6 +234,23 @@ impl ServingState {
                 inventory,
                 supervisor_lock,
             } => self.advertise_hosted_inventory(inventory, operation.id, *supervisor_lock),
+            ServingAction::PrepareHostedPd {
+                model,
+                expected_revision,
+                kv,
+                placements,
+                paths,
+            } => self.prepare_hosted_pd(
+                operation.id,
+                model,
+                *expected_revision,
+                kv,
+                placements,
+                paths,
+            ),
+            ServingAction::ResolveHostedPd { intent, cancel } => {
+                self.resolve_hosted_pd(intent, *cancel)
+            }
             ServingAction::PrepareHostedSwitch {
                 group,
                 expected_epoch,
@@ -703,7 +725,12 @@ impl ServingState {
                 addr,
                 shard,
             } => self.worker_ready_at(*grant, *launch_digest, *addr, Some(*shard)),
-            ServingAction::Activate(version) => self.activate(*version),
+            ServingAction::Activate(version) => {
+                if self.hosted_pd_launches.contains_key(version) {
+                    return Err(ServingError::InvalidDirectory);
+                }
+                self.activate(*version)
+            }
             ServingAction::Drain(version) => self.quiesce(*version, GroupPhase::Draining),
             ServingAction::Revoke(version) => self.quiesce(*version, GroupPhase::Revoked),
             ServingAction::WorkerStopped(grant) => self.worker_stopped(*grant),
@@ -1148,6 +1175,15 @@ impl ServingState {
     ) -> ServingResult {
         let id = RouteSetId::for_model(model);
         let previous = self.routes.get(&id);
+        if previous.is_some_and(|directory| directory.hosted)
+            || activate.is_some_and(|version| self.hosted_pd_launches.contains_key(&version))
+            || paths
+                .iter()
+                .flat_map(|path| [path.prefill, path.decode])
+                .any(|version| self.hosted_pd_launches.contains_key(&version))
+        {
+            return Err(ServingError::InvalidDirectory);
+        }
         if model.is_empty() || previous.is_some_and(|directory| directory.model != model) {
             return Err(ServingError::InvalidDirectory);
         }
@@ -1182,6 +1218,7 @@ impl ServingState {
                 model: model.to_owned(),
                 revision,
                 paths: paths.to_vec(),
+                hosted: false,
             },
         );
         Ok(ServingOutcome::RoutesPublished { revision })
@@ -1193,13 +1230,22 @@ impl ServingState {
         path: PdRoute,
         activate: Option<GroupVersion>,
     ) -> Option<ResolvedPdRoute> {
+        self.resolve_route_with(model, path, |group| routable(group, activate))
+    }
+
+    fn resolve_route_with(
+        &self,
+        model: &str,
+        path: PdRoute,
+        eligible: impl Fn(&GroupView) -> bool,
+    ) -> Option<ResolvedPdRoute> {
         let prefill = self.group(path.prefill)?;
         let decode = self.group(path.decode)?;
         if prefill.plan.role != ServingRole::Prefill
             || decode.plan.role != ServingRole::Decode
             || prefill.plan.model != decode.plan.model
-            || !routable(prefill, activate)
-            || !routable(decode, activate)
+            || !eligible(prefill)
+            || !eligible(decode)
         {
             return None;
         }
@@ -1562,6 +1608,7 @@ impl ServingState {
         self.hosted_switches.remove(&version);
         self.hosted_recipes.remove(&version);
         self.hosted_pool_versions.remove(&version);
+        self.hosted_pd_launches.remove(&version);
         self.decoder.endpoints.remove(&version);
         self.decoder.managed.remove(&version);
         Ok(group_outcome(version, GroupPhase::Retired))
