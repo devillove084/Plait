@@ -227,6 +227,40 @@ pub struct HostedPdIntent {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedPdStage {
+    pub placements: Vec<HostedPdPlacement>,
+    pub paths: Vec<PdRoute>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedPdTransition {
+    pub staged: OpId,
+    pub model: String,
+    pub expected_revision: u64,
+    pub kv: HostedPdKv,
+    pub bridge: Vec<PdRoute>,
+    pub release: BTreeSet<GroupVersion>,
+    pub target: HostedPdStage,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HostedPdTransitionPhase {
+    PreparingBridge,
+    WaitingForRelease,
+    PreparingTarget,
+    Published,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedPdTransitionStatus {
+    pub staged: OpId,
+    pub revision: u64,
+    pub phase: HostedPdTransitionPhase,
+    pub error: Option<ServingError>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedPdInstance {
     pub version: GroupVersion,
     pub model: String,
@@ -970,6 +1004,19 @@ pub enum ServingAction {
         paths: Vec<PdRoute>,
         request_sha256: [u8; 32],
     },
+    PrepareHostedPdTransition {
+        model: String,
+        expected_revision: u64,
+        kv: HostedPdKv,
+        bridge: HostedPdStage,
+        release: BTreeSet<GroupVersion>,
+        target: HostedPdStage,
+    },
+    ResolveHostedPdTransition {
+        transition: HostedPdTransition,
+        intent: HostedPdIntent,
+    },
+    AdvanceHostedPdTransition(HostedPdTransition),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1135,6 +1182,7 @@ pub enum ServingLookup {
     HostedManagedAssignments(NodeId),
     HostedPdPending(RouteSetId),
     HostedPdPlanning(RouteSetId),
+    HostedPdTransition(RouteSetId),
 }
 
 /// A replica's locally applied state. A missing result may indicate replication lag.
@@ -1163,6 +1211,7 @@ pub enum ServingView {
     HostedManagedAssignments(Vec<HostedManagedAssignment>),
     HostedPdPending(Option<HostedPdIntent>),
     HostedPdPlanning(HostedPdPlanning),
+    HostedPdTransition(Option<HostedPdTransitionStatus>),
 }
 
 impl ServingOperation {
@@ -1209,34 +1258,45 @@ impl ServingOperation {
                 ..
             } => {
                 keys.insert(Key::ServingRoutes(RouteSetId::for_model(model)));
-                for placement in placements {
-                    keys.insert(Key::ServingGroup(placement.group));
-                    keys.insert(Key::HostMemory(placement.recipe.api_host));
-                    keys.extend(placement.plan.workers.keys().copied().map(Key::Device));
-                    keys.extend(placement.plan.hosts.keys().copied().map(Key::HostMemory));
-                }
-                for path in paths {
-                    keys.extend([
-                        Key::ServingGroup(path.prefill.group),
-                        Key::ServingGroup(path.decode.group),
-                    ]);
-                }
+                hosted_pd_stage_keys(&mut keys, placements, paths);
             }
             ServingAction::ResolveHostedPd { intent, .. } => {
-                keys.insert(Key::ServingRoutes(RouteSetId::for_model(&intent.model)));
-                for path in intent.paths.iter().chain(&intent.previous) {
-                    keys.extend([
-                        Key::ServingGroup(path.prefill.group),
-                        Key::ServingGroup(path.decode.group),
-                    ]);
-                }
+                hosted_pd_intent_keys(&mut keys, intent);
+            }
+            ServingAction::PrepareHostedPdTransition {
+                model,
+                bridge,
+                release,
+                target,
+                ..
+            } => {
+                keys.insert(Key::ServingRoutes(RouteSetId::for_model(model)));
+                hosted_pd_stage_keys(&mut keys, &bridge.placements, &bridge.paths);
+                hosted_pd_stage_keys(&mut keys, &target.placements, &target.paths);
                 keys.extend(
-                    intent
-                        .prepared
+                    release
                         .iter()
                         .map(|version| Key::ServingGroup(version.group)),
                 );
-                keys.extend(intent.hosts.iter().copied().map(Key::HostMemory));
+            }
+            ServingAction::AdvanceHostedPdTransition(transition)
+            | ServingAction::ResolveHostedPdTransition { transition, .. } => {
+                keys.insert(Key::ServingRoutes(RouteSetId::for_model(&transition.model)));
+                hosted_pd_stage_keys(
+                    &mut keys,
+                    &transition.target.placements,
+                    &transition.target.paths,
+                );
+                hosted_pd_stage_keys(&mut keys, &[], &transition.bridge);
+                keys.extend(
+                    transition
+                        .release
+                        .iter()
+                        .map(|version| Key::ServingGroup(version.group)),
+                );
+                if let ServingAction::ResolveHostedPdTransition { intent, .. } = &self.action {
+                    hosted_pd_intent_keys(&mut keys, intent);
+                }
             }
             ServingAction::Prepare { group, plan, .. }
             | ServingAction::PrepareW4Switch { group, plan, .. }
@@ -1534,4 +1594,36 @@ impl ServingOperation {
             })
             .collect()
     }
+}
+
+fn hosted_pd_stage_keys(
+    keys: &mut BTreeSet<Key>,
+    placements: &[HostedPdPlacement],
+    paths: &[PdRoute],
+) {
+    for placement in placements {
+        keys.insert(Key::ServingGroup(placement.group));
+        keys.insert(Key::HostMemory(placement.recipe.api_host));
+        keys.extend(placement.plan.workers.keys().copied().map(Key::Device));
+        keys.extend(placement.plan.hosts.keys().copied().map(Key::HostMemory));
+    }
+    for path in paths {
+        keys.extend([
+            Key::ServingGroup(path.prefill.group),
+            Key::ServingGroup(path.decode.group),
+        ]);
+    }
+}
+
+fn hosted_pd_intent_keys(keys: &mut BTreeSet<Key>, intent: &HostedPdIntent) {
+    keys.insert(Key::ServingRoutes(RouteSetId::for_model(&intent.model)));
+    hosted_pd_stage_keys(keys, &[], &intent.paths);
+    hosted_pd_stage_keys(keys, &[], &intent.previous);
+    keys.extend(
+        intent
+            .prepared
+            .iter()
+            .map(|version| Key::ServingGroup(version.group)),
+    );
+    keys.extend(intent.hosts.iter().copied().map(Key::HostMemory));
 }

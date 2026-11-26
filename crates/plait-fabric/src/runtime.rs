@@ -5,9 +5,9 @@ use plait_core::serving::{
     DecoderCheckpoint, DecoderClaim, DecoderDirectory, DecoderDrainStatus, DecoderFailover,
     DecoderReplayPage, DecoderRouteWork, DecoderSwitch, ExecutionHostLiveness, GroupVersion,
     GroupView, HostedAssignment, HostedManagedAssignment, HostedPdIntent, HostedPdPlanning,
-    HostedPlanning, HostedProbeEndpoint, ResidentOwner, RouteDirectory, RouteSetId,
-    ServingOperation, ServingReceipt, ServingResources, ServingResult, W4DrainStatus,
-    WorkerDispatch, WorkerGrant,
+    HostedPdTransitionStatus, HostedPlanning, HostedProbeEndpoint, ResidentOwner, RouteDirectory,
+    RouteSetId, ServingAction, ServingOperation, ServingReceipt, ServingResources, ServingResult,
+    W4DrainStatus, WorkerDispatch, WorkerGrant,
 };
 use plait_core::{
     AcceleratorKind, Command, ComputeTask, DeviceId, DeviceProfile, FuseKind, MembershipChange,
@@ -140,6 +140,17 @@ impl Runtime {
 
     pub fn serving_hosted_pd_work(&self) -> Vec<HostedPdIntent> {
         self.serving.hosted_pd_work()
+    }
+
+    pub fn serving_hosted_pd_transition_status(
+        &self,
+        key: RouteSetId,
+    ) -> Option<HostedPdTransitionStatus> {
+        self.serving.hosted_pd_transition_status(key)
+    }
+
+    pub fn serving_hosted_pd_transition_work(&self) -> Vec<ServingAction> {
+        self.serving.hosted_pd_transition_work()
     }
 
     pub fn serving_hosted_probe_endpoints(&self) -> Vec<HostedProbeEndpoint> {

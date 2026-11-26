@@ -292,6 +292,16 @@ impl NodeState {
                                     now,
                                 );
                             }
+                            for action in self.replica.machine().serving_hosted_pd_transition_work()
+                            {
+                                self.propose(
+                                    Command::Serving(Box::new(ServingOperation {
+                                        id: OpId::new(NodeId::random(), 1),
+                                        action,
+                                    })),
+                                    now,
+                                );
+                            }
                         }
                     }
                     self.maybe_register_devices(now);
@@ -501,6 +511,9 @@ impl NodeState {
                     ServingLookup::HostedPdPlanning(key) => {
                         ServingView::HostedPdPlanning(runtime.serving_hosted_pd_planning(key))
                     }
+                    ServingLookup::HostedPdTransition(key) => ServingView::HostedPdTransition(
+                        runtime.serving_hosted_pd_transition_status(key),
+                    ),
                     ServingLookup::HostedProbeEndpoints => {
                         ServingView::HostedProbeEndpoints(runtime.serving_hosted_probe_endpoints())
                     }

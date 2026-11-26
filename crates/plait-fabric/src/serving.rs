@@ -6,11 +6,11 @@ use std::net::SocketAddr;
 use plait_core::serving::{
     ActiveGroup, ExecutionHostLiveness, GroupId, GroupPhase, GroupPlan, GroupResources,
     GroupVersion, GroupView, HostMemory, HostResources, HostedInventory, HostedPdIntent,
-    HostedPdLaunch, HostedProbeEndpoint, HostedRecipe, PdRoute, ResidentOwner, ResolvedPdRoute,
-    RouteDirectory, RouteSetId, ServingAction, ServingEndpoint, ServingError, ServingOperation,
-    ServingOutcome, ServingReceipt, ServingResources, ServingResult, ServingRole,
-    W4_MAX_ADMISSION_MS, W4DrainStatus, W4GroupLayout, W4ShardLayout, WorkerDispatch, WorkerGrant,
-    WorkerResources,
+    HostedPdLaunch, HostedPdTransition, HostedPdTransitionStatus, HostedProbeEndpoint,
+    HostedRecipe, PdRoute, ResidentOwner, ResolvedPdRoute, RouteDirectory, RouteSetId,
+    ServingAction, ServingEndpoint, ServingError, ServingOperation, ServingOutcome, ServingReceipt,
+    ServingResources, ServingResult, ServingRole, W4_MAX_ADMISSION_MS, W4DrainStatus,
+    W4GroupLayout, W4ShardLayout, WorkerDispatch, WorkerGrant, WorkerResources,
 };
 use plait_core::{DeviceId, NodeId, OpId};
 
@@ -18,6 +18,7 @@ mod decoder;
 mod host;
 mod host_launch;
 mod hosted_pd;
+mod hosted_pd_transition;
 use decoder::{DecoderState, RecoveryPolicy};
 use host_launch::{HostLaunch, HostedSwitch};
 
@@ -84,6 +85,8 @@ pub(crate) struct ServingState {
     hosted_pool_versions: BTreeSet<GroupVersion>,
     hosted_pd_launches: BTreeMap<GroupVersion, HostedPdLaunch>,
     hosted_pd_intents: BTreeMap<RouteSetId, HostedPdIntent>,
+    hosted_pd_transitions: BTreeMap<RouteSetId, HostedPdTransition>,
+    hosted_pd_transition_status: BTreeMap<RouteSetId, HostedPdTransitionStatus>,
     hosted_inventories: BTreeMap<NodeId, HostedInventory>,
     hosted_probes: BTreeMap<NodeId, HostedProbeEndpoint>,
     execution_hosts: BTreeMap<NodeId, ExecutionHostLiveness>,
@@ -159,7 +162,8 @@ impl ServingState {
                 .map(|(&host, state)| HostResources {
                     host,
                     capacity: state.capacity,
-                    reserved: state.reserved,
+                    reserved: add_memory(state.reserved, self.deferred_pd_host_memory(host))
+                        .expect("deferred memory is within capacity"),
                 })
                 .collect(),
             workers: self
@@ -257,7 +261,35 @@ impl ServingState {
                 paths,
             ),
             ServingAction::ResolveHostedPd { intent, cancel } => {
+                if self
+                    .hosted_pd_transitions
+                    .contains_key(&RouteSetId::for_model(&intent.model))
+                {
+                    return Err(ServingError::InvalidDirectory);
+                }
                 self.resolve_hosted_pd(intent, *cancel)
+            }
+            ServingAction::PrepareHostedPdTransition {
+                model,
+                expected_revision,
+                kv,
+                bridge,
+                release,
+                target,
+            } => self.prepare_hosted_pd_transition(
+                operation.id,
+                model,
+                *expected_revision,
+                kv,
+                bridge,
+                release,
+                target,
+            ),
+            ServingAction::ResolveHostedPdTransition { transition, intent } => {
+                self.resolve_hosted_pd_transition(transition, intent)
+            }
+            ServingAction::AdvanceHostedPdTransition(transition) => {
+                self.advance_hosted_pd_transition(transition)
             }
             ServingAction::PrepareHostedSwitch {
                 group,
@@ -846,7 +878,9 @@ impl ServingState {
             .hosts
             .get(&host)
             .map_or(HostMemory::default(), |old| old.reserved);
-        if !fits(reserved, capacity) {
+        if add_memory(reserved, self.deferred_pd_host_memory(host))
+            .is_none_or(|total| !fits(total, capacity))
+        {
             return Err(ServingError::HostCapacityExceeded(host));
         }
         self.hosts.insert(host, HostState { capacity, reserved });
@@ -903,6 +937,14 @@ impl ServingState {
         reservations: &mut Reservations,
     ) -> Result<GroupView, ServingError> {
         plan.validate()?;
+        if let Some((transition, _)) = self
+            .deferred_pd_placements()
+            .find(|(_, placement)| placement.group == group)
+        {
+            return Err(ServingError::HostedPdInProgress {
+                staged: transition.staged,
+            });
+        }
         let latest = self
             .groups
             .get(&group)
@@ -933,7 +975,12 @@ impl ServingState {
             if worker.incarnation != demand.incarnation {
                 return Err(ServingError::StaleIncarnation(device));
             }
-            if worker.grant.is_some() || !reservations.devices.insert(device) {
+            if worker.grant.is_some()
+                || self
+                    .deferred_pd_placements()
+                    .any(|(_, placement)| placement.plan.workers.contains_key(&device))
+                || !reservations.devices.insert(device)
+            {
                 return Err(ServingError::WorkerBusy(device));
             }
             if demand.device_bytes > worker.device_bytes {
@@ -964,8 +1011,11 @@ impl ServingState {
                 .get(&host)
                 .copied()
                 .unwrap_or(state.reserved);
+            let held = self.deferred_pd_host_memory(host);
             let reserved = add_memory(prior, *demand)
-                .filter(|total| fits(*total, state.capacity))
+                .filter(|total| {
+                    add_memory(*total, held).is_some_and(|budget| fits(budget, state.capacity))
+                })
                 .ok_or(ServingError::HostCapacityExceeded(host))?;
             reservations.hosts.insert(host, reserved);
         }

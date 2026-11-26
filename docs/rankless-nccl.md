@@ -479,6 +479,47 @@ and the shared store budget current. The loop supplies observed demand
 to the planner and follows the normal staged rollout. Model capacity
 and startup time remain calibration inputs.
 
+### Change a role on an occupied device
+
+Submit `prepare_hosted_pd_transition` when one rollout needs to move traffic
+away from a group and reuse its devices for another role or TP layout. Send
+`id`, `model`, `expected_revision`, and the same `kv` contract used by
+`prepare_hosted_pd`. Send both `bridge` and `target`, each containing a full
+`paths` list and the `placements` it needs at that step. `release` lists the
+old group versions excluded by the bridge. For a group ID reused after
+retirement, set the target placement's `expected_epoch` to the last epoch and
+its `expected_active` to `null`. Upgrade the voting nodes before submitting
+the new operation.
+
+For example, keep the current Prefill, prepare a replacement Decode on the
+new host, and make that pair the bridge. The target can keep the bridge path
+and add a path from a new Prefill on the old Decode's devices. Plait checks
+both layouts before launching the replacement. It protects the target's
+device IDs and launch ports, and holds the host memory shortfall above the
+retiring groups' reservations. As those groups retire, their memory credit
+moves into the target hold. The target receives a new grant only after
+all the listed release records have committed. Reusing a group ID or port
+offers the target under a new epoch. The group proxy rejects an admission
+for the old epoch.
+
+Configure `verify_release` on the retiring groups' resident launch profiles.
+The verifier must attest that the devices and transport are safe to reuse.
+Without a release record, an exited process can leave the rollout serving
+through the bridge and waiting for release.
+
+Query `hosted_pd_transition` with the model alias for the most recent
+transition's operation ID, route revision, phase and any staging error.
+`PreparingBridge` leaves the old directory live. `WaitingForRelease` and
+`PreparingTarget` serve the bridge directory. `Published` exposes the target
+directory. `Cancelled` leaves the last published directory in effect and
+clears the deferred holds. A voter restarted from its WAL can continue the
+same intent. Automatic P/D policies wait for an active transition to finish.
+
+The two layouts are supplied by the caller. Assess the bridge's capacity
+for the expected traffic during drain and target warm-up. Hosted vLLM
+completes existing requests on the old process; the target serves newly
+admitted work after cutover.
+
 ### Reuse prompt KV across TP layouts
 
 Start a shared store on the engine network. It keeps completed pages in

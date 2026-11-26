@@ -1,12 +1,12 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufRead, Write};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use plait_core::serving::{
     GroupId, GroupPhase, GroupPlan, GroupVersion, GroupView, HostMemory, HostedActivation,
-    HostedPdKv, HostedPdLaunch, HostedPdPlacement, HostedRecipe, PdRoute, RouteDirectory,
-    RouteSetId, ServingAction, ServingEndpoint, ServingLookup, ServingOperation, ServingResources,
-    ServingRole, ServingView, W4GroupLayout, WorkerDemand, WorkerGrant,
+    HostedPdKv, HostedPdLaunch, HostedPdPlacement, HostedPdStage, HostedRecipe, PdRoute,
+    RouteDirectory, RouteSetId, ServingAction, ServingEndpoint, ServingLookup, ServingOperation,
+    ServingResources, ServingRole, ServingView, W4GroupLayout, WorkerDemand, WorkerGrant,
 };
 use plait_core::{DeviceId, NodeId, OpId};
 use plait_node::{Client, discover_voters};
@@ -96,6 +96,18 @@ enum Request {
         paths: Vec<PdRoute>,
     },
     HostedPdPending {
+        model: String,
+    },
+    PrepareHostedPdTransition {
+        id: OpId,
+        model: String,
+        expected_revision: u64,
+        kv: HostedPdKv,
+        bridge: HostedPdStageInput,
+        release: BTreeSet<GroupVersion>,
+        target: HostedPdStageInput,
+    },
+    HostedPdTransition {
         model: String,
     },
     ReplanHostedPd {
@@ -200,6 +212,43 @@ struct HostedPdPlacementInput {
     expected_active: Option<u64>,
     plan: NativePlanInput,
     recipe: HostedRecipe,
+}
+
+impl HostedPdPlacementInput {
+    fn placement(self, kv: &HostedPdKv) -> io::Result<HostedPdPlacement> {
+        let mut plan: GroupPlan = self.plan.try_into()?;
+        let pd = HostedPdLaunch {
+            role: plan.role,
+            kv: kv.clone(),
+        };
+        plan.launch_digest = pd.launch_digest(&self.recipe);
+        Ok(HostedPdPlacement {
+            group: self.group,
+            expected_epoch: self.expected_epoch,
+            expected_active: self.expected_active,
+            plan,
+            recipe: self.recipe,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct HostedPdStageInput {
+    placements: Vec<HostedPdPlacementInput>,
+    paths: Vec<PdRoute>,
+}
+
+impl HostedPdStageInput {
+    fn stage(self, kv: &HostedPdKv) -> io::Result<HostedPdStage> {
+        Ok(HostedPdStage {
+            placements: self
+                .placements
+                .into_iter()
+                .map(|input| input.placement(kv))
+                .collect::<io::Result<_>>()?,
+            paths: self.paths,
+        })
+    }
 }
 
 impl TryFrom<NativePlanInput> for GroupPlan {
@@ -368,21 +417,7 @@ async fn handle(
         } => {
             let placements = placements
                 .into_iter()
-                .map(|input| {
-                    let mut plan: GroupPlan = input.plan.try_into()?;
-                    let pd = HostedPdLaunch {
-                        role: plan.role,
-                        kv: kv.clone(),
-                    };
-                    plan.launch_digest = pd.launch_digest(&input.recipe);
-                    Ok(HostedPdPlacement {
-                        group: input.group,
-                        expected_epoch: input.expected_epoch,
-                        expected_active: input.expected_active,
-                        plan,
-                        recipe: input.recipe,
-                    })
-                })
+                .map(|input| input.placement(&kv))
                 .collect::<io::Result<Vec<_>>>()?;
             let action = ServingAction::PrepareHostedPd {
                 model,
@@ -399,6 +434,35 @@ async fn handle(
                 return Err(io::Error::other("expected pending hosted P/D intent"));
             };
             Ok(json!({ "pending": intent }))
+        }
+        Request::PrepareHostedPdTransition {
+            id,
+            model,
+            expected_revision,
+            kv,
+            bridge,
+            release,
+            target,
+        } => {
+            let bridge = bridge.stage(&kv)?;
+            let target = target.stage(&kv)?;
+            let action = ServingAction::PrepareHostedPdTransition {
+                model,
+                expected_revision,
+                kv,
+                bridge,
+                release,
+                target,
+            };
+            execute(client, peers, ServingOperation { id, action }).await
+        }
+        Request::HostedPdTransition { model } => {
+            let lookup = ServingLookup::HostedPdTransition(RouteSetId::for_model(&model));
+            let ServingView::HostedPdTransition(transition) = query(client, peers, lookup).await?
+            else {
+                return Err(io::Error::other("expected a hosted P/D transition status"));
+            };
+            Ok(json!({ "transition": transition }))
         }
         Request::ReplanHostedPd { input } => hosted_pd::replan(client, peers, input).await,
         Request::ReplanW4 {

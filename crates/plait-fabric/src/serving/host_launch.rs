@@ -33,6 +33,7 @@ impl ServingState {
                 .hosted_recipes
                 .values()
                 .map(HostedPortUse::from)
+                .chain(self.deferred_pd_ports())
                 .collect(),
         }
     }
@@ -52,7 +53,8 @@ impl ServingState {
         if self.hosted_recipes.iter().any(|(version, other)| {
             (pooled || self.hosted_pool_versions.contains(version))
                 && ports.conflicts(HostedPortUse::from(other))
-        }) {
+        }) || self.deferred_pd_ports().any(|other| ports.conflicts(other))
+        {
             return Err(ServingError::HostedPortsInUse(recipe.api_host));
         }
         if pooled {

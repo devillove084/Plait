@@ -31,10 +31,8 @@ impl ServingState {
         if revision != expected_revision {
             return Err(ServingError::StaleDirectory { current: revision });
         }
-        if let Some(pending) = self.hosted_pd_intents.get(&key) {
-            return Err(ServingError::HostedPdInProgress {
-                staged: pending.staged,
-            });
+        if let Some(staged) = self.pending_hosted_pd_id(key) {
+            return Err(ServingError::HostedPdInProgress { staged });
         }
         if model.is_empty()
             || current.is_some_and(|directory| directory.model != model)
@@ -64,6 +62,7 @@ impl ServingState {
             .hosted_recipes
             .values()
             .map(HostedPortUse::from)
+            .chain(self.deferred_pd_ports())
             .collect();
         let mut prepared = BTreeMap::new();
         for placement in placements {
@@ -197,7 +196,7 @@ impl ServingState {
         HostedPdPlanning {
             revision: directory.map_or(0, |directory| directory.revision),
             managed: directory.is_none_or(|directory| directory.hosted),
-            pending: self.hosted_pd_intents.get(&key).map(|intent| intent.staged),
+            pending: self.pending_hosted_pd_id(key),
             active,
             paths: self.routes(key).map_or_else(Vec::new, |directory| {
                 directory.paths.into_iter().map(|path| path.route).collect()
@@ -209,10 +208,27 @@ impl ServingState {
 
     pub(crate) fn hosted_pd_work(&self) -> Vec<HostedPdIntent> {
         self.hosted_pd_intents
-            .values()
-            .filter(|intent| !matches!(self.hosted_pd_resolution(intent), Resolution::Wait))
-            .cloned()
+            .iter()
+            .filter(|(key, intent)| {
+                !self.hosted_pd_transitions.contains_key(key) && self.hosted_pd_can_resolve(intent)
+            })
+            .map(|(_, intent)| intent.clone())
             .collect()
+    }
+
+    pub(super) fn pending_hosted_pd_id(&self, key: RouteSetId) -> Option<OpId> {
+        self.hosted_pd_intents
+            .get(&key)
+            .map(|intent| intent.staged)
+            .or_else(|| {
+                self.hosted_pd_transitions
+                    .get(&key)
+                    .map(|transition| transition.staged)
+            })
+    }
+
+    pub(super) fn hosted_pd_can_resolve(&self, intent: &HostedPdIntent) -> bool {
+        !matches!(self.hosted_pd_resolution(intent), Resolution::Wait)
     }
 
     pub(super) fn resolve_hosted_pd(
@@ -345,7 +361,7 @@ impl ServingState {
     }
 }
 
-fn route_versions(paths: &[PdRoute]) -> BTreeSet<GroupVersion> {
+pub(super) fn route_versions(paths: &[PdRoute]) -> BTreeSet<GroupVersion> {
     paths
         .iter()
         .flat_map(|path| [path.prefill, path.decode])
@@ -361,6 +377,7 @@ mod tests {
     use plait_core::{DeviceId, NodeId};
 
     use super::*;
+    use plait_core::serving::{HostedPdStage, HostedPdTransitionPhase};
 
     fn kv() -> HostedPdKv {
         HostedPdKv {
@@ -615,5 +632,188 @@ mod tests {
         let lost = state.group(version(&d)).unwrap();
         assert_eq!(lost.phase, GroupPhase::Revoked);
         assert_eq!(lost.stopped.len(), 1);
+    }
+
+    #[test]
+    fn hosted_pd_transition_fences_reused_device_across_both_cutovers() {
+        let mut state = ServingState::default();
+        let prefill = placement(&mut state, 11, 1, 0, ServingRole::Prefill);
+        let decode = placement(&mut state, 12, 2, 0, ServingRole::Decode);
+        let replacement = placement(&mut state, 13, 3, 0, ServingRole::Decode);
+        let extra_prefill = placement(&mut state, 14, 2, 0, ServingRole::Prefill);
+        let initial = PdRoute {
+            prefill: version(&prefill),
+            decode: version(&decode),
+        };
+        let bridge_path = PdRoute {
+            decode: version(&replacement),
+            ..initial
+        };
+        let added = PdRoute {
+            prefill: version(&extra_prefill),
+            ..bridge_path
+        };
+        let key = RouteSetId::for_model("served");
+        let id = |n| OpId::new(key.0, n);
+        let publish = |state: &mut ServingState, n| {
+            let action = state.hosted_pd_transition_work().pop().unwrap();
+            state.apply(&ServingOperation { id: id(n), action })
+        };
+        state
+            .prepare_hosted_pd(
+                id(1),
+                "served",
+                0,
+                &kv(),
+                &[prefill.clone(), decode.clone()],
+                &[initial],
+            )
+            .unwrap();
+        ready(&mut state, &prefill);
+        ready(&mut state, &decode);
+        let pending = state.hosted_pd_work().pop().unwrap();
+        state.resolve_hosted_pd(&pending, false).unwrap();
+        let device = *decode.plan.workers.keys().next().unwrap();
+        let old_grant = state.group(version(&decode)).unwrap().grants[&device];
+
+        let bridge = HostedPdStage {
+            placements: vec![replacement.clone()],
+            paths: vec![bridge_path],
+        };
+        let release = BTreeSet::from([version(&decode)]);
+        let target = HostedPdStage {
+            placements: vec![extra_prefill.clone()],
+            paths: vec![bridge_path, added],
+        };
+        let mut invalid = target.clone();
+        invalid.placements[0]
+            .plan
+            .workers
+            .get_mut(&device)
+            .unwrap()
+            .device_bytes = 32;
+        assert_eq!(
+            state.prepare_hosted_pd_transition(
+                id(2),
+                "served",
+                1,
+                &kv(),
+                &bridge,
+                &release,
+                &invalid
+            ),
+            Err(ServingError::DeviceCapacityExceeded(device))
+        );
+        assert!(state.group(version(&replacement)).is_none());
+        assert_eq!(state.routes(key).unwrap().paths[0].route, initial);
+
+        state
+            .prepare_hosted_pd_transition(id(3), "served", 1, &kv(), &bridge, &release, &target)
+            .unwrap();
+        assert_eq!(state.hosted_pd_planning(key).pending, Some(id(3)));
+        assert_eq!(state.routes(key).unwrap().paths[0].route, initial);
+        assert!(state.hosted_pd_transition_work().is_empty());
+        ready(&mut state, &replacement);
+        assert_eq!(
+            publish(&mut state, 4),
+            Ok(ServingOutcome::RoutesPublished { revision: 2 })
+        );
+        assert_eq!(state.routes(key).unwrap().paths[0].route, bridge_path);
+        assert_eq!(
+            state.hosted_pd_transition_status(key).unwrap().phase,
+            HostedPdTransitionPhase::WaitingForRelease
+        );
+        assert_eq!(
+            state.group(version(&decode)).unwrap().phase,
+            GroupPhase::Draining
+        );
+        assert!(state.hosted_pd_transition_work().is_empty());
+        assert!(state.hosted_pd_pending(key).is_none());
+        assert!(state.hosted_pd_planning(key).pending.is_some());
+        assert_eq!(
+            state
+                .resources()
+                .workers
+                .iter()
+                .find(|worker| worker.device == device)
+                .unwrap()
+                .grant,
+            Some(old_grant)
+        );
+
+        let host = decode.recipe.api_host;
+        state
+            .host_launch_stopped(version(&decode), host, host)
+            .unwrap();
+        assert!(state.hosted_pd_transition_work().is_empty());
+        state
+            .retire(version(&decode), &BTreeSet::from([device]))
+            .unwrap();
+        let rival = GroupId(NodeId::from_bytes([77; 16]));
+        assert_eq!(
+            state.prepare(rival, 0, &extra_prefill.plan),
+            Err(ServingError::WorkerBusy(device))
+        );
+        assert_eq!(
+            state.set_host_memory(
+                host,
+                HostMemory {
+                    bytes: 7,
+                    pinned_bytes: 1
+                }
+            ),
+            Err(ServingError::HostCapacityExceeded(host))
+        );
+        assert_eq!(
+            state
+                .resources()
+                .hosts
+                .iter()
+                .find(|resource| resource.host == host)
+                .unwrap()
+                .reserved,
+            extra_prefill.plan.hosts[&host]
+        );
+        assert!(
+            state
+                .hosted_planning()
+                .occupied
+                .contains(&HostedPortUse::from(&extra_prefill.recipe))
+        );
+        assert_eq!(
+            publish(&mut state, 5),
+            Ok(ServingOutcome::HostedPdStaged { revision: 2 })
+        );
+        let grant = state.group(version(&extra_prefill)).unwrap().grants[&device];
+        assert!(grant.fence > old_grant.fence);
+        assert_eq!(state.routes(key).unwrap().paths[0].route, bridge_path);
+
+        // A target failure after the bridge keeps that route live and clears
+        // the transition so the model can be planned again.
+        let mut lost = state.clone();
+        lost.expire_execution_host(host, OpId::new(host, 1), &BTreeSet::from([grant.version]))
+            .unwrap();
+        assert_eq!(publish(&mut lost, 6), Ok(ServingOutcome::HostedPdCancelled));
+        assert_eq!(lost.routes(key).unwrap().paths[0].route, bridge_path);
+        assert!(lost.hosted_pd_planning(key).pending.is_none());
+
+        ready(&mut state, &extra_prefill);
+        assert_eq!(
+            publish(&mut state, 7),
+            Ok(ServingOutcome::RoutesPublished { revision: 3 })
+        );
+        let paths: BTreeSet<_> = state
+            .routes(key)
+            .unwrap()
+            .paths
+            .iter()
+            .map(|entry| entry.route)
+            .collect();
+        assert_eq!(paths, BTreeSet::from([bridge_path, added]));
+        assert_eq!(
+            state.hosted_pd_transition_status(key).unwrap().phase,
+            HostedPdTransitionPhase::Published
+        );
+        assert!(state.hosted_pd_planning(key).pending.is_none());
     }
 }
