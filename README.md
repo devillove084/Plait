@@ -164,8 +164,12 @@ errors=0
 ```
 
 `crates/plait-nccl` provides a PyO3 NCCL-compatible communicator for vLLM.
-`PLAIT_NCCL_SHM=1` enables the host-mapped local path and
-`PLAIT_NCCL_KERNEL=1` enables the single-stream GPU-kernel allreduce path.
+The vLLM fork uses peer transport for TP when `VLLM_USE_PLAIT=1` is set.
+Each worker exchanges endpoint metadata over Gloo and sends tensors directly
+to its peers. [Peer transport and startup](docs/rankless-nccl.md)
+
+For the legacy rendezvous, `PLAIT_NCCL_SHM=1` enables the host-mapped local
+path and `PLAIT_NCCL_KERNEL=1` enables the single-stream GPU allreduce path.
 `plait_nccl.kernel_config(device, quantization)` returns a vLLM `KernelConfig`
 using Humming on SM120 and Marlin/Cutlass on Ampere; the collective itself
 stays bf16/fp16.
