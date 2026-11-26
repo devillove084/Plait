@@ -198,10 +198,11 @@ just tcp-twolevel-rust
 ## Formal verification
 
 An admitted operation carries an epoch and a fixed set of shards. A worker may
-finish locally after revocation. Publishing its shard requires a live grant and
-a matching device event followed by a host copy. Shards can arrive out of
-order and are folded in shard order. The caller can release the result after
-the matching completion has executed in the control plane.
+finish locally after revocation. Before publishing a shard, the worker waits
+for a matching device event, copies the output, and checks its grant in the
+control plane. Revocation can execute between that check and the local store.
+Shards can arrive out of order and are folded in shard order. The caller can
+release the result after the matching completion has executed in the control plane.
 
 | TLA+ module | Properties checked with TLC |
 | --- | --- |
@@ -210,10 +211,27 @@ the matching completion has executed in the control plane.
 | [Asynchronous reduction](specs/PlaitAsyncReduction.tla) | W4A4 device completion, stale-event rejection, and deterministic folding. An independent operation completes even while a producer or pull in another operation stalls. |
 | [Ordered publication](specs/PlaitOrderedPublication.tla) | Completion and revocation in the agreed command order, receipt identity on retry, and recovery from a replica's durable command prefix. |
 
-Run the model suite with TLC on your `PATH`.
+TLC 2.19 passes all 23 configurations. The ordered publication configuration
+explores 70,968 distinct states. Run the suite with `tlc` on your `PATH`.
 
 ```sh
 ./scripts/check-tla.sh
+```
+
+TLAPS discharged all 128 obligations. They establish W4A4 zero-point
+correction for any finite group, packed-read bounds under the load guards, and
+the matching-event and copy requirements for device publication.
+[Proof module](specs/PlaitContractsProof.tla)
+
+Run the proofs with `tlapm` on your `PATH`. The run uses the 1.6.0 pre-release
+at commit `e4d66f4`. [TLAPS release](https://github.com/tlaplus/tlapm/releases/tag/1.6.0-pre)
+
+```sh
+(
+  cache=$(mktemp -d)
+  trap 'rm -rf "$cache"' EXIT
+  tlapm --strict --threads 2 --cache-dir "$cache" specs/PlaitContractsProof.tla
+)
 ```
 
 The device model assumes stream ordering and output visibility after a

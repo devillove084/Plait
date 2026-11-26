@@ -52,7 +52,8 @@ Init ==
     /\ online = Replicas
     /\ state = [r \in Replicas |-> InitialState]
     /\ sawGrant = FALSE
-    /\ data = [jobs |-> [k \in Shards |-> EmptyDeviceJob], published |-> {}, count |-> 0, sum |-> 0]
+    /\ data = [jobs |-> [k \in Shards |-> EmptyDeviceJob],
+               checkedAt |-> [k \in Shards |-> 0], published |-> {}, count |-> 0, sum |-> 0]
     /\ delivered = NoDelivery
 
 AllowsOldGrants(s) == s.phase \in {"Active", "Draining"}
@@ -122,11 +123,16 @@ CopyShard(k) ==
     /\ data' = [data EXCEPT !.jobs[k] = CopyDevice(@)]
     /\ UNCHANGED <<history, durable, online, state, sawGrant, delivered>>
 
-\* This cutpoint combines the ordered worker grant check with publication.
-\* Already published data remains available to the modeled requester.
-PublishShard(k) ==
-    /\ Admitted(Agreed) /\ k \notin data.published
+\* CheckW4 observes the agreed prefix, then the worker caches its result
+\* locally. Revocation can execute between the check and the local store.
+CheckShard(k) ==
+    /\ Admitted(Agreed) /\ data.checkedAt[k] = 0
     /\ CanPublishDevice(data.jobs[k], Stamp(k, 1))
+    /\ data' = [data EXCEPT !.checkedAt[k] = Len(history) + 1]
+    /\ UNCHANGED <<history, durable, online, state, sawGrant, delivered>>
+
+PublishShard(k) ==
+    /\ data.checkedAt[k] # 0 /\ k \notin data.published
     /\ data' = [data EXCEPT !.published = @ \cup {k}]
     /\ UNCHANGED <<history, durable, online, state, sawGrant, delivered>>
 
@@ -186,7 +192,7 @@ Next ==
     \/ \E command \in Commands : AppendCommitted(command)
     \/ \E r \in Replicas : ReadGrant(r) \/ Install(r) \/ Crash(r) \/ Restart(r)
     \/ \E k \in Shards :
-           \/ QueueShard(k) \/ WriteShard(k) \/ CopyShard(k) \/ PublishShard(k)
+           \/ QueueShard(k) \/ WriteShard(k) \/ CopyShard(k) \/ CheckShard(k) \/ PublishShard(k)
            \/ \E fence \in {0, 1} : SignalShard(k, Stamp(k, fence))
     \/ PullAndFold
     \/ \E r \in Replicas, command \in Completions : Deliver(r, command)
@@ -205,6 +211,14 @@ MaterializedPrefix ==
            /\ DeviceJobSound(data.jobs[k], Stamp(k, 1), ReferenceValue(k))
            /\ ~ENABLED SignalShard(k, Stamp(k, 0))
     /\ data.sum = ReferencePrefix(data.count)
+
+CheckedBeforeClose ==
+    \A k \in Shards :
+        LET checked == data.checkedAt[k]
+        IN /\ k \in data.published => checked # 0
+           /\ checked # 0 =>
+               /\ checked \in 1..(Len(history) + 1)
+               /\ Admitted(Replay(checked - 1))
 
 \* A returned receipt is identical to the first receipt and to any later copy.
 \* Different arguments under the same identity yield a reuse error.
