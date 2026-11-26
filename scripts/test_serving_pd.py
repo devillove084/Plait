@@ -18,9 +18,10 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from serving_group import (
-    ADMISSION_HEADER, HANDOFF_HEADER, RELEASE_KV_PATH, VERSION_HEADER,
+    ADMISSION_HEADER, CHECKPOINT_ADMISSION_HEADER, HANDOFF_HEADER, KV_RESUME_HEADER,
+    RELEASE_KV_PATH, VERSION_HEADER,
     ControlError, Endpoint, Gate, check_backend_port, group_proxy, record_host_stop, run,
-    verify_seeded_sampler,
+    verify_backend_capabilities,
 )
 from serving_launch import GREEDY_KV_RESUME, SEEDED_KV_RESUME, host_command, resident_spec
 from serving_load import Load
@@ -366,8 +367,10 @@ class HandoffTest(unittest.TestCase):
         legacy, _ = self.group("decode", DECODE, respond, kv_resume=GREEDY_KV_RESUME)
         seeded, _ = self.group("decode", SPARE, respond, kv_resume=SEEDED_KV_RESUME)
         with self.assertRaises(ControlError):
-            verify_seeded_sampler(legacy)
-        verify_seeded_sampler(seeded)
+            verify_backend_capabilities(legacy, {KV_RESUME_HEADER: SEEDED_KV_RESUME})
+        verify_backend_capabilities(seeded, {KV_RESUME_HEADER: SEEDED_KV_RESUME})
+        with self.assertRaises(ControlError):
+            verify_backend_capabilities(seeded, {CHECKPOINT_ADMISSION_HEADER: "1"})
         respond.assert_not_called()
 
     def request(self, port, path, body=None, headers=None):

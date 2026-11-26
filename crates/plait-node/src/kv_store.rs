@@ -12,8 +12,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 
+mod checkpoints;
+use checkpoints::{Checkpoints, Limit};
+
 const MAGIC: &[u8; 8] = b"PLAITKV2";
 const RANGED_MAGIC: &[u8; 8] = b"PLAITKV3";
+const METRICS_MAGIC: &[u8; 8] = b"PLAITKVM";
 const HEADER: usize = 73;
 const MAX_BLOCK_BYTES: usize = 64 << 20;
 const MAX_HEADS: usize = 1024;
@@ -39,13 +43,13 @@ struct Request {
 }
 
 impl Request {
-    async fn read(stream: &mut TcpStream) -> io::Result<Self> {
+    async fn read(stream: &mut TcpStream, magic: [u8; 8]) -> io::Result<Self> {
         let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid KV request");
         let mut header = [0; HEADER];
-        stream.read_exact(&mut header).await?;
-        let ranged = match &header[..8] {
-            bytes if bytes == MAGIC => false,
-            bytes if bytes == RANGED_MAGIC => true,
+        stream.read_exact(&mut header[8..]).await?;
+        let ranged = match &magic {
+            MAGIC => false,
+            RANGED_MAGIC => true,
             _ => return Err(invalid()),
         };
         let field = |index: usize| {
@@ -73,10 +77,12 @@ impl Request {
                 .then(|| first * part_bytes..end * part_bytes)
         };
         let ranges = match (header[8], ranged) {
-            (b'H', true) if field(1) == 0 => Vec::new(),
-            (b'H', false) if field(1) == 0 && field(2) == 0 => Vec::new(),
-            (b'G' | b'P', false) => vec![range(field(1), field(2)).ok_or_else(invalid)?],
-            (b'G' | b'P', true) if (1..=MAX_RANGES).contains(&field(1)) => {
+            (b'H' | b'h', true) if field(1) == 0 => Vec::new(),
+            (b'H' | b'h', false) if field(1) == 0 && field(2) == 0 => Vec::new(),
+            (b'G' | b'g' | b'P' | b'p', false) => {
+                vec![range(field(1), field(2)).ok_or_else(invalid)?]
+            }
+            (b'G' | b'g' | b'P' | b'p', true) if (1..=MAX_RANGES).contains(&field(1)) => {
                 let mut table = vec![0; field(1) * 8];
                 stream.read_exact(&mut table).await?;
                 let mut end = 0;
@@ -95,15 +101,23 @@ impl Request {
             }
             _ => return Err(invalid()),
         };
+        let writer: Writer = header[41..57].try_into().unwrap();
+        if matches!(header[8], b'h' | b'g') && writer == [0; 16] {
+            return Err(invalid());
+        }
         Ok(Self {
             verb: header[8],
             key: header[9..41].try_into().unwrap(),
-            writer: header[41..57].try_into().unwrap(),
+            writer,
             heads,
             head_bytes,
             part_bytes,
             ranges,
         })
+    }
+
+    fn payload_bytes(&self) -> usize {
+        self.ranges.iter().map(Range::len).sum()
     }
 
     fn parts(&self) -> usize {
@@ -270,14 +284,39 @@ impl Store {
     }
 }
 
-async fn exchange(mut stream: TcpStream, store: &Mutex<Store>, capacity: usize) -> io::Result<()> {
-    let request = Request::read(&mut stream).await?;
-    if request.verb == b'P' {
+async fn exchange(
+    mut stream: TcpStream,
+    store: &Mutex<Store>,
+    capacity: usize,
+    checkpoints: &Checkpoints,
+) -> io::Result<()> {
+    let mut magic = [0; 8];
+    stream.read_exact(&mut magic).await?;
+    if &magic == METRICS_MAGIC {
+        let body = checkpoints.snapshot(Instant::now());
+        stream.write_u32(body.len() as u32).await?;
+        return stream.write_all(&body).await;
+    }
+    let request = Request::read(&mut stream, magic).await?;
+    let bytes = request.payload_bytes();
+    if matches!(request.verb, b'P' | b'p') {
         if request.reserved() > capacity {
             return stream.write_u8(REJECTED).await;
         }
-        let mut payload = vec![0; request.ranges.iter().map(Range::len).sum()];
+        let transfer = if request.verb == b'p' {
+            let Some(transfer) = checkpoints.write(bytes as u64, Instant::now()) else {
+                return stream.write_u8(REJECTED).await;
+            };
+            stream.write_u8(OK).await?;
+            Some(transfer)
+        } else {
+            None
+        };
+        let mut payload = vec![0; bytes];
         stream.read_exact(&mut payload).await?;
+        if let Some(transfer) = transfer {
+            transfer.complete();
+        }
         let stored =
             store
                 .lock()
@@ -289,9 +328,31 @@ async fn exchange(mut stream: TcpStream, store: &Mutex<Store>, capacity: usize) 
     let Some(heads) = heads else {
         return stream.write_u8(MISS).await;
     };
+    if request.verb == b'h' {
+        let reserved = checkpoints.reserve_read(
+            request.key,
+            request.writer,
+            (request.heads * request.head_bytes) as u64,
+            Instant::now(),
+        );
+        return stream.write_u8(if reserved { OK } else { REJECTED }).await;
+    }
+    let transfer = if request.verb == b'g' {
+        let Some(transfer) =
+            checkpoints.read(request.key, request.writer, bytes as u64, Instant::now())
+        else {
+            return stream.write_u8(REJECTED).await;
+        };
+        Some(transfer)
+    } else {
+        None
+    };
     stream.write_u8(OK).await?;
     for head in heads {
         stream.write_all(&head).await?;
+    }
+    if let Some(transfer) = transfer {
+        transfer.complete();
     }
     Ok(())
 }
@@ -299,8 +360,21 @@ async fn exchange(mut stream: TcpStream, store: &Mutex<Store>, capacity: usize) 
 pub(super) async fn run(
     mut args: impl Iterator<Item = String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let first = args.next();
+    if first.as_deref() == Some("--stats") {
+        let addr = args.next().ok_or("--stats needs IP:port")?.parse()?;
+        if args.next().is_some() {
+            return Err("--stats accepts a single store address".into());
+        }
+        let body = tokio::time::timeout(DEADLINE, read_stats(addr)).await??;
+        println!("{body}");
+        return Ok(());
+    }
+    let mut args = first.into_iter().chain(args);
     let mut listen = "127.0.0.1:7952".parse::<SocketAddr>()?;
     let mut capacity = 256 << 20;
+    let mut checkpoint_rate = None;
+    let mut checkpoint_burst = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--listen" => listen = args.next().ok_or("--listen needs IP:port")?.parse()?,
@@ -310,14 +384,39 @@ pub(super) async fn run(
                     .ok_or("--capacity-bytes needs a size")?
                     .parse::<usize>()?;
             }
+            "--checkpoint-bytes-per-second" => {
+                checkpoint_rate = Some(
+                    args.next()
+                        .ok_or("--checkpoint-bytes-per-second needs a rate")?
+                        .parse::<u64>()?,
+                );
+            }
+            "--checkpoint-burst-bytes" => {
+                checkpoint_burst = Some(
+                    args.next()
+                        .ok_or("--checkpoint-burst-bytes needs a size")?
+                        .parse::<u64>()?,
+                );
+            }
             _ => return Err(format!("unknown KV store argument {arg}").into()),
         }
     }
     if capacity == 0 {
         return Err("KV store capacity must be positive".into());
     }
+    let limits = match (checkpoint_rate, checkpoint_burst) {
+        (None, None) => None,
+        (Some(bytes_per_second), Some(burst_bytes)) if bytes_per_second > 0 && burst_bytes > 0 => {
+            Some(Limit {
+                bytes_per_second,
+                burst_bytes,
+            })
+        }
+        _ => return Err("checkpoint byte rate and burst must both be positive".into()),
+    };
     let listener = TcpListener::bind(listen).await?;
     let store = Arc::new(Mutex::new(Store::new(capacity)));
+    let checkpoints = Arc::new(Checkpoints::new(limits, Instant::now()));
     let connections = Arc::new(Semaphore::new(32));
     println!("Plait KV store listening on {}", listener.local_addr()?);
     loop {
@@ -325,16 +424,111 @@ pub(super) async fn run(
         let (stream, _) = listener.accept().await?;
         stream.set_nodelay(true)?;
         let store = store.clone();
+        let checkpoints = checkpoints.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let _ = tokio::time::timeout(DEADLINE, exchange(stream, &store, capacity)).await;
+            let _ =
+                tokio::time::timeout(DEADLINE, exchange(stream, &store, capacity, &checkpoints))
+                    .await;
         });
     }
+}
+
+async fn read_stats(addr: SocketAddr) -> io::Result<String> {
+    let mut stream = TcpStream::connect(addr).await?;
+    stream.write_all(METRICS_MAGIC).await?;
+    let size = stream.read_u32().await? as usize;
+    if !(1..=4096).contains(&size) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid KV store metrics size",
+        ));
+    }
+    let mut body = vec![0; size];
+    stream.read_exact(&mut body).await?;
+    String::from_utf8(body).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn open_request(addr: SocketAddr, verb: u8, first: u32, count: u32) -> TcpStream {
+        let mut header = Vec::from(*MAGIC);
+        header.push(verb);
+        header.extend_from_slice(&[3; 32]);
+        header.extend_from_slice(&[7; 16]);
+        for field in [2, first, count, 2] {
+            header.extend_from_slice(&field.to_le_bytes());
+        }
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(&header).await.unwrap();
+        stream
+    }
+
+    #[tokio::test]
+    async fn refusals_precede_optional_payload_and_leave_mandatory_handoff_available() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let store = Mutex::new(Store::new(64));
+            let budget = Checkpoints::new(
+                Some(Limit {
+                    bytes_per_second: 1,
+                    burst_bytes: 4,
+                }),
+                Instant::now(),
+            );
+            for _ in 0..7 {
+                let (stream, _) = listener.accept().await.unwrap();
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    exchange(stream, &store, 64, &budget),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            }
+        });
+
+        let mut write = open_request(addr, b'P', 0, 2).await;
+        write.write_all(&[1, 2, 3, 4]).await.unwrap();
+        assert_eq!(write.read_u8().await.unwrap(), OK);
+        assert_eq!(
+            open_request(addr, b'h', 0, 0)
+                .await
+                .read_u8()
+                .await
+                .unwrap(),
+            OK
+        );
+        assert_eq!(
+            open_request(addr, b'p', 0, 1)
+                .await
+                .read_u8()
+                .await
+                .unwrap(),
+            REJECTED
+        );
+        for (verb, first, count, expected) in [
+            (b'G', 0, 2, &[1, 2, 3, 4][..]),
+            (b'g', 0, 1, &[1, 2][..]),
+            (b'g', 1, 1, &[3, 4][..]),
+        ] {
+            let mut reply = open_request(addr, verb, first, count).await;
+            assert_eq!(reply.read_u8().await.unwrap(), OK);
+            let mut payload = Vec::new();
+            reply.read_to_end(&mut payload).await.unwrap();
+            assert_eq!(payload, expected);
+        }
+        let stats = read_stats(addr).await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+        assert_eq!(stats["read_bytes"], 4);
+        assert_eq!(stats["write_bytes"], 0);
+        assert_eq!(stats["write_reservations_denied"], 1);
+        assert_eq!(stats["pending_bytes"], 0);
+        server.await.unwrap();
+    }
 
     fn request(first: usize, count: usize, writer: u8) -> Request {
         Request {

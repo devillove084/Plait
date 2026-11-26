@@ -30,6 +30,7 @@ ROLE_HEADER = "X-Plait-Group-Role"
 HANDOFF_HEADER = "X-Plait-KV-Handoff"
 ADMISSION_HEADER = "X-Plait-Admission"
 KV_RESUME_HEADER = "X-Plait-KV-Resume"
+CHECKPOINT_ADMISSION_HEADER = "X-Plait-KV-Checkpoint-Admission"
 RELEASE_KV_PATH = "/plait/release-kv"
 INFERENCE_PATHS = frozenset({"/v1/completions", "/v1/chat/completions"})
 MAX_JSON_BYTES = 16 * 1024 * 1024
@@ -225,17 +226,18 @@ def endpoint_ready(endpoint: Endpoint, timeout: float) -> bool:
     return probe_endpoint(endpoint, timeout) is not None
 
 
-def verify_seeded_sampler(port: int) -> None:
+def verify_backend_capabilities(port: int, expected: dict[str, str]) -> None:
     try:
         with contextlib.closing(http.client.HTTPConnection("127.0.0.1", port, timeout=2)) as connection:
             connection.request("GET", "/health")
             with connection.getresponse() as response:
-                if (response.status == 200
-                        and response.getheader(KV_RESUME_HEADER) == serving_launch.SEEDED_KV_RESUME):
+                if response.status == 200 and all(
+                    response.getheader(name) == value for name, value in expected.items()
+                ):
                     return
     except HTTP_ERRORS as error:
-        raise ControlError("cannot verify the seeded sampler on the local engine") from error
-    raise ControlError("the local engine did not advertise the configured seeded sampler")
+        raise ControlError("cannot verify the local engine's KV capabilities") from error
+    raise ControlError(f"the local engine did not advertise {', '.join(expected)}")
 
 
 HOP_HEADERS = frozenset({
@@ -244,6 +246,7 @@ HOP_HEADERS = frozenset({
 })
 PRIVATE_HEADERS = frozenset(header.lower() for header in (
     VERSION_HEADER, ROLE_HEADER, HANDOFF_HEADER, ADMISSION_HEADER, KV_RESUME_HEADER,
+    CHECKPOINT_ADMISSION_HEADER,
 ))
 
 
@@ -549,9 +552,14 @@ def run(
         elif len({grant["device"]["ordinal"] for grant in grants}) != args.tp:
             raise ControlError("duplicate device ordinal in group grants")
 
-        kv_resume = ""
+        expected_capabilities = {}
         if not follower:
-            kv_resume = serving_launch.kv_resume_capability(command, child_env)
+            options = serving_launch.plait_kv_consumer_options(command)
+            kv_resume = serving_launch.kv_resume_capability(options, child_env)
+            if kv_resume == serving_launch.SEEDED_KV_RESUME:
+                expected_capabilities[KV_RESUME_HEADER] = kv_resume
+            if options and options.get("checkpoint_admission") is True:
+                expected_capabilities[CHECKPOINT_ADMISSION_HEADER] = "1"
             server = group_proxy(
                 args.port_base, args.backend_port, gate, version_tag,
                 bind=args.proxy_host, role=args.role, kv_lease=args.kv_lease_seconds,
@@ -598,8 +606,8 @@ def run(
                 else:
                     ready = probe(args.backend_port)
                 if ready and process.poll() is None:
-                    if kv_resume == serving_launch.SEEDED_KV_RESUME:
-                        verify_seeded_sampler(args.backend_port)
+                    if expected_capabilities:
+                        verify_backend_capabilities(args.backend_port, expected_capabilities)
                     if hosted:
                         phase = change("HostLaunchReady", endpoint=None if follower else endpoint)
                     else:

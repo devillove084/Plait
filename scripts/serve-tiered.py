@@ -96,6 +96,7 @@ def parse_args() -> argparse.Namespace:
     args.hosted_block_size = None
     args.stream_checkpoints = False
     args.seeded_stream_resume = False
+    args.checkpoint_admission = False
     args.release_driver = None
     if args.resident_hosted:
         if args.host_launch_spec or args.print_launch_digest or not args.group_id:
@@ -120,6 +121,7 @@ def parse_args() -> argparse.Namespace:
                     args.role == "aggregated" or bootstrap["engine"].get("stream_checkpoints", False)
                 )
                 args.seeded_stream_resume = bootstrap["engine"].get("seeded_stream_resume", False)
+                args.checkpoint_admission = bootstrap["engine"].get("checkpoint_admission", False)
                 kv = pd["kv"]
                 args.plait_kv_namespace = kv["namespace"]
                 args.kv_host, kv_port = kv["store"].rsplit(":", 1)
@@ -286,6 +288,8 @@ def native_command(args: argparse.Namespace, vllm: str, port: int) -> list[str]:
                 config["kv_connector_extra_config"]["checkpoint_decode"] = True
             if args.role != "prefill" and args.seeded_stream_resume:
                 config["kv_connector_extra_config"]["seeded_resume"] = True
+            if args.role != "prefill" and args.checkpoint_admission:
+                config["kv_connector_extra_config"]["checkpoint_admission"] = True
         command.extend(("--kv-transfer-config", json.dumps(config)))
     return command
 

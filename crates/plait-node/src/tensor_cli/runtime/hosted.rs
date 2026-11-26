@@ -64,6 +64,8 @@ struct EngineProfile {
     stream_checkpoints: bool,
     #[serde(default)]
     seeded_stream_resume: bool,
+    #[serde(default)]
+    checkpoint_admission: bool,
     verify_release: Option<PathBuf>,
     release_driver: Option<ReleaseDriver>,
 }

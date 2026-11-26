@@ -814,7 +814,30 @@ planner reserves old-generation writes, target imports, and any new split
 prefill handoff during that interval. It reserves enough for concentration
 on one target because resumed requests can converge on the first available
 group. A candidate must sustain the incumbent's modeled service rate after
-those reserves. The forecast does not pace individual transfers.
+those reserves.
+
+#### Limit optional checkpoint transfers
+
+Run the upgraded KV store with `--checkpoint-bytes-per-second` and
+`--checkpoint-burst-bytes`. Set `checkpoint_admission: true` on the
+participating Decode and aggregate engine profiles. The launcher checks
+the actual engine capability. Multi-host groups agree on the setting
+before starting workers.
+
+The store combines optional checkpoint reads and writes into one byte
+budget. Use a burst at least as large as a full logical page if the
+store should admit optional imports. A writer requests credit before it
+copies or sends the payload. A reader reserves the full page for 30
+seconds. All TP and PP shards draw from that reservation, and in-flight
+transfers occupy credit until their socket operation finishes. Required
+P/D prompt handoffs use their existing path. When an optional prefix
+reservation is declined, the target computes the uncovered known tokens.
+
+Run `plait-node kv-store --stats HOST:PORT` for completed payload bytes,
+refusals, expired read reservations, and bytes currently held. Use the
+change in the byte counters over a sampling window to measure the store's
+optional transfer rate. This is a per-store application budget. The
+planner still uses calibrated directional port limits.
 
 ## Execute a collective
 
