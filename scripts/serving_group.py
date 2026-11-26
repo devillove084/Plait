@@ -46,11 +46,13 @@ class Rejected(ControlError):
 
 
 class Control:
-    def __init__(self, binary: str, peers: list[str], listen: str) -> None:
+    def __init__(self, binary: str, peers: list[str], listen: str, *, seeds: tuple[str, ...] | list[str] = ()) -> None:
         self.argv = [binary, "serving", "--listen", listen]
         for peer in peers:
             self.argv.extend(("--peer", peer))
-        self.timeout = 3.0 + 2.0 * len(peers)
+        for seed in seeds:
+            self.argv.extend(("--seed", seed))
+        self.timeout = 12.0 if seeds else 3.0 + 2.0 * len(peers)
         self.process: subprocess.Popen | None = None
         self.holder = list(uuid.uuid4().bytes)
         self.counter = 0
@@ -416,6 +418,7 @@ def run(
     *,
     endpoint: dict | None = None,
     host_launch_spec: dict | None = None,
+    holder: list[int] | None = None,
 ) -> int:
     version = {"group": list(bytes.fromhex(args.group_id)), "epoch": args.group_epoch}
     version_tag = f"{args.group_id.lower()}@{args.group_epoch}"
@@ -433,7 +436,12 @@ def run(
         address = config["address"]
         if listen is None:
             listen = f"[{address}]:0" if ":" in address else f"{address}:0"
-    control = Control(args.control_bin, args.control_peer, listen or "127.0.0.1:0")
+    control = Control(
+        args.control_bin, args.control_peer, listen or "127.0.0.1:0",
+        seeds=getattr(args, "control_seed", ()),
+    )
+    if holder is not None:
+        control.holder = holder
     identity = {"version": version, "holder": control.holder}
     if hosted:
         identity["host"] = host

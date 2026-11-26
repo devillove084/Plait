@@ -1,0 +1,335 @@
+//! Start assigned vLLM groups using installed host profiles.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
+use std::io;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::time::Duration;
+
+use plait_core::serving::{
+    GroupPhase, GroupVersion, HostMemory, HostedAssignment, ServingAction, ServingLookup,
+    ServingView,
+};
+use plait_core::{DeviceId, NodeId};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use tokio::io::AsyncWriteExt;
+use tokio::process::{Child, ChildStdin, Command};
+
+use super::{
+    ControlPeers, GroupControl, apply, lock_device, lock_identity, register, renew_execution_host,
+};
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Config {
+    listen: SocketAddr,
+    host_memory: HostMemory,
+    lock_dir: PathBuf,
+    launcher: Vec<String>,
+    devices: Vec<Device>,
+    profiles: BTreeMap<String, EngineProfile>,
+}
+
+#[derive(Deserialize)]
+struct Device {
+    ordinal: u32,
+    incarnation: u64,
+    device_bytes: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct EngineProfile {
+    argv: Vec<String>,
+    model_path: String,
+    device_env: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    verify_release: Option<PathBuf>,
+}
+
+struct Launch {
+    child: Child,
+    _lease: ChildStdin,
+}
+
+pub(crate) async fn run(
+    host: NodeId,
+    config: Config,
+    peers: BTreeMap<NodeId, String>,
+    seeds: Vec<SocketAddr>,
+) -> io::Result<()> {
+    let unique: BTreeSet<_> = config.devices.iter().map(|device| device.ordinal).collect();
+    if config.listen.ip().is_unspecified()
+        || config.launcher.first().is_none_or(String::is_empty)
+        || config.profiles.is_empty()
+        || config.devices.is_empty()
+        || unique.len() != config.devices.len()
+        || config.devices.iter().any(|device| device.device_bytes == 0)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid hosted execution configuration",
+        ));
+    }
+    tokio::fs::create_dir_all(&config.lock_dir).await?;
+    let lock = lock_device(&config.lock_dir.join("host-supervisor.lock"))?;
+    let pulse = ServingAction::PulseExecutionHost {
+        host,
+        supervisor_lock: lock_identity(&lock)?,
+    };
+    let peers: Vec<_> = peers
+        .into_iter()
+        .map(|(id, addr)| format!("{id}@{addr}"))
+        .collect();
+    let listen = SocketAddr::new(config.listen.ip(), 0);
+    let peer_config = ControlPeers::new(peers.clone(), seeds.clone(), listen.to_string());
+    let mut control = GroupControl::connect(peer_config.clone()).await?;
+    register(
+        &mut control,
+        ServingAction::SetHostMemory {
+            host,
+            capacity: config.host_memory,
+        },
+    )
+    .await?;
+    for device in &config.devices {
+        register(
+            &mut control,
+            ServingAction::RegisterWorker {
+                device: DeviceId::new(host, device.ordinal),
+                incarnation: device.incarnation,
+                device_bytes: device.device_bytes,
+            },
+        )
+        .await?;
+    }
+    register(&mut control, pulse.clone()).await?;
+    println!("plait hosted execution on {host}");
+    let heartbeat = GroupControl::connect(peer_config).await?;
+    tokio::select! {
+        result = renew_execution_host(heartbeat, pulse) => result,
+        result = supervise(host, &config, &peers, &seeds, &lock, control) => result,
+    }
+}
+
+async fn supervise(
+    host: NodeId,
+    config: &Config,
+    peers: &[String],
+    seeds: &[SocketAddr],
+    lock: &File,
+    mut control: GroupControl,
+) -> io::Result<()> {
+    let mut running: BTreeMap<GroupVersion, Launch> = BTreeMap::new();
+    let mut tick = tokio::time::interval(Duration::from_millis(500));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let mut stopped = Vec::new();
+        for (version, launch) in &mut running {
+            if let Some(status) = launch.child.try_wait()? {
+                eprintln!(
+                    "hosted group {}@{} launcher exited with {status}",
+                    version.group.0, version.epoch
+                );
+                stopped.push(*version);
+            }
+        }
+        for version in stopped {
+            running.remove(&version);
+        }
+        let assignments = match control.query(ServingLookup::HostedAssignments(host)).await {
+            Ok(ServingView::HostedAssignments(assignments)) => assignments,
+            Ok(_) => return Err(io::Error::other("expected hosted assignments")),
+            Err(error) => {
+                eprintln!("hosted assignment lookup: {error}");
+                continue;
+            }
+        };
+        for assignment in assignments {
+            let version = assignment.version;
+            if running.contains_key(&version) {
+                continue;
+            }
+            // The local supervisor lock survives in every live launcher. A
+            // claim without a child under this lock cannot restart its epoch.
+            if assignment.holder.is_some() {
+                if let Err(error) = apply(&mut control, ServingAction::Revoke(version)).await {
+                    eprintln!(
+                        "retiring lost hosted launcher {}@{}: {error}",
+                        version.group.0, version.epoch
+                    );
+                }
+                continue;
+            }
+            if assignment.phase != GroupPhase::Preparing {
+                continue;
+            }
+            let Some(profile) = config.profiles.get(&assignment.recipe.profile) else {
+                continue;
+            };
+            if !assignment
+                .recipe
+                .hosts
+                .iter()
+                .any(|entry| entry.host == host && entry.address == config.listen.ip())
+            {
+                continue;
+            }
+            let holder = NodeId::random();
+            if let Err(error) = apply(
+                &mut control,
+                ServingAction::ClaimHostLaunch {
+                    version,
+                    host,
+                    holder,
+                    launch_digest: assignment.recipe.launch_digest(),
+                },
+            )
+            .await
+            {
+                eprintln!(
+                    "claiming hosted group {}@{}: {error}",
+                    version.group.0, version.epoch
+                );
+                continue;
+            }
+            match launch(
+                host,
+                holder,
+                config,
+                profile,
+                &assignment,
+                peers,
+                seeds,
+                lock,
+            )
+            .await
+            {
+                Ok(launch) => {
+                    running.insert(version, launch);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "starting hosted group {}@{}: {error}",
+                        version.group.0, version.epoch
+                    );
+                    let _ = apply(&mut control, ServingAction::Revoke(version)).await;
+                }
+            }
+        }
+    }
+}
+
+async fn launch(
+    host: NodeId,
+    holder: NodeId,
+    config: &Config,
+    profile: &EngineProfile,
+    assignment: &HostedAssignment,
+    peers: &[String],
+    seeds: &[SocketAddr],
+    lock: &File,
+) -> io::Result<Launch> {
+    let recipe = &assignment.recipe;
+    let version = assignment.version;
+    let mut command = Command::new(&config.launcher[0]);
+    command
+        .args(&config.launcher[1..])
+        .arg("--resident-hosted")
+        .args([
+            "--model",
+            &assignment.model,
+            "--served-model-name",
+            &recipe.api_model,
+        ])
+        .args(["--tp", &assignment.tensor_parallel.to_string()])
+        .args([
+            "--port-base",
+            &recipe.http_port.to_string(),
+            "--backend-port",
+            &recipe.backend_port.to_string(),
+        ])
+        .args(["--max-model-len", &recipe.max_model_len.to_string()])
+        .args([
+            "--gpu-memory-utilization",
+            &(f64::from(recipe.gpu_memory_bps) / 10_000.0).to_string(),
+        ])
+        .args([
+            "--group-id",
+            &version.group.0.to_hex(),
+            "--group-epoch",
+            &version.epoch.to_string(),
+        ])
+        .args([
+            "--host-id",
+            &host.to_hex(),
+            "--control-listen",
+            &SocketAddr::new(config.listen.ip(), 0).to_string(),
+        ])
+        .arg("--control-bin")
+        .arg(std::env::current_exe()?)
+        .stdin(Stdio::piped());
+    if !recipe.prefix_caching {
+        command.arg("--no-prefix-caching");
+    }
+    for peer in peers {
+        command.args(["--control-peer", peer]);
+    }
+    for seed in seeds {
+        command.args(["--control-seed", &seed.to_string()]);
+    }
+    if let Some(path) = &profile.verify_release {
+        command.arg("--verify-release").arg(path);
+    }
+    hold_lock(&mut command, lock)?;
+    let mut bootstrap = serde_json::to_vec(&json!({
+        "holder": holder, "launch_digest": recipe.launch_digest(),
+        "recipe": recipe, "engine": profile,
+    }))?;
+    bootstrap.push(b'\n');
+    if bootstrap.len() > 65_536 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "hosted launch record exceeds 64 KiB",
+        ));
+    }
+    let mut child = command.spawn()?;
+    let mut input = child.stdin.take().expect("piped launcher stdin");
+    tokio::time::timeout(Duration::from_secs(5), input.write_all(&bootstrap)).await??;
+    Ok(Launch {
+        child,
+        _lease: input,
+    })
+}
+
+#[cfg(unix)]
+fn hold_lock(command: &mut Command, lock: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let fd = lock.as_raw_fd();
+    command.env("PLAIT_HOSTED_LOCK_FD", fd.to_string());
+    // SAFETY: The borrowed file stays open through spawn. fcntl is safe after fork.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn hold_lock(_command: &mut Command, _lock: &File) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "hosted supervisor lock requires Unix",
+    ))
+}

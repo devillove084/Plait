@@ -23,7 +23,24 @@ PLACEMENT_FLAGS = {
 
 def load_spec(path: Path) -> dict:
     """Validate the launch document before hashing or starting a process."""
-    spec = json.loads(path.read_text())
+    return validate_spec(json.loads(path.read_text()))
+
+
+def resident_spec(recipe: dict, engine: dict) -> dict:
+    """Project the committed topology onto the installed local engine profile."""
+    api_host = bytes(recipe["api_host"]).hex()
+    program = {key: engine[key] for key in ("argv", "model_path", "device_env", "args", "env")}
+    hosts = {
+        bytes(entry["host"]).hex(): {**program, "address": entry["address"]}
+        for entry in recipe["hosts"]
+    }
+    return validate_spec({
+        "api_host": api_host, "master_addr": hosts[api_host]["address"],
+        "master_port": recipe["master_port"], "hosts": hosts,
+    })
+
+
+def validate_spec(spec: dict) -> dict:
     if not isinstance(spec, dict) or set(spec) != {
         "api_host", "master_addr", "master_port", "hosts",
     }:

@@ -2,23 +2,64 @@ use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use plait_core::serving::{
-    HostedActivation, ServingAction, ServingError, ServingLookup, ServingOperation, ServingRole,
-    ServingView,
+    GroupId, GroupPlan, HostedActivation, HostedRecipe, ServingAction, ServingError, ServingLookup,
+    ServingOperation, ServingRole, ServingView,
 };
 use plait_core::{NodeId, OpId};
 use plait_node::Client;
 use plait_parallel::serving::{ServingCandidate, ServingForecast, select_serving_candidate};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::{CandidateInput, apply, query, query_resources};
+
+#[derive(Deserialize, Serialize)]
+pub(super) struct Input {
+    #[serde(flatten)]
+    candidate: CandidateInput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recipe: Option<HostedRecipe>,
+}
+
+pub(super) fn prepare(
+    group: GroupId,
+    expected_epoch: u64,
+    expected_active: Option<u64>,
+    mut plan: GroupPlan,
+    activation: HostedActivation,
+    recipe: Option<HostedRecipe>,
+    request_sha256: Option<[u8; 32]>,
+) -> ServingAction {
+    if let Some(recipe) = recipe {
+        plan.launch_digest = recipe.launch_digest();
+        ServingAction::PrepareHostedDeployment {
+            group,
+            expected_epoch,
+            expected_active,
+            plan,
+            activation,
+            request_sha256,
+            recipe,
+        }
+    } else {
+        ServingAction::PrepareHostedSwitch {
+            group,
+            expected_epoch,
+            expected_active,
+            plan,
+            activation,
+            request_sha256,
+        }
+    }
+}
 
 pub(super) async fn replan(
     client: &mut Client,
     peers: impl Iterator<Item = NodeId> + Clone,
     id: OpId,
     mut forecast: ServingForecast,
-    inputs: Vec<CandidateInput>,
+    inputs: Vec<Input>,
     activation: HostedActivation,
 ) -> io::Result<Value> {
     forecast.now_ms = 0;
@@ -27,10 +68,24 @@ pub(super) async fn replan(
     if let Some(result) = replay(client, peers.clone(), id, request_sha256).await? {
         return Ok(result);
     }
-    let candidates = inputs
+    let (candidates, recipes): (Vec<_>, Vec<_>) = inputs
         .into_iter()
-        .map(ServingCandidate::try_from)
-        .collect::<io::Result<Vec<_>>>()?;
+        .map(|input| {
+            let mut candidate = ServingCandidate::try_from(input.candidate)?;
+            if let Some(recipe) = &input.recipe {
+                candidate.plan.launch_digest = recipe.launch_digest();
+                recipe.validate(&candidate.plan).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid hosted recipe: {error:?}"),
+                    )
+                })?;
+            }
+            Ok((candidate, input.recipe))
+        })
+        .collect::<io::Result<Vec<_>>>()?
+        .into_iter()
+        .unzip();
     if candidates.iter().any(|candidate| {
         candidate.plan.role != ServingRole::Aggregated || candidate.plan.pipeline_parallel != 1
     }) {
@@ -61,14 +116,15 @@ pub(super) async fn replan(
         .map(|active| active.version.epoch);
     let operation = ServingOperation {
         id,
-        action: ServingAction::PrepareHostedSwitch {
-            group: candidate.group,
-            expected_epoch: candidate.expected_epoch,
+        action: prepare(
+            candidate.group,
+            candidate.expected_epoch,
             expected_active,
-            plan: candidate.plan.clone(),
+            candidate.plan.clone(),
             activation,
-            request_sha256: Some(request_sha256),
-        },
+            recipes[index].clone(),
+            Some(request_sha256),
+        ),
     };
     let result = apply(client, peers.clone(), &operation).await?;
     if result == Err(ServingError::OperationIdReused)
@@ -94,6 +150,10 @@ async fn replay(
         return Ok(None);
     };
     if let ServingAction::PrepareHostedSwitch {
+        request_sha256: Some(prior),
+        ..
+    }
+    | ServingAction::PrepareHostedDeployment {
         request_sha256: Some(prior),
         ..
     } = receipt.operation.action

@@ -139,6 +139,7 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             let mut initialize = false;
             let mut advertise_devices = true;
             let mut execution = None;
+            let mut hosted_execution = None;
             let mut compute_only = false;
             while let Some(arg) = args.next() {
                 match arg.as_str() {
@@ -168,6 +169,12 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                             std::fs::File::open(path)?,
                         )?);
                     }
+                    "--hosted-execution" => {
+                        let path = args.next().ok_or("--hosted-execution needs a path")?;
+                        hosted_execution = Some(serde_json::from_reader::<_, tensor_cli::runtime::hosted::Config>(
+                            std::fs::File::open(path)?,
+                        )?);
+                    }
                     "--compute-only" => compute_only = true,
                     other => return Err(format!("unknown argument {other}").into()),
                 }
@@ -178,18 +185,29 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             if state_dir.is_some() && id.is_none() {
                 return Err("durable replicas require an explicit --id".into());
             }
-            if execution.is_some() && id.is_none() {
-                return Err("--w4-execution requires a stable --id".into());
+            if (execution.is_some() || hosted_execution.is_some()) && id.is_none() {
+                return Err("execution requires a stable --id".into());
+            }
+            if execution.is_some() && hosted_execution.is_some() {
+                return Err("select one local execution supervisor per node".into());
             }
             let id = id.unwrap_or_else(NodeId::random);
             if compute_only {
                 if join.is_some() || state_dir.is_some() || peers.is_empty() == seeds.is_empty() {
                     return Err("--compute-only requires either --peer or --seed and no voting membership or journal flags".into());
                 }
-                let config = execution.ok_or("--compute-only requires --w4-execution")?;
+                let execute = async {
+                    if let Some(config) = execution {
+                        tensor_cli::runtime::run(id, config, peers, seeds).await
+                    } else if let Some(config) = hosted_execution {
+                        tensor_cli::runtime::hosted::run(id, config, peers, seeds).await
+                    } else {
+                        Err(std::io::Error::other("--compute-only requires an execution configuration"))
+                    }
+                };
                 tokio::select! {
                     result = tokio::signal::ctrl_c() => result?,
-                    result = tensor_cli::runtime::run(id, config, peers, seeds) => result?,
+                    result = execute => result?,
                 }
                 return Ok(());
             }
@@ -218,6 +236,8 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             let execute = async {
                 if let Some(config) = execution {
                     tensor_cli::runtime::run(id, config, execution_peers, Vec::new()).await
+                } else if let Some(config) = hosted_execution {
+                    tensor_cli::runtime::hosted::run(id, config, execution_peers, Vec::new()).await
                 } else {
                     std::future::pending::<std::io::Result<()>>().await
                 }

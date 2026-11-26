@@ -470,6 +470,9 @@ impl NodeState {
                     ServingLookup::ExecutionHostLiveness(host) => {
                         ServingView::ExecutionHostLiveness(runtime.serving_execution_host(host))
                     }
+                    ServingLookup::HostedAssignments(host) => {
+                        ServingView::HostedAssignments(runtime.serving_hosted_assignments(host))
+                    }
                     ServingLookup::DecoderClaims(version) => {
                         ServingView::DecoderClaims(runtime.serving_decoder_claims(version))
                     }

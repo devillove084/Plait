@@ -1,9 +1,10 @@
 //! Serving plans and acknowledgements shared by planners and Plait nodes.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, SocketAddr, SocketAddrV4};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{Access, DeviceId, Key, Mode, NodeId, OpId};
 
@@ -35,6 +36,102 @@ pub enum HostedActivation {
     #[default]
     OnReady,
     OnRevocation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedAddress {
+    pub host: NodeId,
+    pub address: IpAddr,
+}
+
+/// The portable inputs needed to launch one committed vLLM process group.
+/// Each host supplies its own installed implementation of `profile`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedRecipe {
+    pub profile: String,
+    pub api_host: NodeId,
+    pub hosts: Vec<HostedAddress>,
+    pub master_port: u16,
+    pub http_port: u16,
+    pub backend_port: u16,
+    pub api_model: String,
+    pub max_model_len: u32,
+    pub gpu_memory_bps: u16,
+    pub prefix_caching: bool,
+}
+
+impl HostedRecipe {
+    pub fn launch_digest(&self) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(b"plait-hosted-recipe-v1");
+        for name in [&self.profile, &self.api_model] {
+            hash.update((name.len() as u64).to_le_bytes());
+            hash.update(name.as_bytes());
+        }
+        hash.update(self.api_host.as_bytes());
+        hash.update((self.hosts.len() as u64).to_le_bytes());
+        for host in &self.hosts {
+            hash.update(host.host.as_bytes());
+            match host.address {
+                IpAddr::V4(address) => {
+                    hash.update([4]);
+                    hash.update(address.octets());
+                }
+                IpAddr::V6(address) => {
+                    hash.update([6]);
+                    hash.update(address.octets());
+                }
+            }
+        }
+        for port in [self.master_port, self.http_port, self.backend_port] {
+            hash.update(port.to_le_bytes());
+        }
+        hash.update(self.max_model_len.to_le_bytes());
+        hash.update(self.gpu_memory_bps.to_le_bytes());
+        hash.update([self.prefix_caching.into()]);
+        hash.finalize().into()
+    }
+
+    pub fn validate(&self, plan: &GroupPlan) -> Result<(), ServingError> {
+        let hosts: BTreeSet<_> = self.hosts.iter().map(|host| host.host).collect();
+        let ports = BTreeSet::from([self.master_port, self.http_port, self.backend_port]);
+        if self.profile.is_empty()
+            || self.profile.len() > 128
+            || self
+                .profile
+                .bytes()
+                .any(|c| !(c.is_ascii_alphanumeric() || b"._-".contains(&c)))
+            || self.api_model.is_empty()
+            || self.api_model.len() > 256
+            || self.api_model.contains('\0')
+            || hosts.len() < 2
+            || hosts.len() != self.hosts.len()
+            || !hosts.contains(&self.api_host)
+            || !hosts.iter().eq(plan.hosts.keys())
+            || self
+                .hosts
+                .iter()
+                .any(|host| host.address.is_unspecified() || host.address.is_multicast())
+            || ports.len() != 3
+            || ports.contains(&0)
+            || self.max_model_len == 0
+            || !(1..=10_000).contains(&self.gpu_memory_bps)
+            || self.launch_digest() != plan.launch_digest
+        {
+            return Err(ServingError::InvalidPlan);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedAssignment {
+    pub version: GroupVersion,
+    pub model: String,
+    pub tensor_parallel: u32,
+    pub phase: GroupPhase,
+    pub holder: Option<NodeId>,
+    pub recipe: HostedRecipe,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -667,6 +764,15 @@ pub enum ServingAction {
         activation: HostedActivation,
         request_sha256: Option<[u8; 32]>,
     },
+    PrepareHostedDeployment {
+        group: GroupId,
+        expected_epoch: u64,
+        expected_active: Option<u64>,
+        plan: GroupPlan,
+        activation: HostedActivation,
+        request_sha256: Option<[u8; 32]>,
+        recipe: HostedRecipe,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -818,6 +924,7 @@ pub enum ServingLookup {
     DecoderSwitch(RouteSetId),
     DecoderRouteWork(RouteSetId),
     DecoderAdmissionRoutes(RouteSetId),
+    HostedAssignments(NodeId),
 }
 
 /// A replica's locally applied state. A missing result may indicate replication lag.
@@ -840,6 +947,7 @@ pub enum ServingView {
     DecoderSwitch(Option<DecoderSwitch>),
     DecoderRouteWork(Option<DecoderRouteWork>),
     DecoderAdmissionRoutes(DecoderAdmissionRoutes),
+    HostedAssignments(Vec<HostedAssignment>),
 }
 
 impl ServingOperation {
@@ -864,7 +972,8 @@ impl ServingOperation {
             ServingAction::Prepare { group, plan, .. }
             | ServingAction::PrepareW4Switch { group, plan, .. }
             | ServingAction::PrepareManagedW4 { group, plan, .. }
-            | ServingAction::PrepareHostedSwitch { group, plan, .. } => {
+            | ServingAction::PrepareHostedSwitch { group, plan, .. }
+            | ServingAction::PrepareHostedDeployment { group, plan, .. } => {
                 keys.insert(Key::ServingGroup(*group));
                 keys.extend(plan.workers.keys().copied().map(Key::Device));
                 keys.extend(plan.hosts.keys().copied().map(Key::HostMemory));

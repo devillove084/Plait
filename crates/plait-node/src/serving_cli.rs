@@ -4,8 +4,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use plait_core::serving::{
     GroupId, GroupPhase, GroupPlan, GroupVersion, GroupView, HostMemory, HostedActivation,
-    RouteDirectory, RouteSetId, ServingAction, ServingEndpoint, ServingLookup, ServingOperation,
-    ServingResources, ServingRole, ServingView, W4GroupLayout, WorkerDemand, WorkerGrant,
+    HostedRecipe, RouteDirectory, RouteSetId, ServingAction, ServingEndpoint, ServingLookup,
+    ServingOperation, ServingResources, ServingRole, ServingView, W4GroupLayout, WorkerDemand,
+    WorkerGrant,
 };
 use plait_core::{DeviceId, NodeId, OpId};
 use plait_node::{Client, discover_voters};
@@ -38,6 +39,7 @@ enum Request {
         plan: NativePlanInput,
         #[serde(default)]
         activation: HostedActivation,
+        recipe: Option<HostedRecipe>,
     },
     Inspect {
         version: GroupVersion,
@@ -81,7 +83,7 @@ enum Request {
     ReplanHosted {
         id: OpId,
         forecast: ServingForecast,
-        candidates: Vec<CandidateInput>,
+        candidates: Vec<hosted::Input>,
         #[serde(default)]
         activation: HostedActivation,
     },
@@ -443,15 +445,17 @@ async fn handle(
             expected_active,
             plan,
             activation,
+            recipe,
         } => {
-            let action = ServingAction::PrepareHostedSwitch {
+            let action = hosted::prepare(
                 group,
                 expected_epoch,
                 expected_active,
-                plan: plan.try_into()?,
+                plan.try_into()?,
                 activation,
-                request_sha256: None,
-            };
+                recipe,
+                None,
+            );
             execute(client, peers, ServingOperation { id, action }).await
         }
     }

@@ -28,6 +28,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -78,8 +79,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--group-epoch", type=int)
     parser.add_argument("--host-id", help="hex ID of the host recorded in the plan")
     parser.add_argument("--host-launch-spec", type=Path, help="shared JSON spec for a managed multi-host TP group")
+    parser.add_argument("--resident-hosted", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--control-bin", default="plait-node")
     parser.add_argument("--control-peer", action="append", default=[])
+    parser.add_argument("--control-seed", action="append", default=[])
     parser.add_argument("--control-listen", help="local address and port for control replies")
     parser.add_argument("--backend-port", type=int, help="private native vLLM port")
     parser.add_argument("--proxy-host", help="bind address of the managed HTTP proxy")
@@ -88,6 +91,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verify-release", help="local executable that verifies the worker grants are released")
     parser.add_argument("--print-launch-digest", action="store_true")
     args = parser.parse_args()
+    args.bootstrap = None
+    if args.resident_hosted:
+        if args.host_launch_spec or args.print_launch_digest or not args.group_id:
+            parser.error("expected a supervised hosted group launch")
+        try:
+            fd = int(os.environ.pop("PLAIT_HOSTED_LOCK_FD"))
+            if fd < 3:
+                raise ValueError("missing inherited supervisor lock")
+            os.set_inheritable(fd, False)
+            payload = sys.stdin.buffer.readline(65537)
+            if len(payload) > 65536 or not payload.endswith(b"\n"):
+                raise ValueError("invalid hosted launch record")
+            bootstrap = json.loads(payload)
+            args.bootstrap = bootstrap
+            args.host_launch_spec = serving_launch.resident_spec(bootstrap["recipe"], bootstrap["engine"])
+            group_api = args.host_launch_spec["master_addr"]
+            address = ipaddress.ip_address(group_api)
+            args.advertise_http = f"[{address}]:{args.port_base}" if address.version == 6 else f"{address}:{args.port_base}"
+        except (KeyError, TypeError, OSError, ValueError) as error:
+            parser.error(f"invalid supervised launch: {error}")
     if args.host_launch_spec is not None:
         if not (args.group_id or args.print_launch_digest):
             parser.error("--host-launch-spec requires a managed launch or --print-launch-digest")
@@ -95,10 +118,11 @@ def parse_args() -> argparse.Namespace:
             parser.error("the hosted launch defines each vLLM command and requires eager mode")
         if args.advertise_http is None:
             parser.error("hosted launches require --advertise-http")
-        try:
-            args.host_launch_spec = serving_launch.load_spec(args.host_launch_spec)
-        except (OSError, ValueError) as error:
-            parser.error(f"invalid --host-launch-spec: {error}")
+        if args.bootstrap is None:
+            try:
+                args.host_launch_spec = serving_launch.load_spec(args.host_launch_spec)
+            except (OSError, ValueError) as error:
+                parser.error(f"invalid --host-launch-spec: {error}")
     if args.proxy_host is None:
         spec = args.host_launch_spec
         args.proxy_host = "127.0.0.1" if spec is None else spec["hosts"][spec["api_host"]]["address"]
@@ -166,8 +190,10 @@ def parse_args() -> argparse.Namespace:
         except ValueError:
             parser.error("--advertise-http must be an IP address and valid proxy port")
     if args.group_id:
-        if not (args.group_epoch and args.group_epoch > 0 and args.control_peer and args.host_id):
-            parser.error("--group-id requires --group-epoch, --host-id, and --control-peer")
+        if not (args.group_epoch and args.group_epoch > 0 and args.host_id):
+            parser.error("--group-id requires --group-epoch and --host-id")
+        if bool(args.control_peer) == bool(args.control_seed):
+            parser.error("--group-id requires either --control-peer or --control-seed")
         try:
             for identity in (args.group_id, args.host_id):
                 if len(identity) != 32 or len(bytes.fromhex(identity)) != 16:
@@ -348,6 +374,13 @@ def main() -> int:
     base_env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
     base_env.update(engine_env)
     stop_requested = False
+    parent_closed = threading.Event()
+
+    def watch_parent() -> None:
+        try:
+            sys.stdin.buffer.read(1)
+        finally:
+            parent_closed.set()
 
     def request_stop(_signum, _frame):
         nonlocal stop_requested
@@ -358,9 +391,15 @@ def main() -> int:
     try:
         if args.group_id:
             command = native_command(args, vllm, args.backend_port)
-            digest = list(launch_digest(command, engine_env, endpoint, args.host_launch_spec))
+            bootstrap = args.bootstrap
+            if bootstrap is None:
+                digest = list(launch_digest(command, engine_env, endpoint, args.host_launch_spec))
+            else:
+                digest = bootstrap["launch_digest"]
+                threading.Thread(target=watch_parent, daemon=True).start()
             return serving_group.run(
-                args, command, digest, base_env, health, lambda: stop_requested, endpoint=endpoint,
+                args, command, digest, base_env, health, lambda: stop_requested or parent_closed.is_set(),
+                endpoint=endpoint, holder=None if bootstrap is None else bootstrap["holder"],
                 host_launch_spec=args.host_launch_spec,
             )
         for replica in range(args.replicas):

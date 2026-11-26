@@ -1,10 +1,10 @@
-use std::collections::{BTreeMap, btree_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
-use plait_core::NodeId;
 use plait_core::serving::{
-    GroupId, GroupPhase, GroupPlan, GroupVersion, HostedActivation, ServingEndpoint, ServingError,
-    ServingOutcome, ServingResult, ServingRole,
+    GroupId, GroupPhase, GroupPlan, GroupVersion, HostedActivation, HostedAssignment,
+    ServingEndpoint, ServingError, ServingOutcome, ServingResult, ServingRole,
 };
+use plait_core::{DeviceId, NodeId};
 
 use super::{
     ServingState, check_launch_endpoint, check_launch_owner, check_quiescing, group_outcome,
@@ -25,6 +25,40 @@ pub(super) struct HostedSwitch {
 }
 
 impl ServingState {
+    pub(crate) fn hosted_assignments(&self, host: NodeId) -> Vec<HostedAssignment> {
+        let versions: BTreeSet<_> = self
+            .workers
+            .range(DeviceId::new(host, 0)..=DeviceId::new(host, u32::MAX))
+            .filter_map(|(_, worker)| worker.grant.map(|grant| grant.version))
+            .collect();
+        versions
+            .into_iter()
+            .filter_map(|version| {
+                let view = self.group(version)?;
+                let recipe = self.hosted_recipes.get(&version)?;
+                matches!(
+                    view.phase,
+                    GroupPhase::Preparing
+                        | GroupPhase::Ready
+                        | GroupPhase::Active
+                        | GroupPhase::Draining
+                )
+                .then(|| HostedAssignment {
+                    version,
+                    model: view.plan.model.clone(),
+                    tensor_parallel: view.plan.tensor_parallel,
+                    phase: view.phase,
+                    holder: self
+                        .host_launches
+                        .get(&version)
+                        .and_then(|launch| launch.owners.get(&host))
+                        .copied(),
+                    recipe: recipe.clone(),
+                })
+            })
+            .collect()
+    }
+
     pub(super) fn prepare_hosted_switch(
         &mut self,
         group: GroupId,
@@ -191,7 +225,18 @@ impl ServingState {
             return Err(ServingError::InvalidPhase(view.phase));
         }
         if let Some(endpoint) = endpoint {
-            if launch.http_host.is_some_and(|previous| previous != host)
+            if self.hosted_recipes.get(&version).is_some_and(|recipe| {
+                recipe.api_host != host
+                    || recipe.api_model != endpoint.api_model
+                    || recipe
+                        .hosts
+                        .iter()
+                        .find(|entry| entry.host == host)
+                        .is_none_or(|entry| {
+                            endpoint.http
+                                != std::net::SocketAddr::new(entry.address, recipe.http_port)
+                        })
+            }) || launch.http_host.is_some_and(|previous| previous != host)
                 || self
                     .hosted_switches
                     .get(&version)
@@ -375,6 +420,88 @@ mod tests {
             http: "127.0.0.1:8100".parse().unwrap(),
             prefill_kv: None,
         }
+    }
+
+    #[test]
+    fn hosted_assignment_is_committed_with_the_grants_and_endpoint() {
+        use plait_core::serving::{HostedAddress, HostedRecipe, ServingAction, ServingOperation};
+
+        let mut state = ServingState::default();
+        let group = GroupId(NodeId::derive("portable-plan"));
+        let [api, follower, spare] = ["api", "follower", "unused"].map(NodeId::derive);
+        let mut plan = plan(&mut state, 0, &[api, follower]);
+        let recipe = HostedRecipe {
+            profile: "local-engine".into(),
+            api_host: api,
+            hosts: vec![
+                HostedAddress {
+                    host: api,
+                    address: "192.0.2.1".parse().unwrap(),
+                },
+                HostedAddress {
+                    host: follower,
+                    address: "192.0.2.2".parse().unwrap(),
+                },
+            ],
+            master_port: 29000,
+            http_port: 8080,
+            backend_port: 8081,
+            api_model: "alias".into(),
+            max_model_len: 4096,
+            gpu_memory_bps: 8000,
+            prefix_caching: true,
+        };
+        let prepare = |id, plan| ServingOperation {
+            id: OpId::new(api, id),
+            action: ServingAction::PrepareHostedDeployment {
+                group,
+                expected_epoch: 0,
+                expected_active: None,
+                plan,
+                activation: HostedActivation::OnReady,
+                request_sha256: None,
+                recipe: recipe.clone(),
+            },
+        };
+        assert_eq!(
+            state.apply(&prepare(1, plan.clone())),
+            Err(ServingError::InvalidPlan)
+        );
+        assert!(state.hosted_assignments(api).is_empty());
+        plan.launch_digest = recipe.launch_digest();
+        let version = GroupVersion { group, epoch: 1 };
+        assert_eq!(
+            state.apply(&prepare(2, plan.clone())),
+            Ok(group_outcome(version, GroupPhase::Preparing))
+        );
+        let assignment = &state.hosted_assignments(api)[0];
+        assert_eq!(assignment.recipe, recipe);
+        assert_eq!(assignment.holder, None);
+        assert_eq!(assignment.tensor_parallel, 2);
+        assert!(state.hosted_assignments(spare).is_empty());
+        for host in [api, follower] {
+            state
+                .claim_host_launch(version, host, host, plan.launch_digest)
+                .unwrap();
+        }
+        assert_eq!(state.hosted_assignments(api)[0].holder, Some(api));
+        let endpoint = ServingEndpoint {
+            http: "192.0.2.1:8080".parse().unwrap(),
+            ..endpoint()
+        };
+        assert_eq!(
+            state.host_launch_ready(version, follower, follower, Some(&endpoint)),
+            Err(ServingError::InvalidEndpoint)
+        );
+        state
+            .host_launch_ready(version, follower, follower, None)
+            .unwrap();
+        assert_eq!(
+            state.host_launch_ready(version, api, api, Some(&endpoint)),
+            Ok(group_outcome(version, GroupPhase::Active))
+        );
+        state.quiesce(version, GroupPhase::Revoked).unwrap();
+        assert!(state.hosted_assignments(api).is_empty());
     }
 
     #[test]

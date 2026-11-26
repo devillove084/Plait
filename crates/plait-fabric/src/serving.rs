@@ -5,9 +5,9 @@ use std::net::SocketAddr;
 
 use plait_core::serving::{
     ActiveGroup, ExecutionHostLiveness, GroupId, GroupPhase, GroupPlan, GroupResources,
-    GroupVersion, GroupView, HostMemory, HostResources, PdRoute, ResidentOwner, ResolvedPdRoute,
-    RouteDirectory, RouteSetId, ServingAction, ServingEndpoint, ServingError, ServingOperation,
-    ServingOutcome, ServingReceipt, ServingResources, ServingResult, ServingRole,
+    GroupVersion, GroupView, HostMemory, HostResources, HostedRecipe, PdRoute, ResidentOwner,
+    ResolvedPdRoute, RouteDirectory, RouteSetId, ServingAction, ServingEndpoint, ServingError,
+    ServingOperation, ServingOutcome, ServingReceipt, ServingResources, ServingResult, ServingRole,
     W4_MAX_ADMISSION_MS, W4DrainStatus, W4GroupLayout, W4ShardLayout, WorkerDispatch, WorkerGrant,
     WorkerResources,
 };
@@ -77,6 +77,7 @@ pub(crate) struct ServingState {
     resident: BTreeMap<GroupVersion, BTreeMap<DeviceId, ResidentOwner>>,
     host_launches: BTreeMap<GroupVersion, HostLaunch>,
     hosted_switches: BTreeMap<GroupVersion, HostedSwitch>,
+    hosted_recipes: BTreeMap<GroupVersion, HostedRecipe>,
     execution_hosts: BTreeMap<NodeId, ExecutionHostLiveness>,
     decoder: DecoderState,
 }
@@ -234,6 +235,40 @@ impl ServingState {
                 plan,
                 *activation,
             ),
+            ServingAction::PrepareHostedDeployment {
+                group,
+                expected_epoch,
+                expected_active,
+                plan,
+                activation,
+                recipe,
+                ..
+            } => {
+                recipe.validate(plan)?;
+                if let Some(epoch) = expected_active
+                    && let Some(endpoint) = self
+                        .group(GroupVersion {
+                            group: *group,
+                            epoch: *epoch,
+                        })
+                        .and_then(|view| view.endpoint.as_ref())
+                    && endpoint.api_model != recipe.api_model
+                {
+                    return Err(ServingError::InvalidEndpoint);
+                }
+                let result = self.prepare_hosted_switch(
+                    *group,
+                    *expected_epoch,
+                    *expected_active,
+                    plan,
+                    *activation,
+                )?;
+                let ServingOutcome::Group { version, .. } = result else {
+                    unreachable!("hosted preparation creates a group version");
+                };
+                self.hosted_recipes.insert(version, recipe.clone());
+                Ok(result)
+            }
             ServingAction::PrepareW4Switch {
                 group,
                 expected_epoch,
@@ -1522,6 +1557,7 @@ impl ServingState {
         self.resident.remove(&version);
         self.host_launches.remove(&version);
         self.hosted_switches.remove(&version);
+        self.hosted_recipes.remove(&version);
         self.decoder.endpoints.remove(&version);
         self.decoder.managed.remove(&version);
         Ok(group_outcome(version, GroupPhase::Retired))

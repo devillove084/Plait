@@ -128,7 +128,7 @@ class LaunchTest(unittest.TestCase):
                 calls = [next(iter(item.args[0])) for item in control.execute.call_args_list]
                 self.assertEqual(calls[0], "ClaimHostLaunch")
                 self.assertEqual("HostLaunchReady" in calls, signal == b"1")
-                factory.assert_called_once_with("plait-node", [], "192.0.2.2:0")
+                factory.assert_called_once_with("plait-node", [], "192.0.2.2:0", seeds=())
                 proxy.assert_not_called()
                 probe.assert_not_called()
                 command = process.call_args.args[0]

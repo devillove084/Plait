@@ -140,6 +140,62 @@ and HTTP alias used by a replacement must match the incumbent. A prepared
 standby keeps its grants while waiting, so account for those reservations
 alongside the active group.
 
+### Start groups from resident execution nodes
+
+Use a version of `plait-node` with hosted recipes on the voters and
+execution hosts. Install the launcher and each model profile on its host. The
+profile supplies local executable paths, device visibility, weights and
+backend settings. For example, one host can use this configuration.
+
+```json
+{
+  "listen": "192.0.2.10:0",
+  "host_memory": {"bytes": 68719476736, "pinned_bytes": 0},
+  "lock_dir": "/var/lib/plait/execution",
+  "devices": [{"ordinal": 0, "incarnation": 1, "device_bytes": 25769803776}],
+  "launcher": ["/opt/engine/bin/python", "/opt/plait/scripts/serve-tiered.py"],
+  "profiles": {
+    "model-fp16": {
+      "argv": ["/opt/engine/bin/vllm"],
+      "model_path": "/models/model",
+      "device_env": "CUDA_VISIBLE_DEVICES",
+      "args": ["--dtype", "float16"],
+      "env": {"PLAIT_NCCL_BACKEND": "cuda"}
+    }
+  }
+}
+```
+
+```sh
+plait-node run --compute-only --id "$HOST_ID" --seed "$VOTER_ADDR" \
+  --hosted-execution /etc/plait/hosted.json
+```
+
+The node discovers control voters from seed IP addresses and registers
+its devices and host memory. Repeat `--seed` for additional address
+hints. Keep the host ID and lock directory stable across restarts.
+
+Include a `recipe` in `prepare_hosted` or on a `replan_hosted` candidate.
+The plan and recipe are committed together. Use 32 zero bytes for the
+plan's `launch_digest` in this request. The CLI derives the digest from
+the recipe. Set these fields on the recipe.
+
+| Field | Meaning |
+| --- | --- |
+| `profile` | Installed profile name on each participating host. |
+| `hosts`, `api_host` | Array of `{"host": node_id, "address": ip}` entries and the host ID serving HTTP. The hosts must match the plan. |
+| `master_port`, `http_port`, `backend_port` | Distinct rendezvous, advertised HTTP, and private engine ports. |
+| `api_model` | Model alias reported by the HTTP server and used by the ingress. |
+| `max_model_len`, `gpu_memory_bps`, `prefix_caching` | Common engine settings. A value of 8000 sets GPU memory utilization to 80 percent. |
+
+Each planned host claims its assignment before starting its launcher.
+The launcher checks the grants and maps them to the local device mask.
+The committed activation policy determines when the ingress switches.
+If the supervisor exits, the launcher closes its worker process group.
+A restarted supervisor uses the same local lock and revokes a claim
+left without a live launcher. Use a profile's optional `verify_release`
+executable to attest device release before its grants can be reused.
+
 ### Keep one HTTP endpoint across group versions
 
 Point clients at `serve-aggregated.py`. Use the same API model alias

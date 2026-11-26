@@ -177,6 +177,9 @@ reuse pages from both the prompt and generated prefix.
 The control plane can activate a prepared replacement at final readiness
 or promote it when the incumbent is revoked.
 [Automatic rollout and standby](docs/rankless-nccl.md#commit-an-automatic-rollout-or-standby)
+Resident execution nodes discover voters from seed addresses and start
+their committed vLLM assignments using local engine profiles.
+[Resident launches](docs/rankless-nccl.md#start-groups-from-resident-execution-nodes)
 
 For the legacy rendezvous, `PLAIT_NCCL_SHM=1` enables the host-mapped local
 path and `PLAIT_NCCL_KERNEL=1` enables the single-stream GPU allreduce path.
@@ -226,11 +229,12 @@ release the result after the matching completion has executed in the control pla
 | [Ordered publication](specs/PlaitOrderedPublication.tla) | Completion and revocation in the agreed command order, receipt identity on retry, and recovery from a replica's durable command prefix. |
 | [Peer collectives](specs/PlaitPeerCollective.tla) | Round pairing, replicated and sharded reduction, and completion of an independent communicator when a participant in another group is lost. |
 | [Hosted rollout and failover](specs/PlaitHostLaunch.tla) | Full readiness before activation, ordered standby promotion on incumbent revocation, and exclusion of groups affected by the same host loss. |
+| [Hosted assignment](specs/PlaitHostedAssignment.tla) | An observed assignment requires an ordered claim before launch. The local lock remains held through supervisor loss until the launcher exits. |
 | [Serving ingress](specs/PlaitServingIngress.tla) | One admission per ordinary forwarded request, monotonic route refresh, and output pinned to the admitted epoch while the old gate drains. |
 | [Completion replay and KV resume](specs/PlaitCompletionReplay.tla) | Visible positions are preserved. Each KV resume sends the latest checkpoint and requires a matching acknowledgment and prefix before publishing a suffix. |
 | [KV publication](specs/PlaitKvPublication.tla) | All heads must come from one write attempt before a page becomes readable. A consumer reads its requested head range, and a complete page stays immutable. |
 
-TLC 2.19 passes all 32 configurations. The ordered publication configuration
+TLC 2.19 passes all 33 configurations. The ordered publication configuration
 explores 70,968 distinct states. Run the suite with `tlc` on your `PATH`.
 
 ```sh
