@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Route OpenAI completions through versioned vLLM NIXL groups."""
+"""Route OpenAI completions through versioned vLLM P/D groups."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import http.client
 import ipaddress
 import itertools
 import json
+import re
 import signal
 import threading
 import time
@@ -129,7 +130,7 @@ def read_json(response: http.client.HTTPResponse) -> dict:
         raise UpstreamError("engine returned an invalid JSON response") from error
 
 
-def prefill_payload(request: dict) -> dict:
+def prefill_payload(request: dict, plait_ticket: str | None = None) -> dict:
     payload = {**request, "stream": False}
     payload.pop("stream_options", None)
     payload["max_tokens"] = 1
@@ -137,12 +138,29 @@ def prefill_payload(request: dict) -> dict:
         payload["max_completion_tokens"] = 1
     if "min_tokens" in payload:
         payload["min_tokens"] = 0
-    payload["kv_transfer_params"] = {"do_remote_decode": True, "do_remote_prefill": False}
+    payload["kv_transfer_params"] = (
+        {"plait_handoff": {"ticket": plait_ticket}}
+        if plait_ticket is not None
+        else {"do_remote_decode": True, "do_remote_prefill": False}
+    )
     return payload
 
 
-def transfer_descriptor(response: dict, route: Route) -> dict:
+def transfer_descriptor(response: dict, route: Route, plait_ticket: str | None = None) -> dict:
     params = response.get("kv_transfer_params")
+    if plait_ticket is not None:
+        receipt = params.get("plait_handoff") if isinstance(params, dict) else None
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("ticket") != plait_ticket
+            or receipt.get("store") != f"{route.kv_host}:{route.kv_port}"
+            or not isinstance(receipt.get("prompt_sha256"), str)
+            or re.fullmatch("[0-9a-f]{64}", receipt["prompt_sha256"]) is None
+            or type(receipt.get("cached_tokens")) is not int
+            or receipt["cached_tokens"] < 0
+        ):
+            raise UpstreamError("prefill did not publish the requested Plait KV handoff")
+        return {"plait_handoff": receipt}
     if (
         not isinstance(params, dict)
         or params.get("do_remote_prefill") is not True
@@ -175,6 +193,7 @@ def request_engine(
 
 def server(
     bind: str, port: int, directory: Directory | ControlDirectory, timeout: float,
+    kv_transport: str = "nixl",
 ) -> ThreadingHTTPServer:
     next_path = itertools.count()
 
@@ -237,10 +256,11 @@ def server(
 
         def try_route(self, route: Route, body: dict, deadline: float) -> bool:
             request_id, token = uuid.uuid4().hex, uuid.uuid4().hex
+            plait_ticket = token if kv_transport == "plait" else None
             budget = max(0.001, deadline - time.monotonic())
             with contextlib.closing(route.prefill.connect(budget)) as connection:
                 with request_engine(
-                    connection, route.prefill, self.path, prefill_payload(body), request_id, token,
+                    connection, route.prefill, self.path, prefill_payload(body, plait_ticket), request_id, token,
                 ) as response:
                     if admission_rejected(response):
                         return False
@@ -248,7 +268,7 @@ def server(
                         self.write_json(response.status, read_json(response))
                         return True
                     try:
-                        params = transfer_descriptor(read_json(response), route)
+                        params = transfer_descriptor(read_json(response), route, plait_ticket)
                     except UpstreamError:
                         release_transfer(route.prefill, token)
                         raise
@@ -330,6 +350,7 @@ def main() -> None:
     parser.add_argument("--control-listen", default="127.0.0.1:0")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8192)
+    parser.add_argument("--kv-transport", choices=("nixl", "plait"), default="nixl")
     parser.add_argument("--timeout", type=float, default=120.0)
     args = parser.parse_args()
     if not 0 < args.port < 65536 or not 0 < args.timeout < float("inf"):
@@ -342,7 +363,9 @@ def main() -> None:
 
     old_handler = signal.signal(signal.SIGTERM, interrupt)
     try:
-        with route_source(args) as directory, server(args.host, args.port, directory, args.timeout) as httpd:
+        with route_source(args) as directory, server(
+            args.host, args.port, directory, args.timeout, args.kv_transport,
+        ) as httpd:
             httpd.serve_forever()
     except KeyboardInterrupt:
         pass

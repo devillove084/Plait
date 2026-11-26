@@ -372,6 +372,45 @@ class HandoffTest(unittest.TestCase):
         self.assertEqual((status, body), (200, stream))
         self.assertFalse(p_gate.drained())
 
+    def test_plait_handoff_rejects_an_unexpected_store_before_decode(self):
+        store = "127.0.0.1:9101"
+        decoded = []
+
+        def prefill(body):
+            handoff = body["kv_transfer_params"]["plait_handoff"]
+            self.assertEqual(set(handoff), {"ticket"})
+            receipt = {
+                **handoff, "store": store, "prompt_sha256": "a" * 64,
+                "cached_tokens": 128,
+            }
+            return "application/json", json.dumps({
+                "kv_transfer_params": {"plait_handoff": receipt},
+            }).encode()
+
+        def decode(body):
+            decoded.append(body)
+            return "application/json", b'{"choices": []}'
+
+        p_port, p_gate = self.group("prefill", PREFILL, prefill)
+        d_port, _ = self.group("decode", DECODE, decode)
+        directory = Path(self.runtime.enter_context(tempfile.TemporaryDirectory())) / "routes.json"
+        directory.write_text(json.dumps({"model": "test", "paths": [{
+            "prefill": {"url": f"http://127.0.0.1:{p_port}", "version": PREFILL,
+                        "kv_host": "127.0.0.1", "kv_port": 9100},
+            "decode": {"url": f"http://127.0.0.1:{d_port}", "version": DECODE},
+        }]}))
+        router_port = self.start(ROUTER["server"](
+            "127.0.0.1", 0, ROUTER["Directory"](directory), 5, kv_transport="plait",
+        ))
+        payload = {"model": "test", "prompt": "test", "max_tokens": 8}
+        self.assertEqual(self.request(router_port, COMPLETIONS, payload)[0], 502)
+        self.assertEqual(decoded, [])
+        self.assertTrue(p_gate.drained())
+
+        store = "127.0.0.1:9100"
+        self.assertEqual(self.request(router_port, COMPLETIONS, payload)[0], 200)
+        self.assertEqual(decoded[0]["kv_transfer_params"]["plait_handoff"]["store"], store)
+
 
 if __name__ == "__main__":
     unittest.main()

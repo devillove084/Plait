@@ -71,8 +71,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plait-w4a16-library", type=Path, help="use the Plait FP16 compressed-tensors kernel")
     parser.add_argument("--attention-backend", help="native vLLM attention backend for matching KV layouts")
     parser.add_argument("--role", choices=("aggregated", "prefill", "decode"), default="aggregated")
-    parser.add_argument("--kv-host", help="IPv4 address advertised by the NIXL side channel")
-    parser.add_argument("--kv-port", type=int, help="NIXL side channel port")
+    parser.add_argument("--kv-host", help="IPv4 address of the NIXL side channel or Plait KV store")
+    parser.add_argument("--kv-port", type=int, help="NIXL side channel or Plait KV store port")
+    parser.add_argument("--plait-kv-namespace", help="use the Plait KV store with this model namespace")
     parser.add_argument("--kv-buffer-device", choices=("cuda", "cpu"), default="cuda")
     parser.add_argument("--kv-lease-seconds", type=int, default=30)
     parser.add_argument("--group-id", help="hex ID of one committed group")
@@ -163,10 +164,14 @@ def parse_args() -> argparse.Namespace:
             parser.error("prefill and decode require an explicit --kv-host IPv4 address")
         if args.replicas != 1 or args.kv_port is None or not (0 < args.kv_port < 65536):
             parser.error("prefill and decode need one replica and a valid --kv-port")
-        if args.kv_port in (args.port_base, args.backend_port) or args.kv_lease_seconds < 1:
-            parser.error("the NIXL port must be distinct and the lease must be positive")
-    elif args.kv_host is not None or args.kv_port is not None:
-        parser.error("--kv-host and --kv-port require a prefill or decode role")
+        if args.kv_lease_seconds < 1:
+            parser.error("the KV handoff lease must be positive")
+        if args.plait_kv_namespace is None and args.kv_port in (args.port_base, args.backend_port):
+            parser.error("the NIXL port must be distinct")
+        if args.plait_kv_namespace is not None and not args.plait_kv_namespace:
+            parser.error("the Plait KV model namespace must be nonempty")
+    elif args.kv_host is not None or args.kv_port is not None or args.plait_kv_namespace is not None:
+        parser.error("KV handoff options require a prefill or decode role")
     if args.advertise_http is not None:
         if (
             (args.role == "aggregated" and args.host_launch_spec is None)
@@ -184,7 +189,11 @@ def parse_args() -> argparse.Namespace:
             args.advertise_http = f"[{host}]:{origin.port}" if host.version == 6 else f"{host}:{origin.port}"
             if args.host_launch_spec is not None and (
                 origin.port != args.port_base
-                or args.host_launch_spec["master_port"] in (args.port_base, args.backend_port, args.kv_port)
+                or args.host_launch_spec["master_port"] in (args.port_base, args.backend_port)
+                or (
+                    args.plait_kv_namespace is None
+                    and args.host_launch_spec["master_port"] == args.kv_port
+                )
             ):
                 raise ValueError("the advertised port must match --port-base and the rendezvous port must be distinct")
         except ValueError:
@@ -227,20 +236,32 @@ def native_command(args: argparse.Namespace, vllm: str, port: int) -> list[str]:
         else:
             command.extend(("--attention-backend", args.attention_backend))
     if args.role != "aggregated":
-        config = {
-            "kv_connector": "NixlConnector",
-            "kv_role": "kv_producer" if args.role == "prefill" else "kv_consumer",
-            "kv_buffer_device": args.kv_buffer_device,
-            "kv_load_failure_policy": "fail",
-            "kv_connector_extra_config": {"kv_lease_duration": args.kv_lease_seconds},
-        }
+        role = "kv_producer" if args.role == "prefill" else "kv_consumer"
+        if args.plait_kv_namespace is None:
+            config = {
+                "kv_connector": "NixlConnector",
+                "kv_role": role,
+                "kv_buffer_device": args.kv_buffer_device,
+                "kv_load_failure_policy": "fail",
+                "kv_connector_extra_config": {"kv_lease_duration": args.kv_lease_seconds},
+            }
+        else:
+            config = {
+                "kv_connector": "PlaitKvConnector",
+                "kv_role": role,
+                "kv_load_failure_policy": "fail",
+                "kv_connector_extra_config": {
+                    "address": f"{args.kv_host}:{args.kv_port}",
+                    "namespace": args.plait_kv_namespace,
+                },
+            }
         command.extend(("--kv-transfer-config", json.dumps(config)))
     return command
 
 
 def engine_environment(args: argparse.Namespace) -> dict[str, str]:
     environment = {}
-    if args.role != "aggregated":
+    if args.role != "aggregated" and args.plait_kv_namespace is None:
         environment["VLLM_NIXL_SIDE_CHANNEL_HOST"] = args.kv_host
         environment["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(args.kv_port)
     if args.plait_w4a16_library is not None:

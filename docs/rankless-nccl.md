@@ -331,6 +331,45 @@ Recovery retains the visible prefix in the running ingress process and
 rebuilds KV by recomputation on the replacement. The same connection
 must remain open throughout recovery.
 
+### Hand off prompt KV between independent Prefill and Decode groups
+
+Use the vLLM fork at `9122df3da` or later on `plait/v0.31-runtime`.
+Start `plait-node kv-store`
+at an address reachable from both groups. Use the same store, model
+namespace, weights, KV dtype, and logical page size on both sides.
+Give each `serve-tiered.py` launch the role `prefill` or `decode` and
+these fetch and publish settings.
+
+```sh
+--plait-kv-namespace "$MODEL_NAMESPACE" --kv-host "$KV_HOST" --kv-port "$KV_PORT"
+```
+
+Use `--proxy-host` to bind the group proxy on an address reachable by
+the router, and `--advertise-http` to publish its HTTP endpoint. The
+Prefill endpoint's `prefill_kv` is the shared store address.
+After the groups report Ready, activate and publish the versioned P/D
+path. Start the router against the published directory.
+
+```sh
+python scripts/serve-disaggregated.py --model "$MODEL_ALIAS" --kv-transport plait \
+  --control-peer "$VOTER_ID@$VOTER_ADDR" --control-listen "$ROUTER_REPLY_ADDR"
+```
+
+The router gives Prefill a ticket. Prefill returns the ticket, store
+address, prompt digest, and number of published prompt tokens. The
+digest binds the model namespace, page layout, token IDs and cache salt.
+The router compares the ticket and the store advertised by the selected
+Prefill group. Decode checks the digest and requires the complete pages
+claimed in the receipt. It computes the remaining prompt tokens before
+generating. A lost page fails the request under the managed Decode
+configuration. Ordinary untagged requests retain the external cache
+lookup and recomputation behavior.
+
+This path uses the bounded, in-memory Plait KV store and supports the
+eager, dense FP16 and BF16 attention layouts described below. Configure
+the two groups and publish the route separately. The resident pool
+planner currently launches aggregated groups.
+
 ### Reuse prompt KV across TP layouts
 
 Start a shared store on the engine network. It keeps completed pages in
