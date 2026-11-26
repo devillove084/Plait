@@ -31,6 +31,7 @@ tlc -deadlock -config specs/PlaitHostedServingModes.cfg specs/PlaitHostedServing
 tlc -deadlock -config specs/PlaitHostedCheckpointContract.cfg specs/PlaitHostedCheckpointContract.tla
 tlc -deadlock -config specs/PlaitHostedCheckpointBudget.cfg specs/PlaitHostedCheckpointBudget.tla
 tlc -deadlock -config specs/PlaitCheckpointAdmission.cfg specs/PlaitCheckpointAdmission.tla
+tlc -deadlock -config specs/PlaitCheckpointPeers.cfg specs/PlaitCheckpointPeers.tla
 tlc -deadlock -config specs/PlaitHostedModeSelection.cfg specs/PlaitHostedModeSelection.tla
 tlc -deadlock -config specs/PlaitExecutionMaintenance.cfg specs/PlaitExecutionMaintenance.tla
 tlc -deadlock -config specs/PlaitHostedPdBudget.cfg specs/PlaitHostedPdBudget.tla

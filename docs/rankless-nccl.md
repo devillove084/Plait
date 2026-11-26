@@ -836,8 +836,39 @@ reservation is declined, the target computes the uncovered known tokens.
 Run `plait-node kv-store --stats HOST:PORT` for completed payload bytes,
 refusals, expired read reservations, and bytes currently held. Use the
 change in the byte counters over a sampling window to measure the store's
-optional transfer rate. This is a per-store application budget. The
-planner still uses calibrated directional port limits.
+optional transfer rate.
+
+#### Limit checkpoint traffic by peer and direction
+
+Pass `--checkpoint-peer-limits PATH` to the store with a JSON map of
+worker source IPs. Each entry has a `read` budget for traffic from the store
+to that peer and a `write` budget for traffic from that peer to the store.
+Use `bytes_per_second` and `burst_bytes` in each direction.
+
+```json
+{
+  "192.0.2.10": {
+    "read": {"bytes_per_second": 16777216, "burst_bytes": 8388608},
+    "write": {"bytes_per_second": 4194304, "burst_bytes": 2097152}
+  }
+}
+```
+
+Set `checkpoint_peer_budget: true` together with `checkpoint_admission`
+on participating Decode and aggregate profiles. Workers use their
+configured host IP for the KV connection. The scheduler gathers their
+actual page sizes and reserves the complete import atomically across the
+store and all peer read budgets. A shard can consume only the reservation
+for its observed TCP source IP. For writes, the store checks the sender's
+write budget and the shared store budget before accepting payload.
+
+With a peer map, optional traffic from an unlisted address and optional
+reads without a complete peer manifest are declined. The target computes
+the uncovered prefix when the read reservation cannot be admitted.
+Required P/D prompt I/O uses the original protocol. The store's
+`--stats` response reports per-peer successful bytes, refusals, and
+pending bytes in each direction. These application budgets are local to one
+store and one registered IP per configured path.
 
 ## Execute a collective
 

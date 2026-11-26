@@ -31,6 +31,7 @@ HANDOFF_HEADER = "X-Plait-KV-Handoff"
 ADMISSION_HEADER = "X-Plait-Admission"
 KV_RESUME_HEADER = "X-Plait-KV-Resume"
 CHECKPOINT_ADMISSION_HEADER = "X-Plait-KV-Checkpoint-Admission"
+CHECKPOINT_PEERS_HEADER = "X-Plait-KV-Checkpoint-Peers"
 RELEASE_KV_PATH = "/plait/release-kv"
 INFERENCE_PATHS = frozenset({"/v1/completions", "/v1/chat/completions"})
 MAX_JSON_BYTES = 16 * 1024 * 1024
@@ -247,6 +248,7 @@ HOP_HEADERS = frozenset({
 PRIVATE_HEADERS = frozenset(header.lower() for header in (
     VERSION_HEADER, ROLE_HEADER, HANDOFF_HEADER, ADMISSION_HEADER, KV_RESUME_HEADER,
     CHECKPOINT_ADMISSION_HEADER,
+    CHECKPOINT_PEERS_HEADER,
 ))
 
 
@@ -560,6 +562,8 @@ def run(
                 expected_capabilities[KV_RESUME_HEADER] = kv_resume
             if options and options.get("checkpoint_admission") is True:
                 expected_capabilities[CHECKPOINT_ADMISSION_HEADER] = "1"
+            if options and options.get("checkpoint_peer_budget") is True:
+                expected_capabilities[CHECKPOINT_PEERS_HEADER] = "1"
             server = group_proxy(
                 args.port_base, args.backend_port, gate, version_tag,
                 bind=args.proxy_host, role=args.role, kv_lease=args.kv_lease_seconds,

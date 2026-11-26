@@ -1,8 +1,8 @@
 //! Bounded storage for complete KV blocks in logical head and layer order.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -13,12 +13,15 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 
 mod checkpoints;
-use checkpoints::{Checkpoints, Limit};
+use checkpoints::{Checkpoints, Limit, MAX_PEERS, PeerLimit};
 
 const MAGIC: &[u8; 8] = b"PLAITKV2";
 const RANGED_MAGIC: &[u8; 8] = b"PLAITKV3";
+const PEER_READ_MAGIC: &[u8; 8] = b"PLAITKV4";
 const METRICS_MAGIC: &[u8; 8] = b"PLAITKVM";
 const HEADER: usize = 73;
+const PEER_ENTRY: usize = 24;
+const MAX_METRICS_BYTES: usize = 128 << 10;
 const MAX_BLOCK_BYTES: usize = 64 << 20;
 const MAX_HEADS: usize = 1024;
 const MAX_PARTS: usize = 65536;
@@ -40,6 +43,7 @@ struct Request {
     head_bytes: usize,
     part_bytes: usize,
     ranges: Vec<Range<usize>>,
+    peers: Option<BTreeMap<IpAddr, u64>>,
 }
 
 impl Request {
@@ -48,7 +52,7 @@ impl Request {
         let mut header = [0; HEADER];
         stream.read_exact(&mut header[8..]).await?;
         let ranged = match &magic {
-            MAGIC => false,
+            MAGIC | PEER_READ_MAGIC => false,
             RANGED_MAGIC => true,
             _ => return Err(invalid()),
         };
@@ -76,7 +80,16 @@ impl Request {
             (count != 0 && end <= block_bytes / part_bytes)
                 .then(|| first * part_bytes..end * part_bytes)
         };
+        let peers = if &magic == PEER_READ_MAGIC {
+            if header[8] != b'h' || !(1..=MAX_PEERS).contains(&field(1)) || field(2) != 0 {
+                return Err(invalid());
+            }
+            Some(read_peers(stream, field(1)).await?)
+        } else {
+            None
+        };
         let ranges = match (header[8], ranged) {
+            (b'h', false) if peers.is_some() => Vec::new(),
             (b'H' | b'h', true) if field(1) == 0 => Vec::new(),
             (b'H' | b'h', false) if field(1) == 0 && field(2) == 0 => Vec::new(),
             (b'G' | b'g' | b'P' | b'p', false) => {
@@ -113,6 +126,7 @@ impl Request {
             head_bytes,
             part_bytes,
             ranges,
+            peers,
         })
     }
 
@@ -133,6 +147,30 @@ impl Request {
             .iter()
             .flat_map(|range| range.start / self.part_bytes..range.end / self.part_bytes)
     }
+}
+
+fn unicast_peer(address: IpAddr) -> bool {
+    !address.is_unspecified()
+        && !address.is_multicast()
+        && !matches!(address, IpAddr::V4(ip) if ip.is_broadcast())
+}
+
+async fn read_peers(stream: &mut TcpStream, count: usize) -> io::Result<BTreeMap<IpAddr, u64>> {
+    let mut table = vec![0; count * PEER_ENTRY];
+    stream.read_exact(&mut table).await?;
+    let mut peers = BTreeMap::new();
+    for entry in table.chunks_exact(PEER_ENTRY) {
+        let ip =
+            IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&entry[..16]).unwrap())).to_canonical();
+        let bytes = u64::from_le_bytes(entry[16..].try_into().unwrap());
+        if !unicast_peer(ip) || bytes == 0 || peers.insert(ip, bytes).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid KV read peer",
+            ));
+        }
+    }
+    Ok(peers)
 }
 
 struct Block {
@@ -286,6 +324,7 @@ impl Store {
 
 async fn exchange(
     mut stream: TcpStream,
+    peer: IpAddr,
     store: &Mutex<Store>,
     capacity: usize,
     checkpoints: &Checkpoints,
@@ -304,7 +343,7 @@ async fn exchange(
             return stream.write_u8(REJECTED).await;
         }
         let transfer = if request.verb == b'p' {
-            let Some(transfer) = checkpoints.write(bytes as u64, Instant::now()) else {
+            let Some(transfer) = checkpoints.write(peer, bytes as u64, Instant::now()) else {
                 return stream.write_u8(REJECTED).await;
             };
             stream.write_u8(OK).await?;
@@ -333,14 +372,19 @@ async fn exchange(
             request.key,
             request.writer,
             (request.heads * request.head_bytes) as u64,
+            request.peers,
             Instant::now(),
         );
         return stream.write_u8(if reserved { OK } else { REJECTED }).await;
     }
     let transfer = if request.verb == b'g' {
-        let Some(transfer) =
-            checkpoints.read(request.key, request.writer, bytes as u64, Instant::now())
-        else {
+        let Some(transfer) = checkpoints.read(
+            request.key,
+            request.writer,
+            peer,
+            bytes as u64,
+            Instant::now(),
+        ) else {
             return stream.write_u8(REJECTED).await;
         };
         Some(transfer)
@@ -375,6 +419,7 @@ pub(super) async fn run(
     let mut capacity = 256 << 20;
     let mut checkpoint_rate = None;
     let mut checkpoint_burst = None;
+    let mut peers = BTreeMap::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--listen" => listen = args.next().ok_or("--listen needs IP:port")?.parse()?,
@@ -398,6 +443,16 @@ pub(super) async fn run(
                         .parse::<u64>()?,
                 );
             }
+            "--checkpoint-peer-limits" => {
+                if !peers.is_empty() {
+                    return Err("the checkpoint peer map may only be supplied once".into());
+                }
+                peers = read_peer_limits(
+                    &args
+                        .next()
+                        .ok_or("--checkpoint-peer-limits needs a JSON file")?,
+                )?;
+            }
             _ => return Err(format!("unknown KV store argument {arg}").into()),
         }
     }
@@ -416,29 +471,56 @@ pub(super) async fn run(
     };
     let listener = TcpListener::bind(listen).await?;
     let store = Arc::new(Mutex::new(Store::new(capacity)));
-    let checkpoints = Arc::new(Checkpoints::new(limits, Instant::now()));
+    let checkpoints = Arc::new(Checkpoints::new(limits, peers, Instant::now()));
     let connections = Arc::new(Semaphore::new(32));
     println!("Plait KV store listening on {}", listener.local_addr()?);
     loop {
         let permit = connections.clone().acquire_owned().await?;
-        let (stream, _) = listener.accept().await?;
+        let (stream, remote) = listener.accept().await?;
         stream.set_nodelay(true)?;
         let store = store.clone();
         let checkpoints = checkpoints.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let _ =
-                tokio::time::timeout(DEADLINE, exchange(stream, &store, capacity, &checkpoints))
-                    .await;
+            let _ = tokio::time::timeout(
+                DEADLINE,
+                exchange(
+                    stream,
+                    remote.ip().to_canonical(),
+                    &store,
+                    capacity,
+                    &checkpoints,
+                ),
+            )
+            .await;
         });
     }
+}
+
+fn read_peer_limits(path: &str) -> Result<BTreeMap<IpAddr, PeerLimit>, Box<dyn std::error::Error>> {
+    let input: BTreeMap<IpAddr, PeerLimit> = serde_json::from_reader(std::fs::File::open(path)?)?;
+    if !(1..=MAX_PEERS).contains(&input.len()) {
+        return Err("invalid number of checkpoint peers".into());
+    }
+    let mut peers = BTreeMap::new();
+    for (address, limits) in input {
+        let address = address.to_canonical();
+        if !unicast_peer(address)
+            || !limits.read.valid()
+            || !limits.write.valid()
+            || peers.insert(address, limits).is_some()
+        {
+            return Err("invalid or duplicate checkpoint peer limit".into());
+        }
+    }
+    Ok(peers)
 }
 
 async fn read_stats(addr: SocketAddr) -> io::Result<String> {
     let mut stream = TcpStream::connect(addr).await?;
     stream.write_all(METRICS_MAGIC).await?;
     let size = stream.read_u32().await? as usize;
-    if !(1..=4096).contains(&size) {
+    if !(1..=MAX_METRICS_BYTES).contains(&size) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid KV store metrics size",
@@ -477,13 +559,14 @@ mod tests {
                     bytes_per_second: 1,
                     burst_bytes: 4,
                 }),
+                BTreeMap::new(),
                 Instant::now(),
             );
             for _ in 0..7 {
-                let (stream, _) = listener.accept().await.unwrap();
+                let (stream, peer) = listener.accept().await.unwrap();
                 tokio::time::timeout(
                     Duration::from_secs(2),
-                    exchange(stream, &store, 64, &budget),
+                    exchange(stream, peer.ip(), &store, 64, &budget),
                 )
                 .await
                 .unwrap()
@@ -539,6 +622,7 @@ mod tests {
             head_bytes: 1,
             part_bytes: 1,
             ranges: vec![first..first + count],
+            peers: None,
         }
     }
 
@@ -580,6 +664,7 @@ mod tests {
             head_bytes: 4,
             part_bytes,
             ranges: spans,
+            peers: None,
         };
         let first_stage = ranges(vec![0..2, 4..6], 2, 1);
         let next_stage = ranges(vec![2..4, 6..8], 2, 1);
