@@ -228,6 +228,63 @@ The measured cap describes the TCP traffic budget for the supplied
 workload estimate. Application goodput still comes from the SLO
 profiles.
 
+### Generate placements from registered hosts
+
+For automatic placement, send a `pool` in place of `candidates` on
+`replan_hosted` and supply `link_policy`. Use
+`{"request":"hosted_planning"}` to inspect the host inventory and committed
+port reservations. Resident nodes advertise their reachable addresses,
+installed profile names, and registered device incarnations. Each host
+should install compatible weights and engine settings under the same
+profile name. Local executable paths and backend settings may differ.
+If a device registration changes, only that device loses eligibility
+until the host advertises its current incarnation.
+
+The example shows the `pool` field. Supply `id`, `forecast`, and
+`link_policy` alongside it. In a running deployment, replace the example
+capacity and Unix millisecond deadline with measurements for the intended
+model and workload. List one entry for each supported TP size.
+
+```json
+{
+  "group": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+  "profile": "model-fp16",
+  "api_model": "model",
+  "max_model_len": 4096,
+  "gpu_memory_bps": 8000,
+  "prefix_caching": true,
+  "ports": {"first": 25000, "count": 48},
+  "sizes": [
+    {
+      "tensor_parallel": 2,
+      "device_bytes": 8589934592,
+      "host_base": {"bytes": 2147483648, "pinned_bytes": 0},
+      "host_per_worker": {"bytes": 536870912, "pinned_bytes": 0},
+      "capacity": {"rps": 4.0, "valid_until_ms": 0},
+      "ready_after_ms": 15000,
+      "transition_loss_requests": 0
+    }
+  ]
+}
+```
+
+For each size, the planner combines free devices on at least two hosts.
+It charges the base host memory once per host and the per-worker memory
+for each assigned rank, including pinned memory. It retains a bounded
+set of layouts ranked by the measured link ceiling, then applies the
+forecast to score the retained candidates. Each size currently uses one
+supplied SLO profile across its layouts. Run `replan_hosted` again with
+a new operation ID after capacity or demand changes.
+
+Keep the port range dedicated to hosted launches. Consecutive triplets
+provide the rendezvous, public HTTP, and backend HTTP ports on the API
+host. The control plane checks for overlapping recipe ports and verifies
+the host inventory, device grants, and group versions when it applies
+the plan. A draining or revoked group retains its ports until retirement.
+`placements` reports generated layouts in the same order as the selection
+scores. An empty list means there was no feasible layout in this search
+using the current inventory and link samples.
+
 ### Keep one HTTP endpoint across group versions
 
 Point clients at `serve-aggregated.py`. Use the same API model alias

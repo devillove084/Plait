@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
 use plait_core::serving::{
-    GroupId, GroupPhase, GroupPlan, GroupVersion, HostedActivation, HostedAssignment,
-    ServingEndpoint, ServingError, ServingOutcome, ServingResult, ServingRole,
+    GroupId, GroupPhase, GroupPlan, GroupVersion, HostedActivation, HostedAddress,
+    HostedAssignment, HostedPlanning, HostedPortUse, HostedRecipe, ServingEndpoint, ServingError,
+    ServingOutcome, ServingResult, ServingRole,
 };
 use plait_core::{DeviceId, NodeId};
 
@@ -25,6 +26,86 @@ pub(super) struct HostedSwitch {
 }
 
 impl ServingState {
+    pub(crate) fn hosted_planning(&self) -> HostedPlanning {
+        HostedPlanning {
+            hosts: self.hosted_inventories.values().cloned().collect(),
+            occupied: self
+                .hosted_recipes
+                .values()
+                .map(HostedPortUse::from)
+                .collect(),
+        }
+    }
+
+    pub(super) fn prepare_hosted_deployment(
+        &mut self,
+        group: GroupId,
+        expected_epoch: u64,
+        expected_active: Option<u64>,
+        plan: &GroupPlan,
+        activation: HostedActivation,
+        recipe: &HostedRecipe,
+        pooled: bool,
+    ) -> ServingResult {
+        recipe.validate(plan)?;
+        let ports = HostedPortUse::from(recipe);
+        if self.hosted_recipes.iter().any(|(version, other)| {
+            (pooled || self.hosted_pool_versions.contains(version))
+                && ports.conflicts(HostedPortUse::from(other))
+        }) {
+            return Err(ServingError::HostedPortsInUse(recipe.api_host));
+        }
+        if pooled {
+            for host in &recipe.hosts {
+                self.check_hosted_inventory(host, plan, &recipe.profile)?;
+            }
+        }
+        if let Some(epoch) = expected_active
+            && let Some(endpoint) = self
+                .group(GroupVersion { group, epoch })
+                .and_then(|view| view.endpoint.as_ref())
+            && endpoint.api_model != recipe.api_model
+        {
+            return Err(ServingError::InvalidEndpoint);
+        }
+        let result =
+            self.prepare_hosted_switch(group, expected_epoch, expected_active, plan, activation)?;
+        let ServingOutcome::Group { version, .. } = result else {
+            unreachable!("hosted preparation creates a group version");
+        };
+        self.hosted_recipes.insert(version, recipe.clone());
+        if pooled {
+            self.hosted_pool_versions.insert(version);
+        }
+        Ok(result)
+    }
+
+    fn check_hosted_inventory(
+        &self,
+        address: &HostedAddress,
+        plan: &GroupPlan,
+        profile: &str,
+    ) -> Result<(), ServingError> {
+        let host = address.host;
+        self.require_execution_host(host)?;
+        let inventory = self
+            .hosted_inventories
+            .get(&host)
+            .ok_or(ServingError::HostedInventoryChanged(host))?;
+        if inventory.address != address.address
+            || !inventory.profiles.contains(profile)
+            || plan
+                .workers
+                .range(DeviceId::new(host, 0)..=DeviceId::new(host, u32::MAX))
+                .any(|(device, demand)| {
+                    inventory.devices.get(&device.ordinal) != Some(&demand.incarnation)
+                })
+        {
+            return Err(ServingError::HostedInventoryChanged(host));
+        }
+        Ok(())
+    }
+
     pub(crate) fn hosted_assignments(&self, host: NodeId) -> Vec<HostedAssignment> {
         let versions: BTreeSet<_> = self
             .workers
@@ -178,6 +259,15 @@ impl ServingState {
         }
         if view.plan.launch_digest != launch_digest {
             return Err(ServingError::LaunchDigestMismatch);
+        }
+        if self.hosted_pool_versions.contains(&version) {
+            let recipe = &self.hosted_recipes[&version];
+            let address = recipe
+                .hosts
+                .iter()
+                .find(|entry| entry.host == host)
+                .expect("pooled recipe covers the planned hosts");
+            self.check_hosted_inventory(address, &view.plan, &recipe.profile)?;
         }
         match self
             .host_launches
@@ -502,6 +592,110 @@ mod tests {
         );
         state.quiesce(version, GroupPhase::Revoked).unwrap();
         assert!(state.hosted_assignments(api).is_empty());
+    }
+
+    #[test]
+    fn pooled_preparation_rechecks_inventory_and_holds_ports_until_retirement() {
+        use plait_core::serving::HostedInventory;
+
+        let mut state = ServingState::default();
+        let [api, peer] = ["pool-api", "pool-peer"].map(NodeId::derive);
+        let [old, next] =
+            ["first-placement", "second-placement"].map(|name| GroupId(NodeId::derive(name)));
+        let mut first = plan(&mut state, 0, &[api, peer]);
+        let mut second = plan(&mut state, 1, &[api, peer]);
+        let recipe = HostedRecipe {
+            profile: "engine".into(),
+            api_host: api,
+            hosts: [api, peer]
+                .into_iter()
+                .enumerate()
+                .map(|(index, host)| HostedAddress {
+                    host,
+                    address: std::net::Ipv4Addr::new(192, 0, 2, index as u8 + 1).into(),
+                })
+                .collect(),
+            master_port: 19100,
+            http_port: 19101,
+            backend_port: 19102,
+            api_model: "alias".into(),
+            max_model_len: 1024,
+            gpu_memory_bps: 6000,
+            prefix_caching: false,
+        };
+        let digest = recipe.launch_digest();
+        first.launch_digest = digest;
+        second.launch_digest = digest;
+        let prepare = |state: &mut ServingState, group, plan| {
+            state.prepare_hosted_deployment(
+                group,
+                0,
+                None,
+                plan,
+                HostedActivation::OnReady,
+                &recipe,
+                true,
+            )
+        };
+        assert_eq!(
+            prepare(&mut state, old, &first),
+            Err(ServingError::HostedInventoryChanged(api)),
+        );
+        assert!(
+            state
+                .resources()
+                .workers
+                .iter()
+                .all(|worker| worker.grant.is_none())
+        );
+        let advertise = |state: &mut ServingState, address: &HostedAddress, counter| {
+            state
+                .advertise_hosted_inventory(
+                    &HostedInventory {
+                        host: address.host,
+                        address: address.address,
+                        profiles: BTreeSet::from([recipe.profile.clone()]),
+                        devices: BTreeMap::from([(0, 1), (1, 1)]),
+                    },
+                    OpId::new(address.host, counter),
+                    [7, 9],
+                )
+                .unwrap();
+        };
+        for address in &recipe.hosts {
+            advertise(&mut state, address, 1);
+        }
+        let version = GroupVersion {
+            group: old,
+            epoch: 1,
+        };
+        assert_eq!(
+            prepare(&mut state, old, &first),
+            Ok(group_outcome(version, GroupPhase::Preparing)),
+        );
+        state
+            .expire_execution_host(peer, OpId::new(peer, 1), &BTreeSet::from([version]))
+            .unwrap();
+        assert_eq!(state.group(version).unwrap().phase, GroupPhase::Revoked);
+        assert_eq!(
+            prepare(&mut state, next, &second),
+            Err(ServingError::HostedPortsInUse(api)),
+        );
+        assert_eq!(
+            state.hosted_planning().occupied,
+            vec![HostedPortUse::from(&recipe)]
+        );
+        let workers = first.workers.keys().copied().collect();
+        for grant in state.group(version).unwrap().grants.clone().into_values() {
+            state.worker_stopped(grant).unwrap();
+        }
+        state.retire(version, &workers).unwrap();
+        assert_eq!(
+            prepare(&mut state, next, &second),
+            Err(ServingError::ExecutionHostOffline(peer)),
+        );
+        advertise(&mut state, &recipe.hosts[1], 2);
+        prepare(&mut state, next, &second).unwrap();
     }
 
     #[test]

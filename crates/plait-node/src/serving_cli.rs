@@ -11,7 +11,7 @@ use plait_core::serving::{
 use plait_core::{DeviceId, NodeId, OpId};
 use plait_node::{Client, discover_voters};
 use plait_parallel::serving::{
-    HostedLinkPolicy, ServingCandidate, ServingForecast, SloProfile, select_serving_candidate,
+    ServingCandidate, ServingForecast, SloProfile, select_serving_candidate,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -81,14 +81,11 @@ enum Request {
         candidates: Vec<CandidateInput>,
     },
     ReplanHosted {
-        id: OpId,
-        forecast: ServingForecast,
-        candidates: Vec<hosted::Input>,
-        #[serde(default)]
-        activation: HostedActivation,
-        link_policy: Option<HostedLinkPolicy>,
+        #[serde(flatten)]
+        input: hosted::Replan,
     },
     HostedLinks,
+    HostedPlanning,
     ReplanW4 {
         id: OpId,
         forecast: ServingForecast,
@@ -331,25 +328,11 @@ async fn handle(
                 .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
             Ok(json!({ "selection": result }))
         }
-        Request::ReplanHosted {
-            id,
-            forecast,
-            candidates,
-            activation,
-            link_policy,
-        } => {
-            hosted::replan(
-                client,
-                peers,
-                id,
-                forecast,
-                candidates,
-                activation,
-                link_policy,
-            )
-            .await
-        }
+        Request::ReplanHosted { input } => hosted::replan(client, peers, input).await,
         Request::HostedLinks => hosted::links(client, peers).await,
+        Request::HostedPlanning => {
+            Ok(json!({ "planning": hosted::planning(client, peers).await? }))
+        }
         Request::ReplanW4 {
             id,
             forecast,

@@ -9,8 +9,8 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use plait_core::serving::{
-    GroupPhase, GroupVersion, HostMemory, HostedAssignment, ServingAction, ServingLookup,
-    ServingView,
+    GroupPhase, GroupVersion, HostMemory, HostedAssignment, HostedInventory, ServingAction,
+    ServingLookup, ServingView,
 };
 use plait_core::{DeviceId, NodeId};
 use serde::{Deserialize, Serialize};
@@ -69,6 +69,7 @@ pub(crate) async fn run(
 ) -> io::Result<()> {
     let unique: BTreeSet<_> = config.devices.iter().map(|device| device.ordinal).collect();
     if config.listen.ip().is_unspecified()
+        || config.listen.ip().is_multicast()
         || config
             .probe_listen
             .is_some_and(|address| address.ip() != config.listen.ip())
@@ -85,8 +86,17 @@ pub(crate) async fn run(
     }
     tokio::fs::create_dir_all(&config.lock_dir).await?;
     let lock = lock_device(&config.lock_dir.join("host-supervisor.lock"))?;
-    let pulse = ServingAction::PulseExecutionHost {
-        host,
+    let pulse = ServingAction::AdvertiseHostedInventory {
+        inventory: HostedInventory {
+            host,
+            address: config.listen.ip(),
+            profiles: config.profiles.keys().cloned().collect(),
+            devices: config
+                .devices
+                .iter()
+                .map(|device| (device.ordinal, device.incarnation))
+                .collect(),
+        },
         supervisor_lock: lock_identity(&lock)?,
     };
     let peers: Vec<_> = peers

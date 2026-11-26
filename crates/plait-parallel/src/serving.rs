@@ -13,7 +13,9 @@ pub use decoder::pool::{DecoderPool, generate_decoder_layouts};
 pub use decoder::{
     DecoderLayoutCandidate, DecoderPlacement, DecoderSelection, select_decoder_layout,
 };
-pub use hosted::{HostedLinkLimit, HostedLinkPolicy, limit_hosted_links};
+pub use hosted::{
+    HostedLinkLimit, HostedLinkPolicy, HostedPool, generate_hosted_candidates, limit_hosted_links,
+};
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
 pub struct SloProfile {

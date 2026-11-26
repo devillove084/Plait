@@ -1,14 +1,41 @@
 use std::collections::BTreeSet;
 
 use plait_core::serving::{
-    ExecutionHostLiveness, GroupPhase, GroupVersion, HostedProbeEndpoint, ServingError,
-    ServingOutcome, ServingResult, WorkerGrant,
+    ExecutionHostLiveness, GroupPhase, GroupVersion, HostedInventory, HostedProbeEndpoint,
+    ServingError, ServingOutcome, ServingResult, WorkerGrant,
 };
 use plait_core::{DeviceId, NodeId, OpId};
 
 use super::ServingState;
 
 impl ServingState {
+    pub(super) fn advertise_hosted_inventory(
+        &mut self,
+        inventory: &HostedInventory,
+        pulse: OpId,
+        supervisor_lock: [u64; 2],
+    ) -> ServingResult {
+        let host = inventory.host;
+        if inventory.address.is_unspecified()
+            || inventory.address.is_multicast()
+            || inventory.profiles.is_empty()
+            || inventory.devices.is_empty()
+        {
+            return Err(ServingError::InvalidPlan);
+        }
+        let mut inventory = inventory.clone();
+        // A stale device report removes that device from future placements.
+        // The rest of the host keeps its inventory and liveness.
+        inventory.devices.retain(|&ordinal, incarnation| {
+            self.workers
+                .get(&DeviceId::new(host, ordinal))
+                .is_some_and(|worker| worker.incarnation == *incarnation)
+        });
+        let result = self.pulse_execution_host(host, pulse, supervisor_lock)?;
+        self.hosted_inventories.insert(host, inventory);
+        Ok(result)
+    }
+
     pub(super) fn register_hosted_probe(&mut self, endpoint: HostedProbeEndpoint) -> ServingResult {
         if !self
             .execution_host(endpoint.host)
@@ -82,12 +109,15 @@ impl ServingState {
                 supervisor_lock,
             },
         );
+        self.hosted_inventories.remove(&host);
         Ok(ServingOutcome::ExecutionHostOnline)
     }
 
     pub(crate) fn execution_versions_on(&self, host: NodeId) -> BTreeSet<GroupVersion> {
         self.versions_on(host, |grant| {
-            self.resident_owner(grant).is_some() || self.host_has_launch(grant.version, host)
+            self.resident_owner(grant).is_some()
+                || self.host_has_launch(grant.version, host)
+                || self.hosted_pool_versions.contains(&grant.version)
         })
     }
 
@@ -144,6 +174,7 @@ impl ServingState {
                 .expect("affected groups checked");
         }
         self.hosted_probes.remove(&host);
+        self.hosted_inventories.remove(&host);
         Ok(ServingOutcome::ExecutionHostOffline)
     }
 }
@@ -156,6 +187,52 @@ mod tests {
     use plait_core::serving::{
         GroupId, GroupPlan, HostMemory, ResidentOwner, ServingRole, WorkerDemand,
     };
+
+    #[test]
+    fn a_stale_device_does_not_expire_the_host_or_its_other_devices() {
+        let mut state = ServingState::default();
+        let host = NodeId::derive("device-registration");
+        state
+            .set_host_memory(
+                host,
+                HostMemory {
+                    bytes: 16,
+                    pinned_bytes: 4,
+                },
+            )
+            .unwrap();
+        state
+            .register_worker(DeviceId::new(host, 0), 2, 16)
+            .unwrap();
+        state
+            .register_worker(DeviceId::new(host, 1), 1, 16)
+            .unwrap();
+        let pulse = OpId::new(host, 1);
+        state
+            .advertise_hosted_inventory(
+                &HostedInventory {
+                    host,
+                    address: "192.0.2.1".parse().unwrap(),
+                    profiles: BTreeSet::from(["weights".into()]),
+                    devices: BTreeMap::from([(0, 1), (1, 1)]),
+                },
+                pulse,
+                [2, 3],
+            )
+            .unwrap();
+        assert_eq!(
+            state
+                .execution_host(host)
+                .filter(|entry| entry.online)
+                .unwrap()
+                .pulse,
+            pulse
+        );
+        assert_eq!(
+            state.hosted_planning().hosts[0].devices,
+            BTreeMap::from([(1, 1)])
+        );
+    }
 
     #[test]
     fn host_expiry_compares_the_pulse_and_keeps_device_reservations() {

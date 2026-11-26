@@ -150,6 +150,42 @@ pub struct HostedLinkSample {
     pub rtt_ns: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedInventory {
+    pub host: NodeId,
+    pub address: IpAddr,
+    pub profiles: BTreeSet<String>,
+    /// Local accelerator ordinal to registered incarnation.
+    pub devices: BTreeMap<u32, u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedPortUse {
+    pub host: NodeId,
+    pub ports: [u16; 3],
+}
+
+impl From<&HostedRecipe> for HostedPortUse {
+    fn from(recipe: &HostedRecipe) -> Self {
+        Self {
+            host: recipe.api_host,
+            ports: [recipe.master_port, recipe.http_port, recipe.backend_port],
+        }
+    }
+}
+
+impl HostedPortUse {
+    pub fn conflicts(self, other: Self) -> bool {
+        self.host == other.host && self.ports.iter().any(|port| other.ports.contains(port))
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedPlanning {
+    pub hosts: Vec<HostedInventory>,
+    pub occupied: Vec<HostedPortUse>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerDemand {
     pub incarnation: u64,
@@ -790,6 +826,19 @@ pub enum ServingAction {
         recipe: HostedRecipe,
     },
     RegisterHostedProbe(HostedProbeEndpoint),
+    AdvertiseHostedInventory {
+        inventory: HostedInventory,
+        supervisor_lock: [u64; 2],
+    },
+    PrepareHostedPoolDeployment {
+        group: GroupId,
+        expected_epoch: u64,
+        expected_active: Option<u64>,
+        plan: GroupPlan,
+        activation: HostedActivation,
+        request_sha256: [u8; 32],
+        recipe: HostedRecipe,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -905,6 +954,8 @@ pub enum ServingError {
     StaleDecoderEntry,
     DecoderSubmissionRouteChanged(PdRoute),
     DecoderSwitchInProgress { staged: OpId },
+    HostedInventoryChanged(NodeId),
+    HostedPortsInUse(NodeId),
 }
 
 pub type ServingResult = Result<ServingOutcome, ServingError>;
@@ -944,6 +995,7 @@ pub enum ServingLookup {
     DecoderAdmissionRoutes(RouteSetId),
     HostedAssignments(NodeId),
     HostedProbeEndpoints,
+    HostedPlanning,
 }
 
 /// A replica's locally applied state. A missing result may indicate replication lag.
@@ -968,6 +1020,7 @@ pub enum ServingView {
     DecoderAdmissionRoutes(DecoderAdmissionRoutes),
     HostedAssignments(Vec<HostedAssignment>),
     HostedProbeEndpoints(Vec<HostedProbeEndpoint>),
+    HostedPlanning(HostedPlanning),
 }
 
 impl ServingOperation {
@@ -980,6 +1033,15 @@ impl ServingOperation {
             }
             ServingAction::RegisterHostedProbe(endpoint) => {
                 keys.insert(Key::HostMemory(endpoint.host));
+            }
+            ServingAction::AdvertiseHostedInventory { inventory, .. } => {
+                keys.insert(Key::HostMemory(inventory.host));
+                keys.extend(
+                    inventory
+                        .devices
+                        .keys()
+                        .map(|&ordinal| Key::Device(DeviceId::new(inventory.host, ordinal))),
+                );
             }
             ServingAction::ExpireExecutionHost { host, groups, .. } => {
                 keys.insert(Key::HostMemory(*host));
@@ -995,9 +1057,24 @@ impl ServingOperation {
             ServingAction::Prepare { group, plan, .. }
             | ServingAction::PrepareW4Switch { group, plan, .. }
             | ServingAction::PrepareManagedW4 { group, plan, .. }
-            | ServingAction::PrepareHostedSwitch { group, plan, .. }
-            | ServingAction::PrepareHostedDeployment { group, plan, .. } => {
+            | ServingAction::PrepareHostedSwitch { group, plan, .. } => {
                 keys.insert(Key::ServingGroup(*group));
+                keys.extend(plan.workers.keys().copied().map(Key::Device));
+                keys.extend(plan.hosts.keys().copied().map(Key::HostMemory));
+            }
+            ServingAction::PrepareHostedDeployment {
+                group,
+                plan,
+                recipe,
+                ..
+            }
+            | ServingAction::PrepareHostedPoolDeployment {
+                group,
+                plan,
+                recipe,
+                ..
+            } => {
+                keys.extend([Key::ServingGroup(*group), Key::HostMemory(recipe.api_host)]);
                 keys.extend(plan.workers.keys().copied().map(Key::Device));
                 keys.extend(plan.hosts.keys().copied().map(Key::HostMemory));
             }

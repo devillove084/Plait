@@ -4,6 +4,9 @@ use plait_core::NodeId;
 use plait_core::serving::{GroupPlan, HostedLinkSample};
 use serde::{Deserialize, Serialize};
 
+mod pool;
+pub use pool::{HostedPool, generate_hosted_candidates};
+
 #[derive(Clone, Copy, Deserialize, Serialize)]
 pub struct HostedLinkPolicy {
     /// Estimated wire bytes per request for each directed pair of TP workers.
@@ -24,21 +27,37 @@ pub fn limit_hosted_links(
     now_ms: u64,
     links: &BTreeMap<(NodeId, NodeId), HostedLinkSample>,
 ) -> Result<HostedLinkLimit, &'static str> {
-    if policy.bytes_per_rank_pair == 0 || policy.max_sample_age_ms == 0 {
-        return Err("hosted link policy requires positive traffic and sample age");
-    }
+    policy.validate()?;
     let mut ranks = BTreeMap::<NodeId, u64>::new();
     for device in plan.workers.keys() {
         *ranks.entry(device.node).or_default() += 1;
     }
+    Ok(limit_hosted_ranks(&ranks, policy, now_ms, links))
+}
+
+impl HostedLinkPolicy {
+    fn validate(self) -> Result<(), &'static str> {
+        if self.bytes_per_rank_pair == 0 || self.max_sample_age_ms == 0 {
+            return Err("hosted link policy requires positive traffic and sample age");
+        }
+        Ok(())
+    }
+}
+
+fn limit_hosted_ranks(
+    ranks: &BTreeMap<NodeId, u64>,
+    policy: HostedLinkPolicy,
+    now_ms: u64,
+    links: &BTreeMap<(NodeId, NodeId), HostedLinkSample>,
+) -> HostedLinkLimit {
     if ranks.len() < 2 {
-        return Ok(HostedLinkLimit::Local);
+        return HostedLinkLimit::Local;
     }
     let mut outgoing = BTreeMap::<NodeId, PortBudget>::new();
     let mut incoming = BTreeMap::<NodeId, PortBudget>::new();
     let mut valid_until_ms = u64::MAX;
-    for (&source, &senders) in &ranks {
-        for (&target, &receivers) in &ranks {
+    for (&source, &senders) in ranks {
+        for (&target, &receivers) in ranks {
             if source == target {
                 continue;
             }
@@ -47,7 +66,7 @@ pub fn limit_hosted_links(
                     && now_ms - sample.sampled_at_ms < policy.max_sample_age_ms
                     && sample.bytes_per_second > 0
             }) else {
-                return Ok(HostedLinkLimit::MissingLink { source, target });
+                return HostedLinkLimit::MissingLink { source, target };
             };
             valid_until_ms = valid_until_ms.min(
                 sample
@@ -70,10 +89,10 @@ pub fn limit_hosted_links(
         .chain(incoming.values())
         .map(|port| port.bytes_per_second as f64 / port.bytes_per_request)
         .fold(f64::INFINITY, f64::min);
-    Ok(HostedLinkLimit::Measured {
+    HostedLinkLimit::Measured {
         rps,
         valid_until_ms,
-    })
+    }
 }
 
 #[derive(Default)]
