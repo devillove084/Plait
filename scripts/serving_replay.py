@@ -11,6 +11,7 @@ from serving_group import HTTP_ERRORS, MAX_JSON_BYTES
 
 RECOVERY_HEADER = "X-Plait-Stream-Recovery"
 RECOVERY_MODE = "replay-prefix"
+RESUME_KV_MODE = "resume-kv"
 
 
 class ReplayMismatch(ValueError):
@@ -73,8 +74,17 @@ def match_prefix(values, prefix, offset: int) -> int:
 
 
 class CompletionReplay:
-    def __init__(self, body: dict) -> None:
-        self.payload = json.dumps(validated_request(body)).encode()
+    def __init__(self, body: dict, mode: str = RECOVERY_MODE) -> None:
+        self.request = validated_request(body)
+        if mode == RESUME_KV_MODE and (
+            body.get("prompt_logprobs") is not None or body.get("structured_outputs")
+            or body.get("response_format") or body.get("repetition_detection")
+            or body.get("thinking_token_budget", -1) not in (None, -1)
+            or body.get("prompt_embeds") or body.get("vllm_xargs")
+        ):
+            raise ValueError("KV resume requires a plain greedy completion")
+        self.payload = json.dumps(self.request).encode()
+        self.mode = mode
         self.model = body["model"]
         self.return_token_ids = bool(body.get("return_token_ids"))
         self.started = False
@@ -85,6 +95,14 @@ class CompletionReplay:
         self.text_bytes = 0
         self.prompt_ids: list[int] | None = None
         self.prompt_sent = False
+
+    def attempt_payload(self) -> bytes:
+        if self.mode != RESUME_KV_MODE or not self.tokens:
+            return self.payload
+        return json.dumps({
+            **self.request,
+            "kv_transfer_params": {"plait_resume_token_ids": self.tokens},
+        }).encode()
 
     def drain_attempt(self, response: HTTPResponse, emit: Callable[[bytes], object]) -> None:
         reference_ids = self.tokens.copy()
@@ -119,6 +137,10 @@ class CompletionReplay:
             ):
                 raise ReplayMismatch("completion stream did not carry one token-addressable choice")
             prompt = choice.pop("prompt_token_ids", None)
+            resumed_tokens = choice.pop("plait_resumed_tokens", None)
+            if first_choice and self.mode == RESUME_KV_MODE and reference_ids:
+                if type(resumed_tokens) is not int or resumed_tokens != len(reference_ids):
+                    raise ReplayMismatch("replacement did not restore the emitted token checkpoint")
             if first_choice or prompt is not None:
                 if not isinstance(prompt, list) or any(type(token) is not int for token in prompt):
                     raise ReplayMismatch("completion stream did not carry its prompt token IDs")

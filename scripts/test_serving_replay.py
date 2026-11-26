@@ -4,24 +4,26 @@ import io
 import json
 import unittest
 
-from serving_replay import CompletionReplay, ReplayMismatch, UpstreamInterrupted, sse
+from serving_replay import RESUME_KV_MODE, CompletionReplay, ReplayMismatch, UpstreamInterrupted, sse
 
 
 DONE = b"data: [DONE]\n\n"
 
 
-def frame(ids, text, request_id="first", *, prompt=None, finish=None):
+def frame(ids, text, request_id="first", *, prompt=None, finish=None, resumed=None):
     choice = {"index": 0, "token_ids": ids, "text": text, "finish_reason": finish}
     if prompt is not None:
         choice["prompt_token_ids"] = prompt
+    if resumed is not None:
+        choice["plait_resumed_tokens"] = resumed
     return sse({"id": request_id, "created": 10, "model": "test", "choices": [choice]})
 
 
-def completion(return_token_ids=True):
+def completion(return_token_ids=True, **options):
     return CompletionReplay({
         "model": "test", "prompt": [7], "stream": True, "temperature": 0,
         "return_token_ids": return_token_ids,
-    })
+    }, **options)
 
 
 class CompletionReplayTest(unittest.TestCase):
@@ -72,6 +74,34 @@ class CompletionReplayTest(unittest.TestCase):
         out = []
         replay.drain_attempt(io.BytesIO(frame([1], "A", prompt=[7], finish="length") + DONE), out.append)
         self.assertNotIn(b"token_ids", b"".join(out))
+
+    def test_kv_resume_sends_latest_emitted_tokens_on_each_replacement(self):
+        replay = completion(mode=RESUME_KV_MODE)
+        out = []
+        self.assertNotIn("kv_transfer_params", json.loads(replay.attempt_payload()))
+        with self.assertRaises(UpstreamInterrupted):
+            replay.drain_attempt(io.BytesIO(frame([1], "A", prompt=[7])), out.append)
+        params = json.loads(replay.attempt_payload())["kv_transfer_params"]
+        self.assertEqual(params, {"plait_resume_token_ids": [1]})
+        with self.assertRaises(UpstreamInterrupted):
+            replay.drain_attempt(io.BytesIO(frame([1, 2], "AB", prompt=[7], resumed=1)), out.append)
+        params = json.loads(replay.attempt_payload())["kv_transfer_params"]
+        self.assertEqual(params, {"plait_resume_token_ids": [1, 2]})
+        final = frame([1, 2, 3], "ABC", prompt=[7], resumed=2, finish="length")
+        replay.drain_attempt(io.BytesIO(final + DONE), out.append)
+        frames = [json.loads(line[6:]) for line in b"".join(out).splitlines() if line.startswith(b"data: {")]
+        self.assertEqual([choice["token_ids"] for body in frames for choice in body["choices"]], [[1], [2], [3]])
+        self.assertNotIn(b"plait_resumed_tokens", b"".join(out))
+
+    def test_kv_resume_rejects_an_unacknowledged_checkpoint(self):
+        replay = completion(mode=RESUME_KV_MODE)
+        out = []
+        with self.assertRaises(UpstreamInterrupted):
+            replay.drain_attempt(io.BytesIO(frame([1], "A", prompt=[7])), out.append)
+        for claimed in (None, 2, True):
+            with self.subTest(claimed=claimed), self.assertRaises(ReplayMismatch):
+                replay.drain_attempt(io.BytesIO(frame([1, 2], "AB", prompt=[7], resumed=claimed)), out.append)
+        self.assertEqual(out, [frame([1], "A", prompt=[7])])
 
 
 if __name__ == "__main__":

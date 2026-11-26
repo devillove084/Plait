@@ -18,7 +18,8 @@ from serving_group import (
     Endpoint, admission_rejected, endpoint_ready,
 )
 from serving_replay import (
-    RECOVERY_HEADER, RECOVERY_MODE, CompletionReplay, ReplayMismatch, UpstreamInterrupted, sse,
+    RECOVERY_HEADER, RECOVERY_MODE, RESUME_KV_MODE,
+    CompletionReplay, ReplayMismatch, UpstreamInterrupted, sse,
 )
 
 
@@ -109,10 +110,9 @@ def server(bind: str, port: int, directory: ActiveGroupDirectory, timeout: float
                 recovery = self.headers.get(RECOVERY_HEADER)
                 replay = None
                 if recovery is not None:
-                    if recovery != RECOVERY_MODE or self.path != "/v1/completions":
+                    if recovery not in (RECOVERY_MODE, RESUME_KV_MODE) or self.path != "/v1/completions":
                         raise ValueError("unsupported stream recovery mode")
-                    replay = CompletionReplay(body)
-                    raw = replay.payload
+                    replay = CompletionReplay(body, recovery)
             except (OSError, ValueError) as error:
                 self.fail(400, str(error))
                 return
@@ -122,7 +122,8 @@ def server(bind: str, port: int, directory: ActiveGroupDirectory, timeout: float
             while (budget := deadline - time.monotonic()) > 0:
                 endpoint = directory.endpoint()
                 if endpoint is not None and (replay is None or endpoint.epoch > replay.failed_epoch):
-                    if self.try_endpoint(endpoint, raw, request_id, budget, replay):
+                    payload = raw if replay is None else replay.attempt_payload()
+                    if self.try_endpoint(endpoint, payload, request_id, budget, replay):
                         return
                 time.sleep(min(DIRECTORY_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
             self.fail_forward(503, "no active execution group accepted the request", replay)
@@ -180,7 +181,7 @@ def server(bind: str, port: int, directory: ActiveGroupDirectory, timeout: float
                 if not replay.started:
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
-                    self.send_header(RECOVERY_HEADER, RECOVERY_MODE)
+                    self.send_header(RECOVERY_HEADER, replay.mode)
                     for key, value in version_headers.items():
                         self.send_header(key, value)
                     self.end_headers()

@@ -186,8 +186,38 @@ A managed TP4 group on CUDA, ROCm, and PPU HGGC populated two 128-token
 blocks. After activation, its TP2 replacement on CUDA and Ascend CANN
 reported 256 external prefix hits. The replacement's output token IDs and
 text matched its cold run, which reported zero external hits. The transfer
-uses host staging over TCP. The stream-recovery mode above still replays
-from the original prompt, and the cache starts empty after a store restart.
+uses host staging over TCP. The cache starts empty after a store restart.
+
+### Resume a stream from its last emitted token
+
+Use `X-Plait-Stream-Recovery: resume-kv` on the same greedy completion
+endpoint. Set `PlaitKvConnector` to produce on the source and consume on
+the replacement. Use the V2 runner on the replacement. Set `kv_both` on
+an engine that should publish additional pages after it takes over.
+The request must carry a plain text or token-array prompt. Structured
+outputs, prompt log probabilities, repetition detection, and thinking
+budgets require their own continuation state.
+
+After a disconnect, the ingress sends the original request and the token
+IDs already delivered. The replacement restores those IDs as generation
+history, initializes its incremental detokenizer from them, and looks up
+KV using the combined prompt and generated prefix. It loads complete pages
+into its own TP layout and computes any uncovered suffix of the known
+sequence before sampling the next token. The scheduler can reuse a full
+page that ends after the prompt. Prompt usage counts only prompt positions,
+while the external cache metric counts all matched positions.
+
+The replacement acknowledges the restored length in its first choice.
+The ingress verifies that count, the prompt IDs, and the previously sent
+token IDs and text before forwarding the suffix. The client keeps the
+original completion ID, usage budget, and one terminal event. The ingress
+and its client connection must survive the replacement.
+
+In the four-backend fault test, the source emitted six tokens before one
+of its TP4 workers was killed. The TP2 replacement reported 256 external
+hits for a 254-token prompt. The client received all 16 output tokens on
+the original SSE connection. Token IDs, text, and usage matched a cold
+run on the replacement.
 
 ## Execute a collective
 

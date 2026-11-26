@@ -170,6 +170,8 @@ to its peers. [Peer transport and startup](docs/rankless-nccl.md)
 
 Managed replacements can reuse complete prompt KV blocks across TP sizes
 with the vLLM fork's `PlaitKvConnector` and `plait-node kv-store`.
+The ingress can restore a greedy stream's emitted token checkpoint and
+reuse pages from both the prompt and generated prefix.
 [KV setup and scope](docs/rankless-nccl.md#reuse-prompt-kv-across-tp-layouts)
 
 For the legacy rendezvous, `PLAIT_NCCL_SHM=1` enables the host-mapped local
@@ -220,10 +222,10 @@ release the result after the matching completion has executed in the control pla
 | [Ordered publication](specs/PlaitOrderedPublication.tla) | Completion and revocation in the agreed command order, receipt identity on retry, and recovery from a replica's durable command prefix. |
 | [Peer collectives](specs/PlaitPeerCollective.tla) | Round pairing, replicated and sharded reduction, and completion of an independent communicator when a participant in another group is lost. |
 | [Serving ingress](specs/PlaitServingIngress.tla) | One admission per ordinary forwarded request, monotonic route refresh, and output pinned to the admitted epoch while the old gate drains. |
-| [Completion replay](specs/PlaitCompletionReplay.tla) | Previously visible token positions are kept, replacement output is checked before use, and a mismatched or short replay cannot publish a suffix. |
+| [Completion replay and KV resume](specs/PlaitCompletionReplay.tla) | Visible positions are preserved. Each KV resume sends the latest checkpoint and requires a matching acknowledgment and prefix before publishing a suffix. |
 | [KV publication](specs/PlaitKvPublication.tla) | All heads must come from one write attempt before a page becomes readable. A consumer reads its requested head range, and a complete page stays immutable. |
 
-TLC 2.19 passes all 29 configurations. The ordered publication configuration
+TLC 2.19 passes all 30 configurations. The ordered publication configuration
 explores 70,968 distinct states. Run the suite with `tlc` on your `PATH`.
 
 ```sh
