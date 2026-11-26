@@ -23,6 +23,7 @@ from serving_group import (
     INFERENCE_PATHS, MAX_JSON_BYTES, RELEASE_KV_PATH, Control, ControlError,
     Endpoint, admission_rejected, endpoint_ready,
 )
+from serving_load import Load, listen as load_listener, parse_address as parse_load_address
 
 class UpstreamError(RuntimeError):
     pass
@@ -193,7 +194,7 @@ def request_engine(
 
 def server(
     bind: str, port: int, directory: Directory | ControlDirectory, timeout: float,
-    kv_transport: str = "nixl",
+    kv_transport: str = "nixl", load: Load | None = None,
 ) -> ThreadingHTTPServer:
     next_path = itertools.count()
 
@@ -216,10 +217,13 @@ def server(
             if self.path not in INFERENCE_PATHS:
                 self.fail(404, "unknown endpoint")
                 return
-            config = self.read_directory()
-            if config is None:
-                return
-            model, routes = config
+            if load is None:
+                config = self.read_directory()
+                if config is None:
+                    return
+                model, routes = config
+            else:
+                model = load.model
             try:
                 size = int(self.headers.get("Content-Length", "0"))
                 if self.headers.get("Transfer-Encoding") or not 0 < size <= MAX_JSON_BYTES:
@@ -236,6 +240,20 @@ def server(
                 self.fail(400, str(error))
                 return
 
+            if load is None:
+                self.route_request(routes, body)
+                return
+            load.begin()
+            completed = False
+            try:
+                config = self.read_directory()
+                if config is not None:
+                    _, routes = config
+                    completed = self.route_request(routes, body)
+            finally:
+                load.finish(completed)
+
+        def route_request(self, routes: list[Route], body: dict) -> bool:
             deadline = time.monotonic() + timeout
             if routes:
                 start = next(next_path) % len(routes)
@@ -247,14 +265,16 @@ def server(
                 if not endpoint_ready(route.decode, budget):
                     continue
                 try:
-                    if self.try_route(route, body, deadline):
-                        return
+                    completed = self.try_route(route, body, deadline)
+                    if completed is not None:
+                        return completed
                 except (OSError, http.client.HTTPException, UpstreamError) as error:
                     self.fail(502, str(error))
-                    return
+                    return False
             self.fail(503, "no P/D route accepted the request")
+            return False
 
-        def try_route(self, route: Route, body: dict, deadline: float) -> bool:
+        def try_route(self, route: Route, body: dict, deadline: float) -> bool | None:
             request_id, token = uuid.uuid4().hex, uuid.uuid4().hex
             plait_ticket = token if kv_transport == "plait" else None
             budget = max(0.001, deadline - time.monotonic())
@@ -263,10 +283,10 @@ def server(
                     connection, route.prefill, self.path, prefill_payload(body, plait_ticket), request_id, token,
                 ) as response:
                     if admission_rejected(response):
-                        return False
+                        return None
                     if response.status != 200:
                         self.write_json(response.status, read_json(response))
-                        return True
+                        return False
                     try:
                         params = transfer_descriptor(read_json(response), route, plait_ticket)
                     except UpstreamError:
@@ -283,10 +303,11 @@ def server(
                 ) as response:
                     if admission_rejected(response):
                         release_transfer(route.prefill, token)
-                        return False
-                    if self.write_decode(response):
+                        return None
+                    completed = self.write_decode(response)
+                    if completed:
                         release_transfer(route.prefill, token)
-            return True
+            return completed
 
         def write_decode(self, response: http.client.HTTPResponse) -> bool:
             content_type = response.getheader("Content-Type", "")
@@ -351,20 +372,32 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8192)
     parser.add_argument("--kv-transport", choices=("nixl", "plait"), default="nixl")
+    parser.add_argument("--load-listen", help="private IP:port for P/D demand counters")
     parser.add_argument("--timeout", type=float, default=120.0)
     args = parser.parse_args()
     if not 0 < args.port < 65536 or not 0 < args.timeout < float("inf"):
         parser.error("port and timeout must be valid")
     if args.routes is None and not args.control_peer:
         parser.error("--model requires at least one --control-peer")
+    load = None
+    load_context = contextlib.nullcontext()
+    if args.load_listen is not None:
+        if args.model is None:
+            parser.error("--load-listen requires a managed model")
+        try:
+            address = parse_load_address(args.load_listen)
+        except ValueError as error:
+            parser.error(str(error))
+        load = Load(args.model)
+        load_context = load_listener(address, load)
 
     def interrupt(_signum: int, _frame: object) -> None:
         raise KeyboardInterrupt
 
     old_handler = signal.signal(signal.SIGTERM, interrupt)
     try:
-        with route_source(args) as directory, server(
-            args.host, args.port, directory, args.timeout, args.kv_transport,
+        with load_context, route_source(args) as directory, server(
+            args.host, args.port, directory, args.timeout, args.kv_transport, load,
         ) as httpd:
             httpd.serve_forever()
     except KeyboardInterrupt:

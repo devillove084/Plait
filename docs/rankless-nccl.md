@@ -443,6 +443,42 @@ layout. A selected layout is submitted through managed P/D staging.
 The voters recheck route and resource versions when applying it. Retry
 an ambiguous submission using the same operation ID and request.
 
+### Drive P/D planning from ingress load
+
+Start each managed P/D ingress with `--load-listen IP:PORT` on a private
+address reachable from the execution node running the policy. Each
+listener reports process-local arrival, completion, failure, and
+in-flight counters for its model alias. Requests that pass the
+ingress checks count towards arrivals while the route directory is
+empty or unavailable. This permits initial placement under offered
+load.
+
+Add a `pd_scaling` list to the resident execution configuration. Each
+policy includes the following fields.
+
+| Field | Value |
+| --- | --- |
+| `model`, `checkpoint` | API alias and the serving plan's model identity. |
+| `ingress` | Private load listener addresses for all ingress processes serving this policy. |
+| `window_ms` | Interval between observations. |
+| `stable_windows` | Consecutive complete windows that must select the same plan. |
+| `cooldown_ms` | Delay after a deployment revision changes or a local attempt submits. |
+| `horizon_ms`, `minimum_gain_requests` | Forecast window and improvement threshold. |
+| `pool`, `link_policy` | The same calibrated pool and link evidence settings used by `replan_hosted_pd`. Enable `pool.allow_scale_down` to permit removing idle groups. |
+
+The node adds arrival rates from all ingress processes. It includes the
+current in-flight count over the forecast horizon. Missing or duplicate
+counters, a process restart, or an excessive gap clears recent
+decisions. A pending deployment blocks another automatic submission.
+Any resident can propose a change. Route revision and reservation
+checks arbitrate concurrent submissions.
+
+Existing group capacities come from the configured slot that matches
+the active role, launch profile, and TP size. Keep those measurements
+and the shared store budget current. The loop supplies observed demand
+to the planner and follows the normal staged rollout. Model capacity
+and startup time remain calibration inputs.
+
 ### Reuse prompt KV across TP layouts
 
 Start a shared store on the engine network. It keeps completed pages in

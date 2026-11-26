@@ -303,6 +303,20 @@ pub fn plan_hosted_pd(
 }
 
 impl HostedPdPool {
+    pub fn calibrated_capacity(
+        &self,
+        group: GroupId,
+        role: ServingRole,
+        profile: &str,
+        tensor_parallel: u32,
+    ) -> Option<SloProfile> {
+        let slot = self
+            .slots
+            .iter()
+            .find(|slot| slot.pool.group() == group && slot.role == role)?;
+        slot.pool.capacity(profile, tensor_parallel)
+    }
+
     fn validate(&self, model: &str, forecast: &ServingForecast) -> Result<(), &'static str> {
         if model.is_empty()
             || self.kv_bytes_per_request == 0

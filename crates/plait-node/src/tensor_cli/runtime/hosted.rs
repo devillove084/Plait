@@ -23,6 +23,7 @@ use super::{
 };
 
 mod probes;
+mod scaling;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,6 +35,8 @@ pub(crate) struct Config {
     launcher: Vec<String>,
     devices: Vec<Device>,
     profiles: BTreeMap<String, EngineProfile>,
+    #[serde(default)]
+    pd_scaling: Vec<scaling::Policy>,
 }
 
 #[derive(Deserialize)]
@@ -63,7 +66,7 @@ struct Launch {
 
 pub(crate) async fn run(
     host: NodeId,
-    config: Config,
+    mut config: Config,
     peers: BTreeMap<NodeId, String>,
     seeds: Vec<SocketAddr>,
 ) -> io::Result<()> {
@@ -84,6 +87,8 @@ pub(crate) async fn run(
             "invalid hosted execution configuration",
         ));
     }
+    scaling::validate(&config.pd_scaling)?;
+    let policies = std::mem::take(&mut config.pd_scaling);
     tokio::fs::create_dir_all(&config.lock_dir).await?;
     let lock = lock_device(&config.lock_dir.join("host-supervisor.lock"))?;
     let pulse = ServingAction::AdvertiseHostedInventory {
@@ -147,6 +152,7 @@ pub(crate) async fn run(
         result = renew_execution_host(heartbeat, pulse) => result,
         result = supervise(host, &config, &peers, &seeds, &lock, control) => result,
         result = network_probes => result,
+        result = scaling::run(policies, peer_config.clone()) => result,
     }
 }
 

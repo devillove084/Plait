@@ -19,6 +19,7 @@ from serving_group import (
     ControlError, Endpoint, Gate, group_proxy, record_host_stop, run,
 )
 from serving_launch import host_command, resident_spec
+from serving_load import Load
 
 
 ROUTER = runpy.run_path(str(Path(__file__).with_name("serve-disaggregated.py")))
@@ -425,6 +426,20 @@ class HandoffTest(unittest.TestCase):
         store = "127.0.0.1:9100"
         self.assertEqual(self.request(router_port, COMPLETIONS, payload)[0], 200)
         self.assertEqual(decoded[0]["kv_transfer_params"]["plait_handoff"]["store"], store)
+
+    def test_load_counts_valid_arrivals_when_routes_are_unavailable(self):
+        directory = Mock()
+        directory.routes.side_effect = ValueError("directory unavailable")
+        load = Load("test")
+        port = self.start(ROUTER["server"](
+            "127.0.0.1", 0, directory, 5, kv_transport="plait", load=load,
+        ))
+        request = {"model": "test", "prompt": "input", "max_tokens": 8}
+        self.assertEqual(self.request(port, COMPLETIONS, request)[0], 503)
+        self.assertEqual(self.request(port, COMPLETIONS, {**request, "model": "other"})[0], 400)
+        snapshot = load.snapshot()
+        self.assertEqual((snapshot["arrivals"], snapshot["completed"],
+                          snapshot["failed"], snapshot["in_flight"]), (1, 0, 1, 0))
 
 
 if __name__ == "__main__":

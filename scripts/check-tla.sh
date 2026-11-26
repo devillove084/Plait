@@ -27,6 +27,7 @@ tlc -deadlock -config specs/PlaitHostedLinkEvidence.cfg specs/PlaitHostedLinkEvi
 tlc -deadlock -config specs/PlaitHostedPool.cfg specs/PlaitHostedPool.tla
 tlc -deadlock -config specs/PlaitHostedPd.cfg specs/PlaitHostedPd.tla
 tlc -deadlock -config specs/PlaitHostedPdBudget.cfg specs/PlaitHostedPdBudget.tla
+tlc -deadlock -config specs/PlaitHostedPdScale.cfg specs/PlaitHostedPdScale.tla
 tlc -deadlock -config specs/PlaitServingIngress.cfg specs/PlaitServingIngress.tla
 tlc -deadlock -config specs/PlaitCompletionReplay.cfg specs/PlaitCompletionReplay.tla
 tlc -deadlock -config specs/PlaitCompletionKvResume.cfg specs/PlaitCompletionReplay.tla

@@ -184,6 +184,16 @@ impl HostedPool {
         &self.api_model
     }
 
+    pub(super) fn capacity(&self, profile: &str, tensor_parallel: u32) -> Option<SloProfile> {
+        if self.profile != profile {
+            return None;
+        }
+        self.sizes
+            .iter()
+            .find(|size| size.tensor_parallel == tensor_parallel)
+            .map(|size| size.capacity)
+    }
+
     pub(super) fn validate(&self, allow_local: bool) -> Result<(), &'static str> {
         let end = u32::from(self.ports.first) + u32::from(self.ports.count);
         if self.ports.first == 0 || self.ports.count < 3 || end > u32::from(u16::MAX) + 1 {
