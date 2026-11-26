@@ -63,9 +63,8 @@ registered memory and move through peer pointers or one-sided descriptors.
   result to contiguous row ranges.
 - **Rejoin policy.** `RejoinCost` chooses between strict recovery, snapshot
   replay, and deterministic recomputation.
-- **Formal models.** Finite TLA+ models under `specs/` cover the scheduler,
-  ordering safety, dependency stability, recovery liveness, and the unified
-  compute/fusion/commit/execute design.
+- **Formal models.** TLA+ covers ordering, epoch admission, and the path from
+  quantized shard computation to asynchronous reduction and result delivery.
 
 ## Measured baseline
 
@@ -182,10 +181,10 @@ defaults off; it is only for cross-host TP.
 Native TP startup (Qwen3.5 must not use `external_launcher`):
 
 ```bash
-# local 4x3090 W4A16 TP1
+# four NVIDIA Ampere devices, one W4A16 TP1 replica per device
 python scripts/serve-tiered.py --model /mnt/nas1/hf/Qwen3.5-9B-W4A16 \
   --replicas 4 --tp 1 --port-base 8000
-# remote 8xPRO 122B-NVFP4, four independent native TP2 replicas
+# eight NVIDIA Blackwell devices, 122B-NVFP4, four independent native TP2 replicas
 python scripts/serve-tiered.py --model /mnt/nas1/hf/Qwen3.5-122B-A10B-NVFP4 \
   --replicas 4 --tp 2 --port-base 8100 --max-model-len 1024
 ```
@@ -196,13 +195,31 @@ Run it with:
 just tcp-twolevel-rust
 ```
 
-TLA+ tools are not vendored. Run:
+## Formal verification
+
+An admitted operation carries an epoch and a fixed set of shards. A worker may
+finish locally after revocation. Publishing its shard requires a live grant and
+a matching device event followed by a host copy. Shards can arrive out of
+order and are folded in shard order. The caller can release the result after
+the matching completion has executed in the control plane.
+
+| TLA+ module | Properties checked with TLC |
+| --- | --- |
+| [Kernel primitives](specs/PlaitKernelPrimitives.tla) | Signed decoding, packed coordinate mapping, and exact integer dot products with accumulator bounds. |
+| [W4A4](specs/PlaitW4A4.tla) and [W4A8 / W4A16](specs/PlaitW4Operators.tla) | INT32 zero-point correction and tail reads for W4A4, byte-wise subtraction for W4A8, and packed indexing and dequantization before rounding for W4A16. |
+| [Asynchronous reduction](specs/PlaitAsyncReduction.tla) | W4A4 device completion, stale-event rejection, and deterministic folding. An independent operation completes even while a producer or pull in another operation stalls. |
+| [Ordered publication](specs/PlaitOrderedPublication.tla) | Completion and revocation in the agreed command order, receipt identity on retry, and recovery from a replica's durable command prefix. |
+
+Run the model suite with TLC on your `PATH`.
 
 ```sh
 ./scripts/check-tla.sh
 ```
 
-The script expects `tlc` on `PATH`.
+The device model assumes stream ordering and output visibility after a
+successful wait and copy. The ordered publication model assumes a common
+order for commands that affect the same group. Each finite configuration
+defines the inputs, faults, and fairness explored by TLC.
 
 ## Repository layout
 
@@ -237,13 +254,15 @@ Design documents:
 ## Limitations
 
 - No authentication or encryption. The transport trusts the network.
-- No durable state. Restart with the same identity is not handled.
+- The local replica journal recovers ordered control state. Device buffers
+  and in-flight tensor transfers must be recreated after process loss.
 - No verified cross-host GPU-buffer collective outside the host-staged `plait-nccl` TCP path.
-- Only NVIDIA has a real kernel adapter. AMD, Huawei, and PPU profiles are
-  discovered and scheduled, but their kernel adapters are not implemented.
+- Native kernel availability depends on the backend, architecture, shape,
+  and activation format. Check the adapter's advertised capability before
+  choosing a placement.
 - LL/LL128 remain opt-in and are slower on the tested PCIe host.
-- TLA+ results are finite-state checks, not a refinement proof of the Rust
-  implementation.
+- Vendor instruction semantics, floating-point rounding, and refinement from
+  the Rust runtime and device code to these specifications remain open.
 
 ## License
 

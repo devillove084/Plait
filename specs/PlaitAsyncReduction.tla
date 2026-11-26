@@ -1,20 +1,35 @@
 ---- MODULE PlaitAsyncReduction ----
 \* Two admitted operations overlap across two epochs or use the same two workers
 \* in one epoch. Each operation uses two immutable K shards.
-\* Publish and Pull model dispatch_and_reduce, Reduce models KReduction,
-\* and Complete models the ordered commit authorizing delivery after reduction.
-EXTENDS Naturals, FiniteSets
+\* An INT32 W4A4 group at each shard has unit scale in this model. The
+\* reduction includes device writes, event synchronization and a host copy.
+\* Complete models the ordered commit authorizing delivery after reduction.
+EXTENDS PlaitW4A4, PlaitDeviceCompletion, FiniteSets
 
 CONSTANTS StopOldShard, HoldOldPull, AllowRevoke, AllowExpire, AllowFailure, SharedEpoch
-VARIABLES active, revoked, admitted, pending, published, pulled, prefix, committed, delivered, failed
+VARIABLES active, revoked, admitted, pending, published, pulled, prefix, committed, delivered, failed,
+          device, partialSum
 
 Ops == {1, 2}
 Shards == {1, 2}
 Epochs == {1, 2}
 Old == 1
 New == 2
-vars == <<active, revoked, admitted, pending, published, pulled, prefix, committed, delivered, failed>>
-EmptyReceipt == [count |-> 0, authorized |-> FALSE]
+vars == <<active, revoked, admitted, pending, published, pulled, prefix, committed, delivered, failed,
+          device, partialSum>>
+EmptyReceipt == [count |-> 0, authorized |-> FALSE, value |-> 0]
+
+ActCodes(o, k) == <<o, 16 - k>>
+WeightCodes(o, k) == <<10 + k, 2 + o>>
+ZeroPoint(k) == 2 * k + 1
+KernelResult(o, k) == NativeDot(ActCodes(o, k), WeightCodes(o, k), ZeroPoint(k))
+ReferenceResult(o, k) == LogicalDot(ActCodes(o, k), WeightCodes(o, k), ZeroPoint(k))
+ReferencePrefix(o, count) ==
+    (IF count >= 1 THEN ReferenceResult(o, 1) ELSE 0)
+    + (IF count >= 2 THEN ReferenceResult(o, 2) ELSE 0)
+ExpectedStamp(o, k) == CompletionStamp(k, admitted[o], o, k, admitted[o])
+EventStamps == {CompletionStamp(s, e, source, shard, f) :
+    s \in Shards, e \in Epochs, source \in Ops, shard \in Shards, f \in Epochs}
 
 Init ==
     /\ active = Old
@@ -27,6 +42,8 @@ Init ==
     /\ committed = [o \in Ops |-> EmptyReceipt]
     /\ delivered = committed
     /\ failed = FALSE
+    /\ device = [o \in Ops |-> [k \in Shards |-> EmptyDeviceJob]]
+    /\ partialSum = [o \in Ops |-> 0]
 
 LiveGrant(o) == o \in pending /\ (admitted[o] # Old \/ ~revoked)
 
@@ -36,37 +53,37 @@ Admit(o) ==
     /\ (HoldOldPull /\ o = New) => 2 \in published[Old]
     /\ admitted' = [admitted EXCEPT ![o] = active]
     /\ pending' = pending \cup {o}
-    /\ UNCHANGED <<active, revoked, published, pulled, prefix, committed, delivered, failed>>
+    /\ UNCHANGED <<active, revoked, published, pulled, prefix, committed, delivered, failed, device, partialSum>>
 
 Activate ==
     /\ ~SharedEpoch /\ active = Old
     /\ admitted[Old] = Old
     /\ active' = New
-    /\ UNCHANGED <<revoked, admitted, pending, published, pulled, prefix, committed, delivered, failed>>
+    /\ UNCHANGED <<revoked, admitted, pending, published, pulled, prefix, committed, delivered, failed, device, partialSum>>
 
 RevokeOld ==
     /\ AllowRevoke /\ active = New /\ ~revoked
     /\ revoked' = TRUE
-    /\ UNCHANGED <<active, admitted, pending, published, pulled, prefix, committed, delivered, failed>>
+    /\ UNCHANGED <<active, admitted, pending, published, pulled, prefix, committed, delivered, failed, device, partialSum>>
 
 \* Exercise the race after the data plane already has the full reduction.
 ExpireOld ==
     /\ AllowExpire /\ active = New /\ Old \in pending
     /\ prefix[Old] = Cardinality(Shards)
     /\ pending' = pending \ {Old}
-    /\ UNCHANGED <<active, revoked, admitted, published, pulled, prefix, committed, delivered, failed>>
+    /\ UNCHANGED <<active, revoked, admitted, published, pulled, prefix, committed, delivered, failed, device, partialSum>>
 
 \* After a terminal error on one shard, the caller's report and the ordered
 \* admission close can advance independently of other shard results.
 ReportOldFailure ==
     /\ AllowFailure /\ Old \in pending /\ ~failed
     /\ failed' = TRUE
-    /\ UNCHANGED <<active, revoked, admitted, pending, published, pulled, prefix, committed, delivered>>
+    /\ UNCHANGED <<active, revoked, admitted, pending, published, pulled, prefix, committed, delivered, device, partialSum>>
 
 CloseFailedAdmission ==
     /\ failed /\ Old \in pending
     /\ pending' = pending \ {Old}
-    /\ UNCHANGED <<active, revoked, admitted, published, pulled, prefix, committed, delivered, failed>>
+    /\ UNCHANGED <<active, revoked, admitted, published, pulled, prefix, committed, delivered, failed, device, partialSum>>
 
 Collecting(o) == ~(o = Old /\ failed)
 
@@ -74,12 +91,35 @@ Collecting(o) == ~(o = Old /\ failed)
 \* transfer is stalled, so the same producer can serve another operation.
 PullHeld(o, k) == HoldOldPull /\ o = Old /\ k = 2
 
+QueueShard(o, k) ==
+    /\ LiveGrant(o)
+    /\ device[o][k].phase = "Idle"
+    /\ device' = [device EXCEPT ![o][k] = QueueDevice(ExpectedStamp(o, k))]
+    /\ UNCHANGED <<active, revoked, admitted, pending, published, pulled, prefix, committed, delivered, failed, partialSum>>
+
+\* Already enqueued work may finish locally even if its grant is revoked.
+WriteShard(o, k) ==
+    /\ ~(StopOldShard /\ o = Old /\ k = 2)
+    /\ CanWriteDevice(device[o][k])
+    /\ device' = [device EXCEPT ![o][k] = WriteDevice(@, KernelResult(o, k))]
+    /\ UNCHANGED <<active, revoked, admitted, pending, published, pulled, prefix, committed, delivered, failed, partialSum>>
+
+SignalShard(o, k, stamp) ==
+    /\ CanSignalDevice(device[o][k], stamp)
+    /\ device' = [device EXCEPT ![o][k] = SignalDevice(@, stamp)]
+    /\ UNCHANGED <<active, revoked, admitted, pending, published, pulled, prefix, committed, delivered, failed, partialSum>>
+
+CopyShard(o, k) ==
+    /\ CanCopyDevice(device[o][k], ExpectedStamp(o, k))
+    /\ device' = [device EXCEPT ![o][k] = CopyDevice(@)]
+    /\ UNCHANGED <<active, revoked, admitted, pending, published, pulled, prefix, committed, delivered, failed, partialSum>>
+
 Publish(o, k) ==
     /\ LiveGrant(o)
-    /\ ~(StopOldShard /\ o = Old /\ k = 2)
+    /\ CanPublishDevice(device[o][k], ExpectedStamp(o, k))
     /\ k \notin published[o]
     /\ published' = [published EXCEPT ![o] = @ \cup {k}]
-    /\ UNCHANGED <<active, revoked, admitted, pending, pulled, prefix, committed, delivered, failed>>
+    /\ UNCHANGED <<active, revoked, admitted, pending, pulled, prefix, committed, delivered, failed, device, partialSum>>
 
 Pull(o, source, epoch, k) ==
     /\ Collecting(o)
@@ -87,13 +127,14 @@ Pull(o, source, epoch, k) ==
     /\ k \in published[source] \ pulled[o]
     /\ ~PullHeld(o, k)
     /\ pulled' = [pulled EXCEPT ![o] = @ \cup {k}]
-    /\ UNCHANGED <<active, revoked, admitted, pending, published, prefix, committed, delivered, failed>>
+    /\ UNCHANGED <<active, revoked, admitted, pending, published, prefix, committed, delivered, failed, device, partialSum>>
 
 Reduce(o) ==
     /\ Collecting(o)
     /\ prefix[o] + 1 \in pulled[o]
+    /\ partialSum' = [partialSum EXCEPT ![o] = @ + device[o][prefix[o] + 1].snapshot]
     /\ prefix' = [prefix EXCEPT ![o] = @ + 1]
-    /\ UNCHANGED <<active, revoked, admitted, pending, published, pulled, committed, delivered, failed>>
+    /\ UNCHANGED <<active, revoked, admitted, pending, published, pulled, committed, delivered, failed, device>>
 
 Complete(o) ==
     /\ Collecting(o)
@@ -101,14 +142,15 @@ Complete(o) ==
     /\ prefix[o] = Cardinality(Shards)
     /\ committed[o] = EmptyReceipt
     /\ pending' = pending \ {o}
-    /\ committed' = [committed EXCEPT ![o] = [count |-> prefix[o], authorized |-> LiveGrant(o)]]
-    /\ UNCHANGED <<active, revoked, admitted, published, pulled, prefix, delivered, failed>>
+    /\ committed' = [committed EXCEPT ![o] =
+        [count |-> prefix[o], authorized |-> LiveGrant(o), value |-> partialSum[o]]]
+    /\ UNCHANGED <<active, revoked, admitted, published, pulled, prefix, delivered, failed, device, partialSum>>
 
 Deliver(o) ==
     /\ committed[o] # EmptyReceipt
     /\ delivered[o].count = 0
     /\ delivered' = [delivered EXCEPT ![o] = committed[o]]
-    /\ UNCHANGED <<active, revoked, admitted, pending, published, pulled, prefix, committed, failed>>
+    /\ UNCHANGED <<active, revoked, admitted, pending, published, pulled, prefix, committed, failed, device, partialSum>>
 
 Next ==
     \/ Activate
@@ -117,7 +159,9 @@ Next ==
     \/ ReportOldFailure
     \/ CloseFailedAdmission
     \/ \E o \in Ops : Admit(o) \/ Reduce(o) \/ Complete(o) \/ Deliver(o)
-    \/ \E o \in Ops, k \in Shards : Publish(o, k)
+    \/ \E o \in Ops, k \in Shards :
+        \/ QueueShard(o, k) \/ WriteShard(o, k) \/ CopyShard(o, k) \/ Publish(o, k)
+        \/ \E stamp \in EventStamps : SignalShard(o, k, stamp)
     \/ \E o, source \in Ops, epoch \in Epochs, k \in Shards : Pull(o, source, epoch, k)
 
 \* Every productive transition advances a finite operation lifecycle.
@@ -125,12 +169,26 @@ Next ==
 Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
 
 PrefixOfReceived ==
-    \A o \in Ops : pulled[o] \subseteq published[o] /\ 1..prefix[o] \subseteq pulled[o]
+    \A o \in Ops :
+        /\ pulled[o] \subseteq published[o] /\ 1..prefix[o] \subseteq pulled[o]
+        /\ partialSum[o] = ReferencePrefix(o, prefix[o])
+
+DeviceHandoffIsSound ==
+    \A o \in Ops, k \in Shards :
+        /\ DeviceJobSound(device[o][k], ExpectedStamp(o, k), ReferenceResult(o, k))
+        /\ k \in published[o] =>
+            CanPublishDevice(device[o][k], ExpectedStamp(o, k))
+            /\ device[o][k].snapshot = ReferenceResult(o, k)
+
+StaleEventRejected ==
+    \A o \in Ops, k \in Shards, stamp \in EventStamps :
+        stamp # ExpectedStamp(o, k) => ~ENABLED SignalShard(o, k, stamp)
 
 CompleteAndAuthorized ==
     \A o \in Ops :
         /\ committed[o] # EmptyReceipt =>
             committed[o].count = Cardinality(Shards) /\ committed[o].authorized /\ o \notin pending
+            /\ committed[o].value = ReferencePrefix(o, Cardinality(Shards))
         /\ delivered[o] # EmptyReceipt => delivered[o] = committed[o]
 
 ForeignPayloadRejected ==
@@ -147,7 +205,8 @@ IncrementalFoldEnabled ==
 
 SharedWorkerCanPublish ==
     \A o \in Ops, k \in Shards :
-        SharedEpoch /\ LiveGrant(o) /\ k \notin published[o] => ENABLED Publish(o, k)
+        SharedEpoch /\ LiveGrant(o) /\ k \notin published[o]
+        /\ CanPublishDevice(device[o][k], ExpectedStamp(o, k)) => ENABLED Publish(o, k)
 
 StalledOldNeverDelivers == StopOldShard => delivered[Old].count = 0
 HeldPullNeverDelivers ==

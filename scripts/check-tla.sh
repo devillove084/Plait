@@ -20,3 +20,7 @@ tlc -deadlock -config specs/PlaitResidentReclaim.cfg specs/PlaitResidentReclaim.
 tlc -deadlock -config specs/PlaitResidentReclaimVerified.cfg specs/PlaitResidentReclaim.tla
 tlc -deadlock -config specs/PlaitEpochAdmission.cfg specs/PlaitEpochAdmission.tla
 tlc -deadlock -config specs/PlaitHostLaunch.cfg specs/PlaitHostLaunch.tla
+tlc -deadlock -config specs/PlaitKernelPrimitivesCheck.cfg specs/PlaitKernelPrimitivesCheck.tla
+tlc -deadlock -config specs/PlaitW4A4Check.cfg specs/PlaitW4A4Check.tla
+tlc -deadlock -config specs/PlaitW4OperatorsCheck.cfg specs/PlaitW4OperatorsCheck.tla
+tlc -deadlock -config specs/PlaitOrderedPublication.cfg specs/PlaitOrderedPublication.tla
