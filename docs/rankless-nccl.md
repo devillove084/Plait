@@ -26,6 +26,31 @@ claim. Plait includes the group ID and epoch in the manifest digest. Peers
 with different group versions fail the handshake. A managed replacement
 and its predecessor can hold separate communicators at the same time.
 
+### Assign different numbers of workers per host
+
+For four TP workers across three hosts, start the same model on each host.
+Use the control host's address and port for `MASTER_ADDR` and `MASTER_PORT`.
+
+```sh
+VLLM_USE_PLAIT=1 vllm serve "$MODEL" --enforce-eager \
+  --distributed-executor-backend mp --nnodes 3 \
+  --master-addr "$MASTER_ADDR" --master-port "$MASTER_PORT" --node-rank "$NODE_RANK" \
+  --tensor-parallel-size 4 --plait-tp-layout 2 1 1
+```
+
+Set `NODE_RANK` to `0`, `1`, or `2` and append `--headless` on
+hosts 1 and 2. Host 0 gets slots 0 and 1, host 1 gets slot 2, and host 2
+gets slot 3. The host's visible device order determines the local workers'
+device assignments. Each host registers its layout on the existing
+vLLM rendezvous endpoint before creating workers. Conflicting layouts
+fail startup. Workers that can share memory with the control worker
+use shared-memory response queues. Other workers use socket queues.
+
+The explicit layout applies to one TP group with DP, PP, and prefill
+context parallel sizes of one. The counts describe workers per host.
+The model's tensor-partitioning rules determine each worker's shard.
+The placement is fixed for the lifetime of that vLLM process group.
+
 ## Execute a collective
 
 For small all-reduces, each worker sends its complete contribution to each
