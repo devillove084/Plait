@@ -22,9 +22,12 @@ mod cross;
 mod ipc;
 mod kernel;
 mod p2p;
+mod peer;
 mod shm;
 
 use backend::{CudaRuntime, DeviceRuntime, HostCopyRuntime, HuaweiRuntime, PpuRuntime};
+use peer::{Collective, PeerGroup};
+pub use peer::{Endpoint as PeerEndpoint, Listener as PeerListener};
 
 pub type NcclResult = i32;
 pub const NCCL_SUCCESS: NcclResult = 0;
@@ -316,8 +319,7 @@ pub struct Comm {
     rank: usize,
     world: usize,
     device: usize,
-    network: Mutex<Network>,
-    p2p: Mutex<p2p::P2p>,
+    transport: Transport,
     kernel: Option<Mutex<kernel::KernelAllreduce>>,
     shm: Option<Arc<Mutex<shm::Shm>>>,
     cross: Option<Mutex<cross::Cross>>,
@@ -326,13 +328,67 @@ pub struct Comm {
     runtime: Box<dyn DeviceRuntime>,
 }
 
-static LAST_ERROR: OnceLock<Mutex<String>> = OnceLock::new();
+enum Transport {
+    Star {
+        network: Mutex<Network>,
+        p2p: Mutex<p2p::P2p>,
+    },
+    Peers(Arc<PeerGroup>),
+}
+
+impl Comm {
+    pub fn connect_peers(
+        listener: PeerListener,
+        members: Vec<PeerEndpoint>,
+        slot: usize,
+        device: usize,
+        timeout: Duration,
+    ) -> Result<Box<Self>, String> {
+        let world = members.len();
+        let group = listener
+            .connect(slot, members, timeout)
+            .map_err(|error| error.to_string())?;
+        let runtime = create_runtime(backend_from_env()?, device)?;
+        Ok(Box::new(Self::with_peers(
+            group, slot, world, device, runtime,
+        )))
+    }
+
+    fn with_peers(
+        group: Arc<PeerGroup>,
+        rank: usize,
+        world: usize,
+        device: usize,
+        runtime: Box<dyn DeviceRuntime>,
+    ) -> Self {
+        Self {
+            rank,
+            world,
+            device,
+            transport: Transport::Peers(group),
+            kernel: None,
+            shm: None,
+            cross: None,
+            ipc: None,
+            layout: None,
+            runtime,
+        }
+    }
+
+    fn star_network(&self) -> &Mutex<Network> {
+        match &self.transport {
+            Transport::Star { network, .. } => network,
+            Transport::Peers(_) => unreachable!("requires a star communicator"),
+        }
+    }
+}
+
+thread_local! {
+    static LAST_ERROR: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
 
 fn set_error(message: impl Into<String>) -> NcclResult {
-    *LAST_ERROR
-        .get_or_init(|| Mutex::new(String::new()))
-        .lock()
-        .unwrap() = message.into();
+    LAST_ERROR.with(|error| *error.borrow_mut() = message.into());
     NCCL_INVALID_USAGE
 }
 
@@ -445,7 +501,45 @@ fn device_to_host(
 fn synchronize_stream(comm: &Comm, stream: *mut std::ffi::c_void) -> Result<(), NcclResult> {
     comm.runtime
         .synchronize_stream(stream as u64)
-        .map_err(|error| set_error(error.0))
+        .map_err(|error| {
+            if let Transport::Peers(group) = &comm.transport {
+                group.fail();
+            }
+            set_error(error.0)
+        })
+}
+
+fn execute_peer_collective(
+    comm: &Comm,
+    group: &PeerGroup,
+    op: Collective,
+    send: *const std::ffi::c_void,
+    recv: *mut std::ffi::c_void,
+    bytes: usize,
+    stream: *mut std::ffi::c_void,
+) -> NcclResult {
+    if let Err(error) = synchronize_stream(comm, stream) {
+        return error;
+    }
+    let mut input = vec![0u8; bytes];
+    let needs_input = !matches!(op, Collective::Broadcast(_, source) if source != comm.rank);
+    if needs_input
+        && bytes != 0
+        && (send.is_null()
+            || device_to_host(comm.runtime.as_ref(), send as u64, &mut input).is_err())
+    {
+        group.fail();
+        return NCCL_UNHANDLED_CUDA_ERROR;
+    }
+    let output = match group.execute(op, &input) {
+        Ok(output) => output,
+        Err(error) => return set_error(error.to_string()),
+    };
+    if !output.is_empty() && host_to_device(comm.runtime.as_ref(), recv as u64, &output).is_err() {
+        group.fail();
+        return NCCL_UNHANDLED_CUDA_ERROR;
+    }
+    NCCL_SUCCESS
 }
 
 /// E4M3 finite value, used by the optional quantized-communication path.
@@ -519,8 +613,9 @@ pub(crate) fn reduce_fp8_to_f32(buffers: &[Vec<u8>]) -> Vec<u8> {
         .collect()
 }
 
+#[cfg(feature = "python")]
 fn all_reduce_fp8_host(comm: &Comm, send: &[u8]) -> Result<Vec<u8>, NcclResult> {
-    let mut network = comm.network.lock().unwrap();
+    let mut network = comm.star_network().lock().unwrap();
     if comm.world == 1 {
         return Ok(reduce_fp8_to_f32(&[send.to_vec()]));
     }
@@ -797,8 +892,10 @@ fn create_comm(
         rank: rank as usize,
         world: nranks as usize,
         device,
-        network: Mutex::new(network),
-        p2p: Mutex::new(p2p),
+        transport: Transport::Star {
+            network: Mutex::new(network),
+            p2p: Mutex::new(p2p),
+        },
         kernel: None,
         shm,
         cross: cross.map(Mutex::new),
@@ -944,8 +1041,10 @@ fn join_group(
         rank,
         world,
         device,
-        network: Mutex::new(network),
-        p2p: Mutex::new(p2p),
+        transport: Transport::Star {
+            network: Mutex::new(network),
+            p2p: Mutex::new(p2p),
+        },
         kernel: None,
         shm,
         cross: cross.map(Mutex::new),
@@ -1133,7 +1232,7 @@ fn all_reduce_two_level_finish(
             }
             result
         } else {
-            let mut network = comm.network.lock().unwrap();
+            let mut network = comm.star_network().lock().unwrap();
             for leader in &remote_leaders {
                 let index = leader.checked_sub(1).ok_or(NCCL_INVALID_USAGE)?;
                 let peer = network.peers.get_mut(index).ok_or(NCCL_INVALID_USAGE)?;
@@ -1158,7 +1257,7 @@ fn all_reduce_two_level_finish(
             .leader_recv(bytes)
             .map_err(|_| NCCL_UNHANDLED_CUDA_ERROR)?
     } else {
-        let mut network = comm.network.lock().unwrap();
+        let mut network = comm.star_network().lock().unwrap();
         let root = network.root.as_mut().ok_or(NCCL_INVALID_USAGE)?;
         send_all(root, &local).map_err(|_| NCCL_UNHANDLED_CUDA_ERROR)?;
         let mut result = vec![0u8; bytes];
@@ -1347,7 +1446,7 @@ fn all_reduce_host(
     dtype: DataType,
     op: ReduceOp,
 ) -> Result<Vec<u8>, NcclResult> {
-    let mut network = comm.network.lock().unwrap();
+    let mut network = comm.star_network().lock().unwrap();
     if comm.world == 1 {
         return Ok(send.to_vec());
     }
@@ -1392,8 +1491,21 @@ pub extern "C" fn ncclAllReduce(
     let Some(op) = ReduceOp::from_raw(op) else {
         return NCCL_INVALID_ARGUMENT;
     };
-    let bytes = count * dtype.bytes();
+    let Some(bytes) = count.checked_mul(dtype.bytes()) else {
+        return NCCL_INVALID_ARGUMENT;
+    };
     let comm = unsafe { &*comm };
+    if let Transport::Peers(group) = &comm.transport {
+        return execute_peer_collective(
+            comm,
+            group,
+            Collective::AllReduce(dtype, op),
+            sendbuff,
+            recvbuff,
+            bytes,
+            stream,
+        );
+    }
     if let Some(kernel) = &comm.kernel {
         if matches!(
             dtype,
@@ -1494,8 +1606,24 @@ pub extern "C" fn ncclAllGather(
     let Some(dtype) = DataType::from_raw(datatype) else {
         return NCCL_INVALID_ARGUMENT;
     };
-    let bytes = count * dtype.bytes();
     let comm = unsafe { &*comm };
+    let Some(bytes) = count
+        .checked_mul(dtype.bytes())
+        .filter(|bytes| bytes.checked_mul(comm.world).is_some())
+    else {
+        return NCCL_INVALID_ARGUMENT;
+    };
+    if let Transport::Peers(group) = &comm.transport {
+        return execute_peer_collective(
+            comm,
+            group,
+            Collective::AllGather(dtype),
+            sendbuff,
+            recvbuff,
+            bytes,
+            stream,
+        );
+    }
     if let Err(error) = synchronize_stream(comm, stream) {
         return error;
     }
@@ -1518,7 +1646,7 @@ pub extern "C" fn ncclAllGather(
     if device_to_host(comm.runtime.as_ref(), sendbuff as u64, &mut host).is_err() {
         return NCCL_UNHANDLED_CUDA_ERROR;
     }
-    let mut network = comm.network.lock().unwrap();
+    let mut network = comm.star_network().lock().unwrap();
     let result = if comm.rank == 0 {
         let mut all = Vec::with_capacity(bytes * comm.world);
         all.extend_from_slice(&host);
@@ -1572,8 +1700,21 @@ pub extern "C" fn ncclBroadcast(
     if root_rank < 0 || root_rank as usize >= unsafe { (*comm).world } {
         return NCCL_INVALID_ARGUMENT;
     }
-    let bytes = count * dtype.bytes();
+    let Some(bytes) = count.checked_mul(dtype.bytes()) else {
+        return NCCL_INVALID_ARGUMENT;
+    };
     let comm = unsafe { &*comm };
+    if let Transport::Peers(group) = &comm.transport {
+        return execute_peer_collective(
+            comm,
+            group,
+            Collective::Broadcast(dtype, root_rank as usize),
+            sendbuff,
+            recvbuff,
+            bytes,
+            stream,
+        );
+    }
     if let Err(error) = synchronize_stream(comm, stream) {
         return error;
     }
@@ -1607,7 +1748,7 @@ pub extern "C" fn ncclBroadcast(
     {
         return NCCL_UNHANDLED_CUDA_ERROR;
     }
-    let mut network = comm.network.lock().unwrap();
+    let mut network = comm.star_network().lock().unwrap();
     let result = if comm.rank == 0 {
         let mut buffers = Vec::with_capacity(comm.world);
         buffers.push(host.clone());
@@ -1706,11 +1847,26 @@ pub extern "C" fn ncclReduceScatter(
     // NCCL's reduce-scatter count is per rank: the send buffer holds
     // count * world elements and each rank receives count elements.
     let comm = unsafe { &*comm };
+    let Some(width) = count.checked_mul(dtype.bytes()) else {
+        return NCCL_INVALID_ARGUMENT;
+    };
+    let Some(bytes) = width.checked_mul(comm.world) else {
+        return NCCL_INVALID_ARGUMENT;
+    };
+    if let Transport::Peers(group) = &comm.transport {
+        return execute_peer_collective(
+            comm,
+            group,
+            Collective::ReduceScatter(dtype, op),
+            sendbuff,
+            recvbuff,
+            bytes,
+            stream,
+        );
+    }
     if let Err(error) = synchronize_stream(comm, stream) {
         return error;
     }
-    let width = count * dtype.bytes();
-    let bytes = width * comm.world;
     if let Some(shm) = &comm.shm {
         let mut shm = shm.lock().unwrap();
         if bytes <= shm.slot_bytes() && !(comm.layout.is_some() && matches!(op, ReduceOp::Avg)) {
@@ -1731,7 +1887,7 @@ pub extern "C" fn ncclReduceScatter(
     if device_to_host(comm.runtime.as_ref(), sendbuff as u64, &mut host).is_err() {
         return NCCL_UNHANDLED_CUDA_ERROR;
     }
-    let mut network = comm.network.lock().unwrap();
+    let mut network = comm.star_network().lock().unwrap();
     let result = if comm.rank == 0 {
         let mut buffers = Vec::with_capacity(comm.world);
         buffers.push(host);
@@ -1780,7 +1936,7 @@ pub extern "C" fn ncclReduce(
     comm: *mut Comm,
     stream: *mut std::ffi::c_void,
 ) -> NcclResult {
-    if sendbuff.is_null() || recvbuff.is_null() || comm.is_null() {
+    if sendbuff.is_null() || comm.is_null() {
         return NCCL_INVALID_ARGUMENT;
     }
     let Some(dtype) = DataType::from_raw(datatype) else {
@@ -1789,8 +1945,27 @@ pub extern "C" fn ncclReduce(
     let Some(op) = ReduceOp::from_raw(op) else {
         return NCCL_INVALID_ARGUMENT;
     };
-    let bytes = count * dtype.bytes();
+    let Some(bytes) = count.checked_mul(dtype.bytes()) else {
+        return NCCL_INVALID_ARGUMENT;
+    };
     let comm = unsafe { &*comm };
+    if root_rank < 0
+        || root_rank as usize >= comm.world
+        || (comm.rank == root_rank as usize && recvbuff.is_null())
+    {
+        return NCCL_INVALID_ARGUMENT;
+    }
+    if let Transport::Peers(group) = &comm.transport {
+        return execute_peer_collective(
+            comm,
+            group,
+            Collective::Reduce(dtype, op, root_rank as usize),
+            sendbuff,
+            recvbuff,
+            bytes,
+            stream,
+        );
+    }
     if let Err(error) = synchronize_stream(comm, stream) {
         return error;
     }
@@ -1798,7 +1973,7 @@ pub extern "C" fn ncclReduce(
     if device_to_host(comm.runtime.as_ref(), sendbuff as u64, &mut host).is_err() {
         return NCCL_UNHANDLED_CUDA_ERROR;
     }
-    let mut network = comm.network.lock().unwrap();
+    let mut network = comm.star_network().lock().unwrap();
     let reduced = if comm.rank == 0 {
         let mut buffers = Vec::with_capacity(comm.world);
         buffers.push(host);
@@ -1859,15 +2034,30 @@ pub extern "C" fn ncclSend(
     if let Err(error) = synchronize_stream(comm, stream) {
         return error;
     }
-    let bytes = count * dtype.bytes();
+    let Some(bytes) = count.checked_mul(dtype.bytes()) else {
+        return NCCL_INVALID_ARGUMENT;
+    };
     let mut host = vec![0u8; bytes];
     if device_to_host(comm.runtime.as_ref(), sendbuff as u64, &mut host).is_err() {
+        if let Transport::Peers(group) = &comm.transport {
+            group.fail();
+        }
         return NCCL_UNHANDLED_CUDA_ERROR;
     }
-    match comm.p2p.lock().unwrap().send(dest as u32, &host) {
-        Ok(()) => NCCL_SUCCESS,
-        Err(error) => set_error(format!("p2p send: {error}")),
-    }
+    let result = match &comm.transport {
+        Transport::Star { p2p, .. } => p2p
+            .lock()
+            .unwrap()
+            .send(dest as u32, &host)
+            .map_err(|error| error.to_string()),
+        Transport::Peers(group) => group
+            .send(dest as usize, dtype, host)
+            .map_err(|error| error.to_string()),
+    };
+    result.map_or_else(
+        |error| set_error(format!("p2p send: {error}")),
+        |()| NCCL_SUCCESS,
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -1892,12 +2082,27 @@ pub extern "C" fn ncclRecv(
     if let Err(error) = synchronize_stream(comm, stream) {
         return error;
     }
-    let bytes = count * dtype.bytes();
-    let result = match comm.p2p.lock().unwrap().recv(src as u32, bytes) {
+    let Some(bytes) = count.checked_mul(dtype.bytes()) else {
+        return NCCL_INVALID_ARGUMENT;
+    };
+    let received = match &comm.transport {
+        Transport::Star { p2p, .. } => p2p
+            .lock()
+            .unwrap()
+            .recv(src as u32, bytes)
+            .map_err(|error| error.to_string()),
+        Transport::Peers(group) => group
+            .recv(src as usize, dtype, bytes)
+            .map_err(|error| error.to_string()),
+    };
+    let result = match received {
         Ok(buffer) => buffer,
         Err(error) => return set_error(format!("p2p recv: {error}")),
     };
     if host_to_device(comm.runtime.as_ref(), recvbuff as u64, &result).is_err() {
+        if let Transport::Peers(group) = &comm.transport {
+            group.fail();
+        }
         return NCCL_UNHANDLED_CUDA_ERROR;
     }
     NCCL_SUCCESS
@@ -1928,6 +2133,25 @@ unsafe impl Send for CommHandle {}
 unsafe impl Sync for CommHandle {}
 
 #[cfg(feature = "python")]
+impl CommHandle {
+    fn pointer(&self) -> *mut Comm {
+        self.ptr
+    }
+
+    fn call(
+        &self,
+        py: Python<'_>,
+        function: impl FnOnce(*mut Comm) -> NcclResult + Send,
+    ) -> NcclResult {
+        if matches!(&unsafe { &*self.ptr }.transport, Transport::Peers(_)) {
+            py.allow_threads(move || function(self.pointer()))
+        } else {
+            function(self.ptr)
+        }
+    }
+}
+
+#[cfg(feature = "python")]
 #[pymethods]
 impl CommHandle {
     #[new]
@@ -1948,20 +2172,38 @@ impl CommHandle {
         unsafe { (*self.ptr).world as i32 }
     }
 
-    fn all_reduce(&self, send: u64, recv: u64, count: usize, dtype: i32, op: i32) -> i32 {
-        ncclAllReduce(
-            send as *const std::ffi::c_void,
-            recv as *mut std::ffi::c_void,
-            count,
-            dtype,
-            op,
-            self.ptr,
-            std::ptr::null_mut(),
-        )
+    fn abort(&self) {
+        if let Transport::Peers(group) = &unsafe { &*self.ptr }.transport {
+            group.fail();
+        }
     }
 
+    fn all_reduce(
+        &self,
+        py: Python<'_>,
+        send: u64,
+        recv: u64,
+        count: usize,
+        dtype: i32,
+        op: i32,
+    ) -> i32 {
+        self.call(py, |ptr| {
+            ncclAllReduce(
+                send as *const std::ffi::c_void,
+                recv as *mut std::ffi::c_void,
+                count,
+                dtype,
+                op,
+                ptr,
+                std::ptr::null_mut(),
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)] // The Python token is in addition to the public ABI.
     fn all_reduce_stream(
         &self,
+        py: Python<'_>,
         send: u64,
         recv: u64,
         count: usize,
@@ -1969,51 +2211,50 @@ impl CommHandle {
         op: i32,
         stream: u64,
     ) -> i32 {
-        ncclAllReduce(
-            send as *const std::ffi::c_void,
-            recv as *mut std::ffi::c_void,
-            count,
-            dtype,
-            op,
-            self.ptr,
-            stream as *mut std::ffi::c_void,
-        )
+        self.call(py, |ptr| {
+            ncclAllReduce(
+                send as *const std::ffi::c_void,
+                recv as *mut std::ffi::c_void,
+                count,
+                dtype,
+                op,
+                ptr,
+                stream as *mut std::ffi::c_void,
+            )
+        })
     }
 
-    fn all_reduce_fp8_to_f32(&self, send: u64, recv: u64, count: usize) -> i32 {
-        let comm = unsafe { &*self.ptr };
-        if count == 0 {
-            return NCCL_SUCCESS;
-        }
-        let mut host = vec![0u8; count];
-        if device_to_host(comm.runtime.as_ref(), send, &mut host).is_err() {
-            return NCCL_UNHANDLED_CUDA_ERROR;
-        }
-        let result = match all_reduce_fp8_host(comm, &host) {
-            Ok(result) => result,
-            Err(error) => return error,
-        };
-        if host_to_device(comm.runtime.as_ref(), recv, &result).is_err() {
-            return NCCL_UNHANDLED_CUDA_ERROR;
-        }
-        NCCL_SUCCESS
+    fn all_reduce_fp8_to_f32(&self, py: Python<'_>, send: u64, recv: u64, count: usize) -> i32 {
+        self.call(py, |ptr| all_reduce_fp8(ptr, send, recv, count))
     }
 
     #[pyo3(signature = (send, recv, count, dtype, stream=0))]
-    fn all_gather(&self, send: u64, recv: u64, count: usize, dtype: i32, stream: u64) -> i32 {
-        ncclAllGather(
-            send as *const std::ffi::c_void,
-            recv as *mut std::ffi::c_void,
-            count,
-            dtype,
-            self.ptr,
-            stream as *mut std::ffi::c_void,
-        )
+    fn all_gather(
+        &self,
+        py: Python<'_>,
+        send: u64,
+        recv: u64,
+        count: usize,
+        dtype: i32,
+        stream: u64,
+    ) -> i32 {
+        self.call(py, |ptr| {
+            ncclAllGather(
+                send as *const std::ffi::c_void,
+                recv as *mut std::ffi::c_void,
+                count,
+                dtype,
+                ptr,
+                stream as *mut std::ffi::c_void,
+            )
+        })
     }
 
     #[pyo3(signature = (send, recv, count, dtype, root, stream=0))]
+    #[allow(clippy::too_many_arguments)]
     fn broadcast(
         &self,
+        py: Python<'_>,
         send: u64,
         recv: u64,
         count: usize,
@@ -2021,20 +2262,24 @@ impl CommHandle {
         root: i32,
         stream: u64,
     ) -> i32 {
-        ncclBroadcast(
-            send as *const std::ffi::c_void,
-            recv as *mut std::ffi::c_void,
-            count,
-            dtype,
-            root,
-            self.ptr,
-            stream as *mut std::ffi::c_void,
-        )
+        self.call(py, |ptr| {
+            ncclBroadcast(
+                send as *const std::ffi::c_void,
+                recv as *mut std::ffi::c_void,
+                count,
+                dtype,
+                root,
+                ptr,
+                stream as *mut std::ffi::c_void,
+            )
+        })
     }
 
     #[pyo3(signature = (send, recv, count, dtype, op, stream=0))]
+    #[allow(clippy::too_many_arguments)]
     fn reduce_scatter(
         &self,
+        py: Python<'_>,
         send: u64,
         recv: u64,
         count: usize,
@@ -2042,20 +2287,24 @@ impl CommHandle {
         op: i32,
         stream: u64,
     ) -> i32 {
-        ncclReduceScatter(
-            send as *const std::ffi::c_void,
-            recv as *mut std::ffi::c_void,
-            count,
-            dtype,
-            op,
-            self.ptr,
-            stream as *mut std::ffi::c_void,
-        )
+        self.call(py, |ptr| {
+            ncclReduceScatter(
+                send as *const std::ffi::c_void,
+                recv as *mut std::ffi::c_void,
+                count,
+                dtype,
+                op,
+                ptr,
+                stream as *mut std::ffi::c_void,
+            )
+        })
     }
 
     #[pyo3(signature = (send, recv, count, dtype, op, root, stream=0))]
+    #[allow(clippy::too_many_arguments)]
     fn reduce(
         &self,
+        py: Python<'_>,
         send: u64,
         recv: u64,
         count: usize,
@@ -2064,41 +2313,160 @@ impl CommHandle {
         root: i32,
         stream: u64,
     ) -> i32 {
-        ncclReduce(
-            send as *const std::ffi::c_void,
-            recv as *mut std::ffi::c_void,
-            count,
-            dtype,
-            op,
-            root,
-            self.ptr,
-            stream as *mut std::ffi::c_void,
-        )
+        self.call(py, |ptr| {
+            ncclReduce(
+                send as *const std::ffi::c_void,
+                recv as *mut std::ffi::c_void,
+                count,
+                dtype,
+                op,
+                root,
+                ptr,
+                stream as *mut std::ffi::c_void,
+            )
+        })
     }
 
     #[pyo3(signature = (ptr, count, dtype, dest, stream=0))]
-    fn send(&self, ptr: u64, count: usize, dtype: i32, dest: i32, stream: u64) -> i32 {
-        ncclSend(
-            ptr as *const std::ffi::c_void,
-            count,
-            dtype,
-            dest,
-            self.ptr,
-            stream as *mut std::ffi::c_void,
-        )
+    fn send(
+        &self,
+        py: Python<'_>,
+        ptr: u64,
+        count: usize,
+        dtype: i32,
+        dest: i32,
+        stream: u64,
+    ) -> i32 {
+        self.call(py, |comm| {
+            ncclSend(
+                ptr as *const std::ffi::c_void,
+                count,
+                dtype,
+                dest,
+                comm,
+                stream as *mut std::ffi::c_void,
+            )
+        })
     }
 
     #[pyo3(signature = (ptr, count, dtype, src, stream=0))]
-    fn recv(&self, ptr: u64, count: usize, dtype: i32, src: i32, stream: u64) -> i32 {
-        ncclRecv(
-            ptr as *mut std::ffi::c_void,
-            count,
-            dtype,
-            src,
-            self.ptr,
-            stream as *mut std::ffi::c_void,
-        )
+    fn recv(
+        &self,
+        py: Python<'_>,
+        ptr: u64,
+        count: usize,
+        dtype: i32,
+        src: i32,
+        stream: u64,
+    ) -> i32 {
+        self.call(py, |comm| {
+            ncclRecv(
+                ptr as *mut std::ffi::c_void,
+                count,
+                dtype,
+                src,
+                comm,
+                stream as *mut std::ffi::c_void,
+            )
+        })
     }
+}
+
+#[cfg(feature = "python")]
+fn all_reduce_fp8(ptr: *mut Comm, send: u64, recv: u64, count: usize) -> NcclResult {
+    let comm = unsafe { &*ptr };
+    if let Transport::Peers(group) = &comm.transport {
+        return execute_peer_collective(
+            comm,
+            group,
+            Collective::AllReduceFp8ToF32,
+            send as _,
+            recv as _,
+            count,
+            std::ptr::null_mut(),
+        );
+    }
+    if count == 0 {
+        return NCCL_SUCCESS;
+    }
+    let mut host = vec![0u8; count];
+    if device_to_host(comm.runtime.as_ref(), send, &mut host).is_err() {
+        return NCCL_UNHANDLED_CUDA_ERROR;
+    }
+    let result = match all_reduce_fp8_host(comm, &host) {
+        Ok(result) => result,
+        Err(error) => return error,
+    };
+    if host_to_device(comm.runtime.as_ref(), recv, &result).is_err() {
+        return NCCL_UNHANDLED_CUDA_ERROR;
+    }
+    NCCL_SUCCESS
+}
+
+#[cfg(feature = "python")]
+#[pyclass(name = "PeerListener")]
+struct PyPeerListener(Option<PeerListener>);
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl PyPeerListener {
+    #[new]
+    fn new(address: &str, ticket: [u8; 16]) -> PyResult<Self> {
+        let address = address.parse().map_err(|error: std::net::AddrParseError| {
+            pyo3::exceptions::PyValueError::new_err(error.to_string())
+        })?;
+        let listener = PeerListener::bind(address, ticket)
+            .map_err(|error| pyo3::exceptions::PyOSError::new_err(error.to_string()))?;
+        Ok(Self(Some(listener)))
+    }
+
+    fn endpoint(&self) -> PyResult<String> {
+        self.0
+            .as_ref()
+            .map(|listener| listener.endpoint().address.to_string())
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("peer listener already used"))
+    }
+
+    fn connect(
+        &mut self,
+        py: Python<'_>,
+        members: Vec<(String, [u8; 16])>,
+        slot: usize,
+        device: usize,
+        timeout_ms: u32,
+    ) -> PyResult<CommHandle> {
+        let members = members
+            .into_iter()
+            .map(|(address, ticket)| {
+                address
+                    .parse()
+                    .map(|address| PeerEndpoint { address, ticket })
+            })
+            .collect::<Result<Vec<_>, std::net::AddrParseError>>()
+            .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
+        let listener = self.0.take().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("peer listener already used")
+        })?;
+        py.allow_threads(move || {
+            Comm::connect_peers(
+                listener,
+                members,
+                slot,
+                device,
+                Duration::from_millis(timeout_ms.into()),
+            )
+            .map(|comm| CommHandle {
+                ptr: Box::into_raw(comm),
+            })
+        })
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyfunction]
+fn take_last_error() -> String {
+    LAST_ERROR.with(|error| std::mem::take(&mut *error.borrow_mut()))
 }
 
 #[cfg(feature = "python")]
@@ -2156,6 +2524,8 @@ fn join(id: &[u8], device: usize) -> PyResult<CommHandle> {
 #[pymodule]
 fn _plait_nccl(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<CommHandle>()?;
+    module.add_class::<PyPeerListener>()?;
+    module.add_function(wrap_pyfunction!(take_last_error, module)?)?;
     module.add_function(wrap_pyfunction!(unique_id, module)?)?;
     module.add_function(wrap_pyfunction!(new_group, module)?)?;
     module.add_function(wrap_pyfunction!(join_root, module)?)?;

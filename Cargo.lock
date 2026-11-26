@@ -450,6 +450,7 @@ dependencies = [
  "libloading 0.8.9",
  "plait-collective",
  "pyo3",
+ "sha2",
 ]
 
 [[package]]

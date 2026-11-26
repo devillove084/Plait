@@ -20,6 +20,7 @@ plait-collective.workspace = true
 half = "2"
 libc = "0.2"
 libloading = "0.8"
+sha2.workspace = true
 pyo3 = { version = "0.23", optional = true, features = ["extension-module"] }
 
 [package.metadata.maturin]

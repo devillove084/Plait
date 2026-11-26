@@ -210,8 +210,9 @@ release the result after the matching completion has executed in the control pla
 | [W4A4](specs/PlaitW4A4.tla) and [W4A8 / W4A16](specs/PlaitW4Operators.tla) | INT32 zero-point correction and tail reads for W4A4, byte-wise subtraction for W4A8, and packed indexing and dequantization before rounding for W4A16. |
 | [Asynchronous reduction](specs/PlaitAsyncReduction.tla) | W4A4 device completion, stale-event rejection, and deterministic folding. An independent operation completes even while a producer or pull in another operation stalls. |
 | [Ordered publication](specs/PlaitOrderedPublication.tla) | Completion and revocation in the agreed command order, receipt identity on retry, and recovery from a replica's durable command prefix. |
+| [Peer collectives](specs/PlaitPeerCollective.tla) | Round pairing, shard ownership, and completion of an independent communicator when a participant in another group is lost. |
 
-TLC 2.19 passes all 23 configurations. The ordered publication configuration
+TLC 2.19 passes all 25 configurations. The ordered publication configuration
 explores 70,968 distinct states. Run the suite with `tlc` on your `PATH`.
 
 ```sh

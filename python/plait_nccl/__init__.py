@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import secrets
 import time
 from typing import Any
 
@@ -93,7 +94,9 @@ def _port() -> int:
 
 def _check(result: int) -> None:
     if result != 0:
-        raise RuntimeError(f"Plait NCCL error {result}")
+        take_error = getattr(_plait_nccl, "take_last_error", None)
+        detail = take_error() if take_error is not None else ""
+        raise RuntimeError(f"Plait NCCL error {result}" + (f": {detail}" if detail else ""))
 
 
 def _ptr(value: Any) -> int:
@@ -157,6 +160,30 @@ class NCCLLibrary:
         self._comms.add(comm)
         return comm
 
+    def connect_peers(self, host: str, slot: int, exchange_endpoints) -> CommHandle:
+        """Exchange per-device endpoints, then connect the peer communicator."""
+        address = f"[{host}]:0" if ":" in host else f"{host}:0"
+        ticket = secrets.token_bytes(16)
+        listener = None
+        try:
+            listener = _plait_nccl.PeerListener(address, ticket)
+            local = (listener.endpoint(), ticket)
+        except (AttributeError, OSError, ValueError) as exc:
+            local = str(exc)
+        members = exchange_endpoints(local)
+        for peer, member in enumerate(members):
+            if isinstance(member, str):
+                raise RuntimeError(f"Plait peer {peer} failed to bind: {member}")
+        if listener is None:
+            raise RuntimeError("local Plait peer listener failed to bind")
+        timeout_ms = int(os.environ.get("PLAIT_NCCL_TIMEOUT_MS", "120000"))
+        device = self.device
+        if device is None:
+            device = int(os.environ.get("PLAIT_NCCL_DEVICE", os.environ.get("LOCAL_RANK", slot)))
+        comm = CommHandle(listener.connect(members, slot, device, timeout_ms))
+        self._comms.add(comm)
+        return comm
+
     def ncclAllReduce(self, sendbuff, recvbuff, count: int, datatype: int, op: int, comm: CommHandle, stream) -> None:
         send = _ptr(sendbuff)
         recv = _ptr(recvbuff)
@@ -175,8 +202,7 @@ class NCCLLibrary:
                 )
         else:
             result = handle.all_reduce_stream(send, recv, count, datatype, op, cstream)
-        if result != 0:
-            raise RuntimeError(f"Plait NCCL error {result}")
+        _check(result)
 
     def ncclAllGather(self, sendbuff, recvbuff, count: int, datatype: int, comm: CommHandle, stream) -> None:
         _check(comm.all_gather(_ptr(sendbuff), _ptr(recvbuff), count, datatype, _ptr(stream)))
@@ -197,10 +223,13 @@ class NCCLLibrary:
         _check(comm.recv(_ptr(recvbuff), count, datatype, src, _ptr(stream)))
 
     def ncclCommDestroy(self, comm: CommHandle) -> None:
+        abort = getattr(comm._handle, "abort", None)
+        if abort is not None:
+            abort()
         self._comms.discard(comm)
 
     def ncclCommAbort(self, comm: CommHandle) -> None:
-        self._comms.discard(comm)
+        self.ncclCommDestroy(comm)
 
     def ncclGroupStart(self) -> None:
         return None
