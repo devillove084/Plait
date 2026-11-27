@@ -6,15 +6,15 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::Notify;
+use tokio::sync::{Notify, oneshot};
 use tokio::task::JoinHandle;
 
 use plait_consensus::{Options, Replica};
 use plait_core::group::{GroupLookup, GroupReply};
 use plait_core::serving::{ServingAction, ServingLookup, ServingOperation, ServingView};
 use plait_core::{
-    AcceleratorKind, ClusterConfig, Command, ComputeRequirement, ComputeTask, DeviceId, FuseKind,
-    NodeId, OpId, OpSpec, ShardId, TensorId, TensorKey,
+    AcceleratorKind, ClusterConfig, Command, ComputeRequirement, ComputeTask, DeviceId,
+    DeviceProfile, FuseKind, NodeId, OpId, OpSpec, ShardId, TensorId, TensorKey,
 };
 use plait_fabric::Runtime;
 use plait_net::{TcpTransport, Wire};
@@ -169,10 +169,13 @@ impl RunningNode {
             options: config.options,
             joined: config.join.is_none(),
             join: config.join,
-            advertise_devices: config.advertise_devices,
+            device_discovery: if config.advertise_devices {
+                DeviceDiscovery::Pending
+            } else {
+                DeviceDiscovery::Finished
+            },
             staged_proposed: BTreeSet::new(),
             commit_proposed: BTreeSet::new(),
-            devices_registered: false,
             last_join_poll: 0,
             last_ready: 0,
             started: Instant::now(),
@@ -223,17 +226,22 @@ struct NodeState {
     journal: Option<Journal>,
     options: Options,
     join: Option<JoinTarget>,
-    advertise_devices: bool,
+    device_discovery: DeviceDiscovery,
     joined: bool,
     staged_proposed: BTreeSet<NodeId>,
     commit_proposed: BTreeSet<NodeId>,
-    devices_registered: bool,
     last_join_poll: u64,
     last_ready: u64,
     started: Instant,
     observations: BTreeMap<(NodeId, u64), PendingObservation>,
     execution_hosts: execution_host::HostWatch,
     next_hosted_pd_scan: u64,
+}
+
+enum DeviceDiscovery {
+    Pending,
+    Running(oneshot::Receiver<Vec<DeviceProfile>>),
+    Finished,
 }
 
 impl NodeState {
@@ -677,18 +685,43 @@ impl NodeState {
     }
 
     fn maybe_register_devices(&mut self, now: u64) {
-        if !self.advertise_devices
-            || self.devices_registered
-            || !self.replica.config().is_voter(self.id)
-            || (self.join.is_some() && !self.joined)
-        {
+        if !self.joined || !self.replica.config().is_voter(self.id) {
             return;
         }
-        let profiles = plait_device::discover(self.id);
-        for profile in &profiles {
-            self.propose(Command::RegisterDevice(profile.clone()), now);
+        let profiles = match &mut self.device_discovery {
+            DeviceDiscovery::Pending => {
+                let id = self.id;
+                let (send, result) = oneshot::channel();
+                // Vendor utilities and driver calls can block indefinitely.
+                // A dedicated thread keeps the replica and Tokio shutdown independent.
+                self.device_discovery = match std::thread::Builder::new()
+                    .name("plait-device-discovery".into())
+                    .spawn(move || {
+                        let _ = send.send(plait_device::discover(id));
+                    }) {
+                    Ok(_) => DeviceDiscovery::Running(result),
+                    Err(error) => {
+                        eprintln!("{id}: cannot start device discovery: {error}");
+                        DeviceDiscovery::Finished
+                    }
+                };
+                return;
+            }
+            DeviceDiscovery::Running(result) => match result.try_recv() {
+                Ok(profiles) => profiles,
+                Err(oneshot::error::TryRecvError::Empty) => return,
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    eprintln!("{}: device discovery exited without results", self.id);
+                    self.device_discovery = DeviceDiscovery::Finished;
+                    return;
+                }
+            },
+            DeviceDiscovery::Finished => return,
+        };
+        self.device_discovery = DeviceDiscovery::Finished;
+        for profile in profiles {
+            self.propose(Command::RegisterDevice(profile), now);
         }
-        self.devices_registered = true;
     }
 
     async fn drive_join(&mut self, now: u64) {

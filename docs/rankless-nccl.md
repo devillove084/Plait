@@ -55,6 +55,12 @@ can accept a proposal. To send newline-delimited requests, start a client with
 `plait-node group --listen 192.0.2.10:0 --seed 192.0.2.11:7950`.
 Rust callers can use `plait_core::group` and `plait_node::Client`.
 
+On startup, a voting node probes local devices on a separate thread and
+submits their profiles through consensus as soon as the probe returns.
+The voter can process group requests while its vendor tools and drivers
+initialize. Each startup launches at most one scan. Hosts that register
+execution workers separately can use `--no-advertise-devices`.
+
 1. Register capacity with `SetHostMemory` and `RegisterWorker`. Use the
    `prepare` request to reserve a version. Its `workers` and `hosts` fields
    are lists of `(identity, demand)` pairs. The version's view contains the

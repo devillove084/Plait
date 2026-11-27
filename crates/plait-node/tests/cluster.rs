@@ -75,6 +75,97 @@ macro_rules! wait_value {
     }};
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn device_discovery_does_not_block_group_control() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::process::Stdio;
+
+    use plait_core::group::{GroupAction, GroupOperation};
+    use plait_core::{ComputeRequirement, ComputeTask};
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command as ProcessCommand;
+
+    struct ProbeDirectory(PathBuf);
+    impl Drop for ProbeDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let dir =
+        ProbeDirectory(std::env::temp_dir().join(format!("plait-probe-{}", NodeId::random())));
+    fs::create_dir(&dir.0).unwrap();
+    let probe = dir.0.join("nvidia-smi");
+    fs::write(
+        &probe,
+        concat!(
+            "#!/bin/sh\n",
+            ": > \"$PLAIT_TEST_PROBE_DIR/started\"\n",
+            "while [ -d \"$PLAIT_TEST_PROBE_DIR\" ]; do /bin/sleep 0.05; done\n",
+            "exit 1\n",
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(probe, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let id = NodeId::random();
+    let mut child = ProcessCommand::new(env!("CARGO_BIN_EXE_plait-node"))
+        .args(["run", "--listen", "127.0.0.1:0", "--id", &id.to_hex()])
+        .env("PATH", &dir.0)
+        .env("PLAIT_TEST_PROBE_DIR", &dir.0)
+        .env("TOKIO_WORKER_THREADS", "2")
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap()).lines();
+    let line = tokio::time::timeout(Duration::from_secs(5), stdout.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let address = line.rsplit_once(" listening on ").unwrap().1;
+    wait_until!("vendor probe to block", dir.0.join("started").exists());
+
+    let mut client = Client::new().await.unwrap();
+    client.add_peer(id, address);
+    let operation = GroupOperation {
+        id: OpId::new(id, 1),
+        action: GroupAction::SetHostMemory {
+            host: id,
+            capacity: HostMemory {
+                bytes: 64,
+                pinned_bytes: 8,
+            },
+        },
+    };
+    let receipt = tokio::time::timeout(Duration::from_secs(5), client.apply_group(id, &operation))
+        .await
+        .expect("control stopped while the vendor probe was running")
+        .unwrap();
+    assert!(receipt.is_ok());
+    drop(dir);
+
+    let task = Command::Compute(ComputeTask {
+        task: OpId::new(id, 2),
+        kernel: "probe-test".into(),
+        device: DeviceId::new(id, u32::MAX),
+        requirement: ComputeRequirement::default(),
+        inputs: Vec::new(),
+        output: TensorKey::new(TensorId(1), ShardId(0)),
+        version: 1,
+        values: vec![1.0],
+    });
+    wait_until!(
+        "discovered CPU profile to be registered",
+        client.submit(id, task.clone()).await.is_ok()
+    );
+    child.kill().await.unwrap();
+}
+
 #[tokio::test]
 async fn tcp_cluster_proposes_and_fuses_from_every_node() {
     let ids = ids("tcp-fuse", 3);
