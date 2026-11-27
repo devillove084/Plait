@@ -155,6 +155,7 @@ pub struct PlacementGroup<'a> {
     pub inventory: &'a PlacementInventory,
     pub workload: &'a Workload,
     pub rates: Option<&'a [ComputeRate]>,
+    pub hosts: Option<&'a BTreeSet<NodeId>>,
 }
 
 #[derive(Clone)]
@@ -237,7 +238,11 @@ pub fn select_set(
                 .workers
                 .iter()
                 .filter(|entry| {
-                    available.contains_key(&entry.device) && hosts.contains_key(&entry.device.node)
+                    available.contains_key(&entry.device)
+                        && hosts.contains_key(&entry.device.node)
+                        && group
+                            .hosts
+                            .is_none_or(|allowed| allowed.contains(&entry.device.node))
                 })
                 .filter_map(|entry| {
                     model
@@ -1002,11 +1007,13 @@ mod tests {
                         inventory: flexible,
                         workload: &either,
                         rates: None,
+                        hosts: None,
                     },
                     PlacementGroup {
                         inventory: restricted,
                         workload: &fast,
                         rates: None,
+                        hosts: None,
                     },
                 ],
                 &[],

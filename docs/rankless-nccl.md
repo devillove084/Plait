@@ -118,6 +118,8 @@ Use `plan_set` when the deployment needs multiple candidates for one
 transition, such as a Prefill and a Decode group. Each `groups` entry
 contains its own `group`, `workload`, and optional `calibration`. Give each
 role the widths, capability requirements, and resource budgets it can use.
+Set a member's optional `hosts` to the list of host IDs that can launch
+that group. Each member has its own host list and shares the resource ledger.
 `guards` can pin the active epoch of any group that the transition assumes
 will remain live. Use `null` to require that a group has no active epoch.
 
@@ -1246,11 +1248,10 @@ compares the active epochs of all groups referenced by the directory. It
 can reject a changed group or target readiness after the check. A lost
 reply is retried with its original operation ID.
 
-The policy switches prepared groups. Prepare successors with the native
-placement planner and resident launchers, then include their bindings in
-both files. Use atomic renames for updates. A revision mismatch or an
-expired profile leaves the current groups active. When a switch succeeds,
-the policy waits through the cooldown before considering another switch.
+For manually prepared successors, include their bindings in the route file.
+Use atomic renames for updates. A revision mismatch or an expired profile
+leaves the current groups active. When a switch succeeds, the policy waits
+through the cooldown before considering another switch.
 
 Three hosts verified automatic switching between CUDA aggregate and ROCm
 Prefill with PPU Decode. The trial used preset capacities of 0.8 and 4.0
@@ -1259,6 +1260,74 @@ requests/s, the ingress switched to P/D. Decode reused 128 prompt tokens
 from the shared store, and all eight output tokens matched the CUDA
 baseline. When the arrivals stopped and a new aggregate epoch was ready,
 the same ingress switched back and served a matching completion.
+
+#### Prepare a native layout on demand
+
+Run one resident launcher per group on each eligible deployment host. Omit
+`--routes` from those launchers so the mode policy can activate the complete
+set. Give each group its own port ranges. Define the stable route roles in
+`--native-routes` using `discover`. Each deployment path is relative to
+the route file and points to the same launch configuration used on the
+workers. The example starts with an aggregate layout.
+
+```json
+{
+  "model": "example",
+  "revision": 1,
+  "paths": [],
+  "discover": {
+    "deployments": {
+      "00000000000000000000000000000001": "aggregate.json",
+      "00000000000000000000000000000002": "prefill.json",
+      "00000000000000000000000000000003": "decode.json"
+    },
+    "aggregated": ["00000000000000000000000000000001"],
+    "paths": [{
+      "prefill": "00000000000000000000000000000002",
+      "decode": "00000000000000000000000000000003",
+      "kv_host": "192.0.2.20",
+      "kv_port": 7952
+    }]
+  }
+}
+```
+
+Add a `provision` array to the mode policy. Each array entry describes a
+prospective layout with its estimated device count and SLO capacity. Its
+`groups` entries use the relative `deployment` path, the same `workload`
+object as `plan_set`, and an optional hexadecimal `calibration` ID.
+For example, add one entry with `devices: 2`, Prefill and Decode workload
+objects of width one, and a current `slo_profile` estimate for the pair.
+Keep the incumbent's exact capacity profile in `modes`.
+
+When consecutive windows favor a projected layout and no ready mode
+qualifies, the policy issues one `plan_set` with the observed active
+epochs as guards. Plait limits each group to its deployment's host list
+and reserves all groups or returns a rejection. A resident launcher
+starts the committed candidate when it sees its grant. The ingress
+derives each HTTP origin from the committed group and its deployment's
+port range. A P/D candidate appears after both groups reach `Ready`.
+The incumbent stays live throughout preparation.
+
+Measure the candidate through a separate private ingress with `--routes`
+for the candidate endpoints and `--kv-transport plait`. Add its measured
+SLO profile to `modes` with the exact discovered versions and the actual
+granted device count. The regular policy then checks observed demand,
+profile lifetime, and versioned health before submitting the switch.
+One route revision covers successive epochs discovered from the same
+deployment definitions. Update the route revision when changing the
+declared roles or paths.
+
+To bring a new host into a deployment, register its devices and budgets
+with Plait, then add its address to the group's deployment file on the
+ingress and launchers. Start its launcher with the same group configuration.
+Running launchers reload host additions when preparing a version.
+Withdraw a host through Plait before reclaiming its grants.
+
+Three durable voters, synthetic device profiles, and versioned HTTP fixtures
+verified the path from HTTP arrivals to joint reservation and atomic switch.
+The incumbent remained active while only one target was ready, and the
+planner excluded a faster device outside the declared hosts.
 
 ### Hand off prompt KV between independent Prefill and Decode groups
 

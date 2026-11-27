@@ -22,6 +22,7 @@ struct SetMember {
     group: GroupId,
     workload: Workload,
     calibration: Option<NodeId>,
+    hosts: Option<BTreeSet<NodeId>>,
 }
 
 #[derive(Deserialize)]
@@ -398,15 +399,17 @@ async fn plan_set(
             guards: previous,
         } = receipt.operation.action
             && guards == previous
-            && preparations
-                .iter()
-                .map(|item| {
-                    (
-                        item.group,
-                        item.rates.as_ref().map(|rates| rates.calibration),
-                    )
-                })
-                .eq(groups.iter().map(|item| (item.group, item.calibration)))
+            && preparations.len() == groups.len()
+            && preparations.iter().zip(&groups).all(|(plan, member)| {
+                plan.group == member.group
+                    && plan.rates.as_ref().map(|rates| rates.calibration) == member.calibration
+                    && member.hosts.as_ref().is_none_or(|allowed| {
+                        plan.resources
+                            .hosts
+                            .keys()
+                            .all(|host| allowed.contains(host))
+                    })
+            })
         {
             return Ok(json!({ "decision": "prepare_set", "replayed": true,
                 "plans": preparations.iter().map(|plan| preparation_json(plan, None)).collect::<Vec<_>>(),
@@ -442,8 +445,17 @@ async fn plan_set(
         None => {
             let hosts: BTreeSet<_> = snapshots
                 .iter()
-                .flat_map(|snapshot| &snapshot.inventory.hosts)
-                .filter(|host| host.eligible)
+                .zip(&groups)
+                .filter(|(_, member)| member.workload.needs_links())
+                .flat_map(|(snapshot, member)| {
+                    snapshot.inventory.hosts.iter().filter(|host| {
+                        host.eligible
+                            && member
+                                .hosts
+                                .as_ref()
+                                .is_none_or(|allowed| allowed.contains(&host.host))
+                    })
+                })
                 .map(|host| host.host)
                 .collect();
             let mut probes = link_probes(client, voters).await?;
@@ -458,6 +470,7 @@ async fn plan_set(
             inventory: &snapshot.inventory,
             workload: &member.workload,
             rates: snapshot.rates.as_deref(),
+            hosts: member.hosts.as_ref(),
         })
         .collect();
     let Some(choices) =

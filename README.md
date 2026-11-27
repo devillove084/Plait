@@ -247,6 +247,10 @@ reserves the entire set while the incumbent keeps serving.
 The vLLM ingress can select among ready layouts using live arrival counters
 and SLO measurements attached to exact group versions.
 [Native layout policy](docs/rankless-nccl.md#select-a-ready-native-layout-from-live-demand)
+The same policy can prepare a candidate set on demand. The ingress
+discovers candidate origins from committed grants and switches after the
+exact candidate versions have current SLO measurements.
+[On-demand native layouts](docs/rankless-nccl.md#prepare-a-native-layout-on-demand)
 
 Managed replacements reuse complete prompt KV blocks across TP sizes and PP
 layouts with the vLLM fork's `PlaitKvConnector` and its optional
@@ -371,6 +375,7 @@ release the result after the matching completion has executed in the control pla
 | [Active group sets](specs/PlaitActiveGroupSet.tla) | An ordered switch checks every expected epoch and applies the complete change. Routing uses one observation and requires every group in a P/D path. Existing work keeps its draining grants. |
 | [Group set preparation](specs/PlaitGroupPrepareSet.tla) | Two placements share a staging ledger on one host. A stale guard or failed reservation leaves both versions and the ledger unchanged. A retry returns the same receipt. TLC checked 50,128 distinct states. |
 | [Native serving mode policy](https://github.com/devillove084/vllm/blob/plait/v0.31-runtime/tools/plait/serving/specs/PlaitServingModePolicy.tla) | A switch requires repeated windows, a viable target, fresh profiles before send, and a matching active set at commit. A retry returns the original receipt. |
+| [On-demand serving preparation](https://github.com/devillove084/vllm/blob/plait/v0.31-runtime/tools/plait/serving/specs/PlaitServingProvision.tla) | Stable demand can prepare a complete candidate set. Launch follows a grant. Switch dispatch checks the exact measured versions and each endpoint before the runtime compares the active set. TLC checked 101,760 distinct states. |
 | [Native serving cutover](specs/PlaitNativeServingCutover.tla) | The deployment publishes a ready engine's origin before activation. An admitted stream keeps its version as ingress replicas observe the switch. |
 | [Native serving retirement](specs/PlaitNativeServingRetire.tla) | Planned retirement closes admission, waits for the engine to drain, and releases each host's grants after its process group exits. |
 | [Hosted rollout and failover](specs/PlaitHostLaunch.tla) | Full readiness before activation, ordered standby promotion on incumbent revocation, and exclusion of groups affected by the same host loss. |
