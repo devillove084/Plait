@@ -5,8 +5,8 @@ use std::io;
 
 use plait_core::NodeId;
 use plait_core::group::{
-    ComputeRate, GroupAction, GroupId, GroupLookup, GroupReply, PlacementInventory, RateEvidence,
-    ResourcePlan,
+    ComputeRate, GroupAction, GroupId, GroupLookup, GroupPreparation, GroupReply,
+    PlacementInventory, RateEvidence, ResourcePlan,
 };
 use plait_core::link::ProbeRegistration;
 use plait_parallel::group_placement::{self, Decision, DirectedLink, Workload};
@@ -74,6 +74,72 @@ impl Snapshot {
         probes: Option<Vec<ProbeRegistration>>,
         recipe: Option<NodeId>,
     ) -> GroupAction {
+        let measured = probes.is_some();
+        let GroupPreparation {
+            group,
+            expected_epoch,
+            expected_active,
+            resources,
+            recipe,
+            probes,
+            rates,
+        } = self.preparation(
+            resources,
+            compared_active,
+            probes.unwrap_or_default(),
+            recipe,
+        );
+        if let Some(recipe) = recipe {
+            GroupAction::PrepareRecipe {
+                group,
+                expected_epoch,
+                expected_active,
+                resources,
+                recipe,
+                probes,
+                rates,
+            }
+        } else if let Some(RateEvidence {
+            calibration,
+            compared_active,
+            rates,
+        }) = rates
+        {
+            GroupAction::PrepareWithRates {
+                group,
+                expected_epoch,
+                expected_active,
+                resources,
+                probes,
+                calibration,
+                compared_active,
+                rates,
+            }
+        } else if measured {
+            GroupAction::PrepareMeasured {
+                group,
+                expected_epoch,
+                expected_active,
+                resources,
+                probes,
+            }
+        } else {
+            GroupAction::PreparePlanned {
+                group,
+                expected_epoch,
+                expected_active,
+                resources,
+            }
+        }
+    }
+
+    pub(super) fn preparation(
+        self,
+        resources: ResourcePlan,
+        compared_active: bool,
+        mut probes: Vec<ProbeRegistration>,
+        recipe: Option<NodeId>,
+    ) -> GroupPreparation {
         let group = self.inventory.group;
         let expected_epoch = self
             .inventory
@@ -81,20 +147,17 @@ impl Snapshot {
             .map_or(0, |(version, _)| version.epoch);
         let incumbent = self.inventory.active.as_ref();
         let expected_active = incumbent.map(|active| active.version.epoch);
-        let probes = probes.map(|mut probes| {
-            let mut used = BTreeSet::new();
-            if resources.hosts.len() > 1 {
-                used.extend(resources.hosts.keys().copied());
-            }
-            if compared_active
-                && let Some(active) = incumbent
-                && active.hosts.len() > 1
-            {
-                used.extend(active.hosts.iter().map(|&(host, _)| host));
-            }
-            probes.retain(|probe| used.contains(&probe.endpoint.host));
-            probes
-        });
+        let mut used = BTreeSet::new();
+        if resources.hosts.len() > 1 {
+            used.extend(resources.hosts.keys().copied());
+        }
+        if compared_active
+            && let Some(active) = incumbent
+            && active.hosts.len() > 1
+        {
+            used.extend(active.hosts.iter().map(|&(host, _)| host));
+        }
+        probes.retain(|probe| used.contains(&probe.endpoint.host));
         let evidence = if let (Some(calibration), Some(mut rates)) = (self.calibration, self.rates)
         {
             let mut used: BTreeSet<_> = resources.workers.keys().copied().collect();
@@ -110,47 +173,14 @@ impl Snapshot {
         } else {
             None
         };
-        if let Some(recipe) = recipe {
-            GroupAction::PrepareRecipe {
-                group,
-                expected_epoch,
-                expected_active,
-                resources,
-                recipe,
-                probes: probes.unwrap_or_default(),
-                rates: evidence,
-            }
-        } else if let Some(RateEvidence {
-            calibration,
-            compared_active,
-            rates,
-        }) = evidence
-        {
-            GroupAction::PrepareWithRates {
-                group,
-                expected_epoch,
-                expected_active,
-                resources,
-                probes: probes.unwrap_or_default(),
-                calibration,
-                compared_active,
-                rates,
-            }
-        } else if let Some(probes) = probes {
-            GroupAction::PrepareMeasured {
-                group,
-                expected_epoch,
-                expected_active,
-                resources,
-                probes,
-            }
-        } else {
-            GroupAction::PreparePlanned {
-                group,
-                expected_epoch,
-                expected_active,
-                resources,
-            }
+        GroupPreparation {
+            group,
+            expected_epoch,
+            expected_active,
+            resources,
+            recipe,
+            probes,
+            rates: evidence,
         }
     }
 }

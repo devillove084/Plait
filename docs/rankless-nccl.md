@@ -112,6 +112,66 @@ registration returns `StaleProbe`. Read fresh samples and submit a new operation
 ID to retry that plan. Retrying a submitted operation ID reads its applied receipt.
 The new group follows the normal endpoint, readiness, and activation steps.
 
+#### Prepare several groups together
+
+Use `plan_set` when the deployment needs multiple candidates for one
+transition, such as a Prefill and a Decode group. Each `groups` entry
+contains its own `group`, `workload`, and optional `calibration`. Give each
+role the widths, capability requirements, and resource budgets it can use.
+`guards` can pin the active epoch of any group that the transition assumes
+will remain live. Use `null` to require that a group has no active epoch.
+
+```json
+{
+  "request": "plan_set",
+  "groups": [
+    {
+      "group": [2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+      "workload": {
+        "widths": [1,2], "device_bytes": 6442450944,
+        "per_worker_host": {"bytes": 536870912, "pinned_bytes": 67108864},
+        "per_host": {"bytes": 268435456, "pinned_bytes": 0},
+        "compute_work": 2000000000, "bytes_per_peer": 1048576,
+        "max_link_age_ms": 10000, "operations": 100, "switch_ns": 0
+      }
+    },
+    {
+      "group": [3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+      "workload": {
+        "widths": [1], "device_bytes": 4294967296,
+        "per_worker_host": {"bytes": 268435456, "pinned_bytes": 67108864},
+        "per_host": {"bytes": 268435456, "pinned_bytes": 0},
+        "compute_work": 500000000, "bytes_per_peer": 0,
+        "max_link_age_ms": 10000, "operations": 500, "switch_ns": 0
+      }
+    }
+  ],
+  "guards": [[[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0], 7]],
+  "prepare": {"origin": [4,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0], "counter": 1}
+}
+```
+
+Send the example as one line to `plait-node group`. Omit `prepare` to
+preview the placements and costs. The planner considers scarce eligible
+devices first, then places the rest against the remaining devices and
+host budgets. Its bounded search keeps up to 24 partial group sets at
+each step, scoring their per-operation estimates over each workload's
+`operations` horizon. A `no_placement` result means the search found no
+feasible set in that snapshot. `pending` identifies candidate versions
+already in preparation or ready. The deployment decides which roles and
+groups to request. Its capacity policy accounts for the cost of moving KV
+between engines and when the layout change pays off.
+
+With `prepare`, a successful `PreparedSet` receipt lists all newly reserved
+versions in the request's group order. The voter checks every specified
+active epoch, candidate epoch, device incarnation, memory budget, and
+applicable probe or rate revision. A rejected transaction leaves every
+version and grant as it was. Retry an ambiguous reply with the same
+operation ID and group set to retrieve the receipt. Replan with a new ID
+after an explicit rejection. Start or let the resident launchers discover
+the prepared groups, wait for all endpoints to become ready, then request
+the separate active-set switch.
+
 #### Replan with measured compute rates
 
 Use a stable `calibration` ID for each workload you want to compare. Use the
@@ -1039,6 +1099,8 @@ and Decode the same [KV store and namespace](#reuse-prompt-kv-across-tp-layouts)
 Set the first engine's connector role to `kv_producer` and the second to
 `kv_consumer`. Use the same model weights, KV dtype and block size.
 Omit the launcher's `--routes` publisher when coordinating a group set.
+Use [`plan_set`](#prepare-several-groups-together) to prepare both candidates
+in one reservation transaction.
 
 Publish the engine-owned bindings in one file. Each route identifies exact
 versions and reachable HTTP origins. The example stages an active aggregate

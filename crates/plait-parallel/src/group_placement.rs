@@ -3,8 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use plait_core::group::{
-    ComputeRate, GroupPhase, GroupVersion, HostMemory, PlacementInventory, PlacementWorker,
-    ResourcePlan, WorkerDemand,
+    ComputeRate, GroupId, GroupPhase, GroupVersion, HostMemory, PlacementHost, PlacementInventory,
+    PlacementWorker, ResourcePlan, WorkerDemand,
 };
 use plait_core::{ComputeRequirement, DeviceId, NodeId};
 use serde::{Deserialize, Serialize};
@@ -151,6 +151,202 @@ pub enum Decision {
     },
 }
 
+pub struct PlacementGroup<'a> {
+    pub inventory: &'a PlacementInventory,
+    pub workload: &'a Workload,
+    pub rates: Option<&'a [ComputeRate]>,
+}
+
+#[derive(Clone)]
+pub struct PreparationChoice {
+    pub resources: ResourcePlan,
+    pub cost: Cost,
+    pub recipe: Option<NodeId>,
+}
+
+#[derive(Clone, Default)]
+struct JointCandidate {
+    choices: Vec<(usize, PreparationChoice)>,
+    devices: BTreeSet<DeviceId>,
+    hosts: BTreeMap<NodeId, HostMemory>,
+    cost: u128,
+}
+
+/// Place a caller-selected set of groups against shared free resources.
+/// Candidates are re-enumerated after reserving each preceding group.
+pub fn select_set(
+    groups: &[PlacementGroup<'_>],
+    links: &[DirectedLink],
+    now_ms: u64,
+) -> Result<Option<Vec<PreparationChoice>>, &'static str> {
+    let Some(first) = groups.first() else {
+        return Err("empty group placement set");
+    };
+    let mut names = BTreeSet::<GroupId>::new();
+    let mut available = free_devices(first.inventory);
+    let mut hosts: BTreeMap<_, _> = first
+        .inventory
+        .hosts
+        .iter()
+        .filter(|host| host.eligible)
+        .map(|host| (host.host, host_headroom(host)))
+        .collect();
+    let mut models = Vec::with_capacity(groups.len());
+    for (index, group) in groups.iter().enumerate() {
+        if !names.insert(group.inventory.group) {
+            return Err("duplicate group in placement set");
+        }
+        let model = Model::new(group.workload, links, now_ms, group.rates)?;
+        if index != 0 {
+            let free = free_devices(group.inventory);
+            available.retain(|id, incarnation| free.get(id) == Some(incarnation));
+            let budgets: BTreeMap<_, _> = group
+                .inventory
+                .hosts
+                .iter()
+                .filter(|host| host.eligible)
+                .map(|host| (host.host, host_headroom(host)))
+                .collect();
+            hosts.retain(|id, budget| {
+                let Some(other) = budgets.get(id) else {
+                    return false;
+                };
+                budget.bytes = budget.bytes.min(other.bytes);
+                budget.pinned_bytes = budget.pinned_bytes.min(other.pinned_bytes);
+                true
+            });
+        }
+        models.push(model);
+    }
+    if groups.iter().any(|group| {
+        matches!(
+            group.inventory.latest,
+            Some((_, GroupPhase::Preparing | GroupPhase::Ready))
+        )
+    }) {
+        return Ok(None);
+    }
+
+    let mut queue: Vec<_> = groups
+        .iter()
+        .zip(models)
+        .enumerate()
+        .map(|(index, (group, model))| {
+            let eligible: Vec<_> = group
+                .inventory
+                .workers
+                .iter()
+                .filter(|entry| {
+                    available.contains_key(&entry.device) && hosts.contains_key(&entry.device.node)
+                })
+                .filter_map(|entry| {
+                    model
+                        .eligible(entry)
+                        .filter(|worker| worker.compute_rate.is_some())
+                })
+                .collect();
+            let minimum = *group
+                .workload
+                .widths
+                .iter()
+                .min()
+                .expect("validated widths") as usize;
+            (
+                eligible.len().saturating_sub(minimum),
+                index,
+                model,
+                eligible,
+            )
+        })
+        .collect();
+    queue.sort_unstable_by_key(|&(slack, index, _, _)| (slack, index));
+
+    let mut candidates = vec![JointCandidate::default()];
+    for (_, index, model, eligible) in queue {
+        let mut next = Vec::new();
+        for partial in candidates {
+            let mut workers: BTreeMap<NodeId, Vec<Worker>> = BTreeMap::new();
+            for worker in eligible
+                .iter()
+                .filter(|worker| !partial.devices.contains(&worker.id))
+            {
+                workers.entry(worker.id.node).or_default().push(*worker);
+            }
+            let inventory: Vec<_> = hosts
+                .iter()
+                .map(|(&host, &capacity)| PlacementHost {
+                    host,
+                    capacity,
+                    reserved: partial.hosts.get(&host).copied().unwrap_or_default(),
+                    eligible: true,
+                })
+                .collect();
+            for (candidate, recipe) in model.candidates(&inventory, &workers, true) {
+                let resources = model.resources(&candidate);
+                let mut joint = partial.clone();
+                joint.devices.extend(resources.workers.keys().copied());
+                for (&host, &demand) in &resources.hosts {
+                    let reserved = joint.hosts.entry(host).or_default();
+                    // The candidate is fitted against this partial reservation.
+                    reserved.bytes += demand.bytes;
+                    reserved.pinned_bytes += demand.pinned_bytes;
+                }
+                joint.cost = joint.cost.saturating_add(
+                    candidate
+                        .cost
+                        .operation_ns()
+                        .saturating_mul(u128::from(model.workload.operations)),
+                );
+                joint.choices.push((
+                    index,
+                    PreparationChoice {
+                        resources,
+                        cost: candidate.cost,
+                        recipe,
+                    },
+                ));
+                let position =
+                    next.partition_point(|prior: &JointCandidate| prior.cost <= joint.cost);
+                if position < BEAM_PER_WIDTH {
+                    next.insert(position, joint);
+                    next.truncate(BEAM_PER_WIDTH);
+                }
+            }
+        }
+        if next.is_empty() {
+            return Ok(None);
+        }
+        candidates = next;
+    }
+    Ok(candidates.into_iter().next().map(|mut candidate| {
+        candidate.choices.sort_unstable_by_key(|(index, _)| *index);
+        candidate
+            .choices
+            .into_iter()
+            .map(|(_, choice)| choice)
+            .collect()
+    }))
+}
+
+fn free_devices(inventory: &PlacementInventory) -> BTreeMap<DeviceId, u64> {
+    inventory
+        .workers
+        .iter()
+        .filter(|entry| entry.eligible && entry.grant.is_none())
+        .map(|entry| (entry.device, entry.incarnation))
+        .collect()
+}
+
+fn host_headroom(entry: &PlacementHost) -> HostMemory {
+    HostMemory {
+        bytes: entry.capacity.bytes.saturating_sub(entry.reserved.bytes),
+        pinned_bytes: entry
+            .capacity
+            .pinned_bytes
+            .saturating_sub(entry.reserved.pinned_bytes),
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Worker {
     id: DeviceId,
@@ -200,43 +396,16 @@ pub fn select_with_recipes(
     rates: Option<&[ComputeRate]>,
     active_recipe: Option<NodeId>,
 ) -> Result<Decision, &'static str> {
-    workload.validate(rates.is_some())?;
     let widths: BTreeSet<_> = workload
         .widths
         .iter()
         .map(|&width| width as usize)
         .collect();
-    let mut fresh = BTreeMap::new();
-    for link in links {
-        if link.source == link.target || link.bytes_per_second == 0 || link.rtt_ns == 0 {
-            return Err("invalid directed link sample");
-        }
-        if now_ms
-            .checked_sub(link.sampled_at_ms)
-            .is_some_and(|age| age <= workload.max_link_age_ms)
-            && fresh.insert((link.source, link.target), *link).is_some()
-        {
-            return Err("duplicate fresh directed link sample");
-        }
-    }
+    let model = Model::new(workload, links, now_ms, rates)?;
     if let Some((version, GroupPhase::Preparing | GroupPhase::Ready)) = inventory.latest {
         return Ok(Decision::Pending(version));
     }
 
-    let model = Model {
-        workload,
-        links: fresh,
-        rates: rates
-            .map(|rates| {
-                let rates_by_device: BTreeMap<_, _> =
-                    rates.iter().map(|rate| (rate.device, *rate)).collect();
-                if rates_by_device.len() != rates.len() {
-                    return Err("duplicate compute rate");
-                }
-                Ok(rates_by_device)
-            })
-            .transpose()?,
-    };
     let mut eligible = BTreeMap::new();
     for entry in &inventory.workers {
         if let Some(worker) = model.eligible(entry) {
@@ -271,24 +440,10 @@ pub fn select_with_recipes(
         }
     }
 
-    let best = if workload.recipes.is_empty() {
-        model
-            .search(inventory, &available, &widths, None)
-            .map(|candidate| (candidate, None))
-    } else {
-        workload
-            .recipes
-            .iter()
-            .filter_map(|recipe| {
-                let width = BTreeSet::from([recipe.work.len()]);
-                model
-                    .search(inventory, &available, &width, Some(recipe))
-                    .map(|candidate| (candidate, Some(recipe.id)))
-            })
-            .min_by(|(left, left_recipe), (right, right_recipe)| {
-                compare(left, right).then_with(|| left_recipe.cmp(right_recipe))
-            })
-    };
+    let best = model
+        .candidates(&inventory.hosts, &available, false)
+        .into_iter()
+        .next();
 
     let incumbent_cost = incumbent.map(|(_, cost)| cost);
     if let Some((version, cost)) = incumbent {
@@ -311,39 +466,129 @@ pub fn select_with_recipes(
     let Some((best, recipe)) = best else {
         return Ok(Decision::NoPlacement);
     };
-    let hosts = count_hosts(&best.workers)
-        .into_iter()
-        .map(|(host, count)| (host, model.host_demand(count).expect("fitted host")))
-        .collect();
-    let workers = best
-        .workers
-        .into_iter()
-        .map(|worker| {
-            (
-                worker.id,
-                WorkerDemand {
-                    incarnation: worker.incarnation,
-                    device_bytes: workload.device_bytes,
-                },
-            )
-        })
-        .collect();
+    let resources = model.resources(&best);
     Ok(Decision::Prepare {
-        resources: ResourcePlan { workers, hosts },
+        resources,
         cost: best.cost,
         incumbent: incumbent_cost,
         recipe,
     })
 }
 
-impl Model<'_> {
-    fn search(
+impl<'a> Model<'a> {
+    fn new(
+        workload: &'a Workload,
+        links: &[DirectedLink],
+        now_ms: u64,
+        rates: Option<&[ComputeRate]>,
+    ) -> Result<Self, &'static str> {
+        workload.validate(rates.is_some())?;
+        let mut fresh = BTreeMap::new();
+        for link in links {
+            if link.source == link.target || link.bytes_per_second == 0 || link.rtt_ns == 0 {
+                return Err("invalid directed link sample");
+            }
+            if now_ms
+                .checked_sub(link.sampled_at_ms)
+                .is_some_and(|age| age <= workload.max_link_age_ms)
+                && fresh.insert((link.source, link.target), *link).is_some()
+            {
+                return Err("duplicate fresh directed link sample");
+            }
+        }
+        let rates = rates
+            .map(|rates| {
+                let by_device: BTreeMap<_, _> =
+                    rates.iter().map(|rate| (rate.device, *rate)).collect();
+                if by_device.len() != rates.len() {
+                    return Err("duplicate compute rate");
+                }
+                Ok(by_device)
+            })
+            .transpose()?;
+        Ok(Self {
+            workload,
+            links: fresh,
+            rates,
+        })
+    }
+
+    fn resources(&self, candidate: &Candidate) -> ResourcePlan {
+        let hosts = count_hosts(&candidate.workers)
+            .into_iter()
+            .map(|(host, count)| (host, self.host_demand(count).expect("fitted host")))
+            .collect();
+        let workers = candidate
+            .workers
+            .iter()
+            .map(|worker| {
+                (
+                    worker.id,
+                    WorkerDemand {
+                        incarnation: worker.incarnation,
+                        device_bytes: self.workload.device_bytes,
+                    },
+                )
+            })
+            .collect();
+        ResourcePlan { workers, hosts }
+    }
+
+    fn candidates(
         &self,
-        inventory: &PlacementInventory,
+        hosts: &[PlacementHost],
+        available: &BTreeMap<NodeId, Vec<Worker>>,
+        alternatives: bool,
+    ) -> Vec<(Candidate, Option<NodeId>)> {
+        let mut candidates: Vec<_> = if self.workload.recipes.is_empty() {
+            let widths = self
+                .workload
+                .widths
+                .iter()
+                .map(|&width| width as usize)
+                .collect();
+            self.search_candidates(hosts, available, &widths, None, alternatives)
+                .into_iter()
+                .map(|candidate| (candidate, None))
+                .collect()
+        } else {
+            self.workload
+                .recipes
+                .iter()
+                .flat_map(|recipe| {
+                    let width = BTreeSet::from([recipe.work.len()]);
+                    self.search_candidates(hosts, available, &width, Some(recipe), alternatives)
+                        .into_iter()
+                        .map(|candidate| (candidate, Some(recipe.id)))
+                })
+                .collect()
+        };
+        candidates.sort_by(|(left, left_recipe), (right, right_recipe)| {
+            compare(left, right).then_with(|| left_recipe.cmp(right_recipe))
+        });
+        if alternatives && !self.workload.recipes.is_empty() {
+            let mut seen = BTreeSet::new();
+            candidates.retain(|(candidate, _)| {
+                seen.insert(
+                    candidate
+                        .workers
+                        .iter()
+                        .map(|worker| worker.id)
+                        .collect::<Vec<_>>(),
+                )
+            });
+        }
+        candidates
+    }
+
+    fn search_candidates(
+        &self,
+        hosts: &[PlacementHost],
         available: &BTreeMap<NodeId, Vec<Worker>>,
         widths: &BTreeSet<usize>,
         recipe: Option<&Recipe>,
-    ) -> Option<Candidate> {
+        alternatives: bool,
+    ) -> Vec<Candidate> {
         let max_width = *widths.last().expect("nonempty widths");
         let mut states = BTreeMap::from([(
             0,
@@ -355,11 +600,7 @@ impl Model<'_> {
                 },
             }],
         )]);
-        let mut hosts: Vec<_> = inventory
-            .hosts
-            .iter()
-            .filter(|host| host.eligible)
-            .collect();
+        let mut hosts: Vec<_> = hosts.iter().filter(|host| host.eligible).collect();
         hosts.sort_unstable_by_key(|host| host.host);
         for host in hosts {
             let Some(mut workers) = available.get(&host.host).cloned() else {
@@ -379,20 +620,25 @@ impl Model<'_> {
                     })
                 })
                 .count();
+            let by_count: Vec<_> = (1..=fit)
+                .map(|count| worker_choices(&workers, count, alternatives))
+                .collect();
             let mut next = states.clone();
             for (&width, candidates) in &states {
                 for candidate in candidates {
                     for count in 1..=fit.min(max_width - width) {
-                        let mut devices = candidate.workers.clone();
-                        devices.extend_from_slice(&workers[..count]);
-                        if let Some(cost) = self.cost(&devices, recipe) {
-                            keep_best(
-                                next.entry(width + count).or_default(),
-                                Candidate {
-                                    workers: devices,
-                                    cost,
-                                },
-                            );
+                        for workers in &by_count[count - 1] {
+                            let mut devices = candidate.workers.clone();
+                            devices.extend_from_slice(workers);
+                            if let Some(cost) = self.cost(&devices, recipe) {
+                                keep_best(
+                                    next.entry(width + count).or_default(),
+                                    Candidate {
+                                        workers: devices,
+                                        cost,
+                                    },
+                                );
+                            }
                         }
                     }
                 }
@@ -402,8 +648,12 @@ impl Model<'_> {
         states
             .into_iter()
             .filter(|(width, _)| widths.contains(width))
-            .flat_map(|(_, ranks)| ranks.into_iter().take(1))
-            .min_by(compare)
+            .flat_map(|(_, ranks)| {
+                ranks
+                    .into_iter()
+                    .take(if alternatives { BEAM_PER_WIDTH } else { 1 })
+            })
+            .collect()
     }
 
     fn eligible(&self, worker: &PlacementWorker) -> Option<Worker> {
@@ -588,6 +838,28 @@ impl Model<'_> {
     }
 }
 
+fn worker_choices(workers: &[Worker], count: usize, alternatives: bool) -> Vec<Vec<Worker>> {
+    if !alternatives {
+        return vec![workers[..count].to_vec()];
+    }
+    let mut indices: Vec<_> = (0..count).collect();
+    let mut choices = Vec::new();
+    while choices.len() < BEAM_PER_WIDTH {
+        choices.push(indices.iter().map(|&index| workers[index]).collect());
+        let Some(position) = (0..count)
+            .rev()
+            .find(|&position| indices[position] < workers.len() - count + position)
+        else {
+            break;
+        };
+        let next = indices[position] + 1;
+        for (offset, index) in indices[position..].iter_mut().enumerate() {
+            *index = next + offset;
+        }
+    }
+    choices
+}
+
 fn ns(numerator: u128, denominator: u128) -> u64 {
     u64::try_from(numerator.div_ceil(denominator)).unwrap_or(u64::MAX)
 }
@@ -697,6 +969,70 @@ mod tests {
             sampled_at_ms,
         };
         [link(a, b), link(b, a)]
+    }
+
+    #[test]
+    fn joint_placement_uses_disjoint_devices_and_combined_host_headroom() {
+        let a = host(1);
+        let mut flexible = PlacementInventory {
+            group: test_group(),
+            latest: None,
+            active: None,
+            hosts: vec![PlacementHost {
+                host: a,
+                capacity: memory(80, 34),
+                reserved: memory(0, 0),
+                eligible: true,
+            }],
+            workers: (0..16)
+                .map(|ordinal| worker(a, ordinal, if ordinal < 8 { 2000 } else { 1000 }))
+                .collect(),
+        };
+        let mut restricted = flexible.clone();
+        restricted.group = GroupId(host(2));
+        let mut either = workload();
+        either.widths = vec![8];
+        either.bytes_per_peer = 0;
+        let mut fast = either.clone();
+        fast.requirement.min_flops = 2000;
+        let select = |flexible: &PlacementInventory, restricted: &PlacementInventory| {
+            select_set(
+                &[
+                    PlacementGroup {
+                        inventory: flexible,
+                        workload: &either,
+                        rates: None,
+                    },
+                    PlacementGroup {
+                        inventory: restricted,
+                        workload: &fast,
+                        rates: None,
+                    },
+                ],
+                &[],
+                0,
+            )
+            .unwrap()
+        };
+        let choices = select(&flexible, &restricted).unwrap();
+        assert!(
+            choices[0]
+                .resources
+                .workers
+                .keys()
+                .copied()
+                .eq((8..16).map(|ordinal| DeviceId::new(a, ordinal)))
+        );
+        assert!(
+            choices[1]
+                .resources
+                .workers
+                .keys()
+                .copied()
+                .eq((0..8).map(|ordinal| DeviceId::new(a, ordinal)))
+        );
+        flexible.hosts[0].capacity.pinned_bytes -= 1;
+        assert!(select(&flexible, &restricted).is_none());
     }
 
     #[test]

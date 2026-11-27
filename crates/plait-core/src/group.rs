@@ -253,6 +253,17 @@ pub struct GroupTransition {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupPreparation {
+    pub group: GroupId,
+    pub expected_epoch: u64,
+    pub expected_active: Option<u64>,
+    pub resources: ResourcePlan,
+    pub recipe: Option<NodeId>,
+    pub probes: Vec<ProbeRegistration>,
+    pub rates: Option<RateEvidence>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GroupAction {
     SetHostMemory {
         host: NodeId,
@@ -350,6 +361,10 @@ pub enum GroupAction {
     ObserveActiveSet {
         groups: Vec<GroupId>,
     },
+    PrepareSet {
+        preparations: Vec<GroupPreparation>,
+        guards: Vec<(GroupId, Option<u64>)>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -369,6 +384,7 @@ pub enum GroupOutcome {
     Probe(Option<ProbeRegistration>),
     ComputeRate(ComputeRate),
     ActiveSet(Vec<(GroupId, Option<u64>)>),
+    PreparedSet(Vec<GroupVersion>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -501,6 +517,25 @@ impl GroupOperation {
             }
             GroupAction::AdvertiseWorker { profile, .. } => {
                 keys.insert(Key::Device(profile.id));
+            }
+            GroupAction::PrepareSet {
+                preparations,
+                guards,
+            } => {
+                reads.extend(guards.iter().map(|(group, _)| Key::ServingGroup(*group)));
+                for plan in preparations {
+                    keys.insert(Key::ServingGroup(plan.group));
+                    keys.extend(plan.resources.hosts.keys().copied().map(Key::HostMemory));
+                    keys.extend(plan.resources.workers.keys().copied().map(Key::Device));
+                    reads.extend(
+                        plan.probes
+                            .iter()
+                            .map(|probe| Key::LinkProbe(probe.endpoint.host)),
+                    );
+                    if let Some(evidence) = &plan.rates {
+                        reads.extend(evidence.rates.iter().map(|rate| Key::Device(rate.device)));
+                    }
+                }
             }
             GroupAction::PublishGrantedComputeRate { grant, .. } => {
                 reads.insert(Key::ServingGroup(grant.version.group));

@@ -5,9 +5,9 @@ use std::num::NonZeroU64;
 
 use plait_core::group::{
     ActivePlacement, ComputeRate, GrantStatus, GroupAction, GroupError, GroupId, GroupManifest,
-    GroupMember, GroupOperation, GroupOutcome, GroupPhase, GroupReceipt, GroupRecipe, GroupResult,
-    GroupTransition, GroupVersion, GroupView, PeerEndpoint, PlacementHost, PlacementInventory,
-    PlacementWorker, ResourcePlan, WorkerGrant,
+    GroupMember, GroupOperation, GroupOutcome, GroupPhase, GroupPreparation, GroupReceipt,
+    GroupRecipe, GroupResult, GroupTransition, GroupVersion, GroupView, PeerEndpoint,
+    PlacementHost, PlacementInventory, PlacementWorker, RateEvidence, ResourcePlan, WorkerGrant,
 };
 use plait_core::link::{ProbeEndpoint, ProbeRegistration};
 use plait_core::serving::{ExecutionDrainTarget, ServingError};
@@ -319,6 +319,10 @@ impl ServingState {
                         .collect(),
                 ))
             }
+            GroupAction::PrepareSet {
+                ref preparations,
+                ref guards,
+            } => self.prepare_peer_set(preparations, guards),
             GroupAction::AdvertiseWorker {
                 ref profile,
                 incarnation,
@@ -439,23 +443,13 @@ impl ServingState {
                 ref probes,
                 ref rates,
             } => {
-                self.check_link_probes(probes)?;
-                if let Some(evidence) = rates {
-                    let incumbent = if evidence.compared_active {
-                        Some(GroupVersion {
-                            group,
-                            epoch: expected_active.ok_or(GroupError::InvalidPlan)?,
-                        })
-                    } else {
-                        None
-                    };
-                    self.check_compute_rates(
-                        evidence.calibration,
-                        resources,
-                        incumbent,
-                        &evidence.rates,
-                    )?;
-                }
+                self.check_preparation_evidence(
+                    group,
+                    expected_active,
+                    resources,
+                    probes,
+                    rates.as_ref(),
+                )?;
                 let result = self.prepare_planned_peer_group(
                     group,
                     expected_epoch,
@@ -484,6 +478,29 @@ impl ServingState {
                     revision: current.map_or(0, |entry| entry.revision),
                 });
             }
+        }
+        Ok(())
+    }
+
+    fn check_preparation_evidence(
+        &self,
+        group: GroupId,
+        expected_active: Option<u64>,
+        resources: &ResourcePlan,
+        probes: &[ProbeRegistration],
+        rates: Option<&RateEvidence>,
+    ) -> Result<(), GroupError> {
+        self.check_link_probes(probes)?;
+        if let Some(evidence) = rates {
+            let incumbent = if evidence.compared_active {
+                Some(GroupVersion {
+                    group,
+                    epoch: expected_active.ok_or(GroupError::InvalidPlan)?,
+                })
+            } else {
+                None
+            };
+            self.check_compute_rates(evidence.calibration, resources, incumbent, &evidence.rates)?;
         }
         Ok(())
     }
@@ -617,6 +634,73 @@ impl ServingState {
         expected_epoch: u64,
         resources: &ResourcePlan,
     ) -> GroupResult {
+        let mut reservations = Reservations::default();
+        let record =
+            self.reserve_peer_group(group, expected_epoch, resources, &mut reservations)?;
+        let result = record.outcome();
+        self.install_peer_groups([record], reservations);
+        Ok(result)
+    }
+
+    fn prepare_peer_set(
+        &mut self,
+        preparations: &[GroupPreparation],
+        guards: &[(GroupId, Option<u64>)],
+    ) -> GroupResult {
+        if preparations.is_empty() {
+            return Err(GroupError::InvalidPlan);
+        }
+        let mut guarded = BTreeSet::new();
+        for &(group, expected) in guards {
+            if !guarded.insert(group) {
+                return Err(GroupError::InvalidPlan);
+            }
+            self.check_active_epoch(group, expected)?;
+        }
+        let mut groups = BTreeSet::new();
+        let mut reservations = Reservations::default();
+        let mut records = Vec::with_capacity(preparations.len());
+        for plan in preparations {
+            if !groups.insert(plan.group) {
+                return Err(GroupError::InvalidPlan);
+            }
+            self.check_active_epoch(plan.group, plan.expected_active)?;
+            self.check_preparation_evidence(
+                plan.group,
+                plan.expected_active,
+                &plan.resources,
+                &plan.probes,
+                plan.rates.as_ref(),
+            )?;
+            let mut record = self.reserve_peer_group(
+                plan.group,
+                plan.expected_epoch,
+                &plan.resources,
+                &mut reservations,
+            )?;
+            record.recipe = plan.recipe;
+            records.push(record);
+        }
+        let versions = records.iter().map(|record| record.version).collect();
+        self.install_peer_groups(records, reservations);
+        Ok(GroupOutcome::PreparedSet(versions))
+    }
+
+    fn check_active_epoch(&self, group: GroupId, expected: Option<u64>) -> Result<(), GroupError> {
+        let current = self.peer_groups.active_epoch(group);
+        if expected != current {
+            return Err(GroupError::GroupSetChanged { group, current });
+        }
+        Ok(())
+    }
+
+    fn reserve_peer_group(
+        &self,
+        group: GroupId,
+        expected_epoch: u64,
+        resources: &ResourcePlan,
+        reservations: &mut Reservations,
+    ) -> Result<Version, GroupError> {
         if !resources.valid()
             || self.groups.contains_key(&group)
             || self
@@ -645,18 +729,10 @@ impl ServingState {
                 .checked_add(1)
                 .ok_or(GroupError::SequenceExhausted)?,
         };
-        let mut reservations = Reservations::default();
         let grants = self
-            .reserve_resources(
-                version,
-                &resources.workers,
-                &resources.hosts,
-                &mut reservations,
-            )
+            .reserve_resources(version, &resources.workers, &resources.hosts, reservations)
             .map_err(resource_error)?;
-        self.install_host_reservations(reservations.hosts);
-        self.install_grants(&grants);
-        let record = Version {
+        Ok(Version {
             version,
             recipe: None,
             phase: GroupPhase::Preparing,
@@ -666,15 +742,24 @@ impl ServingState {
             manifest: None,
             ready: BTreeSet::new(),
             released: BTreeSet::new(),
-        };
-        let result = record.outcome();
-        self.peer_groups
-            .history
-            .entry(group)
-            .or_default()
-            .versions
-            .insert(version.epoch, record);
-        Ok(result)
+        })
+    }
+
+    fn install_peer_groups(
+        &mut self,
+        records: impl IntoIterator<Item = Version>,
+        reservations: Reservations,
+    ) {
+        self.install_host_reservations(reservations.hosts);
+        for record in records {
+            self.install_grants(&record.grants);
+            self.peer_groups
+                .history
+                .entry(record.version.group)
+                .or_default()
+                .versions
+                .insert(record.version.epoch, record);
+        }
     }
 
     fn publish_peer_endpoint(&mut self, member: GroupMember) -> GroupResult {
@@ -1067,6 +1152,104 @@ mod tests {
         let standby = GroupVersion { group, epoch: 2 };
         let grant = state.peer_group_view(active).unwrap().grants[0];
         (state, active, standby, grant)
+    }
+
+    #[test]
+    fn prepare_set_leaves_no_fences_or_budget_after_a_later_plan_fails() {
+        let mut state = ServingState::default();
+        let host = NodeId::derive("host");
+        let first = DeviceId::new(host, 0);
+        let second = DeviceId::new(host, 1);
+        state
+            .set_host_memory(
+                host,
+                HostMemory {
+                    bytes: 24,
+                    pinned_bytes: 6,
+                },
+            )
+            .unwrap();
+        for device in [first, second] {
+            state.register_worker(device, 1, 16).unwrap();
+        }
+        let make_plan = |name, device, pinned_bytes| GroupPreparation {
+            group: GroupId(NodeId::derive(name)),
+            expected_epoch: 0,
+            expected_active: None,
+            resources: ResourcePlan {
+                workers: BTreeMap::from([(
+                    device,
+                    WorkerDemand {
+                        incarnation: 1,
+                        device_bytes: 8,
+                    },
+                )]),
+                hosts: BTreeMap::from([(
+                    host,
+                    HostMemory {
+                        bytes: 8,
+                        pinned_bytes,
+                    },
+                )]),
+            },
+            recipe: Some(NodeId::derive(name)),
+            probes: Vec::new(),
+            rates: None,
+        };
+        let a = make_plan("first group", first, 4);
+        let mut b = make_plan("second group", second, 4);
+        let version = |plan: &GroupPreparation| GroupVersion {
+            group: plan.group,
+            epoch: 1,
+        };
+        assert_eq!(
+            state.prepare_peer_set(&[a.clone(), b.clone()], &[]),
+            Err(GroupError::HostCapacityExceeded(host))
+        );
+        assert!(state.peer_group_view(version(&a)).is_none());
+        assert!(state.peer_group_view(version(&b)).is_none());
+        assert_eq!(state.hosts[&host].reserved, HostMemory::default());
+        for device in [first, second] {
+            assert_eq!(state.workers[&device].fence, 0);
+            assert!(state.workers[&device].grant.is_none());
+        }
+        b.resources.hosts.get_mut(&host).unwrap().pinned_bytes = 2;
+        assert_eq!(
+            state.prepare_peer_set(&[a.clone(), b.clone()], &[(a.group, Some(9))]),
+            Err(GroupError::GroupSetChanged {
+                group: a.group,
+                current: None
+            })
+        );
+        let result = Ok(GroupOutcome::PreparedSet(vec![version(&a), version(&b)]));
+        let operation = GroupOperation {
+            id: OpId {
+                origin: host,
+                counter: 1,
+            },
+            action: GroupAction::PrepareSet {
+                preparations: vec![a.clone(), b.clone()],
+                guards: Vec::new(),
+            },
+        };
+        assert_eq!(state.apply_peer_group(&operation), result);
+        assert_eq!(state.apply_peer_group(&operation), result);
+        assert_eq!(
+            state.hosts[&host].reserved,
+            HostMemory {
+                bytes: 16,
+                pinned_bytes: 6
+            }
+        );
+        for plan in [&a, &b] {
+            let view = state.peer_group_view(version(plan)).unwrap();
+            assert_eq!(view.phase, GroupPhase::Preparing);
+            assert_eq!(view.grants[0].fence, 1);
+            assert_eq!(
+                state.peer_group_recipe(version(plan)).unwrap().recipe,
+                plan.recipe
+            );
+        }
     }
 
     #[test]

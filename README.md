@@ -240,6 +240,10 @@ The native P/D ingress keeps model routes in vLLM. A single ordered group
 operation can switch several active epochs together. The ingress matches
 both sides of a route against one ordered observation.
 [Switch aggregate and P/D groups](docs/rankless-nccl.md#switch-aggregate-and-pd-using-native-groups)
+The `plan_set` request finds disjoint placements for several successor
+groups and charges their combined host memory. One ordered operation
+reserves the entire set while the incumbent keeps serving.
+[Prepare a group set](docs/rankless-nccl.md#prepare-several-groups-together)
 The vLLM ingress can select among ready layouts using live arrival counters
 and SLO measurements attached to exact group versions.
 [Native layout policy](docs/rankless-nccl.md#select-a-ready-native-layout-from-live-demand)
@@ -365,6 +369,7 @@ release the result after the matching completion has executed in the control pla
 | [Resident group replanning](specs/PlaitGroupReplan.tla) | A planner submits after consecutive matching recommendations. Competing planners can reserve only one successor for the observed epoch. |
 | [Committed group recipes](specs/PlaitGroupRecipe.tla) | Reservation binds the recipe and grants together. A launch uses the recipe recorded for its grant epoch. |
 | [Active group sets](specs/PlaitActiveGroupSet.tla) | An ordered switch checks every expected epoch and applies the complete change. Routing uses one observation and requires every group in a P/D path. Existing work keeps its draining grants. |
+| [Group set preparation](specs/PlaitGroupPrepareSet.tla) | Two placements share a staging ledger on one host. A stale guard or failed reservation leaves both versions and the ledger unchanged. A retry returns the same receipt. TLC checked 50,128 distinct states. |
 | [Native serving mode policy](https://github.com/devillove084/vllm/blob/plait/v0.31-runtime/tools/plait/serving/specs/PlaitServingModePolicy.tla) | A switch requires repeated windows, a viable target, fresh profiles before send, and a matching active set at commit. A retry returns the original receipt. |
 | [Native serving cutover](specs/PlaitNativeServingCutover.tla) | The deployment publishes a ready engine's origin before activation. An admitted stream keeps its version as ingress replicas observe the switch. |
 | [Native serving retirement](specs/PlaitNativeServingRetire.tla) | Planned retirement closes admission, waits for the engine to drain, and releases each host's grants after its process group exits. |

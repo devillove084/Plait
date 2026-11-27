@@ -1,18 +1,28 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufRead, Write};
 
 use plait_core::group::{
-    GroupAction, GroupId, GroupLookup, GroupOperation, GroupReceipt, GroupRecipe, GroupReply,
-    GroupVersion, HostMemory, ResourcePlan, WorkerDemand,
+    GroupAction, GroupId, GroupLookup, GroupOperation, GroupPhase, GroupPreparation, GroupReceipt,
+    GroupRecipe, GroupReply, GroupVersion, HostMemory, ResourcePlan, WorkerDemand,
 };
 use plait_core::link::ProbeRegistration;
 use plait_core::{DeviceId, NodeId, OpId};
 use plait_node::{Client, discover_voters};
-use plait_parallel::group_placement::{Decision, DirectedLink, Workload};
+use plait_parallel::group_placement::{
+    self, Cost, Decision, DirectedLink, PlacementGroup, Workload,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::group_plan::{Snapshot, collect_links};
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetMember {
+    group: GroupId,
+    workload: Workload,
+    calibration: Option<NodeId>,
+}
 
 #[derive(Deserialize)]
 #[serde(tag = "request", rename_all = "snake_case")]
@@ -31,6 +41,13 @@ enum Request {
         links: Option<Vec<DirectedLink>>,
         prepare: Option<OpId>,
         calibration: Option<NodeId>,
+    },
+    PlanSet {
+        groups: Vec<SetMember>,
+        #[serde(default)]
+        guards: Vec<(GroupId, Option<u64>)>,
+        links: Option<Vec<DirectedLink>>,
+        prepare: Option<OpId>,
     },
     Apply {
         operation: GroupOperation,
@@ -238,6 +255,14 @@ async fn handle(client: &mut Client, voters: &[NodeId], request: Request) -> io:
             };
             return Ok(response);
         }
+        Request::PlanSet {
+            groups,
+            guards,
+            links,
+            prepare,
+        } => {
+            return plan_set(client, voters, groups, guards, links, prepare).await;
+        }
         Request::Apply { operation } => operation,
         Request::Prepare {
             id,
@@ -336,6 +361,139 @@ async fn group_recipe(
         }
     }
     if missing { Ok(None) } else { Err(last) }
+}
+
+async fn plan_set(
+    client: &mut Client,
+    voters: &[NodeId],
+    groups: Vec<SetMember>,
+    guards: Vec<(GroupId, Option<u64>)>,
+    links: Option<Vec<DirectedLink>>,
+    prepare: Option<OpId>,
+) -> io::Result<Value> {
+    if groups.is_empty()
+        || groups
+            .iter()
+            .map(|member| member.group)
+            .collect::<BTreeSet<_>>()
+            .len()
+            != groups.len()
+        || guards
+            .iter()
+            .map(|&(group, _)| group)
+            .collect::<BTreeSet<_>>()
+            .len()
+            != guards.len()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "empty set or duplicate group or guard",
+        ));
+    }
+    if let Some(id) = prepare
+        && let Some(receipt) = group_receipt(client, voters, id).await?
+    {
+        if let GroupAction::PrepareSet {
+            preparations,
+            guards: previous,
+        } = receipt.operation.action
+            && guards == previous
+            && preparations
+                .iter()
+                .map(|item| {
+                    (
+                        item.group,
+                        item.rates.as_ref().map(|rates| rates.calibration),
+                    )
+                })
+                .eq(groups.iter().map(|item| (item.group, item.calibration)))
+        {
+            return Ok(json!({ "decision": "prepare_set", "replayed": true,
+                "plans": preparations.iter().map(|plan| preparation_json(plan, None)).collect::<Vec<_>>(),
+                "result": receipt.result,
+            }));
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "operation id already used for another action or group set",
+        ));
+    }
+
+    let mut snapshots = Vec::with_capacity(groups.len());
+    for member in &groups {
+        snapshots
+            .push(placement_inventory(client, voters, member.group, member.calibration).await?);
+    }
+    let pending: Vec<_> = snapshots
+        .iter()
+        .filter_map(|snapshot| match snapshot.inventory.latest {
+            Some((version, GroupPhase::Preparing | GroupPhase::Ready)) => Some(version),
+            _ => None,
+        })
+        .collect();
+    if !pending.is_empty() {
+        return Ok(json!({ "decision": "pending", "versions": pending }));
+    }
+    let (links, probes) = match links {
+        Some(links) => (links, Vec::new()),
+        None if !groups.iter().any(|member| member.workload.needs_links()) => {
+            (Vec::new(), Vec::new())
+        }
+        None => {
+            let hosts: BTreeSet<_> = snapshots
+                .iter()
+                .flat_map(|snapshot| &snapshot.inventory.hosts)
+                .filter(|host| host.eligible)
+                .map(|host| host.host)
+                .collect();
+            let mut probes = link_probes(client, voters).await?;
+            probes.retain(|probe| hosts.contains(&probe.endpoint.host));
+            (collect_links(&probes).await, probes)
+        }
+    };
+    let inputs: Vec<_> = groups
+        .iter()
+        .zip(&snapshots)
+        .map(|(member, snapshot)| PlacementGroup {
+            inventory: &snapshot.inventory,
+            workload: &member.workload,
+            rates: snapshot.rates.as_deref(),
+        })
+        .collect();
+    let Some(choices) =
+        group_placement::select_set(&inputs, &links, crate::hosted_probe::now_ms()?)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
+    else {
+        return Ok(json!({ "decision": "no_placement" }));
+    };
+    let mut preparations = Vec::with_capacity(choices.len());
+    let mut plans = Vec::with_capacity(choices.len());
+    for (choice, snapshot) in choices.into_iter().zip(snapshots) {
+        let plan = snapshot.preparation(choice.resources, false, probes.clone(), choice.recipe);
+        plans.push(preparation_json(&plan, Some(choice.cost)));
+        preparations.push(plan);
+    }
+    let mut response = json!({ "decision": "prepare_set", "plans": plans });
+    if let Some(id) = prepare {
+        let action = GroupAction::PrepareSet {
+            preparations,
+            guards,
+        };
+        response["result"] = json!(apply(client, voters, &GroupOperation { id, action }).await?);
+    }
+    Ok(response)
+}
+
+fn preparation_json(plan: &GroupPreparation, cost: Option<Cost>) -> Value {
+    json!({
+        "group": plan.group,
+        "expected_epoch": plan.expected_epoch,
+        "expected_active": plan.expected_active,
+        "workers": plan.resources.workers.iter().collect::<Vec<_>>(),
+        "hosts": plan.resources.hosts.iter().collect::<Vec<_>>(),
+        "recipe": plan.recipe,
+        "cost": cost,
+    })
 }
 
 async fn link_probes(client: &mut Client, voters: &[NodeId]) -> io::Result<Vec<ProbeRegistration>> {
