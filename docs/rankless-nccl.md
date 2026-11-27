@@ -353,6 +353,15 @@ worker, `element_bytes` is its element width, and `count` is the number
 of sequential calls with that shape per scored operation. Add a bucket
 for each payload size, such as separate prefill and decode calls.
 
+For native TP, `peer_all_reduce` accepts `replicated_egress_bytes`. Offer
+multiple recipes with distinct base IDs to compare budgets against current
+link samples. Use the same workload buckets and device work when comparing
+only the exchange choice. Include staging memory in each worker's host
+reservation. The planner prices the advertised cap with the runtime's
+algorithm selector. An explicit cap binds the base recipe ID, width, and
+cap into the committed recipe ID. Omitting the cap preserves the original ID
+and uses the default runtime threshold.
+
 The planner uses the host-staged peer runtime's exchange choice and shard
 rule. A replicated call prices one exchange of the full input. A larger
 call prices scatter and gather separately, using the actual shard sizes
@@ -638,21 +647,25 @@ Widths without a configured partition continue to use tensor parallelism.
 The descriptor binds the full version to the selected collective axis.
 The engine verifies the layer partition during startup, before activation.
 
-For plans using `workload.recipes`, map their exact IDs to engine layouts in
+For plans using `workload.recipes`, map their base IDs to engine layouts in
 the shared deployment file. Use the same mapping on each launch host.
 
 ```json
 {
   "layout_recipes": {
     "01010101010101010101010101010101": {"width": 2},
-    "02020202020202020202020202020202": {"width": 2, "pipeline_layers": [11, 17]}
+    "02020202020202020202020202020202": {"width": 2, "pipeline_layers": [11, 17]},
+    "03030303030303030303030303030303": {"width": 2, "replicated_egress_bytes": 262144}
   }
 }
 ```
 
 A committed ID selects one of these layouts before the host builds its
-launch descriptor. An absent mapping or a width mismatch prevents startup.
-An older untagged version uses the deployment's width-based settings.
+launch descriptor. The launcher derives the same binding ID for an explicit
+TP cap and copies that cap to `tp_groups`. A missing binding or a width
+mismatch prevents startup. An older untagged version uses the deployment's
+width-based settings. Add new entries while the launcher is running to
+offer more recipes. Existing entries retain their widths and options.
 
 Run one route publisher alongside the ingress, or add `--routes` to the
 launcher on that host. Both processes use the same route file.

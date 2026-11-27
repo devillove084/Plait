@@ -2,7 +2,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use plait_core::collective::{PeerAllReducePlan, peer_all_reduce_plan, peer_shard_elements};
+use plait_core::collective::{
+    PeerAllReducePlan, bind_peer_all_reduce_recipe, peer_all_reduce_plan,
+    peer_all_reduce_plan_with_egress, peer_shard_elements,
+};
 use plait_core::group::{
     ComputeRate, GroupId, GroupPhase, GroupVersion, HostMemory, PlacementHost, PlacementInventory,
     PlacementWorker, ResourcePlan, WorkerDemand,
@@ -43,6 +46,18 @@ pub struct Recipe {
     pub communication: Communication,
 }
 
+impl Recipe {
+    pub fn binding_id(&self) -> NodeId {
+        match self.communication {
+            Communication::PeerAllReduce {
+                replicated_egress_bytes: Some(bytes),
+                ..
+            } => bind_peer_all_reduce_recipe(self.id, self.work.len() as u64, bytes),
+            _ => self.id,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComputeOrder {
@@ -53,9 +68,18 @@ pub enum ComputeOrder {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Communication {
-    AllToAll { rounds: u64, bytes_per_peer: u64 },
-    PeerAllReduce { calls: Vec<AllReduceCalls> },
-    Directed { edges: Vec<Exchange> },
+    AllToAll {
+        rounds: u64,
+        bytes_per_peer: u64,
+    },
+    PeerAllReduce {
+        calls: Vec<AllReduceCalls>,
+        #[serde(default)]
+        replicated_egress_bytes: Option<u64>,
+    },
+    Directed {
+        edges: Vec<Exchange>,
+    },
 }
 
 /// A class of serial host-staged peer AllReduce calls for one operation.
@@ -84,7 +108,7 @@ impl Workload {
                 .iter()
                 .any(|recipe| match &recipe.communication {
                     Communication::AllToAll { rounds, .. } => *rounds != 0,
-                    Communication::PeerAllReduce { calls } => !calls.is_empty(),
+                    Communication::PeerAllReduce { calls, .. } => !calls.is_empty(),
                     Communication::Directed { edges } => !edges.is_empty(),
                 })
     }
@@ -101,9 +125,11 @@ impl Workload {
             return Err("invalid group placement workload");
         }
         let mut recipes = BTreeSet::new();
+        let mut bindings = BTreeSet::new();
         for recipe in &self.recipes {
             let width = recipe.work.len();
             if !recipes.insert(recipe.id)
+                || !bindings.insert(recipe.binding_id())
                 || !self.widths.iter().any(|&item| item as usize == width)
                 || recipe.work.iter().all(|&work| work == 0)
                 || matches!(
@@ -113,7 +139,7 @@ impl Workload {
                         bytes_per_peer: 1..
                     }
                 )
-                || matches!(&recipe.communication, Communication::PeerAllReduce { calls }
+                || matches!(&recipe.communication, Communication::PeerAllReduce { calls, .. }
                     if calls.is_empty() || calls.iter().any(|call| call.count == 0 || call.bytes == 0
                         || !matches!(call.element_bytes, 1 | 2 | 4 | 8)
                         || call.bytes % call.element_bytes != 0))
@@ -443,7 +469,9 @@ pub fn select_with_recipes(
                 workload
                     .recipes
                     .iter()
-                    .find(|profile| profile.id == id && profile.work.len() == workers.len())
+                    .find(|profile| {
+                        profile.binding_id() == id && profile.work.len() == workers.len()
+                    })
                     .ok_or("active group recipe is missing from the workload policy")
             })
             .transpose()?;
@@ -580,7 +608,7 @@ impl<'a> Model<'a> {
                     let width = BTreeSet::from([recipe.work.len()]);
                     self.search_candidates(hosts, available, &width, Some(recipe), alternatives)
                         .into_iter()
-                        .map(|candidate| (candidate, Some(recipe.id)))
+                        .map(|candidate| (candidate, Some(recipe.binding_id())))
                 })
                 .collect()
         };
@@ -802,7 +830,10 @@ impl<'a> Model<'a> {
                 rounds,
                 bytes_per_peer,
             } => self.all_to_all(workers, *bytes_per_peer, *rounds)?,
-            Communication::PeerAllReduce { calls } => self.peer_all_reduce(&ordered, calls)?,
+            Communication::PeerAllReduce {
+                calls,
+                replicated_egress_bytes,
+            } => self.peer_all_reduce(&ordered, calls, *replicated_egress_bytes)?,
             Communication::Directed { edges } => {
                 let mut total = 0u64;
                 for edge in edges {
@@ -846,14 +877,23 @@ impl<'a> Model<'a> {
         Some(network_ns)
     }
 
-    fn peer_all_reduce(&self, ordered: &[Worker], calls: &[AllReduceCalls]) -> Option<u64> {
+    fn peer_all_reduce(
+        &self,
+        ordered: &[Worker],
+        calls: &[AllReduceCalls],
+        replicated_egress_bytes: Option<u64>,
+    ) -> Option<u64> {
         let hosts = count_hosts(ordered);
         if hosts.len() < 2 {
             return Some(0);
         }
         let mut total = 0u64;
         for call in calls {
-            let elapsed = match peer_all_reduce_plan(call.bytes, ordered.len()) {
+            let plan = match replicated_egress_bytes {
+                Some(bytes) => peer_all_reduce_plan_with_egress(call.bytes, ordered.len(), bytes),
+                None => peer_all_reduce_plan(call.bytes, ordered.len()),
+            };
+            let elapsed = match plan {
                 PeerAllReducePlan::Replicated => {
                     self.exchange_phase(&hosts, |source, target| {
                         u128::from(call.bytes) * hosts[&source] as u128 * hosts[&target] as u128
@@ -1274,6 +1314,7 @@ mod tests {
                 work: vec![100_000_000; 2],
                 compute: ComputeOrder::Parallel,
                 communication: Communication::PeerAllReduce {
+                    replicated_egress_bytes: None,
                     calls: vec![AllReduceCalls {
                         count: 57,
                         bytes: 1024,
@@ -1356,12 +1397,12 @@ mod tests {
         ];
         // The two-worker host services four cross-host worker pairs per direction.
         assert_eq!(
-            model.peer_all_reduce(&workers, &calls),
+            model.peer_all_reduce(&workers, &calls, None),
             Some(399 * (100 + 4 * 2048) + 57 * (100 + 4 * 10240))
         );
-        assert_eq!(model.peer_all_reduce(&workers[..2], &calls), Some(0));
+        assert_eq!(model.peer_all_reduce(&workers[..2], &calls, None), Some(0));
         let incomplete = Model::new(&workload, &links[..5], 55, None).unwrap();
-        assert_eq!(incomplete.peer_all_reduce(&workers, &calls), None);
+        assert_eq!(incomplete.peer_all_reduce(&workers, &calls, None), None);
     }
 
     #[test]
@@ -1384,9 +1425,77 @@ mod tests {
         // A owns 43,694 bytes and B owns 21,846. B's slower egress is the
         // bottleneck in both sequential phases, with different payload sizes.
         assert_eq!(
-            model.peer_all_reduce(&workers, &calls),
+            model.peer_all_reduce(&workers, &calls, None),
             Some(2 * 43_694 + 2 * 43_692 + 2 * 100)
         );
+    }
+
+    #[test]
+    fn profile_selection_switches_all_reduce_recipe_with_link_latency() {
+        let [a, b, c] = [1, 2, 3].map(host);
+        let inventory = PlacementInventory {
+            group: test_group(),
+            latest: None,
+            active: None,
+            hosts: [a, b, c]
+                .into_iter()
+                .map(|host| PlacementHost {
+                    host,
+                    capacity: memory(32, 16),
+                    reserved: memory(0, 0),
+                    eligible: true,
+                })
+                .collect(),
+            workers: [a, b, c].map(|host| worker(host, 0, 1_000_000_000)).into(),
+        };
+        let mut workload = workload();
+        workload.widths = vec![3];
+        let default = NodeId::from_bytes([3; 16]);
+        let tuned = NodeId::from_bytes([4; 16]);
+        workload.recipes = [(default, None), (tuned, Some(256 * 1024))]
+            .into_iter()
+            .map(|(id, replicated_egress_bytes)| Recipe {
+                id,
+                work: vec![10; 3],
+                compute: ComputeOrder::Parallel,
+                communication: Communication::PeerAllReduce {
+                    calls: vec![AllReduceCalls {
+                        count: 1,
+                        bytes: 128 * 1024,
+                        element_bytes: 2,
+                    }],
+                    replicated_egress_bytes,
+                },
+            })
+            .collect();
+        let mut links: Vec<_> = [(a, b), (a, c), (b, c)]
+            .into_iter()
+            .flat_map(|(left, right)| links_between(left, right, 1_000_000_000, 50))
+            .collect();
+        let quote = |links: &[DirectedLink]| {
+            let Decision::Prepare {
+                resources,
+                recipe: Some(id),
+                cost,
+                ..
+            } = select(&inventory, &workload, links, 55).unwrap()
+            else {
+                panic!("expected a priced TP recipe");
+            };
+            (resources, id, cost.network_ns)
+        };
+        let (before, low_rtt, low_cost) = quote(&links);
+        for link in &mut links {
+            link.rtt_ns = 1_000_000;
+        }
+        let (after, high_rtt, high_cost) = quote(&links);
+        assert_eq!(before, after);
+        assert_eq!(low_rtt, default);
+        assert_eq!(low_cost, 174_968);
+        assert_eq!(high_rtt, bind_peer_all_reduce_recipe(tuned, 3, 256 * 1024));
+        assert_ne!(high_rtt, tuned);
+        assert_eq!(high_rtt.to_hex(), "a04f7569b5d79140032b71bdf79dd49a");
+        assert_eq!(high_cost, 1_262_144);
     }
 
     #[test]
