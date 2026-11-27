@@ -8,14 +8,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{Access, DeviceId, Key, Mode, NodeId, OpId};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct GroupId(pub NodeId);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct GroupVersion {
-    pub group: GroupId,
-    pub epoch: u64,
-}
+pub use crate::group::{GroupId, GroupVersion, WorkerGrant};
 
 /// A pin consumes both the pinning quota and the host's total memory quota.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -416,14 +409,6 @@ impl GroupPlan {
         }
         Ok(())
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkerGrant {
-    pub version: GroupVersion,
-    pub device: DeviceId,
-    pub incarnation: u64,
-    pub fence: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

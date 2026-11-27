@@ -7,6 +7,34 @@ HGGC workers share the same wire format.
 
 ## Start a peer group
 
+### Join by device identity
+
+Use the native [C ABI](../crates/plait-nccl/include/plait_peer.h) or Rust
+`RanklessListener` for a caller that already owns a committed group version
+and the corresponding worker grants. The caller supplies these grants and
+distributes peer endpoint records through its control plane.
+
+1. On every participant, call `plaitPeerListen` with the group ID and epoch,
+   stable device ID, incarnation, fence, and a fresh per-listener ticket.
+   The returned member record carries the selected endpoint and grant.
+2. Give every participant the full member list. Call `plaitPeerConnect`
+   with the list in any order and the local backend and device ordinal.
+   Plait sorts by device ID and checks the group version, complete grant list,
+   endpoints, and tickets in each handshake. Rust callers use
+   `Comm::connect_rankless`.
+3. Use the usual NCCL operations on the returned handle. Resolve a stable
+   device ID to its current slot with `plaitPeerDeviceSlot` when an operation
+   accepts a peer or root slot.
+
+`plaitPeerCancel` closes the communicator's sockets and prevents new calls.
+`plaitPeerFailed` reports failure recorded locally by cancellation or an
+operation. Wait for active calls before destroying the handle or releasing its
+buffers. Build a new communicator from the next group's grants and tickets
+when the control plane changes membership. Independent communicators continue
+using their own sockets and sequence state.
+
+### Bootstrap from vLLM
+
 Start the vLLM workers with the same TP layout and the vendor's PyTorch
 runtime on each worker. The fork uses Gloo to exchange endpoints and for
 its existing CPU control operations. Set `VLLM_HOST_IP` to the address

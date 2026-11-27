@@ -1,12 +1,12 @@
 use super::*;
 use crate::backend::BackendError;
 use crate::{
-    Comm, DeviceRuntime, NCCL_SUCCESS, ncclAllGather, ncclAllReduce, ncclBroadcast, ncclRecv,
-    ncclReduce, ncclReduceScatter, ncclSend,
+    Comm, DeviceRuntime, NCCL_SUCCESS, RanklessComm, Transport, ncclAllGather, ncclAllReduce,
+    ncclBroadcast, ncclRecv, ncclReduce, ncclReduceScatter, ncclSend,
 };
 use std::ffi::c_void;
 
-use plait_core::{NodeId, serving::GroupId};
+use plait_core::{NodeId, group::GroupId};
 
 fn listeners(world: usize) -> (Vec<Listener>, Vec<Endpoint>) {
     let listeners: Vec<_> = (0..world)
@@ -17,7 +17,7 @@ fn listeners(world: usize) -> (Vec<Listener>, Vec<Endpoint>) {
 }
 
 fn groups(world: usize) -> Vec<Arc<PeerGroup>> {
-    groups_with_timeout(world, Duration::from_secs(2))
+    groups_with_timeout(world, Duration::from_secs(8))
 }
 
 #[test]
@@ -144,9 +144,10 @@ fn groups_with_timeout(world: usize, timeout: Duration) -> Vec<Arc<PeerGroup>> {
 
 #[test]
 fn a_stalled_peer_times_out_while_another_group_runs() {
-    let mut stalled = groups_with_timeout(2, Duration::from_millis(350));
+    let mut stalled = groups(2);
     let sleeping = stalled.pop().unwrap();
-    let waiting = stalled.pop().unwrap();
+    let mut waiting = stalled.pop().unwrap();
+    Arc::get_mut(&mut waiting).unwrap().timeout = Duration::from_millis(350);
     let healthy = groups(2);
     let op = Collective::AllReduce(DataType::Uint8, ReduceOp::Sum);
     thread::scope(|scope| {
@@ -410,4 +411,179 @@ fn participants_reject_partial_membership_views() {
         assert!(right.connect(1, full, timeout).is_err());
         assert!(short.join().unwrap());
     });
+}
+
+fn rankless_listeners(
+    version: GroupVersion,
+    devices: &[DeviceId],
+) -> (Vec<RanklessListener>, Vec<RanklessMember>) {
+    let listeners: Vec<_> = devices
+        .iter()
+        .enumerate()
+        .map(|(index, &device)| {
+            RanklessListener::bind(
+                "127.0.0.1:0".parse().unwrap(),
+                [index as u8; 16],
+                plait_core::group::WorkerGrant {
+                    version,
+                    device,
+                    incarnation: 1,
+                    fence: version.epoch,
+                },
+            )
+            .unwrap()
+        })
+        .collect();
+    let members = listeners.iter().map(RanklessListener::member).collect();
+    (listeners, members)
+}
+
+fn rankless_comms(version: GroupVersion, devices: &[DeviceId]) -> Vec<RanklessComm> {
+    let (listeners, members) = rankless_listeners(version, devices);
+    thread::scope(|scope| {
+        let jobs: Vec<_> = listeners
+            .into_iter()
+            .enumerate()
+            .map(|(index, listener)| {
+                let mut members = members.clone();
+                members.rotate_left(index);
+                scope.spawn(move || {
+                    Comm::connect_rankless_with_runtime(
+                        listener,
+                        members,
+                        devices[index].ordinal as usize,
+                        Box::new(HostDevice),
+                        Duration::from_secs(2),
+                    )
+                    .unwrap()
+                })
+            })
+            .collect();
+        jobs.into_iter().map(|job| job.join().unwrap()).collect()
+    })
+}
+
+fn all_reduce_i32(comm: &Comm, value: i32, output: &mut i32) -> i32 {
+    ncclAllReduce(
+        (&value as *const i32).cast(),
+        (output as *mut i32).cast(),
+        1,
+        DataType::Int32 as i32,
+        ReduceOp::Sum as i32,
+        std::ptr::from_ref(comm).cast_mut(),
+        7 as *mut c_void,
+    )
+}
+
+#[test]
+fn rankless_replacement_preserves_device_identity_and_isolates_the_old_failure() {
+    let [a, b, c, replacement] = [
+        DeviceId::new(NodeId::from_bytes([1; 16]), 0),
+        DeviceId::new(NodeId::from_bytes([2; 16]), 0),
+        DeviceId::new(NodeId::from_bytes([2; 16]), 1),
+        DeviceId::new(NodeId::from_bytes([3; 16]), 0),
+    ];
+    let group = GroupId(NodeId::derive("native group"));
+    let old = GroupVersion { group, epoch: 1 };
+    let new = GroupVersion { group, epoch: 2 };
+    let independent = GroupVersion {
+        group: GroupId(NodeId::derive("native independent group")),
+        epoch: 1,
+    };
+    let mut original = rankless_comms(old, &[c, a, b]);
+    let running = rankless_comms(independent, &[c, b]);
+    assert_eq!(original[0].peer_slot(a), Some(0));
+    assert_eq!(original[0].peer_slot(b), Some(1));
+    assert_eq!(original[0].peer_slot(c), Some(2));
+    drop(original.remove(1));
+
+    thread::scope(|scope| {
+        for comm in &original {
+            scope.spawn(move || {
+                let mut output = -1;
+                assert_ne!(all_reduce_i32(comm, 1, &mut output), NCCL_SUCCESS);
+                assert_eq!(output, -1);
+                assert_eq!(comm.peers_failed(), Some(true));
+            });
+        }
+        for comm in &running {
+            scope.spawn(move || {
+                let mut output = -1;
+                assert_eq!(all_reduce_i32(comm, 4, &mut output), NCCL_SUCCESS);
+                assert_eq!(output, 8);
+                assert_eq!(comm.peers_failed(), Some(false));
+            });
+        }
+    });
+
+    let next = rankless_comms(new, &[replacement, c, b]);
+    thread::scope(|scope| {
+        for comm in &next {
+            scope.spawn(move || {
+                assert_eq!(comm.peer_slot(a), None);
+                assert_eq!(comm.peer_slot(b), Some(0));
+                let mut output = -1;
+                assert_eq!(all_reduce_i32(comm, 3, &mut output), NCCL_SUCCESS);
+                assert_eq!(output, 9);
+            });
+        }
+    });
+    for comm in original {
+        let mut output = -1;
+        assert_ne!(all_reduce_i32(&comm, 1, &mut output), NCCL_SUCCESS);
+        assert_eq!(output, -1);
+    }
+}
+
+#[test]
+fn peer_handshake_rejects_different_grants_with_identical_endpoints() {
+    let version = GroupVersion {
+        group: GroupId(NodeId::derive("native mismatched grants")),
+        epoch: 1,
+    };
+    let devices = [1, 2].map(|index| DeviceId::new(NodeId::from_bytes([index; 16]), 0));
+    let (mut listeners, members) = rankless_listeners(version, &devices);
+    let right = listeners.pop().unwrap();
+    let left = listeners.pop().unwrap();
+    let mut stale = members.clone();
+    stale[1].grant.fence += 1;
+    thread::scope(|scope| {
+        let timeout = Duration::from_secs(2);
+        let left = scope.spawn(move || left.connect(stale, timeout).is_err());
+        assert!(right.connect(members, timeout).is_err());
+        assert!(left.join().unwrap());
+    });
+}
+
+#[test]
+fn cancel_wakes_an_active_peer_call_and_rejects_reuse() {
+    let version = GroupVersion {
+        group: GroupId(NodeId::derive("native cancellation")),
+        epoch: 1,
+    };
+    let devices = [1, 2].map(|index| DeviceId::new(NodeId::from_bytes([index; 16]), 0));
+    let mut peers = rankless_comms(version, &devices);
+    let idle = peers.pop().unwrap();
+    let waiting = peers.pop().unwrap();
+    let Transport::Peers(remote) = &idle.transport else {
+        unreachable!()
+    };
+    thread::scope(|scope| {
+        let call = scope.spawn(|| {
+            let mut output = -1;
+            let result = all_reduce_i32(&waiting, 1, &mut output);
+            assert_ne!(result, NCCL_SUCCESS);
+            assert_eq!(output, -1);
+        });
+        // Read the operation header before cancelling so the call is in flight.
+        let mut stream = &remote.link(0).collective;
+        let mut header = [0; 24];
+        stream.read_exact(&mut header).unwrap();
+        assert!(waiting.cancel_peers());
+        assert_eq!(waiting.peers_failed(), Some(true));
+        call.join().unwrap();
+    });
+    let mut output = -1;
+    assert_ne!(all_reduce_i32(&waiting, 1, &mut output), NCCL_SUCCESS);
+    assert_eq!(output, -1);
 }

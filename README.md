@@ -176,6 +176,11 @@ The vLLM fork uses peer transport for TP collectives and PP activations when
 Each worker exchanges endpoint metadata over Gloo and sends tensors directly
 to its peers. [Peer transport and startup](docs/rankless-nccl.md)
 
+Native C and Rust callers can bind a communicator directly to an execution
+group version and its device grants. Stable identities determine the temporary
+slots, and each peer validates the full manifest during the socket handshake.
+[Native peer bootstrap](docs/rankless-nccl.md#join-by-device-identity)
+
 ### vLLM reference integration
 
 Managed replacements reuse complete prompt KV blocks across TP sizes and PP
@@ -287,6 +292,7 @@ release the result after the matching completion has executed in the control pla
 | [Asynchronous reduction](specs/PlaitAsyncReduction.tla) | W4A4 device completion, stale-event rejection, and deterministic folding. An independent operation completes even while a producer or pull in another operation stalls. |
 | [Ordered publication](specs/PlaitOrderedPublication.tla) | Completion and revocation in the agreed command order, receipt identity on retry, and recovery from a replica's durable command prefix. |
 | [Peer collectives](specs/PlaitPeerCollective.tla) | Round pairing, replicated and sharded reduction, and completion of an independent communicator when a participant in another group is lost. |
+| [Rankless peer join](specs/PlaitRanklessPeerJoin.tla) | Socket handshakes bind the group version and grant view. Cancellation closes the participant's links. |
 | [Hosted rollout and failover](specs/PlaitHostLaunch.tla) | Full readiness before activation, ordered standby promotion on incumbent revocation, and exclusion of groups affected by the same host loss. |
 | [Hosted assignment](specs/PlaitHostedAssignment.tla) | An observed assignment requires an ordered claim before launch. The local lock remains held through supervisor loss until the launcher exits. |
 | [KFD device release](specs/PlaitKfdRelease.tla) | A complete report for the captured device checks its queues and VRAM. Activity on another device leaves release enabled. |

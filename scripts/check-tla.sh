@@ -60,3 +60,4 @@ tlc -deadlock -config specs/PlaitOrderedPublication.cfg specs/PlaitOrderedPublic
 tlc -deadlock -config specs/PlaitPeerCollective.cfg specs/PlaitPeerCollective.tla
 tlc -deadlock -config specs/PlaitPeerCollectiveOdd.cfg specs/PlaitPeerCollective.tla
 tlc -deadlock -config specs/PlaitPeerCollectiveReplicatedLoss.cfg specs/PlaitPeerCollective.tla
+tlc -deadlock -config specs/PlaitRanklessPeerJoin.cfg specs/PlaitRanklessPeerJoin.tla

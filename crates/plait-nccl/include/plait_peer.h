@@ -1,0 +1,68 @@
+#ifndef PLAIT_PEER_H
+#define PLAIT_PEER_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+struct ncclComm;
+typedef struct PlaitPeerListener PlaitPeerListener;
+
+typedef struct {
+    uint8_t group[16];
+    uint64_t epoch;
+} PlaitPeerGroupVersion;
+
+typedef struct {
+    uint8_t node[16];
+    uint32_t ordinal;
+} PlaitPeerDevice;
+
+typedef struct {
+    PlaitPeerDevice device;
+    uint64_t incarnation;
+    uint64_t fence;
+} PlaitPeerGrant;
+
+typedef struct {
+    PlaitPeerGroupVersion version;
+    PlaitPeerGrant grant;
+    char address[80];
+    uint8_t ticket[16];
+} PlaitPeerMember;
+
+enum {
+    PLAIT_PEER_CUDA = 0,
+    PLAIT_PEER_ROCM = 1,
+    PLAIT_PEER_HUAWEI = 2,
+    PLAIT_PEER_PPU = 3
+};
+
+/* Use a concrete IP and port 0 for an automatically allocated port. */
+int32_t plaitPeerListen(const char *address, const PlaitPeerGroupVersion *version,
+                        const PlaitPeerGrant *grant, const uint8_t ticket[16],
+                        PlaitPeerListener **listener, PlaitPeerMember *member);
+
+/* Accept the full manifest in any order. The join attempt consumes the listener
+   and sets its pointer to NULL. Invalid input rejected before the join leaves it
+   owned by the caller. The communicator uses the existing NCCL collectives. */
+int32_t plaitPeerConnect(PlaitPeerListener **listener, const PlaitPeerMember *members,
+                         size_t count, int32_t backend, uint32_t device,
+                         uint32_t timeout_ms, struct ncclComm **comm);
+int32_t plaitPeerListenerDestroy(PlaitPeerListener *listener);
+int32_t plaitPeerDeviceSlot(const struct ncclComm *comm, const PlaitPeerDevice *device,
+                            int32_t *slot);
+
+/* Cancel outstanding socket I/O. Wait for active calls before destroying the
+   communicator with ncclCommDestroy or releasing its buffers. */
+int32_t plaitPeerCancel(const struct ncclComm *comm);
+int32_t plaitPeerFailed(const struct ncclComm *comm, int32_t *failed);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

@@ -8,6 +8,7 @@
 pub mod command;
 pub mod config;
 pub mod device;
+pub mod group;
 pub mod identity;
 pub mod serving;
 pub mod tensor;

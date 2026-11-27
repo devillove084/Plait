@@ -11,12 +11,15 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use plait_core::serving::GroupVersion;
+use plait_core::DeviceId;
+use plait_core::group::GroupVersion;
 use sha2::{Digest, Sha256};
 
 use crate::{DataType, ReduceOp, reduce_bytes, reduce_fp8_to_f32};
 
 mod frame;
+mod rankless;
+pub use rankless::{RanklessListener, RanklessMember};
 
 const COLLECTIVE_LANE: u8 = 0;
 const DIRECT_LANE: u8 = 1;
@@ -88,6 +91,16 @@ impl Listener {
         members: Vec<Endpoint>,
         timeout: Duration,
     ) -> io::Result<Arc<PeerGroup>> {
+        self.connect_bound(slot, members, None, timeout)
+    }
+
+    fn connect_bound(
+        self,
+        slot: usize,
+        members: Vec<Endpoint>,
+        binding: Option<GrantBinding>,
+        timeout: Duration,
+    ) -> io::Result<Arc<PeerGroup>> {
         if timeout.is_zero()
             || members.len() > i32::MAX as usize
             || members.get(slot) != Some(&self.endpoint)
@@ -116,7 +129,7 @@ impl Listener {
             slot,
             timeout,
             deadline,
-            manifest: manifest_digest(self.version, &members),
+            manifest: manifest_digest(self.version, &members, binding.as_ref()),
         };
         let mut connections = (0..members.len()).map(|_| [None, None]).collect::<Vec<_>>();
         let (incoming, local_and_outgoing) = connections.split_at_mut(slot);
@@ -146,8 +159,14 @@ impl Listener {
             timeout,
             sequence: Mutex::new(0),
             failed: AtomicBool::new(false),
+            devices: binding.map(|binding| binding.devices),
         }))
     }
+}
+
+struct GrantBinding {
+    devices: Vec<DeviceId>,
+    digest: [u8; 32],
 }
 
 type WireLanes = [Option<TcpStream>; 2];
@@ -234,7 +253,11 @@ fn configure(stream: &TcpStream, timeout: Duration) -> io::Result<()> {
     stream.set_write_timeout(Some(timeout))
 }
 
-fn manifest_digest(version: Option<GroupVersion>, members: &[Endpoint]) -> [u8; 32] {
+fn manifest_digest(
+    version: Option<GroupVersion>,
+    members: &[Endpoint],
+    binding: Option<&GrantBinding>,
+) -> [u8; 32] {
     let mut digest = Sha256::new();
     match version {
         Some(version) => {
@@ -258,6 +281,10 @@ fn manifest_digest(version: Option<GroupVersion>, members: &[Endpoint]) -> [u8; 
         }
         digest.update(member.address.port().to_le_bytes());
         digest.update(member.ticket);
+    }
+    if let Some(binding) = binding {
+        digest.update(b"plait-peer-device-grants-v1");
+        digest.update(binding.digest);
     }
     digest.finalize().into()
 }
@@ -348,14 +375,31 @@ pub(crate) struct PeerGroup {
     timeout: Duration,
     sequence: Mutex<u64>,
     failed: AtomicBool,
+    devices: Option<Vec<DeviceId>>,
 }
 
 impl PeerGroup {
-    fn live(&self) -> io::Result<()> {
-        if self.failed.load(Ordering::Acquire) {
+    pub(crate) fn live(&self) -> io::Result<()> {
+        if self.is_failed() {
             return Err(io::Error::other("peer communicator has failed"));
         }
         Ok(())
+    }
+
+    pub(crate) fn is_failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn slot(&self) -> usize {
+        self.slot
+    }
+
+    pub(crate) fn world(&self) -> usize {
+        self.links.len()
+    }
+
+    pub(crate) fn device_slot(&self, device: DeviceId) -> Option<usize> {
+        self.devices.as_ref()?.binary_search(&device).ok()
     }
 
     pub fn fail(&self) {

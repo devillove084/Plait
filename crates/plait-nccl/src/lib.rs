@@ -21,13 +21,16 @@ mod backend;
 mod cross;
 mod ipc;
 mod kernel;
+mod native;
 mod p2p;
 mod peer;
 mod shm;
 
 use backend::{CudaRuntime, DeviceRuntime, HostCopyRuntime, HuaweiRuntime, PpuRuntime};
 use peer::{Collective, PeerGroup};
-pub use peer::{Endpoint as PeerEndpoint, Listener as PeerListener};
+pub use peer::{
+    Endpoint as PeerEndpoint, Listener as PeerListener, RanklessListener, RanklessMember,
+};
 
 pub type NcclResult = i32;
 pub const NCCL_SUCCESS: NcclResult = 0;
@@ -328,6 +331,34 @@ pub struct Comm {
     runtime: Box<dyn DeviceRuntime>,
 }
 
+/// A peer-only communicator without the legacy IPC and device-kernel state.
+pub struct RanklessComm(Box<Comm>);
+
+// SAFETY: the private constructor installs only a PeerGroup and a Send + Sync
+// DeviceRuntime. The legacy IPC, kernel, and shared-memory fields stay empty.
+unsafe impl Send for RanklessComm {}
+// SAFETY: peer operations synchronize independently of the legacy fields.
+unsafe impl Sync for RanklessComm {}
+
+impl std::ops::Deref for RanklessComm {
+    type Target = Comm;
+
+    fn deref(&self) -> &Comm {
+        &self.0
+    }
+}
+
+impl RanklessComm {
+    /// Borrow the NCCL handle. It remains owned by this value.
+    pub fn as_ptr(&self) -> *mut Comm {
+        std::ptr::from_ref(&*self.0).cast_mut()
+    }
+
+    fn into_raw(self) -> *mut Comm {
+        Box::into_raw(self.0)
+    }
+}
+
 enum Transport {
     Star {
         network: Mutex<Network>,
@@ -337,6 +368,58 @@ enum Transport {
 }
 
 impl Comm {
+    pub fn connect_rankless(
+        listener: RanklessListener,
+        members: Vec<RanklessMember>,
+        backend: BackendKind,
+        device: usize,
+        timeout: Duration,
+    ) -> Result<RanklessComm, String> {
+        let runtime = create_runtime(backend, device)?;
+        Self::connect_rankless_with_runtime(listener, members, device, runtime, timeout)
+    }
+
+    fn connect_rankless_with_runtime(
+        listener: RanklessListener,
+        members: Vec<RanklessMember>,
+        device: usize,
+        runtime: Box<dyn DeviceRuntime>,
+        timeout: Duration,
+    ) -> Result<RanklessComm, String> {
+        let group = listener
+            .connect(members, timeout)
+            .map_err(|error| error.to_string())?;
+        let slot = group.slot();
+        let world = group.world();
+        Ok(RanklessComm(Box::new(Self::with_peers(
+            group, slot, world, device, runtime,
+        ))))
+    }
+
+    pub fn peer_slot(&self, device: plait_core::DeviceId) -> Option<usize> {
+        match &self.transport {
+            Transport::Peers(group) => group.device_slot(device),
+            Transport::Star { .. } => None,
+        }
+    }
+
+    /// Close the peer sockets and refuse new calls. The caller must wait for
+    /// active calls to return before destroying the handle or its buffers.
+    pub fn cancel_peers(&self) -> bool {
+        let Transport::Peers(group) = &self.transport else {
+            return false;
+        };
+        group.fail();
+        true
+    }
+
+    pub fn peers_failed(&self) -> Option<bool> {
+        match &self.transport {
+            Transport::Peers(group) => Some(group.is_failed()),
+            Transport::Star { .. } => None,
+        }
+    }
+
     pub fn connect_peers(
         listener: PeerListener,
         members: Vec<PeerEndpoint>,
@@ -499,6 +582,9 @@ fn device_to_host(
 }
 
 fn synchronize_stream(comm: &Comm, stream: *mut std::ffi::c_void) -> Result<(), NcclResult> {
+    if let Transport::Peers(group) = &comm.transport {
+        group.live().map_err(|error| set_error(error.to_string()))?;
+    }
     comm.runtime
         .synchronize_stream(stream as u64)
         .map_err(|error| {
@@ -2173,9 +2259,7 @@ impl CommHandle {
     }
 
     fn abort(&self) {
-        if let Transport::Peers(group) = &unsafe { &*self.ptr }.transport {
-            group.fail();
-        }
+        unsafe { &*self.ptr }.cancel_peers();
     }
 
     fn all_reduce(
@@ -2420,7 +2504,7 @@ impl PyPeerListener {
             None => PeerListener::bind(address, ticket),
             Some(version) => {
                 use plait_core::NodeId;
-                use plait_core::serving::{GroupId, GroupVersion};
+                use plait_core::group::{GroupId, GroupVersion};
 
                 let version_error = || {
                     pyo3::exceptions::PyValueError::new_err(
