@@ -136,6 +136,10 @@ impl Runtime {
         self.serving.placement_inventory(group)
     }
 
+    pub fn link_probes(&self) -> Vec<plait_core::link::ProbeRegistration> {
+        self.serving.link_probes()
+    }
+
     pub fn peer_group_receipt(&self, id: OpId) -> Option<&GroupReceipt> {
         self.serving.peer_group_receipt(id)
     }

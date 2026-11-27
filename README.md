@@ -188,8 +188,10 @@ release individual device grants after each owner confirms teardown.
 [Replicated group metadata](docs/rankless-nccl.md#publish-a-manifest-through-the-control-plane)
 
 The native planner matches placement to device capabilities, per-device
-memory, host memory, and measured directional links. It can reserve a
-replacement against the current group epoch while the incumbent runs.
+memory, host memory, and directional links measured by resident nodes.
+It can reserve a replacement while the incumbent runs. The reservation
+checks the group epoch, resource ledger, and probe sessions used to score
+the plan.
 [Heterogeneous group placement](docs/rankless-nccl.md#plan-across-heterogeneous-resources)
 
 ### vLLM reference integration
@@ -306,6 +308,7 @@ release the result after the matching completion has executed in the control pla
 | [Rankless peer join](specs/PlaitRanklessPeerJoin.tla) | Socket handshakes bind the group version and grant view. Cancellation closes the participant's links. |
 | [Replicated group manifest](specs/PlaitGroupManifest.tla) | Activation follows complete endpoint and handshake evidence. Retrying an old release preserves any successor grant. |
 | [Native group placement](specs/PlaitGroupPlacement.tla) | A planned reservation checks the version, incumbent, and resource availability against concurrent changes. |
+| [Native probe sessions](specs/PlaitProbePlacement.tla) | A planned reservation checks both endpoint revisions if a probe restarts after measurement. |
 | [Hosted rollout and failover](specs/PlaitHostLaunch.tla) | Full readiness before activation, ordered standby promotion on incumbent revocation, and exclusion of groups affected by the same host loss. |
 | [Hosted assignment](specs/PlaitHostedAssignment.tla) | An observed assignment requires an ordered claim before launch. The local lock remains held through supervisor loss until the launcher exits. |
 | [KFD device release](specs/PlaitKfdRelease.tla) | A complete report for the captured device checks its queues and VRAM. Activity on another device leaves release enabled. |

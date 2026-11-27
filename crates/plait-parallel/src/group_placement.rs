@@ -30,7 +30,7 @@ pub struct Workload {
     pub minimum_gain_ns: u64,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DirectedLink {
     pub source: NodeId,

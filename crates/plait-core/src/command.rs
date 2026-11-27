@@ -91,6 +91,7 @@ pub enum Key {
     HostMemory(NodeId),
     ServingOperation(OpId),
     ServingRoutes(RouteSetId),
+    LinkProbe(NodeId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,9 +177,10 @@ impl Key {
         match self {
             Self::Tensor(_) | Self::Op(_) => KeyClass::Data,
             Self::Device(_) | Self::HostMemory(_) => KeyClass::Device,
-            Self::ServingGroup(_) | Self::ServingOperation(_) | Self::ServingRoutes(_) => {
-                KeyClass::Control
-            }
+            Self::ServingGroup(_)
+            | Self::ServingOperation(_)
+            | Self::ServingRoutes(_)
+            | Self::LinkProbe(_) => KeyClass::Control,
             Self::Config => KeyClass::Config,
         }
     }

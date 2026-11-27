@@ -76,8 +76,10 @@ device bytes. The incarnation binds the profile to the registered device.
 The `placement` request reads the group's versions, available device grants,
 and host capacity and reservations from a replica.
 
-Send a `plan` request with the group ID, a `workload` object, and directed
-link samples. The workload contains the following fields.
+Send a `plan` request with the group ID and a `workload` object. When the
+workload sends bytes between workers, the planner reads the latest samples
+from the hosts' probes. An explicit `links` array supplies the samples for
+that request. Use `links: []` to evaluate with no link measurements.
 
 | Field | Meaning |
 | --- | --- |
@@ -95,7 +97,7 @@ for equal work per device. The network estimate accounts for all worker pairs
 sharing each directed host link, then takes the highest host ingress or egress
 cost. A cross-host communication candidate needs fresh measurements in both
 directions. The search retains up to 24 partial layouts per width. The network
-estimate covers cross-host TCP and the caller supplies the measured links.
+estimate covers cross-host TCP.
 
 The reply reports `prepare` with a placement and cost, `keep` with the active
 version, `pending` with the version in preparation, `await_links` when the
@@ -104,8 +106,38 @@ candidate. When both layouts are feasible, the estimated gain over the horizon
 must exceed the replacement cost and threshold. Set the request's optional
 `prepare` field to an operation ID to reserve the selected placement through
 consensus. The transaction rechecks the latest and active epochs and the live
-resource ledger. Retrying a submitted operation ID reads its applied receipt.
+resource ledger. With automatic sampling, it also compares the probe registrations
+used to score the chosen layout and the incumbent, when compared. A changed
+registration returns `StaleProbe`. Read fresh samples and submit a new operation
+ID to retry that plan. Retrying a submitted operation ID reads its applied receipt.
 The new group follows the normal endpoint, readiness, and activation steps.
+
+#### Run resident link probes
+
+Add `--link-probe "$NODE_IP:0"` to `plait-node run` on each participating host.
+Use the same stable `--id` as the host's worker profiles. The IP must be reachable
+by the other probe hosts and by the planner. `:0` lets the OS select a port.
+Upgrade the voters to a version that supports probe registration before
+enabling this option. A nonvoting host can run a probe without an engine
+configuration.
+
+```sh
+plait-node run --compute-only --id "$HOST_ID" \
+  --seed "$SEED_IP:$SEED_PORT" --link-probe "$NODE_IP:0"
+```
+
+Each process publishes its bound endpoint with a new session ID. It discovers
+targets through the replicated directory. A probe sends 1 MiB per target on a
+ten-second interval and records throughput and RTT in the sending direction.
+Durable voters recover the directory from their journals. Samples remain in
+memory and are rebuilt after restart. A `links` request to `plait-node group` returns
+the directory and the available samples. Sample timestamps use the probe
+host's wall clock. Keep host clocks synchronized for `max_link_age_ms` checks.
+
+The planner checks the source session when it requests samples and compares
+the reported target session against the directory. When a probe is replaced,
+samples for its old session are excluded. The ordered reservation checks the
+registration revisions again in case they change after the planner reads them.
 
 ### Bootstrap from vLLM
 

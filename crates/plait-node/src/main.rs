@@ -13,6 +13,7 @@ mod device_release;
 mod group_cli;
 mod hosted_probe;
 mod kv_store;
+mod peer_probes;
 mod serving_cli;
 mod tensor_cli;
 
@@ -146,6 +147,7 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             let mut advertise_devices = true;
             let mut execution = None;
             let mut hosted_execution = None;
+            let mut link_probe: Option<SocketAddr> = None;
             let mut compute_only = false;
             while let Some(arg) = args.next() {
                 match arg.as_str() {
@@ -182,6 +184,9 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         )?);
                     }
                     "--compute-only" => compute_only = true,
+                    "--link-probe" => {
+                        link_probe = Some(args.next().ok_or("--link-probe needs an IP:port")?.parse()?);
+                    }
                     other => return Err(format!("unknown argument {other}").into()),
                 }
             }
@@ -191,8 +196,8 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             if state_dir.is_some() && id.is_none() {
                 return Err("durable replicas require an explicit --id".into());
             }
-            if (execution.is_some() || hosted_execution.is_some()) && id.is_none() {
-                return Err("execution requires a stable --id".into());
+            if (execution.is_some() || hosted_execution.is_some() || link_probe.is_some()) && id.is_none() {
+                return Err("execution and link probes require a stable --id".into());
             }
             if execution.is_some() && hosted_execution.is_some() {
                 return Err("select one local execution supervisor per node".into());
@@ -202,18 +207,24 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 if join.is_some() || state_dir.is_some() || peers.is_empty() == seeds.is_empty() {
                     return Err("--compute-only requires either --peer or --seed and no voting membership or journal flags".into());
                 }
+                if execution.is_none() && hosted_execution.is_none() && link_probe.is_none() {
+                    return Err("--compute-only requires an execution configuration or --link-probe".into());
+                }
+                let auxiliary = execution.is_some() || hosted_execution.is_some();
+                let probe = peer_probes::run(id, link_probe, peers.clone(), seeds.clone(), auxiliary);
                 let execute = async {
                     if let Some(config) = execution {
                         tensor_cli::runtime::run(id, config, peers, seeds).await
                     } else if let Some(config) = hosted_execution {
                         tensor_cli::runtime::hosted::run(id, config, peers, seeds).await
                     } else {
-                        Err(std::io::Error::other("--compute-only requires an execution configuration"))
+                        std::future::pending::<std::io::Result<()>>().await
                     }
                 };
                 tokio::select! {
                     result = tokio::signal::ctrl_c() => result?,
                     result = execute => result?,
+                    result = probe => result?,
                 }
                 return Ok(());
             }
@@ -239,6 +250,7 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             };
             println!("plait node {} listening on {}", node.id(), node.addr());
             execution_peers.insert(id, node.addr().to_owned());
+            let probe = peer_probes::run(id, link_probe, execution_peers.clone(), Vec::new(), true);
             let execute = async {
                 if let Some(config) = execution {
                     tensor_cli::runtime::run(id, config, execution_peers, Vec::new()).await
@@ -252,6 +264,7 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 result = tokio::signal::ctrl_c() => result?,
                 result = node.wait() => result?,
                 result = execute => result?,
+                result = probe => result?,
             }
             drop(node);
             Ok(())

@@ -10,6 +10,7 @@ pub mod config;
 pub mod device;
 pub mod group;
 pub mod identity;
+pub mod link;
 pub mod serving;
 pub mod tensor;
 

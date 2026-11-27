@@ -7,8 +7,9 @@ use plait_core::group::{
     GroupOutcome, GroupPhase, GroupReceipt, GroupResult, GroupVersion, GroupView, PeerEndpoint,
     PlacementHost, PlacementInventory, PlacementWorker, ResourcePlan, WorkerGrant,
 };
+use plait_core::link::{ProbeEndpoint, ProbeRegistration};
 use plait_core::serving::{ExecutionDrainTarget, ServingError};
-use plait_core::{DeviceId, DeviceProfile, OpId};
+use plait_core::{DeviceId, DeviceProfile, NodeId, OpId};
 
 use super::{Reservations, ServingState};
 
@@ -17,6 +18,7 @@ pub(super) struct PeerGroups {
     history: BTreeMap<GroupId, History>,
     receipts: BTreeMap<OpId, GroupReceipt>,
     profiles: BTreeMap<DeviceId, (u64, DeviceProfile)>,
+    probes: BTreeMap<NodeId, ProbeRegistration>,
 }
 
 #[derive(Clone, Default)]
@@ -96,6 +98,10 @@ impl PeerGroups {
 }
 
 impl ServingState {
+    pub(crate) fn link_probes(&self) -> Vec<ProbeRegistration> {
+        self.peer_groups.probes.values().copied().collect()
+    }
+
     pub(crate) fn placement_inventory(&self, group: GroupId) -> PlacementInventory {
         let history = self.peer_groups.history.get(&group);
         let latest = history
@@ -255,18 +261,85 @@ impl ServingState {
                 expected_epoch,
                 expected_active,
                 ref resources,
+            } => self.prepare_planned_peer_group(group, expected_epoch, expected_active, resources),
+            GroupAction::ObserveProbe(host) => Ok(GroupOutcome::Probe(
+                self.peer_groups.probes.get(&host).copied(),
+            )),
+            GroupAction::PublishProbe {
+                endpoint,
+                expected_revision,
+            } => self.publish_link_probe(endpoint, expected_revision),
+            GroupAction::PrepareMeasured {
+                group,
+                expected_epoch,
+                expected_active,
+                ref resources,
+                ref probes,
             } => {
-                let current = self
-                    .peer_groups
-                    .history
-                    .get(&group)
-                    .and_then(|history| history.active);
-                if current != expected_active {
-                    return Err(GroupError::ActiveEpochChanged { current });
+                for probe in probes {
+                    let host = probe.endpoint.host;
+                    let current = self.peer_groups.probes.get(&host);
+                    if current != Some(probe) {
+                        return Err(GroupError::StaleProbe {
+                            host,
+                            revision: current.map_or(0, |entry| entry.revision),
+                        });
+                    }
                 }
-                self.prepare_peer_group(group, expected_epoch, resources)
+                self.prepare_planned_peer_group(group, expected_epoch, expected_active, resources)
             }
         }
+    }
+
+    fn publish_link_probe(
+        &mut self,
+        endpoint: ProbeEndpoint,
+        expected_revision: u64,
+    ) -> GroupResult {
+        if !endpoint.valid() {
+            return Err(GroupError::InvalidEndpoint);
+        }
+        let current = self.peer_groups.probes.get(&endpoint.host).copied();
+        let revision = current.map_or(0, |entry| entry.revision);
+        if revision != expected_revision {
+            return Err(GroupError::StaleProbe {
+                host: endpoint.host,
+                revision,
+            });
+        }
+        if let Some(entry) = current.filter(|entry| entry.endpoint.session == endpoint.session) {
+            return if entry.endpoint == endpoint {
+                Ok(GroupOutcome::Probe(current))
+            } else {
+                Err(GroupError::InvalidEndpoint)
+            };
+        }
+        let entry = ProbeRegistration {
+            revision: revision
+                .checked_add(1)
+                .ok_or(GroupError::SequenceExhausted)?,
+            endpoint,
+        };
+        self.peer_groups.probes.insert(endpoint.host, entry);
+        Ok(GroupOutcome::Probe(Some(entry)))
+    }
+
+    fn prepare_planned_peer_group(
+        &mut self,
+        group: GroupId,
+        expected_epoch: u64,
+        expected_active: Option<u64>,
+        resources: &ResourcePlan,
+    ) -> GroupResult {
+        let current = self
+            .peer_groups
+            .history
+            .get(&group)
+            .and_then(|history| history.active);
+        if current != expected_active {
+            return Err(GroupError::ActiveEpochChanged { current });
+        }
+        self.prepare_peer_group(group, expected_epoch, resources)
     }
 
     fn prepare_peer_group(
@@ -650,6 +723,88 @@ mod tests {
                 .profile
                 .is_some()
         );
+    }
+
+    #[test]
+    fn probe_restart_fences_a_measured_reservation_and_old_publisher() {
+        let hosts = [NodeId::derive("source"), NodeId::derive("target")];
+        let devices = hosts.map(|host| DeviceId::new(host, 0));
+        let endpoint = |host, session| ProbeEndpoint {
+            host,
+            session: NodeId::derive(session),
+            address: ([127, 0, 0, 1], 9010).into(),
+        };
+        let mut state = ServingState::default();
+        let capacity = HostMemory {
+            bytes: 16,
+            pinned_bytes: 0,
+        };
+        for device in devices {
+            state.set_host_memory(device.node, capacity).unwrap();
+            state.register_worker(device, 1, 16).unwrap();
+        }
+        let first = [
+            endpoint(hosts[0], "first source"),
+            endpoint(hosts[1], "first target"),
+        ];
+        let mut probes = first.map(|endpoint| {
+            let operation = GroupOperation {
+                id: OpId::new(endpoint.session, 1),
+                action: GroupAction::PublishProbe {
+                    endpoint,
+                    expected_revision: 0,
+                },
+            };
+            let Ok(GroupOutcome::Probe(Some(registration))) = state.apply_peer_group(&operation)
+            else {
+                panic!("expected probe registration");
+            };
+            assert_eq!(registration.revision, 1);
+            assert_eq!(
+                state.apply_peer_group(&operation),
+                Ok(GroupOutcome::Probe(Some(registration)))
+            );
+            registration
+        });
+        let plan = |probes: Vec<_>| GroupAction::PrepareMeasured {
+            group: GroupId(NodeId::derive("measured group")),
+            expected_epoch: 0,
+            expected_active: None,
+            resources: ResourcePlan {
+                workers: devices
+                    .into_iter()
+                    .map(|device| {
+                        (
+                            device,
+                            WorkerDemand {
+                                incarnation: 1,
+                                device_bytes: 8,
+                            },
+                        )
+                    })
+                    .collect(),
+                hosts: hosts.into_iter().map(|host| (host, capacity)).collect(),
+            },
+            probes,
+        };
+        let successor = endpoint(hosts[1], "second target");
+        let Ok(GroupOutcome::Probe(Some(current))) = state.publish_link_probe(successor, 1) else {
+            panic!("expected successor registration");
+        };
+        assert_eq!(current.revision, 2);
+        let stale = Err(GroupError::StaleProbe {
+            host: hosts[1],
+            revision: 2,
+        });
+        assert_eq!(state.publish_link_probe(first[1], 1), stale);
+        assert_eq!(state.peer_group_transition(&plan(probes.to_vec())), stale);
+        assert!(
+            devices
+                .into_iter()
+                .all(|device| state.workers[&device].grant.is_none())
+        );
+        probes[1] = current;
+        assert!(state.peer_group_transition(&plan(probes.to_vec())).is_ok());
     }
 
     #[test]

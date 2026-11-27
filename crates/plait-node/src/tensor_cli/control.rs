@@ -4,6 +4,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 
+use plait_core::group::{GroupLookup, GroupOperation, GroupReply, GroupResult};
 use plait_core::serving::{
     GroupId, GroupVersion, GroupView, ServingAction, ServingError, ServingLookup, ServingOperation,
     ServingResult, ServingView, WorkerGrant,
@@ -16,7 +17,7 @@ use serde::{Deserialize, Serialize};
 type PeerCall<'a, T> = Pin<Box<dyn Future<Output = io::Result<T>> + Send + 'a>>;
 
 #[derive(Clone, Deserialize, Serialize)]
-pub(super) struct ControlPeers {
+pub(crate) struct ControlPeers {
     peers: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     seeds: Vec<SocketAddr>,
@@ -25,7 +26,7 @@ pub(super) struct ControlPeers {
 }
 
 impl ControlPeers {
-    pub(super) fn new(peers: Vec<String>, seeds: Vec<SocketAddr>, listen: String) -> Self {
+    pub(crate) fn new(peers: Vec<String>, seeds: Vec<SocketAddr>, listen: String) -> Self {
         Self {
             peers,
             seeds,
@@ -35,7 +36,7 @@ impl ControlPeers {
     }
 }
 
-pub(super) struct GroupControl {
+pub(crate) struct GroupControl {
     client: Client,
     peers: Vec<NodeId>,
     seeds: Vec<SocketAddr>,
@@ -43,7 +44,7 @@ pub(super) struct GroupControl {
 }
 
 impl GroupControl {
-    pub(super) async fn connect(config: ControlPeers) -> io::Result<Self> {
+    pub(crate) async fn connect(config: ControlPeers) -> io::Result<Self> {
         if config.peers.is_empty() == config.seeds.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -102,6 +103,27 @@ impl GroupControl {
             Box::pin(async move { client.apply_serving(peer, &operation).await })
         })
         .await
+    }
+
+    pub(crate) async fn apply_group(
+        &mut self,
+        operation: &GroupOperation,
+    ) -> io::Result<GroupResult> {
+        self.call(|client, peer| {
+            let operation = operation.clone();
+            Box::pin(async move { client.apply_group(peer, &operation).await })
+        })
+        .await
+    }
+
+    pub(crate) async fn query_group(&mut self, lookup: GroupLookup) -> io::Result<GroupReply> {
+        let result = self
+            .call(|client, peer| Box::pin(client.query_group(peer, lookup)))
+            .await;
+        if result.is_ok() {
+            self.peers.rotate_left(1);
+        }
+        result
     }
 
     async fn call<T>(

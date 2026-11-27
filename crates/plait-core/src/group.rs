@@ -6,6 +6,7 @@ use std::net::{IpAddr, SocketAddr};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::link::{ProbeEndpoint, ProbeRegistration};
 use crate::{Access, DeviceId, DeviceProfile, Key, Mode, NodeId, OpId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -258,6 +259,18 @@ pub enum GroupAction {
         expected_active: Option<u64>,
         resources: ResourcePlan,
     },
+    ObserveProbe(NodeId),
+    PublishProbe {
+        endpoint: ProbeEndpoint,
+        expected_revision: u64,
+    },
+    PrepareMeasured {
+        group: GroupId,
+        expected_epoch: u64,
+        expected_active: Option<u64>,
+        resources: ResourcePlan,
+        probes: Vec<ProbeRegistration>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -268,6 +281,7 @@ pub enum GroupOutcome {
         version: GroupVersion,
         phase: GroupPhase,
     },
+    Probe(Option<ProbeRegistration>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -295,6 +309,7 @@ pub enum GroupError {
     SequenceExhausted,
     ProfileMismatch(DeviceId),
     ActiveEpochChanged { current: Option<u64> },
+    StaleProbe { host: NodeId, revision: u64 },
 }
 
 pub type GroupResult = Result<GroupOutcome, GroupError>;
@@ -310,6 +325,7 @@ pub enum GroupLookup {
     Version(GroupVersion),
     Receipt(OpId),
     Placement(GroupId),
+    LinkProbes,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -317,12 +333,13 @@ pub enum GroupReply {
     Version(Option<GroupView>),
     Receipt(Option<GroupReceipt>),
     Placement(PlacementInventory),
+    LinkProbes(Vec<ProbeRegistration>),
 }
 
 impl GroupOperation {
     pub(crate) fn accesses(&self) -> Vec<Access> {
         let mut keys = BTreeSet::from([Key::ServingOperation(self.id)]);
-        let mut mode = Mode::Write;
+        let mut reads = BTreeSet::new();
         match &self.action {
             GroupAction::SetHostMemory { host, .. } => {
                 keys.insert(Key::HostMemory(*host));
@@ -338,10 +355,20 @@ impl GroupOperation {
             }
             | GroupAction::PreparePlanned {
                 group, resources, ..
+            }
+            | GroupAction::PrepareMeasured {
+                group, resources, ..
             } => {
                 keys.insert(Key::ServingGroup(*group));
                 keys.extend(resources.hosts.keys().copied().map(Key::HostMemory));
                 keys.extend(resources.workers.keys().copied().map(Key::Device));
+                if let GroupAction::PrepareMeasured { probes, .. } = &self.action {
+                    reads.extend(
+                        probes
+                            .iter()
+                            .map(|probe| Key::LinkProbe(probe.endpoint.host)),
+                    );
+                }
             }
             GroupAction::PublishEndpoint(GroupMember { grant, .. })
             | GroupAction::Ready { grant, .. } => {
@@ -360,19 +387,24 @@ impl GroupOperation {
                 ]);
             }
             GroupAction::Observe { group, .. } => {
-                keys.insert(Key::ServingGroup(*group));
-                mode = Mode::Read;
+                reads.insert(Key::ServingGroup(*group));
+            }
+            GroupAction::ObserveProbe(host) => {
+                reads.insert(Key::LinkProbe(*host));
+            }
+            GroupAction::PublishProbe { endpoint, .. } => {
+                keys.insert(Key::LinkProbe(endpoint.host));
             }
         }
         keys.into_iter()
             .map(|key| Access {
                 key,
-                mode: if key == Key::ServingOperation(self.id) {
-                    Mode::Write
-                } else {
-                    mode
-                },
+                mode: Mode::Write,
             })
+            .chain(reads.into_iter().map(|key| Access {
+                key,
+                mode: Mode::Read,
+            }))
             .collect()
     }
 }

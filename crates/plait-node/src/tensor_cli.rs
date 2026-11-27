@@ -12,7 +12,7 @@ use plait_node::Client;
 use serde::Deserialize;
 use tokio::task::JoinSet;
 
-mod control;
+pub(crate) mod control;
 mod frame;
 pub(super) mod runtime;
 mod w4;

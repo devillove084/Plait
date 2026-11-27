@@ -479,6 +479,7 @@ impl NodeState {
                     GroupLookup::Placement(group) => {
                         GroupReply::Placement(runtime.placement_inventory(group))
                     }
+                    GroupLookup::LinkProbes => GroupReply::LinkProbes(runtime.link_probes()),
                 };
                 let _ = self
                     .transport

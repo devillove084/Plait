@@ -1,10 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufRead, Write};
 
 use plait_core::group::{
     GroupAction, GroupId, GroupLookup, GroupOperation, GroupReceipt, GroupReply, GroupVersion,
     HostMemory, PlacementInventory, ResourcePlan, WorkerDemand,
 };
+use plait_core::link::ProbeRegistration;
 use plait_core::{DeviceId, NodeId, OpId};
 use plait_node::{Client, discover_voters};
 use plait_parallel::group_placement::{self, Decision, DirectedLink, Workload};
@@ -17,11 +18,11 @@ enum Request {
     Placement {
         group: GroupId,
     },
+    Links,
     Plan {
         group: GroupId,
         workload: Workload,
-        #[serde(default)]
-        links: Vec<DirectedLink>,
+        links: Option<Vec<DirectedLink>>,
         prepare: Option<OpId>,
     },
     Apply {
@@ -94,6 +95,11 @@ async fn handle(client: &mut Client, voters: &[NodeId], request: Request) -> io:
             let available = placement_inventory(client, voters, group).await?;
             return Ok(json!({ "placement": available }));
         }
+        Request::Links => {
+            let probes = link_probes(client, voters).await?;
+            let links = collect_links(&probes).await;
+            return Ok(json!({ "probes": probes, "links": links }));
+        }
         Request::Plan {
             group,
             workload,
@@ -103,11 +109,16 @@ async fn handle(client: &mut Client, voters: &[NodeId], request: Request) -> io:
             if let Some(id) = prepare
                 && let Some(receipt) = group_receipt(client, voters, id).await?
             {
-                let GroupAction::PreparePlanned {
+                let (GroupAction::PreparePlanned {
                     group: selected,
                     resources,
                     ..
-                } = receipt.operation.action
+                }
+                | GroupAction::PrepareMeasured {
+                    group: selected,
+                    resources,
+                    ..
+                }) = receipt.operation.action
                 else {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -127,6 +138,17 @@ async fn handle(client: &mut Client, voters: &[NodeId], request: Request) -> io:
                 }));
             }
             let available = placement_inventory(client, voters, group).await?;
+            let (links, probes) = match links {
+                Some(links) => (links, None),
+                None if workload.bytes_per_peer == 0 => (Vec::new(), None),
+                None => {
+                    let hosts: BTreeSet<_> =
+                        available.hosts.iter().map(|entry| entry.host).collect();
+                    let mut probes = link_probes(client, voters).await?;
+                    probes.retain(|probe| hosts.contains(&probe.endpoint.host));
+                    (collect_links(&probes).await, Some(probes))
+                }
+            };
             let now = crate::hosted_probe::now_ms()?;
             let decision = group_placement::select(&available, &workload, &links, now)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
@@ -152,16 +174,36 @@ async fn handle(client: &mut Client, voters: &[NodeId], request: Request) -> io:
                     if let Some(id) = prepare {
                         let expected_epoch =
                             available.latest.map_or(0, |(version, _)| version.epoch);
-                        let expected_active = available.active.map(|active| active.version.epoch);
-                        let operation = GroupOperation {
-                            id,
-                            action: GroupAction::PreparePlanned {
+                        let expected_active =
+                            available.active.as_ref().map(|active| active.version.epoch);
+                        let action = if let Some(mut probes) = probes {
+                            let mut used = BTreeSet::new();
+                            if resources.hosts.len() > 1 {
+                                used.extend(resources.hosts.keys().copied());
+                            }
+                            if incumbent.is_some()
+                                && let Some(active) = &available.active
+                                && active.hosts.len() > 1
+                            {
+                                used.extend(active.hosts.iter().map(|&(host, _)| host));
+                            }
+                            probes.retain(|probe| used.contains(&probe.endpoint.host));
+                            GroupAction::PrepareMeasured {
                                 group,
                                 expected_epoch,
                                 expected_active,
                                 resources,
-                            },
+                                probes,
+                            }
+                        } else {
+                            GroupAction::PreparePlanned {
+                                group,
+                                expected_epoch,
+                                expected_active,
+                                resources,
+                            }
                         };
+                        let operation = GroupOperation { id, action };
                         response["result"] = json!(apply(client, voters, &operation).await?);
                     }
                     response
@@ -229,6 +271,33 @@ async fn handle(client: &mut Client, voters: &[NodeId], request: Request) -> io:
         }
     };
     Ok(json!({ "result": apply(client, voters, &operation).await? }))
+}
+
+async fn link_probes(client: &mut Client, voters: &[NodeId]) -> io::Result<Vec<ProbeRegistration>> {
+    let mut last = io::Error::other("no reachable voter");
+    for &peer in voters {
+        match client.query_group(peer, GroupLookup::LinkProbes).await {
+            Ok(GroupReply::LinkProbes(probes)) => return Ok(probes),
+            Ok(_) => last = io::Error::other("expected link probe directory"),
+            Err(error) => last = error,
+        }
+    }
+    Err(last)
+}
+
+async fn collect_links(probes: &[ProbeRegistration]) -> Vec<DirectedLink> {
+    let endpoints = probes.iter().map(|probe| probe.endpoint).collect();
+    crate::hosted_probe::collect(endpoints, None)
+        .await
+        .into_iter()
+        .map(|((source, target), sample)| DirectedLink {
+            source,
+            target,
+            sampled_at_ms: sample.sampled_at_ms,
+            bytes_per_second: sample.bytes_per_second,
+            rtt_ns: sample.rtt_ns,
+        })
+        .collect()
 }
 
 async fn apply(
