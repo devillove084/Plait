@@ -54,6 +54,7 @@ tlc -deadlock -config specs/PlaitRanklessPeerJoin.cfg specs/PlaitRanklessPeerJoi
 tlc -deadlock -config specs/PlaitRanklessLayout.cfg specs/PlaitRanklessLayout.tla
 tlc -deadlock -config specs/PlaitPeerRevocation.cfg specs/PlaitPeerRevocation.tla
 tlc -deadlock -config specs/PlaitPeerFailover.cfg specs/PlaitPeerFailover.tla
+tlc -deadlock -config specs/PlaitSharedHostFault.cfg specs/PlaitSharedHostFault.tla
 tlc -deadlock -config specs/PlaitGroupManifest.cfg specs/PlaitGroupManifest.tla
 tlc -deadlock -config specs/PlaitGroupPlacement.cfg specs/PlaitGroupPlacement.tla
 tlc -deadlock -config specs/PlaitGroupReplan.cfg specs/PlaitGroupReplan.tla

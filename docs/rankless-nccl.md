@@ -749,6 +749,21 @@ The deployment layer uses that result for new admissions and the engine owns
 in-flight requests and KV. The revoked group keeps its device fences until its
 owners confirm teardown and submit `Release`.
 
+In a native-group test, CUDA, ROCm, CANN, and PPU ran the active TP4
+version. A CUDA TP1 standby was ready before fault injection. A separate
+CUDA–PPU TP2 group used different devices on two of the same hosts. The
+test killed one TP4 CUDA worker after the client received six tokens.
+The standby activated and rebuilt the context from the emitted prefix
+through the vLLM fork's `resume-prefix` path. The original SSE connection
+kept its completion ID and delivered ten more tokens and one `[DONE]`.
+The first token received after injection arrived in 2.815 seconds.
+
+The independent group delivered 48 tokens before injection and 48
+afterward under its original epoch and grants. All four old TP4 grants
+were released after teardown. A subsequent reservation on the killed
+worker's device received a higher fence. This trial measured a worker
+exit with a warm standby and an admitted stream in each group.
+
 ### Run dense AWQ with integer activations
 
 Set `VLLM_PLAIT_W4_LIBRARY` in each vLLM worker's environment to the Plait W4
