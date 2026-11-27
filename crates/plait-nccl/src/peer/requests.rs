@@ -1,4 +1,5 @@
 use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -6,25 +7,61 @@ use std::thread;
 use super::{Collective, PeerGroup, Timer};
 
 pub(super) const QUEUE_DEPTH: usize = 8;
+const DEFAULT_STAGING_BYTES: usize = 1024 * 1024 * 1024;
 
 struct Job {
     sequence: u64,
     operation: Collective,
     input: Vec<u8>,
-    result: SyncSender<io::Result<Vec<u8>>>,
+    result: SyncSender<io::Result<StagedOutput>>,
+    staging: StagingReservation,
 }
 
-#[derive(Default)]
-pub(crate) struct Dispatcher(Mutex<Option<SyncSender<Job>>>);
+pub(crate) struct Dispatcher {
+    sender: Mutex<Option<SyncSender<Job>>>,
+    staged_bytes: Arc<AtomicUsize>,
+    staging_limit: usize,
+}
 
 impl Dispatcher {
+    pub(super) fn from_env() -> io::Result<Self> {
+        let limit = match std::env::var("PLAIT_NCCL_PEER_ASYNC_STAGING_BYTES") {
+            Ok(value) => value.parse().map_err(|_| invalid_limit())?,
+            Err(std::env::VarError::NotPresent) => DEFAULT_STAGING_BYTES,
+            Err(_) => return Err(invalid_limit()),
+        };
+        Ok(Self::new(limit))
+    }
+
+    pub(super) fn new(staging_limit: usize) -> Self {
+        Self {
+            sender: Mutex::new(None),
+            staged_bytes: Arc::new(AtomicUsize::new(0)),
+            staging_limit,
+        }
+    }
+
+    pub(crate) fn reserve_staging(&self, bytes: usize) -> Option<StagingReservation> {
+        self.staged_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(bytes)
+                    .filter(|&next| next <= self.staging_limit)
+            })
+            .ok()?;
+        Some(StagingReservation {
+            used: Arc::clone(&self.staged_bytes),
+            bytes,
+        })
+    }
+
     pub(crate) fn submit(
         group: &Arc<PeerGroup>,
         operation: Collective,
         input: Vec<u8>,
+        staging: StagingReservation,
     ) -> io::Result<Completion> {
         group.live()?;
-        let mut sender = group.requests.0.lock().unwrap();
+        let mut sender = group.requests.sender.lock().unwrap();
         if sender.is_none() {
             let (tx, rx) = sync_channel::<Job>(QUEUE_DEPTH);
             let weak = Arc::downgrade(group);
@@ -42,7 +79,12 @@ impl Dispatcher {
                             ),
                             None => Err(disconnected()),
                         };
-                        let _ = job.result.send(outcome);
+                        drop(job.input);
+                        let result = outcome.map(|bytes| StagedOutput {
+                            bytes,
+                            _staging: job.staging,
+                        });
+                        let _ = job.result.send(result);
                     }
                 })?;
             *sender = Some(tx);
@@ -56,6 +98,7 @@ impl Dispatcher {
                     operation,
                     input,
                     result,
+                    staging,
                 })
                 .map_err(|error| match error {
                     TrySendError::Full(_) => {
@@ -71,9 +114,33 @@ impl Dispatcher {
     }
 }
 
+pub(crate) struct StagingReservation {
+    used: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl Drop for StagingReservation {
+    fn drop(&mut self) {
+        self.used.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+fn invalid_limit() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "PLAIT_NCCL_PEER_ASYNC_STAGING_BYTES must be a nonnegative byte count",
+    )
+}
+
 pub(crate) struct Completion {
-    receiver: Receiver<io::Result<Vec<u8>>>,
-    result: Option<io::Result<Vec<u8>>>,
+    receiver: Receiver<io::Result<StagedOutput>>,
+    result: Option<io::Result<StagedOutput>>,
+}
+
+pub(crate) struct StagedOutput {
+    pub(crate) bytes: Vec<u8>,
+    // Held by the channel, then by whoever copies or drops these bytes.
+    _staging: StagingReservation,
 }
 
 impl Completion {
@@ -88,7 +155,7 @@ impl Completion {
         self.result.is_some()
     }
 
-    pub(crate) fn wait(self) -> io::Result<Vec<u8>> {
+    pub(crate) fn wait(self) -> io::Result<StagedOutput> {
         self.result
             .unwrap_or_else(|| self.receiver.recv().unwrap_or_else(|_| Err(disconnected())))
     }

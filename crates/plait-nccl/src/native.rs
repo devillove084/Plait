@@ -88,6 +88,14 @@ impl PlaitPeerRequest {
         if op.reads_input(comm.rank) && input_bytes != 0 && send == 0 {
             return Err(NCCL_INVALID_ARGUMENT);
         }
+        group.live().map_err(|error| set_error(error.to_string()))?;
+        let staging_bytes = input_bytes
+            .checked_add(output_bytes)
+            .ok_or(NCCL_INVALID_ARGUMENT)?;
+        let staging = group
+            .requests
+            .reserve_staging(staging_bytes)
+            .ok_or(PLAIT_PEER_BUSY)?;
         let input = stage_peer_input(
             comm,
             group,
@@ -97,7 +105,7 @@ impl PlaitPeerRequest {
             stream as *mut c_void,
             &mut Phases::new(false),
         )?;
-        let completion = Dispatcher::submit(group, op, input).map_err(|error| {
+        let completion = Dispatcher::submit(group, op, input, staging).map_err(|error| {
             if error.kind() == io::ErrorKind::WouldBlock {
                 PLAIT_PEER_BUSY
             } else {
@@ -144,19 +152,19 @@ impl PlaitPeerRequest {
             .completion
             .wait()
             .map_err(|error| set_error(error.to_string()))?;
-        if output.len() != self.output_bytes {
+        if output.bytes.len() != self.output_bytes {
             group.fail(GroupFault::Transport);
             return Err(set_error(
                 "peer collective returned an unexpected output size",
             ));
         }
         group.live().map_err(|error| set_error(error.to_string()))?;
-        if output.is_empty() {
+        if output.bytes.is_empty() {
             return Ok(());
         }
         synchronize_stream(comm, stream as *mut c_void)?;
         group.live().map_err(|error| set_error(error.to_string()))?;
-        host_to_device(comm.runtime.as_ref(), recv, &output).inspect_err(|_| {
+        host_to_device(comm.runtime.as_ref(), recv, &output.bytes).inspect_err(|_| {
             group.fail(GroupFault::Device);
         })
     }

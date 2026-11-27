@@ -120,6 +120,7 @@ impl Listener {
         {
             return Err(io::Error::other("invalid peer group manifest"));
         }
+        let requests = requests::Dispatcher::from_env()?;
         let deadline = Instant::now()
             .checked_add(bootstrap_timeout)
             .ok_or_else(|| io::Error::other("invalid peer bootstrap timeout"))?;
@@ -164,7 +165,7 @@ impl Listener {
             timeout,
             order: Mutex::new(CollectiveOrder::default()),
             turn: Condvar::new(),
-            requests: requests::Dispatcher::default(),
+            requests,
             failed: AtomicBool::new(false),
             binding,
             #[cfg(feature = "control")]

@@ -4,8 +4,8 @@ const REPLICATED_BYTES_PER_RANK: usize = 64 * 1024;
 const TWO_RANK_REPLICATED_LIMIT: usize = 1024 * 1024;
 use crate::backend::BackendError;
 use crate::native::{
-    PlaitPeerCollective, PlaitPeerRequest, plaitPeerCollectiveSubmit, plaitPeerRequestDestroy,
-    plaitPeerRequestTest, plaitPeerRequestWait,
+    PLAIT_PEER_BUSY, PlaitPeerCollective, PlaitPeerRequest, plaitPeerCollectiveSubmit,
+    plaitPeerRequestDestroy, plaitPeerRequestTest, plaitPeerRequestWait,
 };
 use crate::{
     Comm, DeviceRuntime, NCCL_INVALID_ARGUMENT, NCCL_SUCCESS, RanklessComm, Transport,
@@ -728,6 +728,15 @@ fn cancel_wakes_an_active_peer_call_and_rejects_reuse() {
 }
 
 fn submit_i32(kind: i32, count: usize, send: &[i32], comm: &RanklessComm) -> *mut PlaitPeerRequest {
+    try_submit_i32(kind, count, send, comm).unwrap()
+}
+
+fn try_submit_i32(
+    kind: i32,
+    count: usize,
+    send: &[i32],
+    comm: &RanklessComm,
+) -> Result<*mut PlaitPeerRequest, i32> {
     let desc = PlaitPeerCollective {
         kind,
         datatype: DataType::Int32 as i32,
@@ -741,13 +750,14 @@ fn submit_i32(kind: i32, count: usize, send: &[i32], comm: &RanklessComm) -> *mu
         send.as_ptr().cast()
     };
     let mut request = std::ptr::null_mut();
-    assert_eq!(
-        unsafe {
-            plaitPeerCollectiveSubmit(comm.as_ptr(), &desc, send, 7 as *mut c_void, &mut request)
-        },
-        NCCL_SUCCESS
-    );
-    request
+    let status = unsafe {
+        plaitPeerCollectiveSubmit(comm.as_ptr(), &desc, send, 7 as *mut c_void, &mut request)
+    };
+    if status != NCCL_SUCCESS {
+        assert!(request.is_null());
+        return Err(status);
+    }
+    Ok(request)
 }
 
 fn wait_i32(comm: &RanklessComm, request: &mut *mut PlaitPeerRequest, output: &mut [i32]) -> i32 {
@@ -759,6 +769,78 @@ fn wait_i32(comm: &RanklessComm, request: &mut *mut PlaitPeerRequest, output: &m
             std::mem::size_of_val(output),
             7 as *mut c_void,
         )
+    }
+}
+
+#[test]
+fn asynchronous_staging_budget_covers_buffered_and_abandoned_results() {
+    let version = GroupVersion {
+        group: GroupId(NodeId::derive("asynchronous peer staging budget")),
+        epoch: 1,
+    };
+    let devices = [1, 2].map(|index| DeviceId::new(NodeId::from_bytes([index; 16]), 0));
+    let mut peers = rankless_comms(version, &devices, None);
+    let [left, right] = peers.as_mut_slice() else {
+        unreachable!()
+    };
+    let Transport::Peers(group) = &mut left.0.transport else {
+        unreachable!()
+    };
+    // One i32 reduction requires four bytes of input and four of output.
+    Arc::get_mut(group).unwrap().requests = requests::Dispatcher::new(8);
+    let Transport::Peers(group) = &left.transport else {
+        unreachable!()
+    };
+    assert_eq!(try_submit_i32(2, 1, &[1], left), Err(PLAIT_PEER_BUSY));
+    assert_eq!(group.order.lock().unwrap().submitted, 0);
+
+    let mut buffered = submit_i32(1, 1, &[1], left);
+    let mut output = [-1];
+    assert_eq!(all_reduce_i32(right, 4, &mut output[0]), NCCL_SUCCESS);
+    assert_eq!(output, [5]);
+    let mut ready = 0;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while ready == 0 {
+        assert_eq!(
+            unsafe { plaitPeerRequestTest(buffered, &mut ready) },
+            NCCL_SUCCESS
+        );
+        assert!(Instant::now() < deadline);
+        thread::yield_now();
+    }
+    assert_eq!(try_submit_i32(1, 1, &[2], left), Err(PLAIT_PEER_BUSY));
+    assert_eq!(group.order.lock().unwrap().submitted, 1);
+
+    // A worker under local pressure may run the very same operation through
+    // the blocking path while its peer accepts an asynchronous request.
+    let mut remote = submit_i32(1, 1, &[10], right);
+    assert_eq!(all_reduce_i32(left, 2, &mut output[0]), NCCL_SUCCESS);
+    assert_eq!(output, [12]);
+    assert_eq!(wait_i32(right, &mut remote, &mut output), NCCL_SUCCESS);
+    assert_eq!(output, [12]);
+    assert_eq!(wait_i32(left, &mut buffered, &mut output), NCCL_SUCCESS);
+    assert_eq!(output, [5]);
+
+    let abandoned = submit_i32(1, 1, &[7], left);
+    assert_eq!(unsafe { plaitPeerRequestDestroy(abandoned) }, NCCL_SUCCESS);
+    assert_eq!(try_submit_i32(1, 1, &[6], left), Err(PLAIT_PEER_BUSY));
+    assert_eq!(all_reduce_i32(right, 1, &mut output[0]), NCCL_SUCCESS);
+    assert_eq!(output, [8]);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match try_submit_i32(1, 1, &[6], left) {
+            Ok(mut reused) => {
+                assert_eq!(all_reduce_i32(right, 3, &mut output[0]), NCCL_SUCCESS);
+                assert_eq!(wait_i32(left, &mut reused, &mut output), NCCL_SUCCESS);
+                assert_eq!(output, [9]);
+                break;
+            }
+            Err(PLAIT_PEER_BUSY) => {
+                assert!(Instant::now() < deadline);
+                thread::yield_now();
+            }
+            Err(error) => panic!("staging retry failed: {error}"),
+        }
     }
 }
 
@@ -879,11 +961,15 @@ fn cancellation_drains_pending_requests_without_writing_output() {
         unreachable!()
     };
     let op = Collective::AllReduce(DataType::Int32, ReduceOp::Sum);
+    let submit = || {
+        let staging = group.requests.reserve_staging(8).unwrap();
+        requests::Dispatcher::submit(group, op, vec![0; 4], staging)
+    };
     let remaining = (0..requests::QUEUE_DEPTH - 1)
-        .map(|_| requests::Dispatcher::submit(group, op, vec![0; 4]).unwrap())
+        .map(|_| submit().unwrap())
         .collect::<Vec<_>>();
     let submitted = group.order.lock().unwrap().submitted;
-    let Err(error) = requests::Dispatcher::submit(group, op, vec![0; 4]) else {
+    let Err(error) = submit() else {
         panic!("the pending collective queue exceeded capacity");
     };
     assert_eq!(error.kind(), io::ErrorKind::WouldBlock);

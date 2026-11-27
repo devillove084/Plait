@@ -2153,9 +2153,23 @@ collective order, including calls through the blocking ABI.
    the group and wake pending requests. Wait for device calls already in
    progress before releasing their buffers and streams.
 
-The network queue holds up to eight waiting jobs per communicator. A
-`PLAIT_PEER_BUSY` response leaves the collective sequence unchanged. Retry
-that operation before submitting a later one.
+The network queue holds up to eight waiting jobs per communicator. Each
+communicator also has a 1 GiB asynchronous host staging budget. Set
+`PLAIT_NCCL_PEER_ASYNC_STAGING_BYTES` to a decimal byte count before
+connecting a worker. Workers on the same group can set different limits.
+The budget covers staged inputs and expected outputs, including results
+waiting for retrieval. Internal reduction scratch and the blocking path
+use their existing allocations.
+
+Submission reserves bytes before synchronizing the producer stream or
+copying its input. The reservation follows the work through the wire
+exchange and result delivery. Destroying a pending ticket frees its result
+after the worker finishes the accepted operation. A full queue or byte
+budget returns `PLAIT_PEER_BUSY` without allocating a sequence. Retry the
+same operation once there is capacity, or call its blocking entry point
+before submitting a later operation. Python `try_all_gather` returns `None`
+in this case. A peer with available capacity can still submit the same
+operation asynchronously.
 
 In a four-vendor C ABI test the first three participants submitted AllReduce
 and AllGather while the fourth waited. All four later retrieved the results
@@ -2180,9 +2194,9 @@ submits an AllGather. While the network exchanges A, each device projects
 its local logits for chunk B. The runner submits B before collecting A on
 the current device stream. It trims vocabulary padding and computes scores
 in input order. At most two gather requests are outstanding in this loop.
-If the queue is full, the runner submits the same gather through the
-blocking entry point before proceeding. Both entry points use the same
-collective order.
+When local async submission returns `PLAIT_PEER_BUSY`, the runner submits
+the same gather through the blocking entry point before proceeding. Both
+entry points use the same collective order.
 
 A Qwen3-0.6B FP16 group with one CUDA, ROCm, CANN, and PPU worker ran
 the same 1,056-token HTTP request four times with the option off, on, on,
