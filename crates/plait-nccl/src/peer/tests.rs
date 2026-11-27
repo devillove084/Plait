@@ -135,6 +135,85 @@ fn replicated_exchange_drains_two_writers_with_small_send_buffers() {
 }
 
 #[test]
+fn paired_scatter_sends_a_reduced_prefix_before_the_tail_arrives() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let local = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut remote, _) = listener.accept().unwrap();
+    let timeout = Duration::from_secs(3);
+    configure(&remote, timeout).unwrap();
+    let block = frame::PIPELINE_BLOCK_BYTES;
+    let own = 2 * block + 2;
+    let other = 2 * block;
+    let mut output = vec![0; own + other];
+    let (reduced, peer_reduced) = output.split_at_mut(own);
+    let op = Collective::AllReduce(DataType::Float16, ReduceOp::Sum);
+    let scatter = op.header(0, own + other, 0);
+    let gather = op.header(0, own + other, 1);
+
+    thread::scope(|scope| {
+        let pipeline = scope.spawn(|| {
+            frame::ScatterGather {
+                peer: 1,
+                stream: &local,
+                scatter_header: scatter,
+                gather_header: gather,
+                scatter_send: &vec![7; other],
+                scatter_recv: &mut vec![0; own],
+                gather_send: reduced,
+                gather_recv: peer_reduced,
+            }
+            .run(
+                timeout,
+                &mut Timer::new(false),
+                |_, contribution, result| {
+                    for (value, target) in contribution.iter().zip(result) {
+                        *target = *value + 1;
+                    }
+                },
+            )
+            .unwrap();
+        });
+
+        frame::write(&remote, &scatter, &vec![2; block]).unwrap();
+        let mut contribution = vec![0; other];
+        frame::read(&remote, 0, &scatter, &mut contribution).unwrap();
+        assert_eq!(contribution, vec![7; other]);
+        let mut prefix = vec![0; block];
+        frame::read(&remote, 0, &gather, &mut prefix).unwrap();
+        assert_eq!(prefix, vec![3; block]);
+        remote.write_all(&vec![4; own - block]).unwrap();
+        frame::write(&remote, &gather, &vec![9; other]).unwrap();
+        let mut tail = vec![0; own - block];
+        remote.read_exact(&mut tail).unwrap();
+        assert_eq!(tail, vec![5; own - block]);
+        pipeline.join().unwrap();
+    });
+    assert_eq!(&output[..block], vec![3; block]);
+    assert_eq!(&output[block..own], vec![5; own - block]);
+    assert_eq!(&output[own..], vec![9; other]);
+}
+
+#[test]
+fn paired_half_pipeline_keeps_uneven_and_nonfinite_sums_in_slot_order() {
+    let op = Collective::AllReduce(DataType::Float16, ReduceOp::Sum);
+    let words = TWO_RANK_REPLICATED_LIMIT / 2 + 1;
+    let mut inputs = [vec![0; words * 2], vec![0; words * 2]];
+    let patterns = [[0x7e03u16, 0x8000, 0x3800], [0x7e27u16, 0x8000, 0x3c00]];
+    for (input, pattern) in inputs.iter_mut().zip(patterns) {
+        for (i, bytes) in input.chunks_exact_mut(2).enumerate() {
+            bytes.copy_from_slice(&pattern[i % pattern.len()].to_ne_bytes());
+        }
+    }
+    let expected = op.reduce(&inputs);
+    thread::scope(|scope| {
+        for (peer, input) in groups(2).into_iter().zip(&inputs) {
+            let expected = &expected;
+            scope.spawn(move || assert_eq!(peer.execute(op, input).unwrap(), *expected));
+        }
+    });
+}
+
+#[test]
 fn sharded_exchange_progresses_on_other_links_while_one_peer_waits() {
     fn sockets() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

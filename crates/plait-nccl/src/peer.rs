@@ -18,7 +18,7 @@ use plait_core::group::{GroupFault, GroupVersion, peer_digest};
 use sha2::Digest;
 
 use crate::profile::Timer;
-use crate::{DataType, ReduceOp, reduce_bytes, reduce_fp8_to_f32};
+use crate::{DataType, ReduceOp, reduce_bytes, reduce_fp8_to_f32, reduce_slices};
 
 mod frame;
 mod rankless;
@@ -578,6 +578,14 @@ impl PeerGroup {
             wire.measure(|| frame::exchange_all(peers, &header, self.timeout))?;
             return Ok(fold.measure(|| collective.reduce(&inputs)));
         }
+        if world == 2
+            && matches!(
+                collective,
+                Collective::AllReduce(DataType::Float16 | DataType::Bfloat16, ReduceOp::Sum)
+            )
+        {
+            return self.pipeline_pair_sum(collective, sequence, input, wire, fold);
+        }
         match collective {
             Collective::AllReduce(..)
             | Collective::ReduceScatter(..)
@@ -645,6 +653,50 @@ impl PeerGroup {
                 }
             }
         }
+    }
+
+    fn pipeline_pair_sum(
+        &self,
+        collective: Collective,
+        sequence: u64,
+        input: &[u8],
+        wire: &mut Timer,
+        fold: &mut Timer,
+    ) -> io::Result<Vec<u8>> {
+        let (_, dtype, op, _) = collective.wire();
+        let ranges = shard_ranges(input.len(), dtype.bytes(), 2);
+        let peer = 1 - self.slot;
+        let local = &input[ranges[self.slot].clone()];
+        let mut contribution = vec![0; local.len()];
+        let mut output = vec![0; input.len()];
+        let (left, right) = output.split_at_mut(ranges[0].end);
+        let (gather_send, gather_recv) = if self.slot == 0 {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        frame::ScatterGather {
+            peer,
+            stream: &self.link(peer).collective,
+            scatter_header: collective.header(sequence, input.len(), 0),
+            gather_header: collective.header(sequence, input.len(), 1),
+            scatter_send: &input[ranges[peer].clone()],
+            scatter_recv: &mut contribution,
+            gather_send,
+            gather_recv,
+        }
+        .run(self.timeout, wire, |start, remote, result| {
+            let local = &local[start..start + remote.len()];
+            let ordered = if self.slot == 0 {
+                [local, remote]
+            } else {
+                [remote, local]
+            };
+            fold.measure(|| {
+                result.copy_from_slice(&reduce_slices(op, dtype, &ordered));
+            });
+        })?;
+        Ok(output)
     }
 
     fn contributions(

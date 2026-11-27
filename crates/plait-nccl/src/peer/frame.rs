@@ -3,6 +3,8 @@ use std::net::TcpStream;
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
+use crate::profile::Timer;
+
 pub(super) fn write(mut stream: &TcpStream, header: &[u8], data: &[u8]) -> io::Result<()> {
     let mut slices = [IoSlice::new(header), IoSlice::new(data)];
     let mut remaining = slices.as_mut_slice();
@@ -36,19 +38,14 @@ pub(super) fn exchange_all<'a>(
     header: &[u8; 24],
     timeout: Duration,
 ) -> io::Result<()> {
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .ok_or_else(|| io::Error::other("invalid peer exchange timeout"))?;
+    let deadline = phase_deadline(timeout)?;
     let mut transfers: Vec<_> = peers
         .map(|(peer, stream, outgoing, incoming)| Transfer {
             peer,
             stream,
             outgoing,
             incoming,
-            sent: 0,
-            remote_header: [0; 24],
-            header_bytes: 0,
-            body_bytes: 0,
+            progress: Progress::default(),
         })
         .collect();
     let mut enabled = 0;
@@ -70,6 +67,11 @@ struct Transfer<'a> {
     stream: &'a TcpStream,
     outgoing: &'a [u8],
     incoming: &'a mut [u8],
+    progress: Progress,
+}
+
+#[derive(Default)]
+struct Progress {
     sent: usize,
     remote_header: [u8; 24],
     header_bytes: usize,
@@ -78,41 +80,196 @@ struct Transfer<'a> {
 
 impl Transfer<'_> {
     fn progress(&mut self, header: &[u8; 24]) -> io::Result<libc::c_short> {
-        let mut stream = self.stream;
-        let total = header.len() + self.outgoing.len();
-        if self.sent < total {
+        self.progress.send(self.stream, header, self.outgoing)?;
+        self.progress
+            .receive(self.stream, self.peer, header, self.incoming)?;
+        Ok(self
+            .progress
+            .events(self.outgoing.len(), self.incoming.len()))
+    }
+}
+
+impl Progress {
+    fn sending(&self, available: usize) -> bool {
+        self.sent < self.remote_header.len() + available
+    }
+
+    fn receiving(&self, expected: usize) -> bool {
+        self.header_bytes < self.remote_header.len() || self.body_bytes < expected
+    }
+
+    fn send(
+        &mut self,
+        mut stream: &TcpStream,
+        header: &[u8; 24],
+        payload: &[u8],
+    ) -> io::Result<()> {
+        if self.sending(payload.len()) {
             let remaining = [
                 IoSlice::new(&header[self.sent.min(header.len())..]),
-                IoSlice::new(&self.outgoing[self.sent.saturating_sub(header.len())..]),
+                IoSlice::new(&payload[self.sent.saturating_sub(header.len())..]),
             ];
             self.sent +=
                 socket_progress(stream.write_vectored(&remaining), io::ErrorKind::WriteZero)?;
         }
+        Ok(())
+    }
+
+    fn receive(
+        &mut self,
+        mut stream: &TcpStream,
+        peer: usize,
+        header: &[u8; 24],
+        payload: &mut [u8],
+    ) -> io::Result<()> {
         if self.header_bytes < header.len() {
             self.header_bytes += socket_progress(
                 stream.read(&mut self.remote_header[self.header_bytes..]),
                 io::ErrorKind::UnexpectedEof,
             )?;
             if self.header_bytes == header.len() {
-                check_header(self.peer, header, &self.remote_header)?;
+                check_header(peer, header, &self.remote_header)?;
             }
         }
-        if self.header_bytes == header.len() && self.body_bytes < self.incoming.len() {
+        if self.header_bytes == header.len() && self.body_bytes < payload.len() {
             self.body_bytes += socket_progress(
-                stream.read(&mut self.incoming[self.body_bytes..]),
+                stream.read(&mut payload[self.body_bytes..]),
                 io::ErrorKind::UnexpectedEof,
             )?;
         }
+        Ok(())
+    }
 
+    fn events(&self, outgoing: usize, incoming: usize) -> libc::c_short {
         let mut events = 0;
-        if self.sent < total {
+        if self.sending(outgoing) {
             events |= libc::POLLOUT;
         }
-        if self.header_bytes < header.len() || self.body_bytes < self.incoming.len() {
+        if self.receiving(incoming) {
             events |= libc::POLLIN;
         }
-        Ok(events)
+        events
     }
+}
+
+pub(super) const PIPELINE_BLOCK_BYTES: usize = 64 * 1024;
+
+pub(super) struct ScatterGather<'a> {
+    pub peer: usize,
+    pub stream: &'a TcpStream,
+    pub scatter_header: [u8; 24],
+    pub gather_header: [u8; 24],
+    pub scatter_send: &'a [u8],
+    pub scatter_recv: &'a mut [u8],
+    pub gather_send: &'a mut [u8],
+    pub gather_recv: &'a mut [u8],
+}
+
+impl ScatterGather<'_> {
+    /// Keep each direction's frame order while letting the gather send start
+    /// before the scatter receive finishes. Only reduced bytes are writable.
+    pub(super) fn run(
+        self,
+        timeout: Duration,
+        wire: &mut Timer,
+        mut reduce_block: impl FnMut(usize, &[u8], &mut [u8]),
+    ) -> io::Result<()> {
+        let stream = self.stream;
+        stream.set_nonblocking(true)?;
+        let result = self.exchange(timeout, wire, &mut reduce_block);
+        result.and(stream.set_nonblocking(false))
+    }
+
+    fn exchange(
+        self,
+        timeout: Duration,
+        wire: &mut Timer,
+        reduce_block: &mut impl FnMut(usize, &[u8], &mut [u8]),
+    ) -> io::Result<()> {
+        let mut deadline = phase_deadline(timeout)?;
+        let mut scatter = Progress::default();
+        let mut gather = Progress::default();
+        let mut reduced = 0;
+        let mut scatter_finished = false;
+        loop {
+            wire.measure(|| {
+                scatter.send(self.stream, &self.scatter_header, self.scatter_send)?;
+                scatter.receive(
+                    self.stream,
+                    self.peer,
+                    &self.scatter_header,
+                    self.scatter_recv,
+                )
+            })?;
+            let scatter_sending = scatter.sending(self.scatter_send.len());
+            let scatter_receiving = scatter.receiving(self.scatter_recv.len());
+            if !scatter_sending && !scatter_receiving && !scatter_finished {
+                deadline = phase_deadline(timeout)?;
+                scatter_finished = true;
+            }
+
+            let received = scatter.body_bytes;
+            let ready = if scatter_receiving {
+                received / PIPELINE_BLOCK_BYTES * PIPELINE_BLOCK_BYTES
+            } else {
+                received
+            };
+            while reduced < ready {
+                let end = ready.min(reduced + PIPELINE_BLOCK_BYTES);
+                reduce_block(
+                    reduced,
+                    &self.scatter_recv[reduced..end],
+                    &mut self.gather_send[reduced..end],
+                );
+                reduced = end;
+            }
+
+            let events = wire.measure(|| {
+                if !scatter_sending {
+                    gather.send(
+                        self.stream,
+                        &self.gather_header,
+                        &self.gather_send[..reduced],
+                    )?;
+                }
+                if !scatter_receiving {
+                    gather.receive(
+                        self.stream,
+                        self.peer,
+                        &self.gather_header,
+                        self.gather_recv,
+                    )?;
+                }
+                Ok::<_, io::Error>(gather.events(reduced, self.gather_recv.len()))
+            })?;
+            let mut events = events;
+            if scatter_sending {
+                events |= libc::POLLOUT;
+            }
+            if scatter_receiving {
+                events |= libc::POLLIN;
+            }
+            if events == 0 {
+                return Ok(());
+            }
+            wire.measure(|| {
+                wait_ready(
+                    &mut [libc::pollfd {
+                        fd: self.stream.as_raw_fd(),
+                        events,
+                        revents: 0,
+                    }],
+                    deadline,
+                )
+            })?;
+        }
+    }
+}
+
+fn phase_deadline(timeout: Duration) -> io::Result<Instant> {
+    Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| io::Error::other("invalid peer exchange timeout"))
 }
 
 fn transfer_all(

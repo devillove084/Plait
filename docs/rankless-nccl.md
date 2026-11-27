@@ -2119,8 +2119,15 @@ returns after the first phase. All-gather receives each peer's shard directly
 into its slot's output range. Broadcast and reduce use the source or destination
 specified by that call.
 
-Frame writes submit the header and payload together. Before consuming a
-payload, each receiver checks the collective sequence, operation, dtype,
+For two-worker FP16 and BF16 sums above 1 MiB, each worker reduces arriving
+scatter data in 64 KiB blocks. After sending its complete scatter frame, a
+worker can send the available gather prefix while it still receives the peer's
+scatter tail. The two frames keep their original order, lengths, and headers
+in each direction, so older participants can still process them in sequence.
+The data plane writes each reduced block directly into its output range.
+
+Frame writes can send the header and available payload in one vectored call.
+Before consuming a payload, each receiver checks the collective sequence, operation, dtype,
 size, and stage. The point-to-point lane is separate.
 A send stages the payload and enqueues it for that peer, so opposing sends
 can be posted before either receive. The caller's stream is synchronized
