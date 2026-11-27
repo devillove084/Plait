@@ -182,6 +182,10 @@ HGGC workers with the vLLM multiprocess executor. All four workers reported
 their grants ready, and the HTTP response's eight token IDs matched a single-device
 baseline. [Four-vendor serving verification](docs/rankless-nccl.md#verify-four-vendor-tp4-over-http)
 
+The Qwen3 V2 runner can overlap one prompt-logprob chunk's peer AllGather
+with the next chunk's vocabulary projection. This path is opt-in and keeps
+one chunk of lookahead. [Setup and validation](docs/rankless-nccl.md#overlap-vllm-prompt-scoring-with-peer-allgather)
+
 A native TP4 group served dense AWQ with CUDA and CANN at W4A4 and ROCm
 and PPU at W4A8. Three physical control peers agreed on the four device
 grants. Six streamed completions returned the same eight token IDs.

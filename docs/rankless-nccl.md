@@ -2155,8 +2155,7 @@ collective order, including calls through the blocking ABI.
 
 The network queue holds up to eight waiting jobs per communicator. A
 `PLAIT_PEER_BUSY` response leaves the collective sequence unchanged. Retry
-that operation before submitting a later one. The vLLM compatibility path
-continues to call the blocking ABI.
+that operation before submitting a later one.
 
 In a four-vendor C ABI test the first three participants submitted AllReduce
 and AllGather while the fourth waited. All four later retrieved the results
@@ -2165,6 +2164,32 @@ each caller rewrote its source tensor. A blocking AllReduce between
 submission and wait also completed in sequence with the updated inputs.
 An exchange interrupted with one peer idle returned errors to all three
 queued callers and preserved their destination contents.
+
+### Overlap vLLM prompt scoring with peer AllGather
+
+Use the vLLM fork with the Plait extension built with Python support. Set
+`VLLM_PLAIT_PROMPT_LOGPROBS_OVERLAP=1` on every worker in a native TP group
+using the V2 runner. The Qwen3 scoring path uses this option when a prompt
+logprob batch spans more than one 1,024-row chunk and the logits processor
+uses standard TP AllGather. The fork's Ascend plugin patch adds this path
+for CANN's standard TP mode. Other logits layouts use their existing paths.
+[vLLM integration](https://github.com/devillove084/vllm/commit/4d6f53ef1)
+
+The runner projects chunk A on each device, stages its local logits and
+submits an AllGather. While the network exchanges A, each device projects
+its local logits for chunk B. The runner submits B before collecting A on
+the current device stream. It trims vocabulary padding and computes scores
+in input order. At most two gather requests are outstanding in this loop.
+If the queue is full, the runner submits the same gather through the
+blocking entry point before proceeding. Both entry points use the same
+collective order.
+
+A Qwen3-0.6B FP16 group with one CUDA, ROCm, CANN, and PPU worker ran
+the same 1,056-token HTTP request four times with the option off, on, on,
+and off. The prompt scores and generated token ID matched across runs.
+During both enabled requests, the first gather remained pending on each
+worker through completion of the second projection. This debug-build
+test verified overlap and output parity for that request shape.
 
 ## Compatibility API
 
