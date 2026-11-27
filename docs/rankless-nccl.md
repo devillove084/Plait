@@ -1780,6 +1780,10 @@ cover the admitted requests the deployment needs to preserve.
 
 ### Drive P/D planning from ingress load
 
+A voter and a hosted resident can share a host as separate `plait-node`
+processes. Each process defaults to one Tokio worker per available CPU, up to
+eight workers. Set `TOKIO_WORKER_THREADS` to tune a process independently.
+
 Start each managed P/D ingress with `--load-listen IP:PORT` on a private
 address reachable from the execution node running the policy. Each
 listener reports process-local arrival, completion, failure, and

@@ -18,12 +18,21 @@ mod peer_probes;
 mod serving_cli;
 mod tensor_cli;
 
-#[tokio::main]
-async fn main() {
-    if let Err(error) = real_main().await {
+fn main() {
+    if let Err(error) = run() {
         eprintln!("plait-node: {error}");
         std::process::exit(1);
     }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
+    if std::env::var_os("TOKIO_WORKER_THREADS").is_none() {
+        // Voters, residents, and short-lived control commands can share a host.
+        let cpus = std::thread::available_parallelism().map_or(1, |count| count.get());
+        runtime.worker_threads(cpus.min(8));
+    }
+    runtime.enable_all().build()?.block_on(real_main())
 }
 
 async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
