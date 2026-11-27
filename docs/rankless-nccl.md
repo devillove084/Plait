@@ -223,6 +223,32 @@ requires the device owner to finish teardown, including any device work
 already in progress. The observer closes sockets and leaves release to the
 owner.
 
+#### Arm a standby for communication group failover
+
+Prepare a successor under the same group ID using available devices. Once its
+communicators are `Ready` and the engine is healthy, send `SetStandby` through
+the `apply` request. The action takes the incumbent `GroupVersion` in `active`
+and the successor epoch in `standby`. The voters check that `active` is still
+current and that the successor is the latest ready version. The `standby`
+request takes the group ID and reads the armed version from a replica. Set
+`standby` to `null` in `SetStandby` to disarm it.
+
+A native control-plane communicator reports terminal transport or device
+errors with `ReportFailure`. The background client retries the same exact-grant
+operation for up to 15 seconds while its process is alive. On an applied report
+for the incumbent, or an ordered host expiry, the control plane revokes the
+affected version and promotes an eligible standby in the same operation. Host
+expiry excludes a standby affected by that host. Explicit `Drain` and `Revoke`
+disarm the incumbent. A failure in a standby or an older draining version stops
+only that version.
+
+Idle worker loss requires host liveness detection or a surviving participant
+that observes the failure. Run voters that support these actions before arming
+a standby. After promotion, a fresh `observe` resolves the new active version.
+The deployment layer uses that result for new admissions and the engine owns
+in-flight requests and KV. The revoked group keeps its device fences until its
+owners confirm teardown and submit `Release`.
+
 ### Assign different numbers of workers per host
 
 For four TP workers across three hosts, start the same model on each host.

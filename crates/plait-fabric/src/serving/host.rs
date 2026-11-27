@@ -179,7 +179,7 @@ impl ServingState {
         );
         for &version in groups {
             if self.peer_version_is_live(version) {
-                self.quiesce_peer_group(version, GroupPhase::Revoked)
+                self.fail_peer_group(version, Some(groups))
                     .expect("affected groups checked");
             } else {
                 self.fail_resident_version(version)

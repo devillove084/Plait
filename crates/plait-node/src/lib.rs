@@ -480,6 +480,7 @@ impl NodeState {
                     GroupLookup::GrantStatus(grant) => {
                         GroupReply::GrantStatus(runtime.peer_grant_status(grant))
                     }
+                    GroupLookup::Standby(group) => GroupReply::Standby(runtime.peer_standby(group)),
                 };
                 let _ = self
                     .transport

@@ -189,6 +189,12 @@ through the control plane close their sockets when a voter reports that their
 grant has ended. A device grant is released after its owner confirms teardown.
 [Replicated group metadata](docs/rankless-nccl.md#publish-a-manifest-through-the-control-plane)
 
+A communicator can report a terminal device or transport failure against its
+exact grant. One ordered operation revokes that version and activates an
+eligible standby registered by the deployment layer. A standby affected by
+the same known host loss is excluded.
+[Communication group failover](docs/rankless-nccl.md#arm-a-standby-for-communication-group-failover)
+
 The native planner matches placement to device capabilities, per-device
 memory, host memory, and directional links measured by resident nodes.
 It can reserve a replacement while the incumbent runs. The reservation
@@ -310,6 +316,7 @@ release the result after the matching completion has executed in the control pla
 | [Rankless peer join](specs/PlaitRanklessPeerJoin.tla) | Socket handshakes bind the group version and grant view. Cancellation closes the participant's links. |
 | [Logical slot layout](specs/PlaitRanklessLayout.tla) | A participant reports ready after connecting to all members with a common slot layout. |
 | [Peer revocation](specs/PlaitPeerRevocation.tla) | Observing that an exact grant has ended closes that communicator and wakes a pending call. A draining group can keep its links. |
+| [Peer failover](specs/PlaitPeerFailover.tla) | Exact-grant failure reports, readiness and host-loss eligibility for standby activation, one active version, and grant retention until release. |
 | [Replicated group manifest](specs/PlaitGroupManifest.tla) | Activation follows complete endpoint and handshake evidence. Retrying an old release preserves any successor grant. |
 | [Native group placement](specs/PlaitGroupPlacement.tla) | A planned reservation checks the version, incumbent, and resource availability against concurrent changes. |
 | [Native probe sessions](specs/PlaitProbePlacement.tla) | A planned reservation checks both endpoint revisions if a probe restarts after measurement. |
@@ -343,8 +350,8 @@ release the result after the matching completion has executed in the control pla
 | [Prefill to Decode handoff](specs/PlaitKvHandoff.tla) | The receipt matches the request context. Decode emits output after loading the required pages, including when the shared store can reset between admission and load. |
 | [P/D stream replay](specs/PlaitPdStreamReplay.tla) | A failed Decode version is excluded. Each attempt releases its own handoff, and suffix output follows a checked prefix. |
 
-TLC 2.19 passes all 51 configurations. The ordered publication configuration
-explores 70,968 distinct states. Run the suite with `tlc` on your `PATH`.
+The ordered publication configuration explores 70,968 distinct states.
+Run the suite with TLC 2.19 and `tlc` on your `PATH`.
 
 ```sh
 ./scripts/check-tla.sh

@@ -9,12 +9,13 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use plait_core::group::{
-    GrantStatus, GroupAction, GroupLookup, GroupOperation, GroupPhase, GroupReply, GroupVersion,
-    GroupView, WorkerGrant,
+    GrantStatus, GroupAction, GroupFault, GroupLookup, GroupOperation, GroupPhase, GroupReply,
+    GroupVersion, GroupView, WorkerGrant,
 };
 use plait_core::{DeviceId, NodeId, OpId};
 use plait_net::control::{Client, discover_voters};
 use tokio::runtime::Runtime;
+use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep, timeout, timeout_at};
 
 use crate::{BackendKind, Comm, PeerGroup, RanklessComm, RanklessListener, create_runtime};
@@ -155,8 +156,9 @@ async fn connect(
             },
         })
         .await?;
-    let watch = executor.spawn(control.watch(Arc::downgrade(&group), grant));
-    group.watch_grant(watch.abort_handle());
+    let (notify, closes) = mpsc::channel(1);
+    group.watch_grant(notify);
+    executor.spawn(control.watch(Arc::downgrade(&group), grant, OpId::new(session, 4), closes));
     Ok(Comm::rankless_from_peers(group, device, runtime))
 }
 
@@ -192,6 +194,7 @@ const POLL: Duration = Duration::from_millis(100);
 const WATCH_INTERVAL: Duration = Duration::from_millis(250);
 const WATCH_QUERY_TIMEOUT: Duration = Duration::from_millis(750);
 const WATCH_DISCOVERY_INTERVAL: Duration = Duration::from_secs(10);
+const REPORT_TIMEOUT: Duration = Duration::from_secs(15);
 type PeerCall<'a, T> = Pin<Box<dyn Future<Output = io::Result<T>> + Send + 'a>>;
 
 struct Rendezvous {
@@ -234,7 +237,29 @@ impl Rendezvous {
         }
     }
 
-    async fn watch(mut self, group: Weak<PeerGroup>, grant: WorkerGrant) {
+    async fn watch(
+        mut self,
+        group: Weak<PeerGroup>,
+        grant: WorkerGrant,
+        id: OpId,
+        mut closes: mpsc::Receiver<Option<GroupFault>>,
+    ) {
+        let fault = tokio::select! {
+            biased;
+            closed = closes.recv() => closed.flatten(),
+            () = self.wait_for_revocation(&group, grant) => None,
+        };
+        if let Some(fault) = fault {
+            let operation = GroupOperation {
+                id,
+                action: GroupAction::ReportFailure { grant, fault },
+            };
+            // Keep the operation alive briefly even if the caller drops the failed handle.
+            let _ = timeout(REPORT_TIMEOUT, self.apply(&operation)).await;
+        }
+    }
+
+    async fn wait_for_revocation(&mut self, group: &Weak<PeerGroup>, grant: WorkerGrant) {
         let mut ticks = interval(WATCH_INTERVAL);
         ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut refresh_at = Instant::now() + WATCH_DISCOVERY_INTERVAL;
@@ -244,7 +269,7 @@ impl Rendezvous {
             let status = self.poll_grant(grant, &mut legacy).await;
             if status == GrantStatus::Ended {
                 if let Some(group) = group.upgrade() {
-                    group.fail();
+                    group.cancel();
                 }
                 return;
             }
@@ -266,7 +291,8 @@ impl Rendezvous {
             if !legacy.contains(&voter) {
                 let response = timeout(
                     WATCH_QUERY_TIMEOUT,
-                    self.client.query_group(voter, GroupLookup::GrantStatus(grant)),
+                    self.client
+                        .query_group(voter, GroupLookup::GrantStatus(grant)),
                 )
                 .await;
                 match response {
@@ -279,7 +305,8 @@ impl Rendezvous {
             }
             let response = timeout(
                 WATCH_QUERY_TIMEOUT,
-                self.client.query_group(voter, GroupLookup::Version(grant.version)),
+                self.client
+                    .query_group(voter, GroupLookup::Version(grant.version)),
             )
             .await;
             if let Ok(Ok(GroupReply::Version(view))) = response {

@@ -271,6 +271,20 @@ pub enum GroupAction {
         resources: ResourcePlan,
         probes: Vec<ProbeRegistration>,
     },
+    SetStandby {
+        active: GroupVersion,
+        standby: Option<u64>,
+    },
+    ReportFailure {
+        grant: WorkerGrant,
+        fault: GroupFault,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GroupFault {
+    Transport,
+    Device,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -327,6 +341,7 @@ pub enum GroupLookup {
     Placement(GroupId),
     LinkProbes,
     GrantStatus(WorkerGrant),
+    Standby(GroupId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -336,6 +351,7 @@ pub enum GroupReply {
     Placement(PlacementInventory),
     LinkProbes(Vec<ProbeRegistration>),
     GrantStatus(GrantStatus),
+    Standby(Option<GroupVersion>),
 }
 
 /// A replica's applied view of an exact communicator grant.
@@ -403,12 +419,16 @@ impl GroupOperation {
                 }
             }
             GroupAction::PublishEndpoint(GroupMember { grant, .. })
-            | GroupAction::Ready { grant, .. } => {
+            | GroupAction::Ready { grant, .. }
+            | GroupAction::ReportFailure { grant, .. } => {
                 keys.insert(Key::ServingGroup(grant.version.group));
             }
             GroupAction::Activate(version)
             | GroupAction::Drain(version)
-            | GroupAction::Revoke(version) => {
+            | GroupAction::Revoke(version)
+            | GroupAction::SetStandby {
+                active: version, ..
+            } => {
                 keys.insert(Key::ServingGroup(version.group));
             }
             GroupAction::Release(grant) => {

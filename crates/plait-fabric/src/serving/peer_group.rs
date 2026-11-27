@@ -25,6 +25,20 @@ pub(super) struct PeerGroups {
 struct History {
     versions: BTreeMap<u64, Version>,
     active: Option<u64>,
+    standby: Option<u64>,
+}
+
+impl History {
+    fn check_candidate(&self, version: GroupVersion) -> Result<(), GroupError> {
+        let (&current, view) = self.versions.last_key_value().expect("recorded version");
+        if version.epoch != current {
+            return Err(GroupError::StaleEpoch { current });
+        }
+        if view.phase != GroupPhase::Ready {
+            return Err(GroupError::InvalidPhase(view.phase));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -186,6 +200,11 @@ impl ServingState {
         )
     }
 
+    pub(crate) fn peer_standby(&self, group: GroupId) -> Option<GroupVersion> {
+        let epoch = self.peer_groups.history.get(&group)?.standby?;
+        Some(GroupVersion { group, epoch })
+    }
+
     pub(crate) fn peer_group_receipt(&self, operation: OpId) -> Option<&GroupReceipt> {
         self.peer_groups.receipts.get(&operation)
     }
@@ -236,6 +255,8 @@ impl ServingState {
             GroupAction::Drain(version) => self.quiesce_peer_group(version, GroupPhase::Draining),
             GroupAction::Revoke(version) => self.quiesce_peer_group(version, GroupPhase::Revoked),
             GroupAction::Release(grant) => self.release_peer_worker(grant),
+            GroupAction::SetStandby { active, standby } => self.set_peer_standby(active, standby),
+            GroupAction::ReportFailure { grant, .. } => self.report_peer_failure(grant),
             GroupAction::Observe { group, epoch } => {
                 let epoch = epoch
                     .or_else(|| self.peer_groups.history.get(&group)?.active)
@@ -488,13 +509,8 @@ impl ServingState {
             .history
             .get_mut(&version.group)
             .ok_or(GroupError::UnknownVersion(version))?;
-        let (&current, view) = history.versions.last_key_value().expect("recorded version");
-        if version.epoch != current {
-            return Err(GroupError::StaleEpoch { current });
-        }
-        if view.phase != GroupPhase::Ready {
-            return Err(GroupError::InvalidPhase(view.phase));
-        }
+        history.check_candidate(version)?;
+        history.standby = None;
         if let Some(old) = history.active.replace(version.epoch) {
             history
                 .versions
@@ -508,6 +524,70 @@ impl ServingState {
             .expect("latest version");
         view.set_phase(GroupPhase::Active);
         Ok(view.outcome())
+    }
+
+    fn set_peer_standby(&mut self, active: GroupVersion, standby: Option<u64>) -> GroupResult {
+        let history = self
+            .peer_groups
+            .history
+            .get_mut(&active.group)
+            .ok_or(GroupError::UnknownVersion(active))?;
+        if history.active != Some(active.epoch) {
+            return Err(GroupError::ActiveEpochChanged {
+                current: history.active,
+            });
+        }
+        if let Some(epoch) = standby {
+            history.check_candidate(GroupVersion {
+                group: active.group,
+                epoch,
+            })?;
+        }
+        history.standby = standby;
+        Ok(history.versions[&active.epoch].outcome())
+    }
+
+    fn report_peer_failure(&mut self, grant: WorkerGrant) -> GroupResult {
+        let view = self
+            .peer_groups
+            .get(grant.version)
+            .ok_or(GroupError::UnknownVersion(grant.version))?;
+        view.check_grant(grant)?;
+        if matches!(view.phase, GroupPhase::Revoked | GroupPhase::Retired) {
+            return Ok(view.outcome());
+        }
+        if view.released.contains(&grant.device) {
+            return Err(GroupError::GrantMismatch);
+        }
+        self.fail_peer_group(grant.version, None)
+    }
+
+    pub(super) fn fail_peer_group(
+        &mut self,
+        version: GroupVersion,
+        affected: Option<&BTreeSet<GroupVersion>>,
+    ) -> GroupResult {
+        let standby = self
+            .peer_groups
+            .history
+            .get(&version.group)
+            .and_then(|history| {
+                let epoch = history.standby?;
+                let candidate = GroupVersion {
+                    group: version.group,
+                    epoch,
+                };
+                (history.active == Some(version.epoch)
+                    && affected.is_none_or(|lost| !lost.contains(&candidate))
+                    && history.check_candidate(candidate).is_ok())
+                .then_some(candidate)
+            });
+        let revoked = self.quiesce_peer_group(version, GroupPhase::Revoked)?;
+        if let Some(standby) = standby {
+            self.activate_peer_group(standby)
+                .expect("candidate checked before revocation");
+        }
+        Ok(revoked)
     }
 
     pub(super) fn quiesce_peer_group(
@@ -539,6 +619,9 @@ impl ServingState {
             .expect("known group");
         if history.active == Some(version.epoch) {
             history.active = None;
+            history.standby = None;
+        } else if history.standby == Some(version.epoch) {
+            history.standby = None;
         }
         Ok(result)
     }
@@ -618,8 +701,175 @@ mod tests {
     use super::*;
     use plait_core::AcceleratorKind;
     use plait_core::NodeId;
-    use plait_core::group::{HostMemory, WorkerDemand};
+    use plait_core::group::{GroupFault, HostMemory, WorkerDemand};
     use plait_core::serving::{GroupPlan, ServingRole};
+
+    fn ready_single_worker(state: &mut ServingState, version: GroupVersion) -> WorkerGrant {
+        let grant = state.peer_group_view(version).unwrap().grants[0];
+        state
+            .publish_peer_endpoint(GroupMember {
+                grant,
+                endpoint: PeerEndpoint {
+                    address: ([127, 0, 0, 1], 9100 + version.epoch as u16).into(),
+                    ticket: [version.epoch as u8; 16],
+                },
+            })
+            .unwrap();
+        let manifest = state.peer_group_view(version).unwrap().manifest.unwrap();
+        state.ready_peer_group(grant, manifest.digest()).unwrap();
+        grant
+    }
+
+    fn prepared_successor(
+        same_host: bool,
+    ) -> (ServingState, GroupVersion, GroupVersion, WorkerGrant) {
+        let mut state = ServingState::default();
+        let first_host = NodeId::derive("active worker");
+        let second_host = if same_host {
+            first_host
+        } else {
+            NodeId::derive("standby worker")
+        };
+        let group = GroupId(NodeId::derive("failover group"));
+        for (host, ordinal) in [(first_host, 0), (second_host, 1)] {
+            state
+                .set_host_memory(
+                    host,
+                    HostMemory {
+                        bytes: 16,
+                        pinned_bytes: 0,
+                    },
+                )
+                .unwrap();
+            let device = DeviceId::new(host, ordinal);
+            state.register_worker(device, 1, 16).unwrap();
+            let resources = ResourcePlan {
+                workers: BTreeMap::from([(
+                    device,
+                    WorkerDemand {
+                        incarnation: 1,
+                        device_bytes: 8,
+                    },
+                )]),
+                hosts: BTreeMap::from([(
+                    host,
+                    HostMemory {
+                        bytes: 4,
+                        pinned_bytes: 0,
+                    },
+                )]),
+            };
+            state
+                .prepare_peer_group(group, u64::from(ordinal), &resources)
+                .unwrap();
+            if ordinal == 0 {
+                let active = GroupVersion { group, epoch: 1 };
+                ready_single_worker(&mut state, active);
+                state.activate_peer_group(active).unwrap();
+            }
+        }
+        let active = GroupVersion { group, epoch: 1 };
+        let standby = GroupVersion { group, epoch: 2 };
+        let grant = state.peer_group_view(active).unwrap().grants[0];
+        (state, active, standby, grant)
+    }
+
+    #[test]
+    fn exact_fault_promotes_only_the_armed_ready_successor() {
+        let (mut state, active, standby, old) = prepared_successor(false);
+        let arm = GroupAction::SetStandby {
+            active,
+            standby: Some(standby.epoch),
+        };
+        assert_eq!(
+            state.peer_group_transition(&arm),
+            Err(GroupError::InvalidPhase(GroupPhase::Preparing))
+        );
+        let successor = ready_single_worker(&mut state, standby);
+        let fault = |grant| GroupAction::ReportFailure {
+            grant,
+            fault: GroupFault::Transport,
+        };
+        assert!(state.peer_group_transition(&arm).is_ok());
+        assert_eq!(state.peer_standby(active.group), Some(standby));
+
+        let mut manual = state.clone();
+        manual
+            .peer_group_transition(&GroupAction::Revoke(active))
+            .unwrap();
+        assert_eq!(
+            manual.peer_group_view(standby).unwrap().phase,
+            GroupPhase::Ready
+        );
+        assert_eq!(manual.peer_standby(active.group), None);
+
+        let mut lost_standby = state.clone();
+        lost_standby
+            .peer_group_transition(&fault(successor))
+            .unwrap();
+        lost_standby.peer_group_transition(&fault(old)).unwrap();
+        assert!(
+            lost_standby
+                .placement_inventory(active.group)
+                .active
+                .is_none()
+        );
+
+        assert_eq!(
+            state.peer_group_transition(&fault(WorkerGrant {
+                fence: old.fence + 1,
+                ..old
+            })),
+            Err(GroupError::GrantMismatch)
+        );
+        let first = state.peer_group_transition(&fault(old));
+        assert_eq!(
+            first,
+            Ok(GroupOutcome::Version {
+                version: active,
+                phase: GroupPhase::Revoked
+            })
+        );
+        assert_eq!(
+            state.peer_group_view(standby).unwrap().phase,
+            GroupPhase::Active
+        );
+        assert_eq!(state.workers[&old.device].grant, Some(old));
+        assert_eq!(state.peer_group_transition(&fault(old)), first);
+        assert_eq!(
+            state.peer_group_transition(&arm),
+            Err(GroupError::ActiveEpochChanged {
+                current: Some(standby.epoch)
+            })
+        );
+    }
+
+    #[test]
+    fn host_loss_only_promotes_a_standby_outside_the_affected_groups() {
+        for same_host in [false, true] {
+            let (mut state, active, standby, old) = prepared_successor(same_host);
+            ready_single_worker(&mut state, standby);
+            state.set_peer_standby(active, Some(standby.epoch)).unwrap();
+            let host = old.device.node;
+            let pulse = OpId::new(host, 1);
+            state.pulse_execution_host(host, pulse, [1, 2]).unwrap();
+            let affected = state.execution_versions_on(host);
+            state.expire_execution_host(host, pulse, &affected).unwrap();
+            assert_eq!(
+                state.peer_group_view(active).unwrap().phase,
+                GroupPhase::Revoked
+            );
+            assert_eq!(
+                state.peer_group_view(standby).unwrap().phase,
+                if same_host {
+                    GroupPhase::Revoked
+                } else {
+                    GroupPhase::Active
+                }
+            );
+            assert_eq!(state.peer_standby(active.group), None);
+        }
+    }
 
     #[test]
     fn a_planned_reservation_checks_the_incumbent_and_filters_old_profiles() {

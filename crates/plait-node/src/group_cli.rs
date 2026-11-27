@@ -18,6 +18,9 @@ enum Request {
     Placement {
         group: GroupId,
     },
+    Standby {
+        group: GroupId,
+    },
     Links,
     Plan {
         group: GroupId,
@@ -94,6 +97,17 @@ async fn handle(client: &mut Client, voters: &[NodeId], request: Request) -> io:
         Request::Placement { group } => {
             let available = placement_inventory(client, voters, group).await?;
             return Ok(json!({ "placement": available }));
+        }
+        Request::Standby { group } => {
+            let mut last = io::Error::other("no reachable voter");
+            for &peer in voters {
+                match client.query_group(peer, GroupLookup::Standby(group)).await {
+                    Ok(GroupReply::Standby(version)) => return Ok(json!({ "standby": version })),
+                    Ok(_) => last = io::Error::other("expected group standby"),
+                    Err(error) => last = error,
+                }
+            }
+            return Err(last);
         }
         Request::Links => {
             let probes = link_probes(client, voters).await?;

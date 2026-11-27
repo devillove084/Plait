@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use cudarc::driver::CudaContext;
 use half::{bf16, f16};
+use plait_core::group::GroupFault;
 
 mod backend;
 #[cfg(feature = "control")]
@@ -455,7 +456,7 @@ impl Comm {
         let Transport::Peers(group) = &self.transport else {
             return false;
         };
-        group.fail();
+        group.cancel();
         true
     }
 
@@ -635,7 +636,7 @@ fn synchronize_stream(comm: &Comm, stream: *mut std::ffi::c_void) -> Result<(), 
         .synchronize_stream(stream as u64)
         .map_err(|error| {
             if let Transport::Peers(group) = &comm.transport {
-                group.fail();
+                group.fail(GroupFault::Device);
             }
             set_error(error.0)
         })
@@ -655,13 +656,15 @@ fn execute_peer_collective(
     }
     let mut input = vec![0u8; bytes];
     let needs_input = !matches!(op, Collective::Broadcast(_, source) if source != comm.rank);
-    if needs_input
-        && bytes != 0
-        && (send.is_null()
-            || device_to_host(comm.runtime.as_ref(), send as u64, &mut input).is_err())
-    {
-        group.fail();
-        return NCCL_UNHANDLED_CUDA_ERROR;
+    if needs_input && bytes != 0 {
+        if send.is_null() {
+            group.cancel();
+            return NCCL_UNHANDLED_CUDA_ERROR;
+        }
+        if device_to_host(comm.runtime.as_ref(), send as u64, &mut input).is_err() {
+            group.fail(GroupFault::Device);
+            return NCCL_UNHANDLED_CUDA_ERROR;
+        }
     }
     let output = match group.execute(op, &input) {
         Ok(output) => output,
@@ -671,7 +674,7 @@ fn execute_peer_collective(
         return set_error(error.to_string());
     }
     if !output.is_empty() && host_to_device(comm.runtime.as_ref(), recv as u64, &output).is_err() {
-        group.fail();
+        group.fail(GroupFault::Device);
         return NCCL_UNHANDLED_CUDA_ERROR;
     }
     NCCL_SUCCESS
@@ -2175,7 +2178,7 @@ pub extern "C" fn ncclSend(
     let mut host = vec![0u8; bytes];
     if device_to_host(comm.runtime.as_ref(), sendbuff as u64, &mut host).is_err() {
         if let Transport::Peers(group) = &comm.transport {
-            group.fail();
+            group.fail(GroupFault::Device);
         }
         return NCCL_UNHANDLED_CUDA_ERROR;
     }
@@ -2236,7 +2239,7 @@ pub extern "C" fn ncclRecv(
     };
     if host_to_device(comm.runtime.as_ref(), recvbuff as u64, &result).is_err() {
         if let Transport::Peers(group) = &comm.transport {
-            group.fail();
+            group.fail(GroupFault::Device);
         }
         return NCCL_UNHANDLED_CUDA_ERROR;
     }

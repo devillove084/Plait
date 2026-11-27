@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use plait_core::DeviceId;
 pub use plait_core::group::PeerEndpoint as Endpoint;
-use plait_core::group::{GroupVersion, peer_digest};
+use plait_core::group::{GroupFault, GroupVersion, peer_digest};
 use sha2::Digest;
 
 use crate::{DataType, ReduceOp, reduce_bytes, reduce_fp8_to_f32};
@@ -348,7 +348,7 @@ pub(crate) struct PeerGroup {
     failed: AtomicBool,
     binding: Option<GrantBinding>,
     #[cfg(feature = "control")]
-    grant_watch: std::sync::OnceLock<tokio::task::AbortHandle>,
+    grant_watch: std::sync::OnceLock<tokio::sync::mpsc::Sender<Option<GroupFault>>>,
 }
 
 impl PeerGroup {
@@ -379,24 +379,32 @@ impl PeerGroup {
             .position(|&id| id == device)
     }
 
-    pub fn fail(&self) {
+    pub fn cancel(&self) {
+        self.close(None);
+    }
+
+    pub(crate) fn fail(&self, fault: GroupFault) {
+        self.close(Some(fault));
+    }
+
+    fn close(&self, _fault: Option<GroupFault>) {
         if !self.failed.swap(true, Ordering::AcqRel) {
             for link in self.links.iter().flatten() {
                 let _ = link.collective.shutdown(Shutdown::Both);
                 let _ = link.direct.shutdown(Shutdown::Both);
             }
             #[cfg(feature = "control")]
-            if let Some(task) = self.grant_watch.get() {
-                task.abort();
+            if let Some(watch) = self.grant_watch.get() {
+                let _ = watch.try_send(_fault);
             }
         }
     }
 
     #[cfg(feature = "control")]
-    pub(crate) fn watch_grant(&self, task: tokio::task::AbortHandle) {
-        if self.grant_watch.set(task.clone()).is_err() || self.is_failed() {
-            task.abort();
-        }
+    pub(crate) fn watch_grant(&self, watch: tokio::sync::mpsc::Sender<Option<GroupFault>>) {
+        self.grant_watch
+            .set(watch)
+            .expect("one watcher per communicator");
     }
 
     pub(crate) fn manifest_digest(&self) -> Option<[u8; 32]> {
@@ -446,10 +454,10 @@ impl PeerGroup {
         let mut sequence = self.sequence.lock().unwrap();
         self.live()?;
         let result = self.run(collective, *sequence, input);
-        if result.is_err() {
-            self.fail();
-        } else {
-            *sequence += 1;
+        match &result {
+            Ok(_) => *sequence += 1,
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => self.cancel(),
+            Err(_) => self.fail(GroupFault::Transport),
         }
         result
     }
@@ -600,7 +608,7 @@ impl PeerGroup {
                             .is_err()
                         {
                             if let Some(group) = group.upgrade() {
-                                group.fail();
+                                group.fail(GroupFault::Transport);
                             }
                             break;
                         }
@@ -617,7 +625,7 @@ impl PeerGroup {
             })
             .map_err(|error| io::Error::other(format!("peer send queue: {error}")));
         if result.is_err() {
-            self.fail();
+            self.fail(GroupFault::Transport);
         }
         result
     }
@@ -640,7 +648,7 @@ impl PeerGroup {
             Ok(payload)
         })();
         if result.is_err() {
-            self.fail();
+            self.fail(GroupFault::Transport);
         }
         result
     }
@@ -648,7 +656,7 @@ impl PeerGroup {
 
 impl Drop for PeerGroup {
     fn drop(&mut self) {
-        self.fail();
+        self.cancel();
     }
 }
 

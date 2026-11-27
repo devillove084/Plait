@@ -137,6 +137,10 @@ impl Runtime {
         self.serving.peer_grant_status(grant)
     }
 
+    pub fn peer_standby(&self, group: plait_core::group::GroupId) -> Option<GroupVersion> {
+        self.serving.peer_standby(group)
+    }
+
     pub fn placement_inventory(&self, group: plait_core::group::GroupId) -> PlacementInventory {
         self.serving.placement_inventory(group)
     }
