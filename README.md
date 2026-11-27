@@ -177,6 +177,11 @@ from Plait's control plane by setting `VLLM_PLAIT_TP_GROUP_CONFIG`.
 The engine's logical slot order is checked during the peer handshake.
 [Join a committed TP group](docs/rankless-nccl.md#join-a-committed-tp-group-from-vllm)
 
+One native TP4 group served Qwen3-0.6B in FP16 across CUDA, ROCm, CANN, and
+HGGC workers with the vLLM multiprocess executor. All four workers reported
+their grants ready, and the HTTP response's eight token IDs matched a single-device
+baseline. [Four-vendor serving verification](docs/rankless-nccl.md#verify-four-vendor-tp4-over-http)
+
 Native C and Rust callers can bind a communicator directly to an execution
 group version and its device grants. Stable identities determine the default
 slot order. Each peer validates the full manifest during the socket handshake.

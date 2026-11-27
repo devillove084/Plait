@@ -202,6 +202,29 @@ Rust clients can use `join_committed_group` with the `plait-nccl/control`
 feature for the same sequence. C clients can publish and join through the
 native group APIs and existing C ABI.
 
+#### Verify four-vendor TP4 over HTTP
+
+The integration test used Qwen3-0.6B in FP16 and one device each on CUDA,
+ROCm, CANN, and HGGC. It applied the vLLM fork's Python changes over the
+existing per-platform wheels and loaded the same Plait native module on each
+host. [vLLM revision](https://github.com/devillove084/vllm/commit/acea9b5adb9919192b1b9ef1207c2f4868c64fcb)
+[Plait revision](https://github.com/devillove084/Plait/commit/eff9561cc1c1bc74163566bcfde77570700474ec)
+
+Start four hosts with `--distributed-executor-backend mp`, `--nnodes 4`,
+`--tensor-parallel-size 4`, and `--plait-tp-layout 1 1 1 1`. Use
+`VLLM_USE_V2_MODEL_RUNNER=1`, `--enforce-eager`, `--block-size 128`, and
+`--disable-custom-all-reduce`. Give each host its own node rank. Run the API on
+node rank 0 and append `--headless` on the other hosts. The small-model test set
+`--max-model-len 96`, `--no-enable-prefix-caching`, and
+`--kv-cache-memory-bytes 268435456` on each worker. It selected `TRITON_ATTN`
+on CUDA, ROCm, and HGGC and used the Ascend plugin's attention backend on CANN.
+
+Confirm one ready grant per worker and an HTTP 200 from `/health` on the
+API host. Apply `Activate` to the native group version, then send the same
+greedy completion request to the TP4 endpoint and a single-device baseline.
+The test received HTTP 200 from both `/v1/completions` endpoints and compared
+all eight returned token IDs.
+
 #### Cancel a committed communicator
 
 Communicators created through the control-plane join keep their control
