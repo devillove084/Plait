@@ -414,6 +414,77 @@ returned HTTP 503 after the ingress observed the switch. Publishing the
 binding let the same URL serve new requests from TP2. Its eight token IDs
 matched TP4, and the original TP4 stream returned all 24 tokens and `[DONE]`.
 
+#### Launch and activate groups from the vLLM fork
+
+Run `vllm.entrypoints.serve.plait_deploy` on each eligible vLLM host. Give
+each instance the same deployment file and a local engine configuration.
+Use the group ID from the Plait replanning policy, expressed in hexadecimal.
+
+```json
+{
+  "group_id": "00000000000000000000000000000003",
+  "seeds": ["192.0.2.11:7950", "192.0.2.12:7950", "192.0.2.13:7950"],
+  "model_alias": "example-model",
+  "hosts": {
+    "00000000000000000000000000000001": "192.0.2.21",
+    "00000000000000000000000000000002": "192.0.2.22"
+  },
+  "api_port_base": 8000,
+  "rendezvous_port_base": 8100,
+  "epoch_ports": 16,
+  "max_num_batched_tokens": 2048,
+  "max_num_seqs": 128
+}
+```
+
+```json
+{
+  "argv": ["vllm"],
+  "model": "/models/example-model",
+  "device_env": "CUDA_VISIBLE_DEVICES",
+  "args": ["--dtype", "float16", "--enforce-eager", "--disable-custom-all-reduce"],
+  "env": {"PLAIT_NCCL_BACKEND": "cuda"}
+}
+```
+
+```sh
+python -m vllm.entrypoints.serve.plait_deploy deployment.json \
+  --control-listen "$LOCAL_IP:0" --host-id "$HOST_ID" \
+  --engine local-engine.json --state-dir "$ENGINE_STATE"
+```
+
+The launcher reads a `Preparing` version through ordered `Observe`. Each
+participant launches only the devices granted to its host. The first granted
+host in ID order starts the API and the vLLM CPU rendezvous. Its peers start
+headless engines. The device order in the descriptor follows host ID and
+local device ordinal, so every worker agrees on vLLM's logical TP slots.
+For multi-host groups, the launcher selects the Gloo interface from the
+local deployment address when `GLOO_SOCKET_IFNAME` is unset.
+The shared batch limits give all workers the same profiling tensor shapes.
+Set matching model and shape-affecting options on the participating engines.
+The two port ranges must be disjoint and reachable. Epochs cycle through
+the configured slots. Keep enough slots for all overlapping engines.
+An optional `compute_calibration` object in the deployment file enables the
+same GEMM startup measurement on each new engine.
+
+Run one route publisher alongside the ingress, or add `--routes` to the
+launcher on that host. Both processes use the same route file.
+
+```sh
+python -m vllm.entrypoints.serve.plait_deploy deployment.json \
+  --control-listen "$LOCAL_IP:0" --routes "$ROUTES"
+```
+
+The route publisher waits for Plait to report `Ready` and for the engine to
+return HTTP 200 from `/health` with the expected group version. It publishes
+the new origin atomically before sending `Activate`. The ingress opens new
+requests on the new version once it observes activation. Existing streams
+finish on their original engine. If activation's reply is lost, the
+publisher retries with the same operation ID. Deployment keeps the old
+engine running until the operator has confirmed drain and can retire its
+grants. Each launcher reports an unexpected child exit against an exact
+grant in the affected version.
+
 #### Cancel a committed communicator
 
 Communicators created through the control-plane join keep their control
