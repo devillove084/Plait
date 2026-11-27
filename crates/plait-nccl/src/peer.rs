@@ -12,6 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use plait_core::DeviceId;
+use plait_core::collective::{PeerAllReducePlan, peer_all_reduce_plan, peer_shard_elements};
 pub use plait_core::group::PeerEndpoint as Endpoint;
 use plait_core::group::{GroupFault, GroupVersion, peer_digest};
 use sha2::Digest;
@@ -26,8 +27,6 @@ pub use rankless::{RanklessListener, RanklessMember};
 const COLLECTIVE_LANE: u8 = 0;
 const DIRECT_LANE: u8 = 1;
 const REPLICATED_EXCHANGE: u8 = 2;
-const REPLICATED_BYTES_PER_RANK: usize = 64 * 1024;
-const TWO_RANK_REPLICATED_LIMIT: usize = 1024 * 1024;
 
 pub struct Listener {
     socket: TcpListener,
@@ -329,18 +328,10 @@ impl Collective {
 }
 
 fn use_replicated_exchange(collective: Collective, bytes: usize, world: usize) -> bool {
-    if !matches!(
+    matches!(
         collective,
         Collective::AllReduce(..) | Collective::AllReduceFp8ToF32
-    ) {
-        return false;
-    }
-    match world {
-        // One exchange of the complete input moves no more bytes than two
-        // shard rounds for two ranks. Bound the replicated host reduction.
-        2 => bytes <= TWO_RANK_REPLICATED_LIMIT,
-        _ => bytes.saturating_mul(world - 1) <= REPLICATED_BYTES_PER_RANK,
-    }
+    ) && peer_all_reduce_plan(bytes as u64, world) == PeerAllReducePlan::Replicated
 }
 
 pub(crate) struct PeerGroup {
@@ -730,12 +721,10 @@ fn direct_header(dtype: DataType, bytes: usize) -> [u8; 9] {
 }
 
 fn shard_ranges(bytes: usize, width: usize, world: usize) -> Vec<Range<usize>> {
-    let elements = bytes / width;
-    let minimum = elements / world;
-    let extra = elements % world;
+    let elements = (bytes / width) as u64;
     (0..world)
         .scan(0, |start, slot| {
-            let end = *start + (minimum + usize::from(slot < extra)) * width;
+            let end = *start + peer_shard_elements(elements, world, slot) as usize * width;
             let range = *start..end;
             *start = end;
             Some(range)

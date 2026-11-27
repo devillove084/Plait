@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use plait_core::collective::{PeerAllReducePlan, peer_all_reduce_plan, peer_shard_elements};
 use plait_core::group::{
     ComputeRate, GroupId, GroupPhase, GroupVersion, HostMemory, PlacementHost, PlacementInventory,
     PlacementWorker, ResourcePlan, WorkerDemand,
@@ -53,7 +54,17 @@ pub enum ComputeOrder {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Communication {
     AllToAll { rounds: u64, bytes_per_peer: u64 },
+    PeerAllReduce { calls: Vec<AllReduceCalls> },
     Directed { edges: Vec<Exchange> },
+}
+
+/// A class of serial host-staged peer AllReduce calls for one operation.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AllReduceCalls {
+    pub count: u64,
+    pub bytes: u64,
+    pub element_bytes: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -73,6 +84,7 @@ impl Workload {
                 .iter()
                 .any(|recipe| match &recipe.communication {
                     Communication::AllToAll { rounds, .. } => *rounds != 0,
+                    Communication::PeerAllReduce { calls } => !calls.is_empty(),
                     Communication::Directed { edges } => !edges.is_empty(),
                 })
     }
@@ -101,6 +113,10 @@ impl Workload {
                         bytes_per_peer: 1..
                     }
                 )
+                || matches!(&recipe.communication, Communication::PeerAllReduce { calls }
+                    if calls.is_empty() || calls.iter().any(|call| call.count == 0 || call.bytes == 0
+                        || !matches!(call.element_bytes, 1 | 2 | 4 | 8)
+                        || call.bytes % call.element_bytes != 0))
                 || matches!(&recipe.communication, Communication::Directed { edges } if edges.iter().any(|edge|
                     edge.from >= width || edge.to >= width || edge.from == edge.to || edge.rounds == 0))
             {
@@ -786,6 +802,7 @@ impl<'a> Model<'a> {
                 rounds,
                 bytes_per_peer,
             } => self.all_to_all(workers, *bytes_per_peer, *rounds)?,
+            Communication::PeerAllReduce { calls } => self.peer_all_reduce(&ordered, calls)?,
             Communication::Directed { edges } => {
                 let mut total = 0u64;
                 for edge in edges {
@@ -827,6 +844,66 @@ impl<'a> Model<'a> {
             }
         }
         Some(network_ns)
+    }
+
+    fn peer_all_reduce(&self, ordered: &[Worker], calls: &[AllReduceCalls]) -> Option<u64> {
+        let hosts = count_hosts(ordered);
+        if hosts.len() < 2 {
+            return Some(0);
+        }
+        let mut total = 0u64;
+        for call in calls {
+            let elapsed = match peer_all_reduce_plan(call.bytes, ordered.len()) {
+                PeerAllReducePlan::Replicated => {
+                    self.exchange_phase(&hosts, |source, target| {
+                        u128::from(call.bytes) * hosts[&source] as u128 * hosts[&target] as u128
+                    })?
+                }
+                PeerAllReducePlan::ScatterGather => {
+                    let elements = call.bytes / call.element_bytes;
+                    let mut shards = BTreeMap::new();
+                    for (slot, worker) in ordered.iter().enumerate() {
+                        let count = peer_shard_elements(elements, ordered.len(), slot);
+                        *shards.entry(worker.id.node).or_insert(0u64) += count * call.element_bytes;
+                    }
+                    let scatter =
+                        |source, target| hosts[&source] as u128 * u128::from(shards[&target]);
+                    let scatter_ns = self.exchange_phase(&hosts, scatter)?;
+                    let gather_ns =
+                        self.exchange_phase(&hosts, |source, target| scatter(target, source))?;
+                    scatter_ns.saturating_add(gather_ns)
+                }
+            };
+            total = total.saturating_add(elapsed.saturating_mul(call.count));
+        }
+        Some(total)
+    }
+
+    fn exchange_phase(
+        &self,
+        hosts: &BTreeMap<NodeId, usize>,
+        traffic: impl Fn(NodeId, NodeId) -> u128,
+    ) -> Option<u64> {
+        let mut peak_rtt = 0;
+        let mut peak_serialization = 0u64;
+        let mut inbound = BTreeMap::new();
+        for &source in hosts.keys() {
+            let mut outgoing = 0u64;
+            for &target in hosts.keys().filter(|&&target| target != source) {
+                let link = self.links.get(&(source, target))?;
+                peak_rtt = peak_rtt.max(link.rtt_ns);
+                let time = ns(
+                    traffic(source, target).saturating_mul(NANOS),
+                    u128::from(link.bytes_per_second),
+                );
+                outgoing = outgoing.saturating_add(time);
+                let incoming = inbound.entry(target).or_insert(0u64);
+                *incoming = incoming.saturating_add(time);
+                peak_serialization = peak_serialization.max(*incoming);
+            }
+            peak_serialization = peak_serialization.max(outgoing);
+        }
+        Some(peak_rtt.saturating_add(peak_serialization))
     }
 
     fn link_time(&self, source: NodeId, target: NodeId, bytes: u128, rounds: u64) -> Option<u64> {
@@ -1196,9 +1273,12 @@ mod tests {
                 id: parallel,
                 work: vec![100_000_000; 2],
                 compute: ComputeOrder::Parallel,
-                communication: Communication::AllToAll {
-                    rounds: 57,
-                    bytes_per_peer: 1024,
+                communication: Communication::PeerAllReduce {
+                    calls: vec![AllReduceCalls {
+                        count: 57,
+                        bytes: 1024,
+                        element_bytes: 2,
+                    }],
                 },
             },
             Recipe {
@@ -1241,6 +1321,72 @@ mod tests {
         assert_eq!(selected, resources);
         assert_eq!(cost.compute_ns, 125_000_000);
         assert_eq!(cost.network_ns, 41_001_024);
+    }
+
+    #[test]
+    fn peer_all_reduce_charges_each_call_and_overlaps_peer_rtt() {
+        let [a, b, c] = [1, 2, 3].map(host);
+        let ranks = [
+            worker(a, 0, 1),
+            worker(a, 1, 1),
+            worker(b, 0, 1),
+            worker(c, 0, 1),
+        ];
+        let links: Vec<_> = [(a, b), (a, c), (b, c)]
+            .into_iter()
+            .flat_map(|(left, right)| links_between(left, right, 1_000_000_000, 50))
+            .collect();
+        let workload = workload();
+        let model = Model::new(&workload, &links, 55, None).unwrap();
+        let workers: Vec<_> = ranks
+            .iter()
+            .map(|rank| model.eligible(rank).unwrap())
+            .collect();
+        let calls = [
+            AllReduceCalls {
+                count: 399,
+                bytes: 2048,
+                element_bytes: 2,
+            },
+            AllReduceCalls {
+                count: 57,
+                bytes: 10240,
+                element_bytes: 2,
+            },
+        ];
+        // The two-worker host services four cross-host worker pairs per direction.
+        assert_eq!(
+            model.peer_all_reduce(&workers, &calls),
+            Some(399 * (100 + 4 * 2048) + 57 * (100 + 4 * 10240))
+        );
+        assert_eq!(model.peer_all_reduce(&workers[..2], &calls), Some(0));
+        let incomplete = Model::new(&workload, &links[..5], 55, None).unwrap();
+        assert_eq!(incomplete.peer_all_reduce(&workers, &calls), None);
+    }
+
+    #[test]
+    fn peer_all_reduce_prices_uneven_shards_in_both_directions() {
+        let [a, b] = [1, 2].map(host);
+        let ranks = [worker(a, 0, 1), worker(a, 1, 1), worker(b, 0, 1)];
+        let mut links = links_between(a, b, 1_000_000_000, 50);
+        links[1].bytes_per_second = 500_000_000;
+        let workload = workload();
+        let model = Model::new(&workload, &links, 55, None).unwrap();
+        let workers: Vec<_> = ranks
+            .iter()
+            .map(|rank| model.eligible(rank).unwrap())
+            .collect();
+        let calls = [AllReduceCalls {
+            count: 1,
+            bytes: 65_540,
+            element_bytes: 2,
+        }];
+        // A owns 43,694 bytes and B owns 21,846. B's slower egress is the
+        // bottleneck in both sequential phases, with different payload sizes.
+        assert_eq!(
+            model.peer_all_reduce(&workers, &calls),
+            Some(2 * 43_694 + 2 * 43_692 + 2 * 100)
+        );
     }
 
     #[test]

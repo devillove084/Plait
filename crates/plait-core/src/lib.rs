@@ -5,6 +5,7 @@
 //! tensor/operator keys they touch, and membership is a replicated
 //! configuration rather than an array of ranks.
 
+pub mod collective;
 pub mod command;
 pub mod config;
 pub mod device;

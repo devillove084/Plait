@@ -1,4 +1,7 @@
 use super::*;
+
+const REPLICATED_BYTES_PER_RANK: usize = 64 * 1024;
+const TWO_RANK_REPLICATED_LIMIT: usize = 1024 * 1024;
 use crate::backend::BackendError;
 use crate::{
     Comm, DeviceRuntime, NCCL_SUCCESS, RanklessComm, Transport, ncclAllGather, ncclAllReduce,

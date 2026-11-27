@@ -308,7 +308,10 @@ or calibrated device rates.
     "id": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
     "work": [500000000, 500000000],
     "compute": "parallel",
-    "communication": {"kind": "all_to_all", "rounds": 57, "bytes_per_peer": 2048}
+    "communication": {
+      "kind": "peer_all_reduce",
+      "calls": [{"count": 57, "bytes": 2048, "element_bytes": 2}]
+    }
   },
   {
     "id": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
@@ -326,10 +329,26 @@ or calibrated device rates.
 ```
 
 Parallel compute charges the slowest device. Sequential compute adds the
-stage times. Each cross-host exchange charges its stated number of rounds
-using measured bandwidth and RTT. All-to-all rounds use the busiest host
-direction. Directed exchanges follow the supplied device positions and add
-their costs. The planner uses these estimates for latency per operation.
+stage times. In `peer_all_reduce`, `bytes` is the entire input on one
+worker, `element_bytes` is its element width, and `count` is the number
+of sequential calls with that shape per scored operation. Add a bucket
+for each payload size, such as separate prefill and decode calls.
+
+The planner uses the host-staged peer runtime's exchange choice and shard
+rule. A replicated call prices one exchange of the full input. A larger
+call prices scatter and gather separately, using the actual shard sizes
+and reversing the traffic for gather. In each exchange, it charges the
+largest fresh cross-host RTT once because peer sockets advance concurrently.
+It adds the highest ingress or egress serialization cost across hosts.
+That cost sums the bytes on each directed host link divided by its measured
+rate. The planner charges each call in the bucket and requires both link
+directions between participating hosts. Same-host transfers contribute
+zero cross-host cost.
+
+Directed exchanges follow the supplied device positions and add their
+round costs. The generic `all_to_all` recipe charges the supplied worker-pair
+bytes and per-link rounds. All recipe costs are latency estimates for one
+operation. Kernel work and device staging need their own calibration.
 
 With recipes configured, each candidate uses a listed recipe. The running
 group is scored with its committed recipe. Legacy groups use the policy's
