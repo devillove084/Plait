@@ -30,11 +30,6 @@ tlc -deadlock -config specs/PlaitHostedPd.cfg specs/PlaitHostedPd.tla
 tlc -deadlock -config specs/PlaitHostedServingModes.cfg specs/PlaitHostedServingModes.tla
 tlc -deadlock -config specs/PlaitHostedCheckpointContract.cfg specs/PlaitHostedCheckpointContract.tla
 tlc -deadlock -config specs/PlaitHostedCheckpointBudget.cfg specs/PlaitHostedCheckpointBudget.tla
-tlc -deadlock -config specs/PlaitCheckpointAdmission.cfg specs/PlaitCheckpointAdmission.tla
-tlc -deadlock -config specs/PlaitCheckpointPeers.cfg specs/PlaitCheckpointPeers.tla
-tlc -deadlock -config specs/PlaitCheckpointPeerPlan.cfg specs/PlaitCheckpointPeerPlan.tla
-tlc -deadlock -config specs/PlaitCheckpointBudgetSwitch.cfg specs/PlaitCheckpointBudgetSwitch.tla
-tlc -deadlock -config specs/PlaitCheckpointBudgetSwitchThree.cfg specs/PlaitCheckpointBudgetSwitch.tla
 tlc -deadlock -config specs/PlaitHostedModeSelection.cfg specs/PlaitHostedModeSelection.tla
 tlc -deadlock -config specs/PlaitExecutionMaintenance.cfg specs/PlaitExecutionMaintenance.tla
 tlc -deadlock -config specs/PlaitHostedPdBudget.cfg specs/PlaitHostedPdBudget.tla
@@ -50,8 +45,6 @@ tlc -deadlock -config specs/PlaitCompletionReplay.cfg specs/PlaitCompletionRepla
 tlc -deadlock -config specs/PlaitCompletionKvResume.cfg specs/PlaitCompletionReplay.tla
 tlc -deadlock -config specs/PlaitPlannedStreamHandoff.cfg specs/PlaitPlannedStreamHandoff.tla
 tlc -deadlock -config specs/PlaitSeededStreamHandoff.cfg specs/PlaitPlannedStreamHandoff.tla
-tlc -deadlock -config specs/PlaitKvPublication.cfg specs/PlaitKvPublication.tla
-tlc -deadlock -config specs/PlaitLayeredKv.cfg specs/PlaitLayeredKv.tla
 tlc -deadlock -config specs/PlaitKvHandoff.cfg specs/PlaitKvHandoff.tla
 tlc -deadlock -config specs/PlaitPdStreamReplay.cfg specs/PlaitPdStreamReplay.tla
 tlc -deadlock -config specs/PlaitKernelPrimitivesCheck.cfg specs/PlaitKernelPrimitivesCheck.tla

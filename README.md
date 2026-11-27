@@ -233,7 +233,8 @@ group to either a tensor-parallel replica or a pipeline with one worker per stag
 ### vLLM reference integration
 
 Managed replacements reuse complete prompt KV blocks across TP sizes and PP
-layouts with the vLLM fork's `PlaitKvConnector` and `plait-node kv-store`.
+layouts with the vLLM fork's `PlaitKvConnector` and its optional
+`vllm-plait-kv-store` binary.
 The ingress restores emitted token checkpoints and reuses pages from the
 prompt and generated prefix. The unified ingress supports greedy streams and
 streams with an explicit seed on the standard V2 sampler.
@@ -362,10 +363,10 @@ release the result after the matching completion has executed in the control pla
 | [Hosted serving modes](specs/PlaitHostedServingModes.tla) | An aggregate, a split path, or both can be published in one revision after all target groups are ready. Removed groups drain admitted requests before retiring. |
 | [Hosted checkpoint contract](specs/PlaitHostedCheckpointContract.tla) | A published route agrees with the KV contract of each participating group. A retained group version keeps its launch binding as the directory changes serving shapes. |
 | [Hosted checkpoint budget](specs/PlaitHostedCheckpointBudget.tla) | A replacement preserves the incumbent rate after steady traffic and in-flight checkpoint reservations are charged to shared ports and storage. |
-| [Checkpoint admission](specs/PlaitCheckpointAdmission.tla) | Optional writes and reserved reads share a burst. Refill accounts for bytes already granted to unfinished transfers. |
-| [Checkpoint peers](specs/PlaitCheckpointPeers.tla) | A complete page reservation fits every peer and the store. Each peer claims only its own reserved bytes. |
-| [Shared checkpoint peer budget](specs/PlaitCheckpointPeerPlan.tla) | Independent store shares stay inside one directional budget over any sampled interval, including a store restart. |
-| [Checkpoint budget replacement](specs/PlaitCheckpointBudgetSwitch.tla) | Each generation installs one plan. Older generations stop admitting optional transfers and drain their grants before the next generation opens, including during conflicting proposals and restarts. |
+| [Checkpoint admission](https://github.com/devillove084/vllm/blob/plait/v0.31-runtime/tools/plait/kv-store/specs/PlaitCheckpointAdmission.tla) | Optional writes and reserved reads share a burst. Refill accounts for bytes already granted to unfinished transfers. |
+| [Checkpoint peers](https://github.com/devillove084/vllm/blob/plait/v0.31-runtime/tools/plait/kv-store/specs/PlaitCheckpointPeers.tla) | A complete page reservation fits every peer and the store. Each peer claims only its own reserved bytes. |
+| [Shared checkpoint peer budget](https://github.com/devillove084/vllm/blob/plait/v0.31-runtime/tools/plait/kv-store/specs/PlaitCheckpointPeerPlan.tla) | Independent store shares stay inside one directional budget over any sampled interval, including a store restart. |
+| [Checkpoint budget replacement](https://github.com/devillove084/vllm/blob/plait/v0.31-runtime/tools/plait/kv-store/specs/PlaitCheckpointBudgetSwitch.tla) | Each generation installs one plan. Older generations stop admitting optional transfers and drain their grants before the next generation opens, including during conflicting proposals and restarts. |
 | [Hosted mode selection](specs/PlaitHostedModeSelection.tla) | Mixed routes fit the combined port and KV-store budgets. A switch preserves the incumbent SLO rate and has positive benefit after startup and drain. |
 | [Execution maintenance](specs/PlaitExecutionMaintenance.tla) | A new grant avoids a withdrawn target, a separate device keeps its group, and confirmation waits for both grants and deferred holds to release. |
 | [Hosted P/D budgeting](specs/PlaitHostedPdBudget.tla) | Equal path shares consume the same Prefill and directional port budgets. The model checks combined TP and KV demand on shared ports. |
@@ -378,8 +379,8 @@ release the result after the matching completion has executed in the control pla
 | [Serving ingress](specs/PlaitServingIngress.tla) | One admission per ordinary forwarded request, monotonic route refresh, version checks on native HTTP bindings, and output pinned to the admitted epoch. |
 | [Completion replay and KV resume](specs/PlaitCompletionReplay.tla) | Visible positions are preserved. Each KV resume sends the latest checkpoint and requires a matching acknowledgment and prefix before publishing a suffix. |
 | [Planned stream handoff](specs/PlaitPlannedStreamHandoff.tla) | A cut uses the last visible position and waits for a ready replacement. A seeded request requires a compatible sampler and a seed acknowledgment before the target publishes. |
-| [KV publication](specs/PlaitKvPublication.tla) | All heads must come from one write attempt before a page becomes readable. A consumer reads its requested head range, and a complete page stays immutable. |
-| [Layered KV](specs/PlaitLayeredKv.tla) | A page publishes after one write attempt covers every layer and head. A consumer can read it with a different stage partition or a whole-head request. |
+| [KV publication](https://github.com/devillove084/vllm/blob/plait/v0.31-runtime/tools/plait/kv-store/specs/PlaitKvPublication.tla) | All heads must come from one write attempt before a page becomes readable. A consumer reads its requested head range, and a complete page stays immutable. |
+| [Layered KV](https://github.com/devillove084/vllm/blob/plait/v0.31-runtime/tools/plait/kv-store/specs/PlaitLayeredKv.tla) | A page publishes after one write attempt covers every layer and head. A consumer can read it with a different stage partition or a whole-head request. |
 | [Prefill to Decode handoff](specs/PlaitKvHandoff.tla) | The receipt matches the request context. Decode emits output after loading the required pages, including when the shared store can reset between admission and load. |
 | [P/D stream replay](specs/PlaitPdStreamReplay.tla) | A failed Decode version is excluded. Each attempt releases its own handoff, and suffix output follows a checked prefix. |
 

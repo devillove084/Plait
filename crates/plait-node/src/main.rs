@@ -14,7 +14,6 @@ mod group_cli;
 mod group_plan;
 mod group_replan;
 mod hosted_probe;
-mod kv_store;
 mod peer_probes;
 mod serving_cli;
 mod tensor_cli;
@@ -136,7 +135,6 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         "group" => group_cli::run(args).await,
         "verify-host-release" => device_release::run(args).await,
         "capture-host-release" => device_release::capture(args).await,
-        "kv-store" => kv_store::run(args).await,
         "tensor" => tensor_cli::run(args).await,
         "run" => {
             let mut listen = "127.0.0.1:7001".to_owned();
@@ -285,7 +283,7 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         other => Err(format!(
-            "unknown command {other}; expected run, group, serving, kv-store, tensor, demo, dsa, parallel, rdma-selftest, devices, hetero, gpu-demo, gpu-bench, gpu-rdma, or id"
+            "unknown command {other}; expected run, group, serving, tensor, demo, dsa, parallel, rdma-selftest, devices, hetero, gpu-demo, gpu-bench, gpu-rdma, or id"
         )
         .into()),
     }

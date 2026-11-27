@@ -1014,7 +1014,7 @@ must remain open throughout recovery.
 ### Hand off prompt KV between independent Prefill and Decode groups
 
 Use the vLLM fork at `9122df3da` or later on `plait/v0.31-runtime`.
-Start `plait-node kv-store`
+Start the vLLM fork's [KV page store](#reuse-prompt-kv-across-tp-layouts)
 at an address reachable from both groups. Use the same store, model
 namespace, weights, KV dtype, and logical page size on both sides.
 Give each `serve-tiered.py` launch the role `prefill` or `decode` and
@@ -1271,12 +1271,24 @@ profiles calibrated for this model and load.
 
 ### Reuse prompt KV across TP layouts
 
-Start a shared store on the engine network. It keeps completed pages in
-memory, independent of either vLLM process group.
+Build the optional page store from the vLLM fork's `plait/v0.31-runtime`
+branch with Rust 1.95 or later. Start it on the engine network. It keeps
+completed pages in memory, independent of either vLLM process group.
 
 ```sh
-plait-node kv-store --listen 192.0.2.10:7952 --capacity-bytes 268435456
+cargo build --release --locked --manifest-path tools/plait/kv-store/Cargo.toml
+tools/plait/kv-store/target/release/vllm-plait-kv-store \
+  --listen 192.0.2.10:7952 --capacity-bytes 268435456
 ```
+
+Use `vllm-plait-kv-store` in place of the former `plait-node kv-store`
+entry point. The new binary takes the same flags and budget files, and
+the connector uses the same address and wire protocol. Deploy it before
+retiring the old entry point. A store restart empties its in-memory pages.
+
+Run `tools/plait/kv-store/check-tla.sh` from the vLLM fork to check page
+publication and checkpoint budgets. Use `tlc` on PATH or set
+`TLA2TOOLS_JAR` to the absolute path of the TLC jar.
 
 Pass the same model namespace, KV dtype, and logical block size to both
 engines. Choose a namespace that identifies the same model weights,
@@ -1451,7 +1463,7 @@ transfers occupy credit until their socket operation finishes. Required
 P/D prompt handoffs use their existing path. When an optional prefix
 reservation is declined, the target computes the uncovered known tokens.
 
-Run `plait-node kv-store --stats HOST:PORT` for completed payload bytes,
+Run `vllm-plait-kv-store --stats HOST:PORT` for completed payload bytes,
 refusals, expired read reservations, and bytes currently held. Use the
 change in the byte counters over a sampling window to measure the store's
 optional transfer rate.
@@ -1531,7 +1543,7 @@ Store buckets start empty on each restart and refill at their assigned
 rate, so restarting a member never supplies another initial burst.
 
 With all stores listening, run
-`plait-node kv-store --audit-checkpoint-peer-budget-plan PATH`. It
+`vllm-plait-kv-store --audit-checkpoint-peer-budget-plan PATH`. It
 verifies the installed plan ID and actual read and write shares at every
 endpoint. A successful audit prints the common ID and member list.
 With static configuration, retire the old allocation before starting stores
@@ -1551,14 +1563,14 @@ Run the following on each store host, with `0` replaced by the currently
 installed generation.
 
 ```shell
-plait-node kv-store --prepare-checkpoint-peer-budget-plan DIR 0 OLD.json NEW.json
-plait-node kv-store --activate-checkpoint-peer-budget-plan DIR 0 OLD.json NEW.json
+vllm-plait-kv-store --prepare-checkpoint-peer-budget-plan DIR 0 OLD.json NEW.json
+vllm-plait-kv-store --activate-checkpoint-peer-budget-plan DIR 0 OLD.json NEW.json
 ```
 
 1. Prepare all members. Each store closes new optional reservations and
    persists the target. Already granted reads and writes can finish. The
    normal P/D prompt handoff and the stored KV stay available.
-2. Use `plait-node kv-store --stats ENDPOINT` to see the target in
+2. Use `vllm-plait-kv-store --stats ENDPOINT` to see the target in
    `peer_budget_epoch.target_plan_id` and outstanding work in `pending_bytes`.
    Each activation checks every old member. A member must report zero pending
    bytes for the same target or show that it already activated that successor.
