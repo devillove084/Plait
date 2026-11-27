@@ -1124,6 +1124,80 @@ until drain finished. A new request reused 144 prompt tokens in Decode
 and matched the aggregate's output. After releasing the old grant, the
 test reused that device for a new aggregate epoch and switched back.
 
+#### Select a ready native layout from live demand
+
+Run the native ingress with `--mode-policy policy.json`. Enable this flag
+on the ingress that measures the demand for the model. The policy reads
+arrival counters in the ingress process. Readiness probes and control
+submissions use a separate control client from the route refresher.
+
+Calibrate each full layout against the workload and its latency SLO with
+`python -m vllm.entrypoints.serve.plait_serving.benchmark`. Record the
+benchmark's `slo_profile` against the exact worker epochs it measured.
+The profile expires at its `valid_until_ms` Unix timestamp. A split
+profile contains both group versions. A mixed profile lists every
+version used by its aggregate and split paths and uses a measurement of
+that combined deployment. Keep the active layout in the policy until
+another layout has activated. Use `route_revision` to bind the capacity
+measurements to the ingress's route file.
+
+```json
+{
+  "route_revision": 1,
+  "window_seconds": 2,
+  "stable_windows": 3,
+  "horizon_seconds": 60,
+  "cooldown_seconds": 10,
+  "device_cost_requests_per_second": 0.1,
+  "switch_loss_requests": 3,
+  "minimum_gain_requests": 2,
+  "modes": [
+    {
+      "versions": ["00000000000000000000000000000001@1"],
+      "devices": 1,
+      "slo_profile": {"rps": 4.0, "valid_until_ms": 1893456000000}
+    },
+    {
+      "versions": [
+        "00000000000000000000000000000002@1",
+        "00000000000000000000000000000003@1"
+      ],
+      "devices": 2,
+      "slo_profile": {"rps": 11.0, "valid_until_ms": 1893456000000}
+    }
+  ]
+}
+```
+
+Replace the example capacities and deadlines with benchmark output. The device
+rate converts the benefit of freeing one device-second to requests. The
+switch loss charges preparation overlap and drain in the same units. In
+each completed window, the ingress caps predicted service by the lesser of
+arrivals per second and measured SLO capacity. It keeps candidates that can
+serve at least the incumbent rate. The score compares projected requests
+and device-seconds over the horizon, then subtracts the switch loss.
+
+After `stable_windows` agree on one ready target, the controller rechecks
+the route revision, active set, and profile lifetime. It validates each
+target's device count and versioned HTTP health. One `SwitchActiveSet`
+compares the active epochs of all groups referenced by the directory. It
+can reject a changed group or target readiness after the check. A lost
+reply is retried with its original operation ID.
+
+The policy switches prepared groups. Prepare successors with the native
+placement planner and resident launchers, then include their bindings in
+both files. Use atomic renames for updates. A revision mismatch or an
+expired profile leaves the current groups active. When a switch succeeds,
+the policy waits through the cooldown before considering another switch.
+
+Three hosts verified automatic switching between CUDA aggregate and ROCm
+Prefill with PPU Decode. The trial used preset capacities of 0.8 and 4.0
+requests/s to exercise the policy with real HTTP arrivals. At 4.55
+requests/s, the ingress switched to P/D. Decode reused 128 prompt tokens
+from the shared store, and all eight output tokens matched the CUDA
+baseline. When the arrivals stopped and a new aggregate epoch was ready,
+the same ingress switched back and served a matching completion.
+
 ### Hand off prompt KV between independent Prefill and Decode groups
 
 Use the vLLM fork at `9122df3da` or later on `plait/v0.31-runtime`.
