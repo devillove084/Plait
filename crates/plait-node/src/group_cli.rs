@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufRead, Write};
 
 use plait_core::group::{
-    GroupAction, GroupId, GroupLookup, GroupOperation, GroupReceipt, GroupReply, GroupVersion,
-    HostMemory, PlacementInventory, ResourcePlan, WorkerDemand,
+    ComputeRate, GroupAction, GroupId, GroupLookup, GroupOperation, GroupReceipt, GroupReply,
+    GroupVersion, HostMemory, PlacementInventory, ResourcePlan, WorkerDemand,
 };
 use plait_core::link::ProbeRegistration;
 use plait_core::{DeviceId, NodeId, OpId};
@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 enum Request {
     Placement {
         group: GroupId,
+        calibration: Option<NodeId>,
     },
     Standby {
         group: GroupId,
@@ -27,6 +28,7 @@ enum Request {
         workload: Workload,
         links: Option<Vec<DirectedLink>>,
         prepare: Option<OpId>,
+        calibration: Option<NodeId>,
     },
     Apply {
         operation: GroupOperation,
@@ -94,9 +96,13 @@ pub(super) async fn run(
 
 async fn handle(client: &mut Client, voters: &[NodeId], request: Request) -> io::Result<Value> {
     let operation = match request {
-        Request::Placement { group } => {
-            let available = placement_inventory(client, voters, group).await?;
-            return Ok(json!({ "placement": available }));
+        Request::Placement { group, calibration } => {
+            let (available, rates) =
+                placement_inventory(client, voters, group, calibration).await?;
+            return Ok(match rates {
+                Some(rates) => json!({ "placement": available, "rates": rates }),
+                None => json!({ "placement": available }),
+            });
         }
         Request::Standby { group } => {
             let mut last = io::Error::other("no reachable voter");
@@ -119,6 +125,7 @@ async fn handle(client: &mut Client, voters: &[NodeId], request: Request) -> io:
             workload,
             links,
             prepare,
+            calibration,
         } => {
             if let Some(id) = prepare
                 && let Some(receipt) = group_receipt(client, voters, id).await?
@@ -129,6 +136,11 @@ async fn handle(client: &mut Client, voters: &[NodeId], request: Request) -> io:
                     ..
                 }
                 | GroupAction::PrepareMeasured {
+                    group: selected,
+                    resources,
+                    ..
+                }
+                | GroupAction::PrepareWithRates {
                     group: selected,
                     resources,
                     ..
@@ -151,7 +163,8 @@ async fn handle(client: &mut Client, voters: &[NodeId], request: Request) -> io:
                     "result": receipt.result,
                 }));
             }
-            let available = placement_inventory(client, voters, group).await?;
+            let (available, rates) =
+                placement_inventory(client, voters, group, calibration).await?;
             let (links, probes) = match links {
                 Some(links) => (links, None),
                 None if workload.bytes_per_peer == 0 => (Vec::new(), None),
@@ -164,13 +177,22 @@ async fn handle(client: &mut Client, voters: &[NodeId], request: Request) -> io:
                 }
             };
             let now = crate::hosted_probe::now_ms()?;
-            let decision = group_placement::select(&available, &workload, &links, now)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            let decision = group_placement::select_with_rates(
+                &available,
+                &workload,
+                &links,
+                now,
+                rates.as_deref(),
+            )
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
             let response = match decision {
                 Decision::Pending(version) => json!({ "decision": "pending", "version": version }),
                 Decision::NoPlacement => json!({ "decision": "no_placement" }),
                 Decision::AwaitLinks(version) => {
                     json!({ "decision": "await_links", "version": version })
+                }
+                Decision::AwaitComputeRates(version) => {
+                    json!({ "decision": "await_compute_rates", "version": version })
                 }
                 Decision::Keep { version, cost } => {
                     json!({ "decision": "keep", "version": version, "cost": cost })
@@ -190,7 +212,7 @@ async fn handle(client: &mut Client, voters: &[NodeId], request: Request) -> io:
                             available.latest.map_or(0, |(version, _)| version.epoch);
                         let expected_active =
                             available.active.as_ref().map(|active| active.version.epoch);
-                        let action = if let Some(mut probes) = probes {
+                        let probes = probes.map(|mut probes| {
                             let mut used = BTreeSet::new();
                             if resources.hosts.len() > 1 {
                                 used.extend(resources.hosts.keys().copied());
@@ -202,6 +224,28 @@ async fn handle(client: &mut Client, voters: &[NodeId], request: Request) -> io:
                                 used.extend(active.hosts.iter().map(|&(host, _)| host));
                             }
                             probes.retain(|probe| used.contains(&probe.endpoint.host));
+                            probes
+                        });
+                        let action = if let (Some(calibration), Some(mut rates)) =
+                            (calibration, rates)
+                        {
+                            let compared_active = incumbent.is_some();
+                            let mut used: BTreeSet<_> = resources.workers.keys().copied().collect();
+                            if compared_active && let Some(active) = &available.active {
+                                used.extend(active.workers.iter().map(|&(device, _)| device));
+                            }
+                            rates.retain(|rate| used.contains(&rate.device));
+                            GroupAction::PrepareWithRates {
+                                group,
+                                expected_epoch,
+                                expected_active,
+                                resources,
+                                probes: probes.unwrap_or_default(),
+                                calibration,
+                                compared_active,
+                                rates,
+                            }
+                        } else if let Some(probes) = probes {
                             GroupAction::PrepareMeasured {
                                 group,
                                 expected_epoch,
@@ -333,14 +377,18 @@ async fn placement_inventory(
     client: &mut Client,
     voters: &[NodeId],
     group: GroupId,
-) -> io::Result<PlacementInventory> {
+    calibration: Option<NodeId>,
+) -> io::Result<(PlacementInventory, Option<Vec<ComputeRate>>)> {
+    let lookup = calibration.map_or(GroupLookup::Placement(group), |calibration| {
+        GroupLookup::PlacementWithRates { group, calibration }
+    });
     let mut last = io::Error::other("no reachable voter");
     for &peer in voters {
-        match client
-            .query_group(peer, GroupLookup::Placement(group))
-            .await
-        {
-            Ok(GroupReply::Placement(view)) => return Ok(view),
+        match client.query_group(peer, lookup).await {
+            Ok(GroupReply::Placement(view)) if calibration.is_none() => return Ok((view, None)),
+            Ok(GroupReply::PlacementWithRates { inventory, rates }) if calibration.is_some() => {
+                return Ok((inventory, Some(rates)));
+            }
             Ok(_) => last = io::Error::other("expected group placement inventory"),
             Err(error) => last = error,
         }

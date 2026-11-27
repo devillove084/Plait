@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -213,6 +214,16 @@ pub struct PlacementWorker {
     pub profile: Option<DeviceProfile>,
 }
 
+/// A revision for one device incarnation within a caller's calibration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComputeRate {
+    pub device: DeviceId,
+    pub incarnation: u64,
+    pub revision: u64,
+    /// `None` invalidates an earlier measurement and preserves its revision history.
+    pub operations_per_second: Option<NonZeroU64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupOperation {
     pub id: OpId,
@@ -279,6 +290,23 @@ pub enum GroupAction {
         grant: WorkerGrant,
         fault: GroupFault,
     },
+    PublishComputeRate {
+        calibration: NodeId,
+        device: DeviceId,
+        incarnation: u64,
+        expected_revision: u64,
+        operations_per_second: Option<NonZeroU64>,
+    },
+    PrepareWithRates {
+        group: GroupId,
+        expected_epoch: u64,
+        expected_active: Option<u64>,
+        resources: ResourcePlan,
+        probes: Vec<ProbeRegistration>,
+        calibration: NodeId,
+        compared_active: bool,
+        rates: Vec<ComputeRate>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -296,6 +324,7 @@ pub enum GroupOutcome {
         phase: GroupPhase,
     },
     Probe(Option<ProbeRegistration>),
+    ComputeRate(ComputeRate),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -324,6 +353,7 @@ pub enum GroupError {
     ProfileMismatch(DeviceId),
     ActiveEpochChanged { current: Option<u64> },
     StaleProbe { host: NodeId, revision: u64 },
+    StaleComputeRate { device: DeviceId, revision: u64 },
 }
 
 pub type GroupResult = Result<GroupOutcome, GroupError>;
@@ -342,6 +372,7 @@ pub enum GroupLookup {
     LinkProbes,
     GrantStatus(WorkerGrant),
     Standby(GroupId),
+    PlacementWithRates { group: GroupId, calibration: NodeId },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -352,6 +383,10 @@ pub enum GroupReply {
     LinkProbes(Vec<ProbeRegistration>),
     GrantStatus(GrantStatus),
     Standby(Option<GroupVersion>),
+    PlacementWithRates {
+        inventory: PlacementInventory,
+        rates: Vec<ComputeRate>,
+    },
 }
 
 /// A replica's applied view of an exact communicator grant.
@@ -392,7 +427,8 @@ impl GroupOperation {
             GroupAction::SetHostMemory { host, .. } => {
                 keys.insert(Key::HostMemory(*host));
             }
-            GroupAction::RegisterWorker { device, .. } => {
+            GroupAction::RegisterWorker { device, .. }
+            | GroupAction::PublishComputeRate { device, .. } => {
                 keys.insert(Key::Device(*device));
             }
             GroupAction::AdvertiseWorker { profile, .. } => {
@@ -406,16 +442,24 @@ impl GroupOperation {
             }
             | GroupAction::PrepareMeasured {
                 group, resources, ..
+            }
+            | GroupAction::PrepareWithRates {
+                group, resources, ..
             } => {
                 keys.insert(Key::ServingGroup(*group));
                 keys.extend(resources.hosts.keys().copied().map(Key::HostMemory));
                 keys.extend(resources.workers.keys().copied().map(Key::Device));
-                if let GroupAction::PrepareMeasured { probes, .. } = &self.action {
+                if let GroupAction::PrepareMeasured { probes, .. }
+                | GroupAction::PrepareWithRates { probes, .. } = &self.action
+                {
                     reads.extend(
                         probes
                             .iter()
                             .map(|probe| Key::LinkProbe(probe.endpoint.host)),
                     );
+                }
+                if let GroupAction::PrepareWithRates { rates, .. } = &self.action {
+                    reads.extend(rates.iter().map(|rate| Key::Device(rate.device)));
                 }
             }
             GroupAction::PublishEndpoint(GroupMember { grant, .. })
@@ -448,6 +492,7 @@ impl GroupOperation {
                 keys.insert(Key::LinkProbe(endpoint.host));
             }
         }
+        reads.retain(|key| !keys.contains(key));
         keys.into_iter()
             .map(|key| Access {
                 key,

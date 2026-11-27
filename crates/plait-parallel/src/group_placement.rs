@@ -3,8 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use plait_core::group::{
-    GroupPhase, GroupVersion, HostMemory, PlacementInventory, PlacementWorker, ResourcePlan,
-    WorkerDemand,
+    ComputeRate, GroupPhase, GroupVersion, HostMemory, PlacementInventory, PlacementWorker,
+    ResourcePlan, WorkerDemand,
 };
 use plait_core::{ComputeRequirement, DeviceId, NodeId};
 use serde::{Deserialize, Serialize};
@@ -57,6 +57,7 @@ pub enum Decision {
     Pending(GroupVersion),
     NoPlacement,
     AwaitLinks(GroupVersion),
+    AwaitComputeRates(GroupVersion),
     Keep {
         version: GroupVersion,
         cost: Cost,
@@ -72,7 +73,7 @@ pub enum Decision {
 struct Worker {
     id: DeviceId,
     incarnation: u64,
-    flops: u64,
+    compute_rate: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -84,6 +85,7 @@ struct Candidate {
 struct Model<'a> {
     workload: &'a Workload,
     links: BTreeMap<(NodeId, NodeId), DirectedLink>,
+    rates: Option<BTreeMap<DeviceId, ComputeRate>>,
 }
 
 pub fn select(
@@ -91,6 +93,17 @@ pub fn select(
     workload: &Workload,
     links: &[DirectedLink],
     now_ms: u64,
+) -> Result<Decision, &'static str> {
+    select_with_rates(inventory, workload, links, now_ms, None)
+}
+
+/// When rates are supplied, use a single calibration for the whole comparison.
+pub fn select_with_rates(
+    inventory: &PlacementInventory,
+    workload: &Workload,
+    links: &[DirectedLink],
+    now_ms: u64,
+    rates: Option<&[ComputeRate]>,
 ) -> Result<Decision, &'static str> {
     let widths: BTreeSet<_> = workload
         .widths
@@ -104,6 +117,7 @@ pub fn select(
         || workload.per_worker_host.pinned_bytes > workload.per_worker_host.bytes
         || workload.per_host.pinned_bytes > workload.per_host.bytes
         || (workload.compute_work == 0 && workload.bytes_per_peer == 0)
+        || (rates.is_some() && workload.compute_work == 0)
     {
         return Err("invalid group placement workload");
     }
@@ -128,6 +142,16 @@ pub fn select(
     let model = Model {
         workload,
         links: fresh,
+        rates: rates
+            .map(|rates| {
+                let rates_by_device: BTreeMap<_, _> =
+                    rates.iter().map(|rate| (rate.device, *rate)).collect();
+                if rates_by_device.len() != rates.len() {
+                    return Err("duplicate compute rate");
+                }
+                Ok(rates_by_device)
+            })
+            .transpose()?,
     };
     let mut eligible = BTreeMap::new();
     for entry in &inventory.workers {
@@ -135,14 +159,21 @@ pub fn select(
             eligible.insert(worker.id, (worker, entry));
         }
     }
-    let incumbent = match model.incumbent(inventory, &eligible, &widths) {
-        Some((version, Some(cost))) => Some((version, cost)),
-        Some((version, None)) => return Ok(Decision::AwaitLinks(version)),
-        None => None,
+    let incumbent = if let Some((version, workers)) = model.incumbent(inventory, &eligible, &widths)
+    {
+        if workers.iter().any(|worker| worker.compute_rate.is_none()) {
+            return Ok(Decision::AwaitComputeRates(version));
+        }
+        let Some(cost) = model.cost(&workers) else {
+            return Ok(Decision::AwaitLinks(version));
+        };
+        Some((version, cost))
+    } else {
+        None
     };
     let mut available: BTreeMap<NodeId, Vec<Worker>> = BTreeMap::new();
     for (worker, entry) in eligible.values() {
-        if entry.grant.is_none() {
+        if entry.grant.is_none() && worker.compute_rate.is_some() {
             available.entry(worker.id.node).or_default().push(*worker);
         }
     }
@@ -168,7 +199,7 @@ pub fn select(
         let Some(mut workers) = available.remove(&host.host) else {
             continue;
         };
-        workers.sort_unstable_by_key(|worker| (std::cmp::Reverse(worker.flops), worker.id));
+        workers.sort_unstable_by_key(|worker| (std::cmp::Reverse(worker.compute_rate), worker.id));
         let fit = (1..=workers.len().min(max_width))
             .take_while(|&count| {
                 model.host_demand(count).is_some_and(|needed| {
@@ -255,16 +286,24 @@ pub fn select(
 impl Model<'_> {
     fn eligible(&self, worker: &PlacementWorker) -> Option<Worker> {
         let profile = worker.profile.as_ref()?;
+        let compute_rate = match &self.rates {
+            Some(rates) => rates
+                .get(&worker.device)
+                .filter(|rate| rate.incarnation == worker.incarnation)
+                .and_then(|rate| rate.operations_per_second)
+                .map(u64::from),
+            None => Some(profile.flops),
+        };
         (worker.eligible
             && profile.id == worker.device
             && worker.device_bytes >= self.workload.device_bytes
             && profile.memory_bytes >= self.workload.device_bytes
-            && (self.workload.compute_work == 0 || profile.flops > 0)
+            && (self.workload.compute_work == 0 || compute_rate != Some(0))
             && self.workload.requirement.matches(profile))
         .then_some(Worker {
             id: worker.device,
             incarnation: worker.incarnation,
-            flops: profile.flops,
+            compute_rate,
         })
     }
 
@@ -288,7 +327,7 @@ impl Model<'_> {
         inventory: &PlacementInventory,
         eligible: &BTreeMap<DeviceId, (Worker, &PlacementWorker)>,
         widths: &BTreeSet<usize>,
-    ) -> Option<(GroupVersion, Option<Cost>)> {
+    ) -> Option<(GroupVersion, Vec<Worker>)> {
         let active = inventory.active.as_ref()?;
         if !widths.contains(&active.workers.len()) {
             return None;
@@ -319,17 +358,21 @@ impl Model<'_> {
                 return None;
             }
         }
-        Some((active.version, self.cost(&workers)))
+        Some((active.version, workers))
     }
 
     fn cost(&self, workers: &[Worker]) -> Option<Cost> {
-        let floor_flops = workers.iter().map(|worker| worker.flops).min()?;
         let compute_ns = if self.workload.compute_work == 0 {
             0
         } else {
+            let floor_rate = workers
+                .iter()
+                .map(|worker| worker.compute_rate)
+                .min()
+                .flatten()?;
             ns(
                 u128::from(self.workload.compute_work) * NANOS,
-                u128::from(floor_flops) * workers.len() as u128,
+                u128::from(floor_rate) * workers.len() as u128,
             )
         };
         let mut network_ns = 0;
@@ -601,5 +644,85 @@ mod tests {
         assert_eq!(resources.hosts, BTreeMap::from([(c, memory(9, 5))]));
         assert_eq!(cost.network_ns, 0);
         assert!(incumbent.unwrap().network_ns > 0);
+    }
+
+    #[test]
+    fn rates_rank_slow_and_fast_devices_within_one_calibration() {
+        let host = host(1);
+        let mut workers = vec![
+            worker(host, 0, 100),
+            worker(host, 1, 10),
+            worker(host, 2, 20),
+        ];
+        let version = GroupVersion {
+            group: test_group(),
+            epoch: 1,
+        };
+        let device = workers[0].device;
+        workers[0].grant = Some(WorkerGrant {
+            version,
+            device,
+            incarnation: 1,
+            fence: 1,
+        });
+        let held = memory(5, 3);
+        let inventory = PlacementInventory {
+            group: test_group(),
+            latest: Some((version, GroupPhase::Active)),
+            active: Some(ActivePlacement {
+                version,
+                workers: vec![(
+                    device,
+                    WorkerDemand {
+                        incarnation: 1,
+                        device_bytes: 16,
+                    },
+                )],
+                hosts: vec![(host, held)],
+            }),
+            hosts: vec![PlacementHost {
+                host,
+                capacity: memory(32, 16),
+                reserved: held,
+                eligible: true,
+            }],
+            workers,
+        };
+        let mut workload = workload();
+        workload.widths = vec![1];
+        let rate = |ordinal, speed| ComputeRate {
+            device: DeviceId::new(host, ordinal),
+            incarnation: 1,
+            revision: 1,
+            operations_per_second: std::num::NonZeroU64::new(speed),
+        };
+        let mut rates = [rate(0, 20), rate(1, 80), rate(2, 50)];
+        assert!(matches!(
+            select(&inventory, &workload, &[], 0).unwrap(),
+            Decision::Keep { .. }
+        ));
+        assert!(matches!(
+            select_with_rates(&inventory, &workload, &[], 0, Some(&rates[1..])).unwrap(),
+            Decision::AwaitComputeRates(waiting) if waiting == version
+        ));
+        let Decision::Prepare {
+            resources,
+            incumbent,
+            cost,
+        } = select_with_rates(&inventory, &workload, &[], 0, Some(&rates)).unwrap()
+        else {
+            panic!("expected a faster candidate");
+        };
+        assert_eq!(
+            resources.workers.keys().copied().collect::<Vec<_>>(),
+            [rates[1].device]
+        );
+        assert_eq!(incumbent.unwrap().compute_ns, 50_000_000_000_000);
+        assert_eq!(cost.compute_ns, 12_500_000_000_000);
+        rates[0] = rate(0, 120);
+        assert!(matches!(
+            select_with_rates(&inventory, &workload, &[], 0, Some(&rates)).unwrap(),
+            Decision::Keep { .. }
+        ));
     }
 }

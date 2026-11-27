@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use plait_consensus::{InstanceId, StateMachine};
 use plait_core::group::{
-    GrantStatus, GroupOperation, GroupReceipt, GroupResult, GroupView as PeerGroupView,
-    PlacementInventory,
+    ComputeRate, GrantStatus, GroupOperation, GroupReceipt, GroupResult,
+    GroupView as PeerGroupView, PlacementInventory,
 };
 use plait_core::serving::{
     DecoderCheckpoint, DecoderClaim, DecoderDirectory, DecoderDrainStatus, DecoderFailover,
@@ -143,6 +143,10 @@ impl Runtime {
 
     pub fn placement_inventory(&self, group: plait_core::group::GroupId) -> PlacementInventory {
         self.serving.placement_inventory(group)
+    }
+
+    pub fn compute_rates(&self, calibration: NodeId) -> Vec<ComputeRate> {
+        self.serving.compute_rates(calibration)
     }
 
     pub fn link_probes(&self) -> Vec<plait_core::link::ProbeRegistration> {

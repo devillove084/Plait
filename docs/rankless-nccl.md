@@ -112,6 +112,44 @@ registration returns `StaleProbe`. Read fresh samples and submit a new operation
 ID to retry that plan. Retrying a submitted operation ID reads its applied receipt.
 The new group follows the normal endpoint, readiness, and activation steps.
 
+#### Replan with measured compute rates
+
+Use a stable `calibration` ID for each workload you want to compare. Use the
+same definition of an operation across participating backends, including the
+operator, shapes, and precision requirements. Measure each device in those
+units and send `PublishComputeRate` through `plait-node group`.
+
+```json
+{"request":"apply","operation":{"id":{"origin":[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"counter":1},"action":{"PublishComputeRate":{"calibration":[2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"device":{"node":[3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"ordinal":0},"incarnation":1,"expected_revision":0,"operations_per_second":2000000000}}}}
+```
+
+Use the registered device identity and incarnation. The first publication
+expects revision zero. Subsequent updates expect the revision returned in
+the `ComputeRate` receipt. Sending the same value at the current revision
+preserves that revision. Publish `null` to invalidate an unusable reading.
+Registration of a new device incarnation clears that device's readings.
+Updating the rate leaves existing device grants and communicator membership
+intact.
+
+Pass the same `calibration` to `placement` to see the inventory and rate
+revisions from one replica snapshot. Pass it to `plan` with nonzero
+`compute_work` to use those rates in the comparison. Candidates need valid
+rates on every device. An otherwise eligible incumbent with a missing rate
+causes `await_compute_rates`. A plan without `calibration` uses the advertised
+compute scores.
+
+When `prepare` is set, the reservation checks the exact rates for the chosen
+devices and for the incumbent if it was scored. If a rate changes before
+reservation, the command returns `StaleComputeRate` with the current
+revision and holds no new resources. Read fresh rates and use a new operation
+ID to rescore. Updates to other calibrations or to devices outside the
+comparison leave the reservation eligible. Journal recovery restores applied
+rate revisions along with the group metadata.
+
+The caller supplies and invalidates measurements. Publish stable estimates
+at the control-plane rate required by the planner. Upgrade the voting nodes
+before enabling the measured-compute requests.
+
 #### Run resident link probes
 
 Add `--link-probe "$NODE_IP:0"` to `plait-node run` on each participating host.

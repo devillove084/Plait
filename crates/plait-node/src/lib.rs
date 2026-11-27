@@ -481,6 +481,12 @@ impl NodeState {
                         GroupReply::GrantStatus(runtime.peer_grant_status(grant))
                     }
                     GroupLookup::Standby(group) => GroupReply::Standby(runtime.peer_standby(group)),
+                    GroupLookup::PlacementWithRates { group, calibration } => {
+                        GroupReply::PlacementWithRates {
+                            inventory: runtime.placement_inventory(group),
+                            rates: runtime.compute_rates(calibration),
+                        }
+                    }
                 };
                 let _ = self
                     .transport

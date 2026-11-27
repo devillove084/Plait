@@ -69,3 +69,4 @@ tlc -deadlock -config specs/PlaitPeerFailover.cfg specs/PlaitPeerFailover.tla
 tlc -deadlock -config specs/PlaitGroupManifest.cfg specs/PlaitGroupManifest.tla
 tlc -deadlock -config specs/PlaitGroupPlacement.cfg specs/PlaitGroupPlacement.tla
 tlc -deadlock -config specs/PlaitProbePlacement.cfg specs/PlaitProbePlacement.tla
+tlc -deadlock -config specs/PlaitComputeRatePlacement.cfg specs/PlaitComputeRatePlacement.tla

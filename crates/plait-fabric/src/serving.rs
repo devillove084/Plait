@@ -998,6 +998,7 @@ impl ServingState {
             }
             fence = old.fence;
         }
+        self.peer_groups.clear_compute_rates(device);
         self.workers.insert(
             device,
             WorkerState {

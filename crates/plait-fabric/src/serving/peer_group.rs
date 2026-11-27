@@ -1,11 +1,13 @@
 //! Generic execution groups use the same device fences and budgets as hosted groups.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU64;
 
 use plait_core::group::{
-    ActivePlacement, GrantStatus, GroupAction, GroupError, GroupId, GroupManifest, GroupMember,
-    GroupOperation, GroupOutcome, GroupPhase, GroupReceipt, GroupResult, GroupVersion, GroupView,
-    PeerEndpoint, PlacementHost, PlacementInventory, PlacementWorker, ResourcePlan, WorkerGrant,
+    ActivePlacement, ComputeRate, GrantStatus, GroupAction, GroupError, GroupId, GroupManifest,
+    GroupMember, GroupOperation, GroupOutcome, GroupPhase, GroupReceipt, GroupResult, GroupVersion,
+    GroupView, PeerEndpoint, PlacementHost, PlacementInventory, PlacementWorker, ResourcePlan,
+    WorkerGrant,
 };
 use plait_core::link::{ProbeEndpoint, ProbeRegistration};
 use plait_core::serving::{ExecutionDrainTarget, ServingError};
@@ -19,6 +21,7 @@ pub(super) struct PeerGroups {
     receipts: BTreeMap<OpId, GroupReceipt>,
     profiles: BTreeMap<DeviceId, (u64, DeviceProfile)>,
     probes: BTreeMap<NodeId, ProbeRegistration>,
+    rates: BTreeMap<DeviceId, BTreeMap<NodeId, ComputeRate>>,
 }
 
 #[derive(Clone, Default)]
@@ -92,6 +95,10 @@ impl Version {
 }
 
 impl PeerGroups {
+    pub(super) fn clear_compute_rates(&mut self, device: DeviceId) {
+        self.rates.remove(&device);
+    }
+
     pub(super) fn has_group(&self, group: GroupId) -> bool {
         self.history.contains_key(&group)
     }
@@ -114,6 +121,14 @@ impl PeerGroups {
 impl ServingState {
     pub(crate) fn link_probes(&self) -> Vec<ProbeRegistration> {
         self.peer_groups.probes.values().copied().collect()
+    }
+
+    pub(crate) fn compute_rates(&self, calibration: NodeId) -> Vec<ComputeRate> {
+        self.peer_groups
+            .rates
+            .values()
+            .filter_map(|entries| entries.get(&calibration).copied())
+            .collect()
     }
 
     pub(crate) fn placement_inventory(&self, group: GroupId) -> PlacementInventory {
@@ -307,19 +322,135 @@ impl ServingState {
                 ref resources,
                 ref probes,
             } => {
-                for probe in probes {
-                    let host = probe.endpoint.host;
-                    let current = self.peer_groups.probes.get(&host);
-                    if current != Some(probe) {
-                        return Err(GroupError::StaleProbe {
-                            host,
-                            revision: current.map_or(0, |entry| entry.revision),
-                        });
-                    }
-                }
+                self.check_link_probes(probes)?;
+                self.prepare_planned_peer_group(group, expected_epoch, expected_active, resources)
+            }
+            GroupAction::PublishComputeRate {
+                calibration,
+                device,
+                incarnation,
+                expected_revision,
+                operations_per_second,
+            } => self.publish_compute_rate(
+                calibration,
+                device,
+                incarnation,
+                expected_revision,
+                operations_per_second,
+            ),
+            GroupAction::PrepareWithRates {
+                group,
+                expected_epoch,
+                expected_active,
+                ref resources,
+                ref probes,
+                calibration,
+                compared_active,
+                ref rates,
+            } => {
+                self.check_link_probes(probes)?;
+                let incumbent = if compared_active {
+                    Some(GroupVersion {
+                        group,
+                        epoch: expected_active.ok_or(GroupError::InvalidPlan)?,
+                    })
+                } else {
+                    None
+                };
+                self.check_compute_rates(calibration, resources, incumbent, rates)?;
                 self.prepare_planned_peer_group(group, expected_epoch, expected_active, resources)
             }
         }
+    }
+
+    fn check_link_probes(&self, probes: &[ProbeRegistration]) -> Result<(), GroupError> {
+        for probe in probes {
+            let host = probe.endpoint.host;
+            let current = self.peer_groups.probes.get(&host);
+            if current != Some(probe) {
+                return Err(GroupError::StaleProbe {
+                    host,
+                    revision: current.map_or(0, |entry| entry.revision),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn publish_compute_rate(
+        &mut self,
+        calibration: NodeId,
+        device: DeviceId,
+        incarnation: u64,
+        expected_revision: u64,
+        operations_per_second: Option<NonZeroU64>,
+    ) -> GroupResult {
+        let worker = self
+            .workers
+            .get(&device)
+            .ok_or(GroupError::UnknownWorker(device))?;
+        if worker.incarnation != incarnation {
+            return Err(GroupError::StaleIncarnation(device));
+        }
+        let entries = self.peer_groups.rates.entry(device).or_default();
+        let current = entries.get(&calibration).copied();
+        let revision = current.map_or(0, |rate| rate.revision);
+        if revision != expected_revision {
+            return Err(GroupError::StaleComputeRate { device, revision });
+        }
+        if let Some(rate) =
+            current.filter(|rate| rate.operations_per_second == operations_per_second)
+        {
+            return Ok(GroupOutcome::ComputeRate(rate));
+        }
+        let rate = ComputeRate {
+            device,
+            incarnation,
+            revision: revision
+                .checked_add(1)
+                .ok_or(GroupError::SequenceExhausted)?,
+            operations_per_second,
+        };
+        entries.insert(calibration, rate);
+        Ok(GroupOutcome::ComputeRate(rate))
+    }
+
+    fn check_compute_rates(
+        &self,
+        calibration: NodeId,
+        resources: &ResourcePlan,
+        incumbent: Option<GroupVersion>,
+        rates: &[ComputeRate],
+    ) -> Result<(), GroupError> {
+        let mut devices: BTreeSet<_> = resources.workers.keys().copied().collect();
+        if let Some(version) = incumbent {
+            let view = self
+                .peer_groups
+                .get(version)
+                .ok_or(GroupError::UnknownVersion(version))?;
+            devices.extend(view.resources.workers.keys().copied());
+        }
+        for rate in rates {
+            let device = rate.device;
+            if !devices.remove(&device) || rate.operations_per_second.is_none() {
+                return Err(GroupError::InvalidPlan);
+            }
+            let current = self
+                .peer_groups
+                .rates
+                .get(&device)
+                .and_then(|entries| entries.get(&calibration));
+            if current != Some(rate) {
+                return Err(GroupError::StaleComputeRate {
+                    device,
+                    revision: current.map_or(0, |entry| entry.revision),
+                });
+            }
+        }
+        if !devices.is_empty() {
+            return Err(GroupError::InvalidPlan);
+        }
+        Ok(())
     }
 
     fn publish_link_probe(
@@ -1065,6 +1196,118 @@ mod tests {
         );
         probes[1] = current;
         assert!(state.peer_group_transition(&plan(probes.to_vec())).is_ok());
+    }
+
+    #[test]
+    fn rate_changes_fence_the_candidate_and_incumbent_before_any_reservation() {
+        let host = NodeId::derive("rate host");
+        let calibration = NodeId::derive("test calibration");
+        let [a, b] = [0, 1].map(|ordinal| DeviceId::new(host, ordinal));
+        let group = GroupId(NodeId::derive("rated group"));
+        let memory = HostMemory {
+            bytes: 8,
+            pinned_bytes: 4,
+        };
+        let plan = |device| ResourcePlan {
+            workers: BTreeMap::from([(
+                device,
+                WorkerDemand {
+                    incarnation: 1,
+                    device_bytes: 8,
+                },
+            )]),
+            hosts: BTreeMap::from([(host, memory)]),
+        };
+        let mut state = ServingState::default();
+        state
+            .set_host_memory(
+                host,
+                HostMemory {
+                    bytes: 32,
+                    pinned_bytes: 16,
+                },
+            )
+            .unwrap();
+        state.register_worker(a, 1, 16).unwrap();
+        state.register_worker(b, 1, 16).unwrap();
+        state.prepare_peer_group(group, 0, &plan(a)).unwrap();
+        let active = GroupVersion { group, epoch: 1 };
+        let grant = ready_single_worker(&mut state, active);
+        state.activate_peer_group(active).unwrap();
+
+        let update = |state: &mut ServingState, device, old, rate| {
+            let Ok(GroupOutcome::ComputeRate(rate)) =
+                state.publish_compute_rate(calibration, device, 1, old, NonZeroU64::new(rate))
+            else {
+                panic!("expected an applied rate");
+            };
+            rate
+        };
+        let mut rates = [update(&mut state, a, 0, 100), update(&mut state, b, 0, 200)];
+        let action = |rates: Vec<_>| GroupAction::PrepareWithRates {
+            group,
+            expected_epoch: 1,
+            expected_active: Some(1),
+            resources: plan(b),
+            probes: vec![],
+            calibration,
+            compared_active: true,
+            rates,
+        };
+        assert_eq!(
+            state.peer_group_transition(&action(vec![rates[1]])),
+            Err(GroupError::InvalidPlan)
+        );
+        let faster = update(&mut state, a, 1, 300);
+        let stale = GroupOperation {
+            id: OpId::new(host, 1),
+            action: action(rates.to_vec()),
+        };
+        let stale_result = Err(GroupError::StaleComputeRate {
+            device: a,
+            revision: 2,
+        });
+        assert_eq!(state.apply_peer_group(&stale), stale_result);
+        assert_eq!(state.apply_peer_group(&stale), stale_result);
+        assert_eq!(state.peer_grant_status(grant), GrantStatus::Held);
+        rates[0] = faster;
+
+        let invalidated = update(&mut state, b, 1, 0);
+        assert_eq!(
+            state.peer_group_transition(&action(rates.to_vec())),
+            Err(GroupError::StaleComputeRate {
+                device: b,
+                revision: 2
+            })
+        );
+        assert_eq!(state.compute_rates(calibration), [faster, invalidated]);
+        assert_eq!(state.placement_inventory(group).hosts[0].reserved, memory);
+        assert!(state.workers[&b].grant.is_none());
+
+        state.register_worker(b, 2, 16).unwrap();
+        assert_eq!(state.compute_rates(calibration), [faster]);
+        assert_eq!(
+            state.publish_compute_rate(calibration, b, 1, 2, NonZeroU64::new(400)),
+            Err(GroupError::StaleIncarnation(b))
+        );
+        let Ok(GroupOutcome::ComputeRate(current)) =
+            state.publish_compute_rate(calibration, b, 2, 0, NonZeroU64::new(400))
+        else {
+            panic!("expected a rate for the new incarnation");
+        };
+        rates[1] = current;
+        let mut prepare = action(rates.to_vec());
+        if let GroupAction::PrepareWithRates { resources, .. } = &mut prepare {
+            resources.workers.get_mut(&b).unwrap().incarnation = 2;
+        }
+        assert!(matches!(
+            state.peer_group_transition(&prepare),
+            Ok(GroupOutcome::Version {
+                phase: GroupPhase::Preparing,
+                ..
+            })
+        ));
+        assert_eq!(state.peer_grant_status(grant), GrantStatus::Held);
     }
 
     #[test]
