@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use plait_consensus::{InstanceId, StateMachine};
-use plait_core::group::{GroupOperation, GroupReceipt, GroupResult, GroupView as PeerGroupView};
+use plait_core::group::{
+    GroupOperation, GroupReceipt, GroupResult, GroupView as PeerGroupView, PlacementInventory,
+};
 use plait_core::serving::{
     DecoderCheckpoint, DecoderClaim, DecoderDirectory, DecoderDrainStatus, DecoderFailover,
     DecoderReplayPage, DecoderRouteWork, DecoderSwitch, ExecutionHostLiveness, GroupVersion,
@@ -128,6 +130,10 @@ impl Runtime {
 
     pub fn peer_group(&self, version: GroupVersion) -> Option<PeerGroupView> {
         self.serving.peer_group_view(version)
+    }
+
+    pub fn placement_inventory(&self, group: plait_core::group::GroupId) -> PlacementInventory {
+        self.serving.placement_inventory(group)
     }
 
     pub fn peer_group_receipt(&self, id: OpId) -> Option<&GroupReceipt> {

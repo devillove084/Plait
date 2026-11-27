@@ -3,12 +3,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use plait_core::group::{
-    GroupAction, GroupError, GroupId, GroupManifest, GroupMember, GroupOperation, GroupOutcome,
-    GroupPhase, GroupReceipt, GroupResult, GroupVersion, GroupView, PeerEndpoint, ResourcePlan,
-    WorkerGrant,
+    ActivePlacement, GroupAction, GroupError, GroupId, GroupManifest, GroupMember, GroupOperation,
+    GroupOutcome, GroupPhase, GroupReceipt, GroupResult, GroupVersion, GroupView, PeerEndpoint,
+    PlacementHost, PlacementInventory, PlacementWorker, ResourcePlan, WorkerGrant,
 };
 use plait_core::serving::{ExecutionDrainTarget, ServingError};
-use plait_core::{DeviceId, OpId};
+use plait_core::{DeviceId, DeviceProfile, OpId};
 
 use super::{Reservations, ServingState};
 
@@ -16,6 +16,7 @@ use super::{Reservations, ServingState};
 pub(super) struct PeerGroups {
     history: BTreeMap<GroupId, History>,
     receipts: BTreeMap<OpId, GroupReceipt>,
+    profiles: BTreeMap<DeviceId, (u64, DeviceProfile)>,
 }
 
 #[derive(Clone, Default)]
@@ -95,6 +96,76 @@ impl PeerGroups {
 }
 
 impl ServingState {
+    pub(crate) fn placement_inventory(&self, group: GroupId) -> PlacementInventory {
+        let history = self.peer_groups.history.get(&group);
+        let latest = history
+            .and_then(|history| history.versions.last_key_value())
+            .map(|(_, version)| (version.version, version.phase));
+        let active = history
+            .and_then(|history| {
+                history
+                    .active
+                    .and_then(|epoch| history.versions.get(&epoch))
+            })
+            .map(|version| ActivePlacement {
+                version: version.version,
+                workers: version
+                    .resources
+                    .workers
+                    .iter()
+                    .map(|(&id, &demand)| (id, demand))
+                    .collect(),
+                hosts: version
+                    .resources
+                    .hosts
+                    .iter()
+                    .map(|(&id, &demand)| (id, demand))
+                    .collect(),
+            });
+        let hosts = self
+            .hosts
+            .iter()
+            .map(|(&host, record)| PlacementHost {
+                host,
+                capacity: record.capacity,
+                reserved: super::add_memory(record.reserved, self.deferred_pd_host_memory(host))
+                    .expect("host reservations are within capacity"),
+                eligible: self.require_execution_host(host).is_ok()
+                    && !self
+                        .execution_drains
+                        .contains_key(&ExecutionDrainTarget::Host(host)),
+            })
+            .collect();
+        let deferred: BTreeSet<_> = self
+            .deferred_pd_placements()
+            .flat_map(|(_, placement)| placement.plan.workers.keys().copied())
+            .collect();
+        let workers = self
+            .workers
+            .iter()
+            .map(|(&device, record)| PlacementWorker {
+                device,
+                incarnation: record.incarnation,
+                device_bytes: record.device_bytes,
+                grant: record.grant,
+                eligible: self.execution_drain_for(device).is_none() && !deferred.contains(&device),
+                profile: self
+                    .peer_groups
+                    .profiles
+                    .get(&device)
+                    .filter(|(incarnation, _)| *incarnation == record.incarnation)
+                    .map(|(_, profile)| profile.clone()),
+            })
+            .collect();
+        PlacementInventory {
+            group,
+            latest,
+            active,
+            hosts,
+            workers,
+        }
+    }
+
     pub(crate) fn peer_group_view(&self, version: GroupVersion) -> Option<GroupView> {
         self.peer_groups.get(version).map(Version::view)
     }
@@ -158,6 +229,42 @@ impl ServingState {
                     .get(version)
                     .map(Version::outcome)
                     .ok_or(GroupError::UnknownVersion(version))
+            }
+            GroupAction::AdvertiseWorker {
+                ref profile,
+                incarnation,
+                device_bytes,
+            } => {
+                if profile.name.is_empty() || device_bytes > profile.memory_bytes {
+                    return Err(GroupError::InvalidCapacity);
+                }
+                if self.peer_groups.profiles.get(&profile.id).is_some_and(
+                    |(version, registered)| *version == incarnation && registered != profile,
+                ) {
+                    return Err(GroupError::ProfileMismatch(profile.id));
+                }
+                self.register_worker(profile.id, incarnation, device_bytes)
+                    .map_err(resource_error)?;
+                self.peer_groups
+                    .profiles
+                    .insert(profile.id, (incarnation, profile.clone()));
+                Ok(GroupOutcome::WorkerRegistered)
+            }
+            GroupAction::PreparePlanned {
+                group,
+                expected_epoch,
+                expected_active,
+                ref resources,
+            } => {
+                let current = self
+                    .peer_groups
+                    .history
+                    .get(&group)
+                    .and_then(|history| history.active);
+                if current != expected_active {
+                    return Err(GroupError::ActiveEpochChanged { current });
+                }
+                self.prepare_peer_group(group, expected_epoch, resources)
             }
         }
     }
@@ -426,9 +533,124 @@ fn resource_error(error: ServingError) -> GroupError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use plait_core::AcceleratorKind;
     use plait_core::NodeId;
     use plait_core::group::{HostMemory, WorkerDemand};
     use plait_core::serving::{GroupPlan, ServingRole};
+
+    #[test]
+    fn a_planned_reservation_checks_the_incumbent_and_filters_old_profiles() {
+        let host = NodeId::derive("placement host");
+        let [a, b] = [0, 1].map(|ordinal| DeviceId::new(host, ordinal));
+        let group = GroupId(NodeId::derive("planned group"));
+        let capacity = HostMemory {
+            bytes: 32,
+            pinned_bytes: 0,
+        };
+        let demand = WorkerDemand {
+            incarnation: 1,
+            device_bytes: 8,
+        };
+        let resources = |device| ResourcePlan {
+            workers: BTreeMap::from([(device, demand)]),
+            hosts: BTreeMap::from([(
+                host,
+                HostMemory {
+                    bytes: 4,
+                    pinned_bytes: 0,
+                },
+            )]),
+        };
+        let profile = DeviceProfile {
+            id: b,
+            name: "test".into(),
+            arch: AcceleratorKind::Amd,
+            memory_bytes: 32,
+            flops: 800,
+            compute_units: 2,
+            supports_fp16: true,
+            supports_bf16: true,
+            supports_fp64: false,
+            rdma_capable: false,
+            numa_node: None,
+        };
+        let mut state = ServingState::default();
+        state.set_host_memory(host, capacity).unwrap();
+        state.register_worker(a, 1, 16).unwrap();
+        let advertise = |profile, incarnation| GroupAction::AdvertiseWorker {
+            profile,
+            incarnation,
+            device_bytes: 16,
+        };
+        state
+            .peer_group_transition(&advertise(profile.clone(), 1))
+            .unwrap();
+        let mut different = profile.clone();
+        different.flops += 1;
+        assert_eq!(
+            state.peer_group_transition(&advertise(different, 1)),
+            Err(GroupError::ProfileMismatch(b))
+        );
+        state.prepare_peer_group(group, 0, &resources(a)).unwrap();
+        let version = GroupVersion { group, epoch: 1 };
+        let grant = state.peer_group_view(version).unwrap().grants[0];
+        state
+            .publish_peer_endpoint(GroupMember {
+                grant,
+                endpoint: PeerEndpoint {
+                    address: "127.0.0.1:1025".parse().unwrap(),
+                    ticket: [1; 16],
+                },
+            })
+            .unwrap();
+        let digest = state
+            .peer_group_view(version)
+            .unwrap()
+            .manifest
+            .unwrap()
+            .digest();
+        state.ready_peer_group(grant, digest).unwrap();
+        state.activate_peer_group(version).unwrap();
+        assert_eq!(
+            state.placement_inventory(group).active.unwrap().version,
+            version
+        );
+        state
+            .quiesce_peer_group(version, GroupPhase::Revoked)
+            .unwrap();
+        assert_eq!(
+            state.peer_group_transition(&GroupAction::PreparePlanned {
+                group,
+                expected_epoch: 1,
+                expected_active: Some(1),
+                resources: resources(b),
+            }),
+            Err(GroupError::ActiveEpochChanged { current: None })
+        );
+        assert!(state.workers[&b].grant.is_none());
+        state.register_worker(b, 2, 16).unwrap();
+        let inventory = state.placement_inventory(group);
+        assert!(
+            inventory
+                .workers
+                .iter()
+                .find(|worker| worker.device == b)
+                .unwrap()
+                .profile
+                .is_none()
+        );
+        state.peer_group_transition(&advertise(profile, 2)).unwrap();
+        assert!(
+            state
+                .placement_inventory(group)
+                .workers
+                .iter()
+                .find(|worker| worker.device == b)
+                .unwrap()
+                .profile
+                .is_some()
+        );
+    }
 
     #[test]
     fn publication_is_immutable_and_release_cannot_clear_a_successor_grant() {

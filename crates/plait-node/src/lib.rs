@@ -476,6 +476,9 @@ impl NodeState {
                     GroupLookup::Receipt(id) => {
                         GroupReply::Receipt(runtime.peer_group_receipt(id).cloned())
                     }
+                    GroupLookup::Placement(group) => {
+                        GroupReply::Placement(runtime.placement_inventory(group))
+                    }
                 };
                 let _ = self
                     .transport

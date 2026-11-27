@@ -69,6 +69,44 @@ Voters with `run --state-dir` preserve applied group metadata through restart.
 Callers use current metadata and device completion to decide when existing
 handles can be reclaimed.
 
+### Plan across heterogeneous resources
+
+Use `AdvertiseWorker` with a `DeviceProfile`, incarnation, and allocatable
+device bytes. The incarnation binds the profile to the registered device.
+The `placement` request reads the group's versions, available device grants,
+and host capacity and reservations from a replica.
+
+Send a `plan` request with the group ID, a `workload` object, and directed
+link samples. The workload contains the following fields.
+
+| Field | Meaning |
+| --- | --- |
+| `widths` | Legal group sizes supplied by the caller. |
+| `requirement` | Optional device capabilities, including the operation data type. The default data type is FP32. |
+| `device_bytes` | Allocatable device memory required by each worker. |
+| `per_worker_host`, `per_host` | Host memory charged per worker and once per participating host. Each has `bytes` and `pinned_bytes`. |
+| `compute_work`, `bytes_per_peer` | Estimated work per operation and bytes sent per directed worker pair. A zero term excludes that cost. |
+| `max_link_age_ms` | Freshness limit for the link samples. Each sample has `source`, `target`, `bytes_per_second`, `rtt_ns`, and Unix `sampled_at_ms`. |
+| `operations`, `switch_ns`, `minimum_gain_ns` | Forecast horizon in operations, one-time replacement cost, and optional gain threshold. |
+
+The planner filters unavailable devices and accounts for both versions' host
+reservations during preparation. Its estimate uses the slowest compute rate
+for equal work per device. The network estimate accounts for all worker pairs
+sharing each directed host link, then takes the highest host ingress or egress
+cost. A cross-host communication candidate needs fresh measurements in both
+directions. The search retains up to 24 partial layouts per width. The network
+estimate covers cross-host TCP and the caller supplies the measured links.
+
+The reply reports `prepare` with a placement and cost, `keep` with the active
+version, `pending` with the version in preparation, `await_links` when the
+incumbent cannot be compared, or `no_placement` when the search finds no
+candidate. When both layouts are feasible, the estimated gain over the horizon
+must exceed the replacement cost and threshold. Set the request's optional
+`prepare` field to an operation ID to reserve the selected placement through
+consensus. The transaction rechecks the latest and active epochs and the live
+resource ledger. Retrying a submitted operation ID reads its applied receipt.
+The new group follows the normal endpoint, readiness, and activation steps.
+
 ### Bootstrap from vLLM
 
 Start the vLLM workers with the same TP layout and the vendor's PyTorch

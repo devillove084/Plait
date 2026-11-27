@@ -6,7 +6,7 @@ use std::net::{IpAddr, SocketAddr};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{Access, DeviceId, Key, Mode, NodeId, OpId};
+use crate::{Access, DeviceId, DeviceProfile, Key, Mode, NodeId, OpId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct GroupId(pub NodeId);
@@ -179,6 +179,40 @@ pub struct GroupView {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementInventory {
+    pub group: GroupId,
+    pub latest: Option<(GroupVersion, GroupPhase)>,
+    pub active: Option<ActivePlacement>,
+    pub hosts: Vec<PlacementHost>,
+    pub workers: Vec<PlacementWorker>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivePlacement {
+    pub version: GroupVersion,
+    pub workers: Vec<(DeviceId, WorkerDemand)>,
+    pub hosts: Vec<(NodeId, HostMemory)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementHost {
+    pub host: NodeId,
+    pub capacity: HostMemory,
+    pub reserved: HostMemory,
+    pub eligible: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementWorker {
+    pub device: DeviceId,
+    pub incarnation: u64,
+    pub device_bytes: u64,
+    pub grant: Option<WorkerGrant>,
+    pub eligible: bool,
+    pub profile: Option<DeviceProfile>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupOperation {
     pub id: OpId,
     pub action: GroupAction,
@@ -212,6 +246,17 @@ pub enum GroupAction {
     Observe {
         group: GroupId,
         epoch: Option<u64>,
+    },
+    AdvertiseWorker {
+        profile: DeviceProfile,
+        incarnation: u64,
+        device_bytes: u64,
+    },
+    PreparePlanned {
+        group: GroupId,
+        expected_epoch: u64,
+        expected_active: Option<u64>,
+        resources: ResourcePlan,
     },
 }
 
@@ -248,6 +293,8 @@ pub enum GroupError {
     InvalidEndpoint,
     ManifestMismatch,
     SequenceExhausted,
+    ProfileMismatch(DeviceId),
+    ActiveEpochChanged { current: Option<u64> },
 }
 
 pub type GroupResult = Result<GroupOutcome, GroupError>;
@@ -262,12 +309,14 @@ pub struct GroupReceipt {
 pub enum GroupLookup {
     Version(GroupVersion),
     Receipt(OpId),
+    Placement(GroupId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GroupReply {
     Version(Option<GroupView>),
     Receipt(Option<GroupReceipt>),
+    Placement(PlacementInventory),
 }
 
 impl GroupOperation {
@@ -281,7 +330,13 @@ impl GroupOperation {
             GroupAction::RegisterWorker { device, .. } => {
                 keys.insert(Key::Device(*device));
             }
+            GroupAction::AdvertiseWorker { profile, .. } => {
+                keys.insert(Key::Device(profile.id));
+            }
             GroupAction::Prepare {
+                group, resources, ..
+            }
+            | GroupAction::PreparePlanned {
                 group, resources, ..
             } => {
                 keys.insert(Key::ServingGroup(*group));
