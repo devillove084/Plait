@@ -204,12 +204,17 @@ native group APIs and existing C ABI.
 
 #### Verify four-vendor TP4 over HTTP
 
-The integration test used Qwen3-0.6B in FP16 and one device each on CUDA,
-ROCm, CANN, and HGGC. It applied the vLLM fork's Python changes over the
-existing per-platform wheels and loaded the same Plait native module on each
-host. [vLLM revision](https://github.com/devillove084/vllm/commit/acea9b5adb9919192b1b9ef1207c2f4868c64fcb)
-[Plait revision](https://github.com/devillove084/Plait/commit/eff9561cc1c1bc74163566bcfde77570700474ec)
+The integration test installed vLLM `0.31.0+plait.acea9b5ad` and the Plait
+Python wheel in six Linux environments. Each vLLM wheel was built from the
+same source revision. CUDA and ROCm builds reused the native extensions for
+their installed PyTorch and runtime versions. CANN and HGGC used their vendor
+plugins. The test checked the installed vLLM source files for the native TP
+join and loaded the same Plait wheel on every host. The Plait wheel used the
+dev build profile for this functional test.
+[vLLM revision](https://github.com/devillove084/vllm/commit/acea9b5adb9919192b1b9ef1207c2f4868c64fcb)
+[Plait build source](https://github.com/devillove084/Plait/commit/9bb383cf6c99ec314eab57d976593df85fd0cd06)
 
+For Qwen3-0.6B in FP16, use one device each on CUDA, ROCm, CANN, and HGGC.
 Start four hosts with `--distributed-executor-backend mp`, `--nnodes 4`,
 `--tensor-parallel-size 4`, and `--plait-tp-layout 1 1 1 1`. Use
 `VLLM_USE_V2_MODEL_RUNNER=1`, `--enforce-eager`, `--block-size 128`, and
@@ -224,6 +229,20 @@ API host. Apply `Activate` to the native group version, then send the same
 greedy completion request to the TP4 endpoint and a single-device baseline.
 The test received HTTP 200 from both `/v1/completions` endpoints and compared
 all eight returned token IDs.
+
+#### Verify a planned change in TP width
+
+The installed build also ran a TP2 successor on separate CUDA and ROCm
+devices. Prepare it under the same group ID with a new epoch and a TP2 launch
+descriptor. The TP4 incumbent continued to answer requests while TP2 loaded
+the model. Both engines had their own HTTP endpoint.
+
+Once TP2 was ready, the test opened a stream on TP4 and submitted `Activate`
+after receiving its first token. The control plane marked TP4 `Draining` and
+TP2 `Active`. The new endpoint returned HTTP 200 with eight token IDs matching
+the single-device baseline. The old stream delivered all 48 tokens and the
+final `[DONE]` frame. The deployment layer uses the active group to route new
+requests and keeps an admitted stream on its original engine.
 
 #### Cancel a committed communicator
 
