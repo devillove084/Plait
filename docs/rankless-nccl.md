@@ -425,13 +425,12 @@ requests and keeps an admitted stream on its original engine.
 
 #### Route native groups through one HTTP endpoint
 
-On each vLLM API host, add the Plait `scripts` directory to `PYTHONPATH` and
-pass `--middleware serving_native.NativeGroupHeaders` to `vllm serve`.
-The middleware reads the version from the unchanged
-`VLLM_PLAIT_TP_GROUP_CONFIG` launch descriptor. This entry point supports an
-API instance with one committed TP group. A request carrying a different
-version receives HTTP 409 before model dispatch. Matching responses carry
-the engine's group version, including `/health` and streaming responses.
+Install the vLLM fork on the API and ingress hosts. For a manual launch,
+pass `--middleware vllm.entrypoints.serve.plait_version.NativeGroupHeaders`
+to `vllm serve`. The middleware reads the version from
+`VLLM_PLAIT_TP_GROUP_CONFIG`. The descriptor binds one native TP or PP
+group to the HTTP instance. A request carrying a different version receives
+HTTP 409 before model dispatch. Responses carry the instance's group version.
 
 Give each epoch its own HTTP origin and write the map to a JSON file.
 
@@ -443,7 +442,8 @@ Give each epoch its own HTTP origin and write the map to a JSON file.
 ```
 
 ```sh
-python scripts/serve-aggregated.py --model "$MODEL_ALIAS" --group-id "$GROUP_ID" \
+python -m vllm.entrypoints.serve.plait_serving.aggregate \
+  --model "$MODEL_ALIAS" --group-id "$GROUP_ID" \
   --native-routes "$ROUTES" --control-seed "$SEED" --control-listen "$LOCAL_LISTEN"
 ```
 
@@ -455,6 +455,11 @@ new admissions until its binding is available. The ingress refreshes every
 Retain the old engine until ingress observers have cut over and its admitted
 requests have drained. Each admitted stream retains its upstream connection
 and version across a route change.
+
+The ingress can [recover a greedy stream](#recover-a-greedy-completion-stream)
+after a transport failure when the client opts into `replay-prefix`. Plait
+supplies the next active group version. The vLLM ingress owns the HTTP
+origin map and the emitted prefix.
 
 The installed vLLM test used one client URL for a four-vendor TP4 and its
 CUDA and ROCm TP2 successor. With the new binding withheld, `/health`
@@ -689,9 +694,10 @@ before forwarding. This path requires eager execution.
 
 ### Start a committed group on several hosts
 
-Run `scripts/serve-tiered.py` with `--host-launch-spec` to derive the
-placement from a committed `GroupPlan`. Give each host the same
-JSON document. The keys under `hosts` are the plan's host IDs.
+Run `python -m vllm.entrypoints.serve.plait_serving.launcher` with
+`--host-launch-spec` to derive the placement from a committed `GroupPlan`.
+Give each host the same JSON document. The keys under `hosts` are the
+plan's host IDs.
 
 ```json
 {
@@ -791,7 +797,7 @@ backend settings. For example, one host can use this configuration.
   "host_memory": {"bytes": 68719476736, "pinned_bytes": 0},
   "lock_dir": "/var/lib/plait/execution",
   "devices": [{"ordinal": 0, "incarnation": 1, "device_bytes": 25769803776}],
-  "launcher": ["/opt/engine/bin/python", "/opt/plait/scripts/serve-tiered.py"],
+  "launcher": ["/opt/engine/bin/python", "-m", "vllm.entrypoints.serve.plait_serving.launcher"],
   "profiles": {
     "model-fp16": {
       "argv": ["/opt/engine/bin/vllm"],
@@ -967,12 +973,13 @@ using the current inventory and link samples.
 
 ### Keep one HTTP endpoint across group versions
 
-Point clients at `serve-aggregated.py`. Use the same API model alias
+Point clients at the aggregate ingress. Use the same API model alias
 for every version of the group. The ingress follows the active version
 through the control replicas.
 
 ```sh
-python scripts/serve-aggregated.py --model "$SERVED_MODEL" --group-id "$GROUP_ID" \
+python -m vllm.entrypoints.serve.plait_serving.aggregate \
+  --model "$SERVED_MODEL" --group-id "$GROUP_ID" \
   --control-peer "$VOTER_ID@$VOTER_ADDR" --control-listen "$INGRESS_REPLY_ADDR" \
   --host "$INGRESS_BIND_IP" --port 8192
 ```
@@ -1011,14 +1018,25 @@ Recovery retains the visible prefix in the running ingress process and
 rebuilds KV by recomputation on the replacement. The same connection
 must remain open throughout recovery.
 
+An engine-loss test used two native TP1 epochs running Qwen3-0.6B FP16 on
+separate CUDA devices. After the first token event, the test killed the old
+engine and reported the failure against its grant. Plait promoted the ready
+standby. The vLLM ingress kept the same completion ID and returned all 96
+token IDs in order, matching a direct request to the replacement.
+
+The vLLM fork ships the ingress and launcher in its Python package.
+Replace the previous Plait checkout script paths with the module commands
+above when updating vLLM. Run `tools/plait/serving/check-tla.sh` from the
+fork to check ingress versioning and stream handoff.
+
 ### Hand off prompt KV between independent Prefill and Decode groups
 
 Use the vLLM fork at `9122df3da` or later on `plait/v0.31-runtime`.
 Start the vLLM fork's [KV page store](#reuse-prompt-kv-across-tp-layouts)
 at an address reachable from both groups. Use the same store, model
 namespace, weights, KV dtype, and logical page size on both sides.
-Give each `serve-tiered.py` launch the role `prefill` or `decode` and
-these fetch and publish settings.
+Give each engine launcher the role `prefill` or `decode` and these fetch
+and publish settings.
 
 ```sh
 --plait-kv-namespace "$MODEL_NAMESPACE" --kv-host "$KV_HOST" --kv-port "$KV_PORT"
@@ -1031,7 +1049,8 @@ After the groups report Ready, activate and publish the versioned P/D
 path. Start the router against the published directory.
 
 ```sh
-python scripts/serve-disaggregated.py --model "$MODEL_ALIAS" --kv-transport plait \
+python -m vllm.entrypoints.serve.plait_serving.disaggregate \
+  --model "$MODEL_ALIAS" --kv-transport plait \
   --control-peer "$VOTER_ID@$VOTER_ADDR" --control-listen "$ROUTER_REPLY_ADDR"
 ```
 
@@ -1050,7 +1069,7 @@ eager, dense FP16 and BF16 attention layouts described below.
 
 ### Recover a P/D completion after Decode disconnects
 
-With `serve-disaggregated.py --kv-transport plait`, send
+With the P/D ingress running `--kv-transport plait`, send
 `X-Plait-Stream-Recovery: replay-prefix` on `POST /v1/completions`. Use
 `stream: true`, `temperature: 0`, and one token-addressable text completion.
 
@@ -1364,8 +1383,8 @@ token IDs and text before forwarding the suffix. The client keeps the
 original completion ID, usage budget, and one terminal event. The ingress
 and its client connection must survive the replacement.
 
-On the unified ingress (`serve-disaggregated.py --kv-transport plait`), the
-same header also opts in to planned handoff. When the active directory stops
+On the unified ingress with `--kv-transport plait`, the same header also opts
+in to planned handoff. When the active directory stops
 routing to the current generator and a replacement path accepts work, the
 ingress cuts after a complete emitted SSE frame. It closes the source attempt
 before starting the replacement. A changed Prefill with the same available

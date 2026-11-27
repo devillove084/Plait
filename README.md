@@ -232,6 +232,10 @@ group to either a tensor-parallel replica or a pipeline with one worker per stag
 
 ### vLLM reference integration
 
+The vLLM fork ships the aggregate and P/D ingress, stream recovery,
+resident launcher, and serving benchmark as Python modules.
+[Serving modules](https://github.com/devillove084/vllm/tree/plait/v0.31-runtime/vllm/entrypoints/serve/plait_serving)
+
 Managed replacements reuse complete prompt KV blocks across TP sizes and PP
 layouts with the vLLM fork's `PlaitKvConnector` and its optional
 `vllm-plait-kv-store` binary.
@@ -313,11 +317,11 @@ Native TP startup (Qwen3.5 must not use `external_launcher`):
 
 ```bash
 # four NVIDIA Ampere devices, one W4A16 TP1 replica per device
-python scripts/serve-tiered.py --model /mnt/nas1/hf/Qwen3.5-9B-W4A16 \
-  --replicas 4 --tp 1 --port-base 8000
+python -m vllm.entrypoints.serve.plait_serving.launcher \
+  --model /models/local-w4a16 --replicas 4 --tp 1 --port-base 8000
 # eight NVIDIA Blackwell devices, 122B-NVFP4, four independent native TP2 replicas
-python scripts/serve-tiered.py --model /mnt/nas1/hf/Qwen3.5-122B-A10B-NVFP4 \
-  --replicas 4 --tp 2 --port-base 8100 --max-model-len 1024
+python -m vllm.entrypoints.serve.plait_serving.launcher \
+  --model /models/remote-nvfp4 --replicas 4 --tp 2 --port-base 8100 --max-model-len 1024
 ```
 
 Run it with:
@@ -376,13 +380,13 @@ release the result after the matching completion has executed in the control pla
 | [Hosted P/D reconfiguration](specs/PlaitHostedPdReconfigure.tla) | A bridge preserves the incumbent rate. The projected gain pays for the transition. Commit checks the directory and declared release capability. |
 | [Hosted P/D recovery](specs/PlaitHostedPdRecovery.tla) | A spare can restore a failed slot without ingress traffic. Cutover preserves healthy epochs, checks readiness and directory revision, and leaves old grants subject to release proof. |
 | [Hosted pipeline rollout](specs/PlaitHostedPipeline.tla) | Both pipeline lanes deliver activations for the admitted epoch. The next version waits for all workers, and the old version retires after its requests drain. |
-| [Serving ingress](specs/PlaitServingIngress.tla) | One admission per ordinary forwarded request, monotonic route refresh, version checks on native HTTP bindings, and output pinned to the admitted epoch. |
-| [Completion replay and KV resume](specs/PlaitCompletionReplay.tla) | Visible positions are preserved. Each KV resume sends the latest checkpoint and requires a matching acknowledgment and prefix before publishing a suffix. |
-| [Planned stream handoff](specs/PlaitPlannedStreamHandoff.tla) | A cut uses the last visible position and waits for a ready replacement. A seeded request requires a compatible sampler and a seed acknowledgment before the target publishes. |
+| [Serving ingress](https://github.com/devillove084/vllm/blob/plait/v0.31-runtime/tools/plait/serving/specs/PlaitServingIngress.tla) | One admission per ordinary forwarded request, monotonic route refresh, version checks on native HTTP bindings, and output pinned to the admitted epoch. |
+| [Completion replay and KV resume](https://github.com/devillove084/vllm/blob/plait/v0.31-runtime/tools/plait/serving/specs/PlaitCompletionReplay.tla) | Visible positions are preserved. Each KV resume sends the latest checkpoint and requires a matching acknowledgment and prefix before publishing a suffix. |
+| [Planned stream handoff](https://github.com/devillove084/vllm/blob/plait/v0.31-runtime/tools/plait/serving/specs/PlaitPlannedStreamHandoff.tla) | A cut uses the last visible position and waits for a ready replacement. A seeded request requires a compatible sampler and a seed acknowledgment before the target publishes. |
 | [KV publication](https://github.com/devillove084/vllm/blob/plait/v0.31-runtime/tools/plait/kv-store/specs/PlaitKvPublication.tla) | All heads must come from one write attempt before a page becomes readable. A consumer reads its requested head range, and a complete page stays immutable. |
 | [Layered KV](https://github.com/devillove084/vllm/blob/plait/v0.31-runtime/tools/plait/kv-store/specs/PlaitLayeredKv.tla) | A page publishes after one write attempt covers every layer and head. A consumer can read it with a different stage partition or a whole-head request. |
-| [Prefill to Decode handoff](specs/PlaitKvHandoff.tla) | The receipt matches the request context. Decode emits output after loading the required pages, including when the shared store can reset between admission and load. |
-| [P/D stream replay](specs/PlaitPdStreamReplay.tla) | A failed Decode version is excluded. Each attempt releases its own handoff, and suffix output follows a checked prefix. |
+| [Prefill to Decode handoff](https://github.com/devillove084/vllm/blob/plait/v0.31-runtime/tools/plait/serving/specs/PlaitKvHandoff.tla) | The receipt matches the request context. Decode emits output after loading the required pages, including when the shared store can reset between admission and load. |
+| [P/D stream replay](https://github.com/devillove084/vllm/blob/plait/v0.31-runtime/tools/plait/serving/specs/PlaitPdStreamReplay.tla) | A failed Decode version is excluded. Each attempt releases its own handoff, and suffix output follows a checked prefix. |
 
 The ordered publication configuration explores 70,968 distinct states.
 Run the suite with TLC 2.19 and `tlc` on your `PATH`.

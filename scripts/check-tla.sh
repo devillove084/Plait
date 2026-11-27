@@ -39,14 +39,6 @@ tlc -deadlock -config specs/PlaitHostedPdTransition.cfg specs/PlaitHostedPdTrans
 tlc -deadlock -config specs/PlaitHostedPdReconfigure.cfg specs/PlaitHostedPdReconfigure.tla
 tlc -deadlock -config specs/PlaitHostedPdRecovery.cfg specs/PlaitHostedPdRecovery.tla
 tlc -deadlock -config specs/PlaitHostedPipeline.cfg specs/PlaitHostedPipeline.tla
-tlc -deadlock -config specs/PlaitServingIngress.cfg specs/PlaitServingIngress.tla
-tlc -deadlock -config specs/PlaitNativeServingIngress.cfg specs/PlaitServingIngress.tla
-tlc -deadlock -config specs/PlaitCompletionReplay.cfg specs/PlaitCompletionReplay.tla
-tlc -deadlock -config specs/PlaitCompletionKvResume.cfg specs/PlaitCompletionReplay.tla
-tlc -deadlock -config specs/PlaitPlannedStreamHandoff.cfg specs/PlaitPlannedStreamHandoff.tla
-tlc -deadlock -config specs/PlaitSeededStreamHandoff.cfg specs/PlaitPlannedStreamHandoff.tla
-tlc -deadlock -config specs/PlaitKvHandoff.cfg specs/PlaitKvHandoff.tla
-tlc -deadlock -config specs/PlaitPdStreamReplay.cfg specs/PlaitPdStreamReplay.tla
 tlc -deadlock -config specs/PlaitKernelPrimitivesCheck.cfg specs/PlaitKernelPrimitivesCheck.tla
 tlc -deadlock -config specs/PlaitW4A4Check.cfg specs/PlaitW4A4Check.tla
 tlc -deadlock -config specs/PlaitW4OperatorsCheck.cfg specs/PlaitW4OperatorsCheck.tla
