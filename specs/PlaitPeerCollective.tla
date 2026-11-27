@@ -1,10 +1,10 @@
 ---- MODULE PlaitPeerCollective ----
-\* Sharded phases follow paired rounds. Replicated inputs can arrive in any order.
+\* A legacy participant uses paired rounds for scatter and gather.
 \* The scopes share participants but use separate connections and failure state.
 \* Tensor chunks contain one integer each to model ownership and materialization.
 EXTENDS Naturals
 
-CONSTANTS World, LoseSlotZero, ReplicatedGroups
+CONSTANTS World, LoseSlotZero, ReplicatedGroups, PairedSlots
 VARIABLES local, lost, aborted
 
 Groups == {1, 2}
@@ -43,6 +43,12 @@ Init ==
 Alive(g, slot) == ~(lost /\ g = First /\ slot = 0)
 Running(g, slot) == g \notin aborted /\ Alive(g, slot)
 InRound(state) == state.phase # "Done" /\ state.round < Pivot
+Paired(slot, state) == slot \in PairedSlots /\ state.phase # "Replicated"
+Complete(slot, state) == IF Paired(slot, state) THEN state.round = Pivot ELSE state.seen = Slots
+
+ReadyFor(slot, state, peer) ==
+    /\ state.phase # "Done" /\ peer \notin state.seen
+    /\ (Paired(slot, state) => InRound(state) /\ Partner(slot, state.round) = peer)
 
 Receive(state, peer, payload) ==
     CASE state.phase = "Scatter" ->
@@ -63,11 +69,8 @@ Exchange(g, a, b) ==
     /\ Running(g, a) /\ Running(g, b)
     /\ LET left == local[g][a]
            right == local[g][b]
-       IN /\ left.phase = right.phase /\ left.phase # "Done"
-          /\ IF left.phase = "Replicated"
-                THEN b \notin left.seen /\ a \notin right.seen
-                ELSE /\ InRound(left) /\ left.round = right.round
-                     /\ b = Partner(a, left.round)
+       IN /\ left.phase = right.phase
+          /\ ReadyFor(a, left, b) /\ ReadyFor(b, right, a)
           /\ local' = [local EXCEPT
                 ![g][a] = Receive(@, b, Payload(g, b, a)),
                 ![g][b] = Receive(@, a, Payload(g, a, b))]
@@ -75,14 +78,14 @@ Exchange(g, a, b) ==
 
 Idle(g, slot) ==
     /\ Running(g, slot) /\ InRound(local[g][slot])
-    /\ local[g][slot].phase # "Replicated"
+    /\ Paired(slot, local[g][slot])
     /\ Partner(slot, local[g][slot].round) \notin Slots
     /\ local' = [local EXCEPT ![g][slot].round = @ + 1]
     /\ UNCHANGED <<lost, aborted>>
 
 BeginGather(g, slot) ==
     /\ Running(g, slot)
-    /\ local[g][slot].phase = "Scatter" /\ local[g][slot].round = Pivot
+    /\ local[g][slot].phase = "Scatter" /\ Complete(slot, local[g][slot])
     /\ local' = [local EXCEPT ![g][slot].phase = "Gather", ![g][slot].round = 0,
             ![g][slot].seen = {slot}, ![g][slot].gathered[slot] = local[g][slot].sum]
     /\ UNCHANGED <<lost, aborted>>
@@ -90,8 +93,8 @@ BeginGather(g, slot) ==
 Finish(g, slot) ==
     /\ Running(g, slot)
     /\ LET state == local[g][slot]
-       IN \/ state.phase = "Gather" /\ state.round = Pivot
-          \/ state.phase = "Replicated" /\ state.seen = Slots
+       IN /\ state.phase \in {"Gather", "Replicated"}
+          /\ Complete(slot, state)
     /\ local' = [local EXCEPT ![g][slot].phase = "Done"]
     /\ UNCHANGED <<lost, aborted>>
 
@@ -102,12 +105,7 @@ Lose ==
 
 Timeout(g, slot) ==
     /\ Running(g, slot)
-    /\ LET state == local[g][slot]
-       IN IF state.phase = "Replicated"
-             THEN \E peer \in Slots \ state.seen : ~Alive(g, peer)
-             ELSE /\ InRound(state)
-                  /\ LET peer == Partner(slot, state.round)
-                     IN peer \in Slots /\ ~Alive(g, peer)
+    /\ \E peer \in Slots : ReadyFor(slot, local[g][slot], peer) /\ ~Alive(g, peer)
     /\ aborted' = aborted \cup {g}
     /\ UNCHANGED <<local, lost>>
 

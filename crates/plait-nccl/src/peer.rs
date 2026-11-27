@@ -487,10 +487,15 @@ impl PeerGroup {
             inputs[self.slot].copy_from_slice(input);
             let peers = self.links.iter().zip(&mut inputs).enumerate().filter_map(
                 |(peer, (link, received))| {
-                    Some((peer, &link.as_ref()?.collective, received.as_mut_slice()))
+                    Some((
+                        peer,
+                        &link.as_ref()?.collective,
+                        input,
+                        received.as_mut_slice(),
+                    ))
                 },
             );
-            frame::exchange_replicated(peers, &header, input, self.timeout)?;
+            frame::exchange_all(peers, &header, self.timeout)?;
             return Ok(collective.reduce(&inputs));
         }
         match collective {
@@ -498,7 +503,6 @@ impl PeerGroup {
             | Collective::ReduceScatter(..)
             | Collective::AllReduceFp8ToF32 => {
                 let ranges = shard_ranges(bytes, dtype.bytes(), world);
-                let own = ranges[self.slot].clone();
                 let inputs = self.contributions(&header, input, &ranges)?;
                 let fp8 = matches!(collective, Collective::AllReduceFp8ToF32);
                 let reduced = collective.reduce(&inputs);
@@ -510,17 +514,13 @@ impl PeerGroup {
                     .checked_mul(output_width)
                     .ok_or_else(|| io::Error::other("reduction size overflow"))?;
                 let mut output = vec![0; total];
-                output[own.start * output_width..own.end * output_width].copy_from_slice(&reduced);
                 let header = collective.header(sequence, bytes, 1);
-                for peer in self.partners() {
-                    let range = &ranges[peer];
-                    self.exchange(
-                        peer,
-                        &header,
-                        &reduced,
-                        &mut output[range.start * output_width..range.end * output_width],
-                    )?;
-                }
+                self.gather(
+                    &header,
+                    &reduced,
+                    &mut output,
+                    ranges.iter().map(|range| range.len() * output_width),
+                )?;
                 Ok(output)
             }
             Collective::AllGather(_) => {
@@ -528,15 +528,12 @@ impl PeerGroup {
                     .checked_mul(world)
                     .ok_or_else(|| io::Error::other("gather size overflow"))?;
                 let mut output = vec![0; total];
-                output[self.slot * bytes..(self.slot + 1) * bytes].copy_from_slice(input);
-                for peer in self.partners() {
-                    self.exchange(
-                        peer,
-                        &header,
-                        input,
-                        &mut output[peer * bytes..(peer + 1) * bytes],
-                    )?;
-                }
+                self.gather(
+                    &header,
+                    input,
+                    &mut output,
+                    std::iter::repeat_n(bytes, world),
+                )?;
                 Ok(output)
             }
             Collective::Broadcast(..) => {
@@ -575,15 +572,46 @@ impl PeerGroup {
         let own = ranges[self.slot].clone();
         let mut contributions = vec![vec![0; own.len()]; self.links.len()];
         contributions[self.slot].copy_from_slice(&input[own]);
-        for peer in self.partners() {
-            self.exchange(
-                peer,
-                header,
-                &input[ranges[peer].clone()],
-                &mut contributions[peer],
-            )?;
-        }
+        let peers = self
+            .links
+            .iter()
+            .zip(&mut contributions)
+            .enumerate()
+            .filter_map(|(peer, (link, received))| {
+                Some((
+                    peer,
+                    &link.as_ref()?.collective,
+                    &input[ranges[peer].clone()],
+                    received.as_mut_slice(),
+                ))
+            });
+        frame::exchange_all(peers, header, self.timeout)?;
         Ok(contributions)
+    }
+
+    fn gather(
+        &self,
+        header: &[u8; 24],
+        input: &[u8],
+        mut output: &mut [u8],
+        shard_lengths: impl Iterator<Item = usize>,
+    ) -> io::Result<()> {
+        let peers =
+            self.links
+                .iter()
+                .zip(shard_lengths)
+                .enumerate()
+                .filter_map(|(peer, (link, bytes))| {
+                    let (shard, rest) = std::mem::take(&mut output).split_at_mut(bytes);
+                    output = rest;
+                    if let Some(link) = link {
+                        Some((peer, &link.collective, input, shard))
+                    } else {
+                        shard.copy_from_slice(input);
+                        None
+                    }
+                });
+        frame::exchange_all(peers, header, self.timeout)
     }
 
     pub fn send(self: &Arc<Self>, peer: usize, dtype: DataType, input: Vec<u8>) -> io::Result<()> {

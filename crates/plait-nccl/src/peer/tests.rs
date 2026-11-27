@@ -128,7 +128,7 @@ fn replicated_exchange_drains_two_writers_with_small_send_buffers() {
 }
 
 #[test]
-fn replicated_exchange_progresses_on_other_links_while_one_peer_waits() {
+fn sharded_exchange_progresses_on_other_links_while_one_peer_waits() {
     fn sockets() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let local = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -142,34 +142,57 @@ fn replicated_exchange_progresses_on_other_links_while_one_peer_waits() {
     let (slow, slow_remote) = sockets();
     let (fast, fast_remote) = sockets();
     let (release, wait) = std::sync::mpsc::channel();
-    let op = Collective::AllReduce(DataType::Uint8, ReduceOp::Sum);
-    let header = op.header(0, 1, REPLICATED_EXCHANGE);
+    let op = Collective::ReduceScatter(DataType::Uint8, ReduceOp::Sum);
+    let header = op.header(0, 4, 0);
 
     thread::scope(|scope| {
         scope.spawn(move || {
-            frame::read(&slow_remote, 0, &header, &mut [0]).unwrap();
+            let mut input = [0; 2];
+            frame::read(&slow_remote, 0, &header, &mut input).unwrap();
+            assert_eq!(input, [1, 2]);
             wait.recv_timeout(Duration::from_secs(3)).unwrap();
             frame::write(&slow_remote, &header, &[7]).unwrap();
         });
         scope.spawn(move || {
-            frame::read(&fast_remote, 0, &header, &mut [0]).unwrap();
+            let mut input = [0];
+            frame::read(&fast_remote, 0, &header, &mut input).unwrap();
+            assert_eq!(input, [3]);
             frame::write(&fast_remote, &header, &[8]).unwrap();
             release.send(()).unwrap();
         });
         let mut first = [0];
         let mut second = [0];
-        frame::exchange_replicated(
+        frame::exchange_all(
             [
-                (1, &slow, first.as_mut_slice()),
-                (2, &fast, second.as_mut_slice()),
+                (1, &slow, &[1, 2][..], first.as_mut_slice()),
+                (2, &fast, &[3][..], second.as_mut_slice()),
             ]
             .into_iter(),
             &header,
-            &[1],
             Duration::from_secs(3),
         )
         .unwrap();
         assert_eq!((first, second), ([7], [8]));
+    });
+}
+
+#[test]
+fn sharded_fp8_allreduce_preserves_uneven_output_ranges() {
+    let op = Collective::AllReduceFp8ToF32;
+    let count = REPLICATED_BYTES_PER_RANK / 2 + 1;
+    let input: Vec<_> = (0..count)
+        .map(|index| if index % 2 == 0 { 0x38 } else { 0x40 })
+        .collect();
+    assert!(!use_replicated_exchange(op, input.len(), 3));
+    let expected: Vec<_> = (0..count)
+        .flat_map(|index| (if index % 2 == 0 { 3f32 } else { 6f32 }).to_ne_bytes())
+        .collect();
+    thread::scope(|scope| {
+        for group in groups(3) {
+            let input = &input;
+            let expected = &expected;
+            scope.spawn(move || assert_eq!(&group.execute(op, input).unwrap(), expected));
+        }
     });
 }
 

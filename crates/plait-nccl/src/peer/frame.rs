@@ -31,19 +31,19 @@ pub(super) fn read(
 
 // The collective sequence lock owns these lanes. Point-to-point traffic uses
 // separate sockets with their own blocking mode.
-pub(super) fn exchange_replicated<'a>(
-    peers: impl Iterator<Item = (usize, &'a TcpStream, &'a mut [u8])>,
+pub(super) fn exchange_all<'a>(
+    peers: impl Iterator<Item = (usize, &'a TcpStream, &'a [u8], &'a mut [u8])>,
     header: &[u8; 24],
-    outgoing: &[u8],
     timeout: Duration,
 ) -> io::Result<()> {
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| io::Error::other("invalid peer exchange timeout"))?;
     let mut transfers: Vec<_> = peers
-        .map(|(peer, stream, incoming)| Transfer {
+        .map(|(peer, stream, outgoing, incoming)| Transfer {
             peer,
             stream,
+            outgoing,
             incoming,
             sent: 0,
             remote_header: [0; 24],
@@ -57,7 +57,7 @@ pub(super) fn exchange_replicated<'a>(
             transfer.stream.set_nonblocking(true)?;
             enabled += 1;
         }
-        transfer_all(&mut transfers, header, outgoing, deadline)
+        transfer_all(&mut transfers, header, deadline)
     })();
     for transfer in &transfers[..enabled] {
         result = result.and(transfer.stream.set_nonblocking(false));
@@ -68,6 +68,7 @@ pub(super) fn exchange_replicated<'a>(
 struct Transfer<'a> {
     peer: usize,
     stream: &'a TcpStream,
+    outgoing: &'a [u8],
     incoming: &'a mut [u8],
     sent: usize,
     remote_header: [u8; 24],
@@ -76,13 +77,13 @@ struct Transfer<'a> {
 }
 
 impl Transfer<'_> {
-    fn progress(&mut self, header: &[u8; 24], outgoing: &[u8]) -> io::Result<libc::c_short> {
+    fn progress(&mut self, header: &[u8; 24]) -> io::Result<libc::c_short> {
         let mut stream = self.stream;
-        let total = header.len() + outgoing.len();
+        let total = header.len() + self.outgoing.len();
         if self.sent < total {
             let remaining = [
                 IoSlice::new(&header[self.sent.min(header.len())..]),
-                IoSlice::new(&outgoing[self.sent.saturating_sub(header.len())..]),
+                IoSlice::new(&self.outgoing[self.sent.saturating_sub(header.len())..]),
             ];
             self.sent +=
                 socket_progress(stream.write_vectored(&remaining), io::ErrorKind::WriteZero)?;
@@ -117,14 +118,13 @@ impl Transfer<'_> {
 fn transfer_all(
     transfers: &mut [Transfer<'_>],
     header: &[u8; 24],
-    outgoing: &[u8],
     deadline: Instant,
 ) -> io::Result<()> {
     let mut waiting = Vec::with_capacity(transfers.len());
     loop {
         waiting.clear();
         for transfer in transfers.iter_mut() {
-            let events = transfer.progress(header, outgoing)?;
+            let events = transfer.progress(header)?;
             if events != 0 {
                 waiting.push(libc::pollfd {
                     fd: transfer.stream.as_raw_fd(),

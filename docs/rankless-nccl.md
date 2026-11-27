@@ -1270,12 +1270,13 @@ reduces the complete inputs in slot order. The planner uses this path up to
 traffic per worker at 64 KiB.
 
 Larger all-reduces divide the tensor into contiguous shards and assign one
-shard to each slot. In each round a worker sends its contribution to a
-partner's shard and receives that partner's contribution to its own shard.
-It reduces the received values in slot order and exchanges the completed
-shard with its peers. Reduce-scatter ends after the first phase.
-All-gather exchanges complete input shards in slot order. Broadcast and
-reduce use the source or destination specified by that call.
+shard to each slot. Each worker concurrently sends contributions to the peers
+that own those shards and receives contributions to its own shard. It reduces
+the received values in slot order, then starts a second concurrent exchange
+of the reduced shard. Each phase has its own collective deadline. Reduce-scatter
+returns after the first phase. All-gather receives each peer's shard directly
+into its slot's output range. Broadcast and reduce use the source or destination
+specified by that call.
 
 Frame writes submit the header and payload together. Before consuming a
 payload, each receiver checks the collective sequence, operation, dtype,
