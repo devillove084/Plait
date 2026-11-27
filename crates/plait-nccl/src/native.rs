@@ -72,6 +72,96 @@ pub struct PlaitPeerRequest {
     output_bytes: usize,
 }
 
+impl PlaitPeerRequest {
+    pub(crate) fn submit(
+        comm: &Comm,
+        operation: &PlaitPeerCollective,
+        send: u64,
+        stream: u64,
+    ) -> Result<Self, NcclResult> {
+        let Transport::Peers(group) = &comm.transport else {
+            return Err(NCCL_UNSUPPORTED);
+        };
+        let Some((op, input_bytes, output_bytes)) = operation.plan(comm) else {
+            return Err(NCCL_INVALID_ARGUMENT);
+        };
+        if op.reads_input(comm.rank) && input_bytes != 0 && send == 0 {
+            return Err(NCCL_INVALID_ARGUMENT);
+        }
+        let input = stage_peer_input(
+            comm,
+            group,
+            op,
+            send as *const c_void,
+            input_bytes,
+            stream as *mut c_void,
+            &mut Phases::new(false),
+        )?;
+        let completion = Dispatcher::submit(group, op, input).map_err(|error| {
+            if error.kind() == io::ErrorKind::WouldBlock {
+                PLAIT_PEER_BUSY
+            } else {
+                set_error(error.to_string())
+            }
+        })?;
+        Ok(Self {
+            owner: Arc::downgrade(group),
+            completion,
+            output_bytes,
+        })
+    }
+
+    pub(crate) fn ready(&mut self) -> bool {
+        self.completion.ready()
+    }
+
+    pub(crate) fn destination<'a>(
+        &self,
+        comm: &'a Comm,
+        recv: u64,
+        recv_bytes: usize,
+    ) -> Result<&'a PeerGroup, NcclResult> {
+        let Transport::Peers(group) = &comm.transport else {
+            return Err(NCCL_UNSUPPORTED);
+        };
+        if !self.owner.ptr_eq(&Arc::downgrade(group))
+            || self.output_bytes != recv_bytes
+            || (recv_bytes != 0 && recv == 0)
+        {
+            return Err(NCCL_INVALID_ARGUMENT);
+        }
+        Ok(group)
+    }
+
+    pub(crate) fn deliver(
+        self,
+        comm: &Comm,
+        group: &PeerGroup,
+        recv: u64,
+        stream: u64,
+    ) -> Result<(), NcclResult> {
+        let output = self
+            .completion
+            .wait()
+            .map_err(|error| set_error(error.to_string()))?;
+        if output.len() != self.output_bytes {
+            group.fail(GroupFault::Transport);
+            return Err(set_error(
+                "peer collective returned an unexpected output size",
+            ));
+        }
+        group.live().map_err(|error| set_error(error.to_string()))?;
+        if output.is_empty() {
+            return Ok(());
+        }
+        synchronize_stream(comm, stream as *mut c_void)?;
+        group.live().map_err(|error| set_error(error.to_string()))?;
+        host_to_device(comm.runtime.as_ref(), recv, &output).inspect_err(|_| {
+            group.fail(GroupFault::Device);
+        })
+    }
+}
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct PlaitPeerGroupVersion {
@@ -359,36 +449,10 @@ pub unsafe extern "C" fn plaitPeerCollectiveSubmit(
     if request.is_null() {
         return NCCL_INVALID_ARGUMENT;
     }
-    let Transport::Peers(group) = &comm.transport else {
-        return NCCL_UNSUPPORTED;
-    };
-    let Some((op, input_bytes, output_bytes)) = operation.plan(comm) else {
-        return NCCL_INVALID_ARGUMENT;
-    };
-    if op.reads_input(comm.rank) && input_bytes != 0 && send.is_null() {
-        return NCCL_INVALID_ARGUMENT;
-    }
-    let input = match stage_peer_input(
-        comm,
-        group,
-        op,
-        send,
-        input_bytes,
-        stream,
-        &mut Phases::new(false),
-    ) {
-        Ok(input) => input,
+    let request_value = match PlaitPeerRequest::submit(comm, operation, send as u64, stream as u64)
+    {
+        Ok(request) => request,
         Err(error) => return error,
-    };
-    let completion = match Dispatcher::submit(group, op, input) {
-        Ok(completion) => completion,
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => return PLAIT_PEER_BUSY,
-        Err(error) => return set_error(error.to_string()),
-    };
-    let request_value = PlaitPeerRequest {
-        owner: Arc::downgrade(group),
-        completion,
-        output_bytes,
     };
     unsafe { request.write(Box::into_raw(Box::new(request_value))) };
     NCCL_SUCCESS
@@ -407,7 +471,7 @@ pub unsafe extern "C" fn plaitPeerRequestTest(
     if ready.is_null() {
         return NCCL_INVALID_ARGUMENT;
     }
-    unsafe { ready.write(i32::from(request.completion.ready())) };
+    unsafe { ready.write(i32::from(request.ready())) };
     NCCL_SUCCESS
 }
 
@@ -429,40 +493,14 @@ pub unsafe extern "C" fn plaitPeerRequestWait(
     let Some(pending) = (unsafe { request.as_ref() }) else {
         return NCCL_INVALID_ARGUMENT;
     };
-    let Transport::Peers(group) = &comm.transport else {
-        return NCCL_UNSUPPORTED;
+    let group = match pending.destination(comm, recv as u64, recv_bytes) {
+        Ok(group) => group,
+        Err(error) => return error,
     };
-    if !pending.owner.ptr_eq(&Arc::downgrade(group))
-        || pending.output_bytes != recv_bytes
-        || (recv_bytes != 0 && recv.is_null())
-    {
-        return NCCL_INVALID_ARGUMENT;
-    }
     let request_value = unsafe { *Box::from_raw(std::mem::replace(request, ptr::null_mut())) };
-    let output = match request_value.completion.wait() {
-        Ok(output) => output,
-        Err(error) => return set_error(error.to_string()),
-    };
-    if output.len() != recv_bytes {
-        group.fail(GroupFault::Transport);
-        return set_error("peer collective returned an unexpected output size");
-    }
-    if let Err(error) = group.live() {
-        return set_error(error.to_string());
-    }
-    if !output.is_empty() {
-        if let Err(error) = synchronize_stream(comm, stream) {
-            return error;
-        }
-        if let Err(error) = group.live() {
-            return set_error(error.to_string());
-        }
-        if let Err(error) = host_to_device(comm.runtime.as_ref(), recv as u64, &output) {
-            group.fail(GroupFault::Device);
-            return error;
-        }
-    }
-    NCCL_SUCCESS
+    request_value
+        .deliver(comm, group, recv as u64, stream as u64)
+        .map_or_else(|error| error, |_| NCCL_SUCCESS)
 }
 
 /// # Safety

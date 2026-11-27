@@ -2378,6 +2378,31 @@ impl CommHandle {
         }
     }
 
+    fn submit_all_gather(
+        &self,
+        py: Python<'_>,
+        send: u64,
+        count: usize,
+        datatype: i32,
+        stream: u64,
+    ) -> PyResult<Option<PyPeerRequest>> {
+        let descriptor = native::PlaitPeerCollective {
+            kind: 2,
+            datatype,
+            count,
+            reduction: 0,
+            root: 0,
+        };
+        let outcome = py.allow_threads(|| {
+            native::PlaitPeerRequest::submit(unsafe { &*self.pointer() }, &descriptor, send, stream)
+        });
+        match outcome {
+            Ok(request) => Ok(Some(PyPeerRequest(Mutex::new(Some(request))))),
+            Err(native::PLAIT_PEER_BUSY | NCCL_UNSUPPORTED) => Ok(None),
+            Err(status) => Err(peer_request_error(status)),
+        }
+    }
+
     fn all_reduce(
         &self,
         py: Python<'_>,
@@ -2573,6 +2598,55 @@ impl CommHandle {
 }
 
 #[cfg(feature = "python")]
+#[pyclass(name = "PeerRequest")]
+struct PyPeerRequest(Mutex<Option<native::PlaitPeerRequest>>);
+
+#[cfg(feature = "python")]
+fn peer_request_error(status: NcclResult) -> PyErr {
+    let detail = take_last_error();
+    pyo3::exceptions::PyRuntimeError::new_err(if detail.is_empty() {
+        format!("Plait peer request error {status}")
+    } else {
+        format!("Plait peer request error {status}: {detail}")
+    })
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl PyPeerRequest {
+    fn is_completed(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap()
+            .as_mut()
+            .is_none_or(|request| request.ready())
+    }
+
+    fn wait(
+        &self,
+        py: Python<'_>,
+        owner: &CommHandle,
+        target: u64,
+        bytes: usize,
+        stream: u64,
+    ) -> PyResult<()> {
+        let status = py.allow_threads(|| {
+            let comm = unsafe { &*owner.pointer() };
+            let (request, group) = {
+                let mut slot = self.0.lock().unwrap();
+                let group = slot
+                    .as_ref()
+                    .ok_or(NCCL_INVALID_USAGE)?
+                    .destination(comm, target, bytes)?;
+                (slot.take().expect("validated peer request"), group)
+            };
+            request.deliver(comm, group, target, stream)
+        });
+        status.map_err(peer_request_error)
+    }
+}
+
+#[cfg(feature = "python")]
 fn all_reduce_fp8(ptr: *mut Comm, send: u64, recv: u64, count: usize) -> NcclResult {
     let comm = unsafe { &*ptr };
     if let Transport::Peers(group) = &comm.transport {
@@ -2733,6 +2807,7 @@ fn join(id: &[u8], device: usize) -> PyResult<CommHandle> {
 #[pymodule]
 fn _plait_nccl(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<CommHandle>()?;
+    module.add_class::<PyPeerRequest>()?;
     module.add_class::<PyPeerListener>()?;
     module.add_function(wrap_pyfunction!(
         python_control::join_versioned_group,

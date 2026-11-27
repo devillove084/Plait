@@ -40,6 +40,20 @@ class ncclUniqueId:
         return value
 
 
+class PeerRequest:
+    """One native collective result, with a retained communicator."""
+
+    def __init__(self, request: "_plait_nccl.PeerRequest", owner: "_plait_nccl.CommHandle") -> None:
+        self._request = request
+        self._owner = owner
+
+    def is_completed(self) -> bool:
+        return self._request.is_completed()
+
+    def wait(self, target: int, size_bytes: int, stream: int) -> None:
+        self._request.wait(self._owner, target, size_bytes, stream)
+
+
 class CommHandle:
     """Thin Python view over the Rust communicator."""
 
@@ -96,6 +110,17 @@ class CommHandle:
 
     def all_gather(self, send: int, recv: int, count: int, dtype: int, stream: int = 0) -> int:
         return self._handle.all_gather(send, recv, count, dtype, stream)
+
+    def try_all_gather(
+        self, send: int, count: int, dtype: int, stream: int = 0
+    ) -> PeerRequest | None:
+        submit = getattr(self._handle, "submit_all_gather", None)
+        request = None if submit is None else submit(send, count, dtype, stream)
+        return None if request is None else PeerRequest(request, self._handle)
+
+    @property
+    def supports_all_gather_requests(self) -> bool:
+        return hasattr(self._handle, "submit_all_gather") and self.peer_failed is not None
 
     def broadcast(self, send: int, recv: int, count: int, dtype: int, root: int, stream: int = 0) -> int:
         return self._handle.broadcast(send, recv, count, dtype, root, stream)
