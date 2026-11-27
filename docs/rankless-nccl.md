@@ -2347,9 +2347,9 @@ exchange and result delivery. Destroying a pending ticket frees its result
 after the worker finishes the accepted operation. A full queue or byte
 budget returns `PLAIT_PEER_BUSY` without allocating a sequence. Retry the
 same operation once there is capacity, or call its blocking entry point
-before submitting a later operation. Python `try_all_gather` returns `None`
-in this case. A peer with available capacity can still submit the same
-operation asynchronously.
+before submitting a later operation. Python `try_all_gather` and
+`try_all_reduce` return `None` in this case. A peer with available capacity
+can still submit the same operation asynchronously.
 
 In a four-vendor C ABI test the first three participants submitted AllReduce
 and AllGather while the fourth waited. All four later retrieved the results

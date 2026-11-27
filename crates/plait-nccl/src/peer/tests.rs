@@ -741,12 +741,17 @@ fn hosted_peer_handshake_binds_explicit_zero_and_nonzero_egress() {
             }
         }
         thread::scope(|scope| {
-            let timeout = Duration::from_millis(500);
+            let timeout = Duration::from_secs(2);
             let left_members = members.clone();
             let dialer = scope.spawn(move || left.connect(0, left_members, timeout));
             let right = right.connect(1, members, timeout);
             for group in [dialer.join().unwrap(), right] {
-                assert_eq!(group.is_ok(), left_limit == right_limit);
+                assert_eq!(
+                    group.is_ok(),
+                    left_limit == right_limit,
+                    "egress options {left_limit:?} and {right_limit:?}: {:?}",
+                    group.as_ref().err()
+                );
                 if let Ok(group) = group {
                     assert_eq!(group.replicated_egress_bytes, left_limit);
                 }

@@ -108,6 +108,18 @@ class CommHandle:
     ) -> int:
         return self._handle.all_reduce_fp8_to_f32(send, recv, count)
 
+    def try_all_reduce(
+        self, send: int, count: int, dtype: int, op: int, stream: int = 0
+    ) -> PeerRequest | None:
+        """Stage input and submit, or return None before assigning a sequence."""
+        submit = getattr(self._handle, "submit_all_reduce", None)
+        request = None if submit is None else submit(send, count, dtype, op, stream)
+        return None if request is None else PeerRequest(request, self._handle)
+
+    @property
+    def supports_all_reduce_requests(self) -> bool:
+        return hasattr(self._handle, "submit_all_reduce") and self.peer_failed is not None
+
     def all_gather(self, send: int, recv: int, count: int, dtype: int, stream: int = 0) -> int:
         return self._handle.all_gather(send, recv, count, dtype, stream)
 

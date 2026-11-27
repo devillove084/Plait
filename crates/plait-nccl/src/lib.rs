@@ -2338,6 +2338,23 @@ impl CommHandle {
             function(self.ptr)
         }
     }
+
+    fn submit_peer_request(
+        &self,
+        py: Python<'_>,
+        descriptor: native::PlaitPeerCollective,
+        send: u64,
+        stream: u64,
+    ) -> PyResult<Option<PyPeerRequest>> {
+        let outcome = py.allow_threads(|| {
+            native::PlaitPeerRequest::submit(unsafe { &*self.pointer() }, &descriptor, send, stream)
+        });
+        match outcome {
+            Ok(request) => Ok(Some(PyPeerRequest(Mutex::new(Some(request))))),
+            Err(native::PLAIT_PEER_BUSY | NCCL_UNSUPPORTED) => Ok(None),
+            Err(status) => Err(peer_request_error(status)),
+        }
+    }
 }
 
 #[cfg(feature = "python")]
@@ -2397,21 +2414,41 @@ impl CommHandle {
         datatype: i32,
         stream: u64,
     ) -> PyResult<Option<PyPeerRequest>> {
-        let descriptor = native::PlaitPeerCollective {
-            kind: 2,
-            datatype,
-            count,
-            reduction: 0,
-            root: 0,
-        };
-        let outcome = py.allow_threads(|| {
-            native::PlaitPeerRequest::submit(unsafe { &*self.pointer() }, &descriptor, send, stream)
-        });
-        match outcome {
-            Ok(request) => Ok(Some(PyPeerRequest(Mutex::new(Some(request))))),
-            Err(native::PLAIT_PEER_BUSY | NCCL_UNSUPPORTED) => Ok(None),
-            Err(status) => Err(peer_request_error(status)),
-        }
+        self.submit_peer_request(
+            py,
+            native::PlaitPeerCollective {
+                kind: 2,
+                datatype,
+                count,
+                reduction: 0,
+                root: 0,
+            },
+            send,
+            stream,
+        )
+    }
+
+    fn submit_all_reduce(
+        &self,
+        py: Python<'_>,
+        send: u64,
+        count: usize,
+        datatype: i32,
+        reduction: i32,
+        stream: u64,
+    ) -> PyResult<Option<PyPeerRequest>> {
+        self.submit_peer_request(
+            py,
+            native::PlaitPeerCollective {
+                kind: 1,
+                datatype,
+                count,
+                reduction,
+                root: 0,
+            },
+            send,
+            stream,
+        )
     }
 
     fn all_reduce(
