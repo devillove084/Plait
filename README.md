@@ -375,6 +375,7 @@ release the result after the matching completion has executed in the control pla
 | [Peer revocation](specs/PlaitPeerRevocation.tla) | Observing that an exact grant has ended closes that communicator and wakes a pending call. A draining group can keep its links. |
 | [Peer failover](specs/PlaitPeerFailover.tla) | Exact-grant failure reports, readiness and host-loss eligibility for standby activation, one active version, and grant retention until release. |
 | [Shared-host fault isolation](specs/PlaitSharedHostFault.tla) | A device fault revokes its group version. A separate group on the same host keeps its communicator and grants. The model also checks standby activation, asynchronous cancellation, and per-device release after stop. TLC checked 36,895 states. |
+| [Peer collective requests](specs/PlaitPeerRequests.tla) | Blocking and ticketed operations share the wire order. A dropped ticket keeps its sequence, and a cancelled communicator denies delivery of a buffered result. TLC checked 695,556 states. |
 | [Replicated group manifest](specs/PlaitGroupManifest.tla) | Activation follows complete endpoint and handshake evidence. Retrying an old release preserves any successor grant. |
 | [Native group placement](specs/PlaitGroupPlacement.tla) | A planned reservation checks the version, incumbent, and resource availability against concurrent changes. |
 | [Native probe sessions](specs/PlaitProbePlacement.tla) | A planned reservation checks both endpoint revisions if a probe restarts after measurement. |

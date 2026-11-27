@@ -1,19 +1,76 @@
 //! C entry points for the device-identity bootstrap.
 
-use std::ffi::{CStr, c_char};
+use std::ffi::{CStr, c_char, c_void};
+use std::io;
 use std::mem::size_of;
 use std::ptr;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use plait_core::group::{GroupId, GroupVersion, WorkerGrant};
+use plait_core::group::{GroupFault, GroupId, GroupVersion, WorkerGrant};
 use plait_core::{DeviceId, NodeId};
 
+use crate::peer::requests::{Completion, Dispatcher};
+use crate::profile::Phases;
 use crate::{
-    BackendKind, Comm, NCCL_INVALID_ARGUMENT, NCCL_SUCCESS, NCCL_UNSUPPORTED, NcclResult,
-    PeerEndpoint, RanklessListener, RanklessMember, set_error,
+    BackendKind, Collective, Comm, DataType, NCCL_INVALID_ARGUMENT, NCCL_SUCCESS, NCCL_UNSUPPORTED,
+    NcclResult, PeerEndpoint, PeerGroup, RanklessListener, RanklessMember, ReduceOp, Transport,
+    host_to_device, set_error, stage_peer_input, synchronize_stream,
 };
 
 const ADDRESS_BYTES: usize = 80;
+pub const PLAIT_PEER_BUSY: NcclResult = 5;
+
+#[repr(C)]
+pub struct PlaitPeerCollective {
+    pub(crate) kind: i32,
+    pub(crate) datatype: i32,
+    pub(crate) reduction: i32,
+    pub(crate) root: i32,
+    pub(crate) count: usize,
+}
+
+impl PlaitPeerCollective {
+    fn plan(&self, comm: &Comm) -> Option<(Collective, usize, usize)> {
+        let dtype = DataType::from_raw(self.datatype)?;
+        let width = self.count.checked_mul(dtype.bytes())?;
+        let root = || {
+            usize::try_from(self.root)
+                .ok()
+                .filter(|&root| root < comm.world)
+        };
+        let reduction = || ReduceOp::from_raw(self.reduction);
+        Some(match self.kind {
+            1 => (Collective::AllReduce(dtype, reduction()?), width, width),
+            2 => (
+                Collective::AllGather(dtype),
+                width,
+                width.checked_mul(comm.world)?,
+            ),
+            3 => (
+                Collective::ReduceScatter(dtype, reduction()?),
+                width.checked_mul(comm.world)?,
+                width,
+            ),
+            4 => (Collective::Broadcast(dtype, root()?), width, width),
+            5 => {
+                let dest = root()?;
+                (
+                    Collective::Reduce(dtype, reduction()?, dest),
+                    width,
+                    if comm.rank == dest { width } else { 0 },
+                )
+            }
+            _ => return None,
+        })
+    }
+}
+
+pub struct PlaitPeerRequest {
+    owner: Weak<PeerGroup>,
+    completion: Completion,
+    output_bytes: usize,
+}
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -281,6 +338,139 @@ pub unsafe extern "C" fn plaitPeerManifestDigest(
     };
     unsafe {
         digest.write(value);
+    }
+    NCCL_SUCCESS
+}
+
+/// # Safety
+/// The communicator and descriptor are live, and the input device allocation
+/// and producer stream remain valid for this call. The output is writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn plaitPeerCollectiveSubmit(
+    comm: *const Comm,
+    operation: *const PlaitPeerCollective,
+    send: *const c_void,
+    stream: *mut c_void,
+    request: *mut *mut PlaitPeerRequest,
+) -> NcclResult {
+    let (Some(comm), Some(operation)) = (unsafe { (comm.as_ref(), operation.as_ref()) }) else {
+        return NCCL_INVALID_ARGUMENT;
+    };
+    if request.is_null() {
+        return NCCL_INVALID_ARGUMENT;
+    }
+    let Transport::Peers(group) = &comm.transport else {
+        return NCCL_UNSUPPORTED;
+    };
+    let Some((op, input_bytes, output_bytes)) = operation.plan(comm) else {
+        return NCCL_INVALID_ARGUMENT;
+    };
+    if op.reads_input(comm.rank) && input_bytes != 0 && send.is_null() {
+        return NCCL_INVALID_ARGUMENT;
+    }
+    let input = match stage_peer_input(
+        comm,
+        group,
+        op,
+        send,
+        input_bytes,
+        stream,
+        &mut Phases::new(false),
+    ) {
+        Ok(input) => input,
+        Err(error) => return error,
+    };
+    let completion = match Dispatcher::submit(group, op, input) {
+        Ok(completion) => completion,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => return PLAIT_PEER_BUSY,
+        Err(error) => return set_error(error.to_string()),
+    };
+    let request_value = PlaitPeerRequest {
+        owner: Arc::downgrade(group),
+        completion,
+        output_bytes,
+    };
+    unsafe { request.write(Box::into_raw(Box::new(request_value))) };
+    NCCL_SUCCESS
+}
+
+/// # Safety
+/// The request is live and exclusively accessed. The output is writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn plaitPeerRequestTest(
+    request: *mut PlaitPeerRequest,
+    ready: *mut i32,
+) -> NcclResult {
+    let Some(request) = (unsafe { request.as_mut() }) else {
+        return NCCL_INVALID_ARGUMENT;
+    };
+    if ready.is_null() {
+        return NCCL_INVALID_ARGUMENT;
+    }
+    unsafe { ready.write(i32::from(request.completion.ready())) };
+    NCCL_SUCCESS
+}
+
+/// # Safety
+/// The request and communicator remain live until consumed. The request is
+/// exclusively owned. The output allocation and consumer stream are valid
+/// throughout the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn plaitPeerRequestWait(
+    comm: *const Comm,
+    request: *mut *mut PlaitPeerRequest,
+    recv: *mut c_void,
+    recv_bytes: usize,
+    stream: *mut c_void,
+) -> NcclResult {
+    let (Some(comm), Some(request)) = (unsafe { (comm.as_ref(), request.as_mut()) }) else {
+        return NCCL_INVALID_ARGUMENT;
+    };
+    let Some(pending) = (unsafe { request.as_ref() }) else {
+        return NCCL_INVALID_ARGUMENT;
+    };
+    let Transport::Peers(group) = &comm.transport else {
+        return NCCL_UNSUPPORTED;
+    };
+    if !pending.owner.ptr_eq(&Arc::downgrade(group))
+        || pending.output_bytes != recv_bytes
+        || (recv_bytes != 0 && recv.is_null())
+    {
+        return NCCL_INVALID_ARGUMENT;
+    }
+    let request_value = unsafe { *Box::from_raw(std::mem::replace(request, ptr::null_mut())) };
+    let output = match request_value.completion.wait() {
+        Ok(output) => output,
+        Err(error) => return set_error(error.to_string()),
+    };
+    if output.len() != recv_bytes {
+        group.fail(GroupFault::Transport);
+        return set_error("peer collective returned an unexpected output size");
+    }
+    if let Err(error) = group.live() {
+        return set_error(error.to_string());
+    }
+    if !output.is_empty() {
+        if let Err(error) = synchronize_stream(comm, stream) {
+            return error;
+        }
+        if let Err(error) = group.live() {
+            return set_error(error.to_string());
+        }
+        if let Err(error) = host_to_device(comm.runtime.as_ref(), recv as u64, &output) {
+            group.fail(GroupFault::Device);
+            return error;
+        }
+    }
+    NCCL_SUCCESS
+}
+
+/// # Safety
+/// A non-null request is live and exclusively owned by the caller.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn plaitPeerRequestDestroy(request: *mut PlaitPeerRequest) -> NcclResult {
+    if !request.is_null() {
+        unsafe { drop(Box::from_raw(request)) };
     }
     NCCL_SUCCESS
 }

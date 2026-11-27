@@ -10,6 +10,7 @@ extern "C" {
 
 struct ncclComm;
 typedef struct PlaitPeerListener PlaitPeerListener;
+typedef struct PlaitPeerRequest PlaitPeerRequest;
 
 typedef struct {
     uint8_t group[16];
@@ -61,6 +62,44 @@ int32_t plaitPeerManifestDigest(const struct ncclComm *comm, uint8_t digest[32])
    communicator with ncclCommDestroy or releasing its buffers. */
 int32_t plaitPeerCancel(const struct ncclComm *comm);
 int32_t plaitPeerFailed(const struct ncclComm *comm, int32_t *failed);
+
+enum {
+    PLAIT_PEER_ALL_REDUCE = 1,
+    PLAIT_PEER_ALL_GATHER = 2,
+    PLAIT_PEER_REDUCE_SCATTER = 3,
+    PLAIT_PEER_BROADCAST = 4,
+    PLAIT_PEER_REDUCE = 5
+};
+
+enum { PLAIT_PEER_BUSY = 5 };
+
+typedef struct {
+    int32_t kind;
+    int32_t datatype;   /* NCCL datatype code */
+    int32_t reduction;  /* NCCL reduction code for reducing operations */
+    int32_t root;       /* Logical slot for broadcast and reduce */
+    size_t count;       /* NCCL count: input count for gather, output count for scatter */
+} PlaitPeerCollective;
+
+/* Stage input from the producer stream and enqueue network work in collective
+   order. Successful submission owns the staged bytes and returns a request.
+   BUSY leaves the sequence unallocated; retry before issuing later calls.
+   As with blocking collectives, peers submit matching operations in order. */
+int32_t plaitPeerCollectiveSubmit(const struct ncclComm *comm,
+                                 const PlaitPeerCollective *operation, const void *send,
+                                 void *producer_stream, PlaitPeerRequest **request);
+
+/* Test host completion. Wait reports errors and delivers the result, then
+   consumes the request and sets it to NULL. Argument errors leave it live.
+   Use the originating communicator, ready destination and its consumer
+   stream. Reduce on non-root slots expects zero output bytes. */
+int32_t plaitPeerRequestTest(PlaitPeerRequest *request, int32_t *ready);
+int32_t plaitPeerRequestWait(const struct ncclComm *comm, PlaitPeerRequest **request,
+                            void *recv, size_t recv_bytes, void *consumer_stream);
+
+/* Abandon the result. An accepted operation still occupies its wire sequence.
+   Use plaitPeerCancel to interrupt the group's network operations. */
+int32_t plaitPeerRequestDestroy(PlaitPeerRequest *request);
 
 #ifdef __cplusplus
 }

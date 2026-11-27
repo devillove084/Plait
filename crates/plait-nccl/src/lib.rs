@@ -339,6 +339,12 @@ pub struct Comm {
     runtime: Box<dyn DeviceRuntime>,
 }
 
+impl Drop for Comm {
+    fn drop(&mut self) {
+        self.cancel_peers();
+    }
+}
+
 /// A peer-only communicator without the legacy IPC and device-kernel state.
 pub struct RanklessComm(Box<Comm>);
 
@@ -654,25 +660,10 @@ fn execute_peer_collective(
 ) -> NcclResult {
     let log = profile::log();
     let mut phases = profile::Phases::new(log.is_some());
-    if let Err(error) = phases.sync.measure(|| synchronize_stream(comm, stream)) {
-        return error;
-    }
-    let mut input = vec![0u8; bytes];
-    let needs_input = !matches!(op, Collective::Broadcast(_, source) if source != comm.rank);
-    if needs_input && bytes != 0 {
-        if send.is_null() {
-            group.cancel();
-            return NCCL_UNHANDLED_CUDA_ERROR;
-        }
-        if phases
-            .download
-            .measure(|| device_to_host(comm.runtime.as_ref(), send as u64, &mut input))
-            .is_err()
-        {
-            group.fail(GroupFault::Device);
-            return NCCL_UNHANDLED_CUDA_ERROR;
-        }
-    }
+    let input = match stage_peer_input(comm, group, op, send, bytes, stream, &mut phases) {
+        Ok(input) => input,
+        Err(error) => return error,
+    };
     let output = match phases
         .collective
         .measure(|| group.execute_timed(op, &input, &mut phases.wire, &mut phases.fold))
@@ -696,6 +687,37 @@ fn execute_peer_collective(
         phases.record(log, comm.rank, comm.world, op, bytes);
     }
     NCCL_SUCCESS
+}
+
+fn stage_peer_input(
+    comm: &Comm,
+    group: &PeerGroup,
+    op: Collective,
+    send: *const std::ffi::c_void,
+    bytes: usize,
+    stream: *mut std::ffi::c_void,
+    phases: &mut profile::Phases,
+) -> Result<Vec<u8>, NcclResult> {
+    phases.sync.measure(|| synchronize_stream(comm, stream))?;
+    let mut input = Vec::new();
+    input
+        .try_reserve_exact(bytes)
+        .map_err(|error| set_error(format!("peer input allocation: {error}")))?;
+    input.resize(bytes, 0);
+    if bytes != 0 && op.reads_input(comm.rank) {
+        if send.is_null() {
+            group.cancel();
+            return Err(NCCL_UNHANDLED_CUDA_ERROR);
+        }
+        if let Err(error) = phases
+            .download
+            .measure(|| device_to_host(comm.runtime.as_ref(), send as u64, &mut input))
+        {
+            group.fail(GroupFault::Device);
+            return Err(error);
+        }
+    }
+    Ok(input)
 }
 
 /// E4M3 finite value, used by the optional quantized-communication path.

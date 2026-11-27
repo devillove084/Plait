@@ -7,7 +7,7 @@ use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -22,6 +22,7 @@ use crate::{DataType, ReduceOp, reduce_bytes, reduce_fp8_to_f32};
 
 mod frame;
 mod rankless;
+pub(crate) mod requests;
 pub use rankless::{RanklessListener, RanklessMember};
 
 const COLLECTIVE_LANE: u8 = 0;
@@ -161,7 +162,9 @@ impl Listener {
             slot,
             links,
             timeout,
-            sequence: Mutex::new(0),
+            order: Mutex::new(CollectiveOrder::default()),
+            turn: Condvar::new(),
+            requests: requests::Dispatcher::default(),
             failed: AtomicBool::new(false),
             binding,
             #[cfg(feature = "control")]
@@ -296,6 +299,10 @@ pub(crate) enum Collective {
 }
 
 impl Collective {
+    pub(crate) fn reads_input(self, slot: usize) -> bool {
+        !matches!(self, Self::Broadcast(_, source) if source != slot)
+    }
+
     pub(crate) fn wire(self) -> (u8, DataType, ReduceOp, usize) {
         match self {
             Self::AllReduce(dtype, op) => (1, dtype, op, 0),
@@ -338,11 +345,19 @@ pub(crate) struct PeerGroup {
     slot: usize,
     links: Vec<Option<Link>>,
     timeout: Duration,
-    sequence: Mutex<u64>,
+    order: Mutex<CollectiveOrder>,
+    turn: Condvar,
+    pub(crate) requests: requests::Dispatcher,
     failed: AtomicBool,
     binding: Option<GrantBinding>,
     #[cfg(feature = "control")]
     grant_watch: std::sync::OnceLock<tokio::sync::mpsc::Sender<Option<GroupFault>>>,
+}
+
+#[derive(Default)]
+struct CollectiveOrder {
+    submitted: u64,
+    completed: u64,
 }
 
 impl PeerGroup {
@@ -382,7 +397,13 @@ impl PeerGroup {
     }
 
     fn close(&self, _fault: Option<GroupFault>) {
-        if !self.failed.swap(true, Ordering::AcqRel) {
+        let first = {
+            let _order = self.order.lock().unwrap();
+            let first = !self.failed.swap(true, Ordering::AcqRel);
+            self.turn.notify_all();
+            first
+        };
+        if first {
             for link in self.links.iter().flatten() {
                 let _ = link.collective.shutdown(Shutdown::Both);
                 let _ = link.direct.shutdown(Shutdown::Both);
@@ -467,11 +488,44 @@ impl PeerGroup {
         wire: &mut Timer,
         fold: &mut Timer,
     ) -> io::Result<Vec<u8>> {
-        let mut sequence = self.sequence.lock().unwrap();
+        let sequence = self.reserve(Ok)?;
+        self.execute_reserved(sequence, collective, input, wire, fold)
+    }
+
+    fn reserve<T>(&self, admit: impl FnOnce(u64) -> io::Result<T>) -> io::Result<T> {
+        let mut order = self.order.lock().unwrap();
         self.live()?;
-        let result = self.run(collective, *sequence, input, wire, fold);
+        let next = order
+            .submitted
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("peer collective sequence exhausted"))?;
+        let value = admit(order.submitted)?;
+        order.submitted = next;
+        Ok(value)
+    }
+
+    fn execute_reserved(
+        &self,
+        sequence: u64,
+        collective: Collective,
+        input: &[u8],
+        wire: &mut Timer,
+        fold: &mut Timer,
+    ) -> io::Result<Vec<u8>> {
+        let order = self
+            .turn
+            .wait_while(self.order.lock().unwrap(), |order| {
+                order.completed != sequence && !self.is_failed()
+            })
+            .unwrap();
+        self.live()?;
+        drop(order);
+        let result = self.run(collective, sequence, input, wire, fold);
         match &result {
-            Ok(_) => *sequence += 1,
+            Ok(_) => {
+                self.order.lock().unwrap().completed += 1;
+                self.turn.notify_all();
+            }
             Err(error) if error.kind() == io::ErrorKind::Unsupported => self.cancel(),
             Err(_) => self.fail(GroupFault::Transport),
         }

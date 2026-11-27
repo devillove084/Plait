@@ -2124,14 +2124,47 @@ payload, each receiver checks the collective sequence, operation, dtype,
 size, and stage. The point-to-point lane is separate.
 A send stages the payload and enqueues it for that peer, so opposing sends
 can be posted before either receive. The caller's stream is synchronized
-before device input is read. Collective calls return after the host exchange
-and output copy.
+before device input is read. The blocking NCCL-compatible calls return after
+the host exchange and output copy.
 
 A failed TCP lane closes the affected communicator's sockets. Independent
 communicators retain their own sockets, sequence counters, and send queues.
 Each group holds two sockets per peer. This transport uses a fixed group
 for its lifetime. Changing membership also requires a new vLLM tensor
 layout and activation of a new application group.
+
+### Submit peer collectives and collect their results
+
+The native peer C API exposes requests for AllReduce, AllGather,
+ReduceScatter, Broadcast, and Reduce. It uses the communicator's existing
+collective order, including calls through the blocking ABI.
+[C declarations](../crates/plait-nccl/include/plait_peer.h)
+
+1. Call `plaitPeerCollectiveSubmit` with the input and its producer stream.
+   The caller waits for prior work on that stream and stages the input.
+   After successful submission the input can be reused while the network
+   worker exchanges and reduces the staged bytes.
+2. Poll host completion with `plaitPeerRequestTest` or call
+   `plaitPeerRequestWait` directly. Wait checks the communicator and
+   the exact output size, synchronizes the destination's consumer stream,
+   copies the result to the device, and consumes the request.
+3. Use `plaitPeerRequestDestroy` to discard a result. The accepted operation
+   still runs in its assigned sequence. Use `plaitPeerCancel` to interrupt
+   the group and wake pending requests. Wait for device calls already in
+   progress before releasing their buffers and streams.
+
+The network queue holds up to eight waiting jobs per communicator. A
+`PLAIT_PEER_BUSY` response leaves the collective sequence unchanged. Retry
+that operation before submitting a later one. The vLLM compatibility path
+continues to call the blocking ABI.
+
+In a four-vendor C ABI test the first three participants submitted AllReduce
+and AllGather while the fourth waited. All four later retrieved the results
+in reverse wait order. The results used the original device inputs after
+each caller rewrote its source tensor. A blocking AllReduce between
+submission and wait also completed in sequence with the updated inputs.
+An exchange interrupted with one peer idle returned errors to all three
+queued callers and preserved their destination contents.
 
 ## Compatibility API
 
