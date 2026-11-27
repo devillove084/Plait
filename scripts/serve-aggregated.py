@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 from serving_group import (
     DIRECTORY_POLL_SECONDS, DIRECTORY_READ_TTL, HOP_HEADERS, HTTP_ERRORS, INFERENCE_PATHS,
@@ -24,6 +25,8 @@ from serving_replay import (
 
 
 class ActiveGroupDirectory:
+    observation = "observe_group"
+
     def __init__(self, model: str, group: bytes, control: Control) -> None:
         self.model = model
         self.group = list(group)
@@ -31,16 +34,19 @@ class ActiveGroupDirectory:
         self.lock = threading.Lock()
         self.epoch = 0
         self.current: Endpoint | None = None
+        self.closed = False
         self.until = 0.0
 
     def refresh(self) -> None:
         sent = time.monotonic()
         result = self.control.request({
-            "request": "observe_group", "group": self.group, "id": self.control.next_operation_id(),
+            "request": self.observation, "group": self.group,
+            "id": self.control.next_operation_id(),
         })["result"]
         if result.get("Err") == {"NoActiveGroup": self.group}:
             with self.lock:
                 self.current = None
+                self.closed = True
             return
 
         view = result["Ok"]
@@ -48,23 +54,27 @@ class ActiveGroupDirectory:
         epoch = version["epoch"]
         if version["group"] != self.group or type(epoch) is not int or epoch < 1:
             raise ValueError("control returned a different group")
-        advertised = view["endpoint"]
-        endpoint = None
-        if (
-            view["role"] == "Aggregated" and view["phase"] == "Active"
-            and advertised and advertised["api_model"] == self.model
-        ):
-            endpoint = Endpoint.parse({
-                "url": "http://" + advertised["http"],
-                "version": f"{bytes(self.group).hex()}@{epoch}",
-            }, "aggregated")
+        endpoint, closed = self.resolve(view, epoch)
 
         with self.lock:
-            if epoch < self.epoch or (epoch == self.epoch and self.current is None):
+            if epoch < self.epoch or (epoch == self.epoch and self.closed):
                 return
             self.epoch = epoch
             self.current = endpoint
+            self.closed = closed
             self.until = sent + DIRECTORY_READ_TTL
+
+    def endpoint_at(self, url: str, epoch: int) -> Endpoint:
+        return Endpoint.parse({
+            "url": url, "version": f"{bytes(self.group).hex()}@{epoch}",
+        }, "aggregated")
+
+    def resolve(self, view: dict, epoch: int) -> tuple[Endpoint | None, bool]:
+        advertised = view["endpoint"]
+        if (view["role"] == "Aggregated" and view["phase"] == "Active"
+                and advertised and advertised["api_model"] == self.model):
+            return self.endpoint_at("http://" + advertised["http"], epoch), False
+        return None, True
 
     def endpoint(self) -> Endpoint | None:
         with self.lock:
@@ -80,7 +90,29 @@ class ActiveGroupDirectory:
             self.control.close()
 
 
-def server(bind: str, port: int, directory: ActiveGroupDirectory, timeout: float) -> ThreadingHTTPServer:
+class NativeGroupDirectory(ActiveGroupDirectory):
+    observation = "observe"
+
+    def __init__(self, model: str, group: bytes, control: Control, routes: Path) -> None:
+        super().__init__(model, group, control)
+        self.routes = routes
+
+    def resolve(self, view: dict, epoch: int) -> tuple[Endpoint | None, bool]:
+        if view["phase"] != "Active":
+            return None, True
+        try:
+            routes = json.loads(self.routes.read_text(encoding="utf-8"))
+            url = routes[str(epoch)]
+            if isinstance(url, str):
+                return self.endpoint_at(url, epoch), False
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        return None, False
+
+
+def server(
+    bind: str, port: int, directory: ActiveGroupDirectory, timeout: float, *, allow_recovery: bool = True,
+) -> ThreadingHTTPServer:
     class Entry(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             if self.path == "/v1/models":
@@ -110,7 +142,8 @@ def server(bind: str, port: int, directory: ActiveGroupDirectory, timeout: float
                 recovery = self.headers.get(RECOVERY_HEADER)
                 replay = None
                 if recovery is not None:
-                    if recovery not in (RECOVERY_MODE, RESUME_KV_MODE) or self.path != "/v1/completions":
+                    if (not allow_recovery or recovery not in (RECOVERY_MODE, RESUME_KV_MODE)
+                            or self.path != "/v1/completions"):
                         raise ValueError("unsupported stream recovery mode")
                     replay = CompletionReplay(body, recovery)
                     if replay.seed is not None:
@@ -228,8 +261,10 @@ def main() -> None:
     parser.add_argument("--model", required=True, help="stable API model alias")
     parser.add_argument("--group-id", required=True, help="hex ID of the versioned aggregate group")
     parser.add_argument("--control-bin", default="plait-node")
-    parser.add_argument("--control-peer", action="append", required=True)
+    parser.add_argument("--control-peer", action="append", default=[])
+    parser.add_argument("--control-seed", action="append", default=[])
     parser.add_argument("--control-listen", default="127.0.0.1:0")
+    parser.add_argument("--native-routes", type=Path, help="JSON map from native group epoch to HTTP origin")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8192)
     parser.add_argument("--timeout", type=float, default=120.0)
@@ -242,9 +277,15 @@ def main() -> None:
         parser.error(str(error))
     if not args.model or not 0 < args.port < 65536 or not 0 < args.timeout < float("inf"):
         parser.error("model, port and timeout must be valid")
+    if bool(args.control_peer) == bool(args.control_seed):
+        parser.error("provide either --control-peer or --control-seed")
 
-    control = Control(args.control_bin, args.control_peer, args.control_listen)
-    directory = ActiveGroupDirectory(args.model, group, control)
+    control = Control(args.control_bin, args.control_peer, args.control_listen,
+                      seeds=args.control_seed, command="group" if args.native_routes else "serving")
+    if args.native_routes:
+        directory = NativeGroupDirectory(args.model, group, control, args.native_routes)
+    else:
+        directory = ActiveGroupDirectory(args.model, group, control)
     stop = threading.Event()
     watcher = threading.Thread(target=directory.watch, args=(stop,))
 
@@ -254,7 +295,7 @@ def main() -> None:
     old_handler = signal.signal(signal.SIGTERM, interrupt)
     watcher.start()
     try:
-        with server(args.host, args.port, directory, args.timeout) as httpd:
+        with server(args.host, args.port, directory, args.timeout, allow_recovery=args.native_routes is None) as httpd:
             httpd.serve_forever()
     except KeyboardInterrupt:
         pass

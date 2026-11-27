@@ -182,6 +182,11 @@ HGGC workers with the vLLM multiprocess executor. All four workers reported
 their grants ready, and the HTTP response's eight token IDs matched a single-device
 baseline. [Four-vendor serving verification](docs/rankless-nccl.md#verify-four-vendor-tp4-over-http)
 
+The deployment ingress resolves the active native epoch. The engine validates
+the requested version before admission. Existing streams keep their upstream
+connection.
+[One HTTP endpoint for native groups](docs/rankless-nccl.md#route-native-groups-through-one-http-endpoint)
+
 Native C and Rust callers can bind a communicator directly to an execution
 group version and its device grants. Stable identities determine the default
 slot order. Each peer validates the full manifest during the socket handshake.
@@ -347,7 +352,7 @@ release the result after the matching completion has executed in the control pla
 | [Hosted P/D reconfiguration](specs/PlaitHostedPdReconfigure.tla) | A bridge preserves the incumbent rate. The projected gain pays for the transition. Commit checks the directory and declared release capability. |
 | [Hosted P/D recovery](specs/PlaitHostedPdRecovery.tla) | A spare can restore a failed slot without ingress traffic. Cutover preserves healthy epochs, checks readiness and directory revision, and leaves old grants subject to release proof. |
 | [Hosted pipeline rollout](specs/PlaitHostedPipeline.tla) | Both pipeline lanes deliver activations for the admitted epoch. The next version waits for all workers, and the old version retires after its requests drain. |
-| [Serving ingress](specs/PlaitServingIngress.tla) | One admission per ordinary forwarded request, monotonic route refresh, and output pinned to the admitted epoch while the old gate drains. |
+| [Serving ingress](specs/PlaitServingIngress.tla) | One admission per ordinary forwarded request, monotonic route refresh, version checks on native HTTP bindings, and output pinned to the admitted epoch. |
 | [Completion replay and KV resume](specs/PlaitCompletionReplay.tla) | Visible positions are preserved. Each KV resume sends the latest checkpoint and requires a matching acknowledgment and prefix before publishing a suffix. |
 | [Planned stream handoff](specs/PlaitPlannedStreamHandoff.tla) | A cut uses the last visible position and waits for a ready replacement. A seeded request requires a compatible sampler and a seed acknowledgment before the target publishes. |
 | [KV publication](specs/PlaitKvPublication.tla) | All heads must come from one write attempt before a page becomes readable. A consumer reads its requested head range, and a complete page stays immutable. |

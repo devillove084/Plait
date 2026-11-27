@@ -244,6 +244,45 @@ the single-device baseline. The old stream delivered all 48 tokens and the
 final `[DONE]` frame. The deployment layer uses the active group to route new
 requests and keeps an admitted stream on its original engine.
 
+#### Route native groups through one HTTP endpoint
+
+On each vLLM API host, add the Plait `scripts` directory to `PYTHONPATH` and
+pass `--middleware serving_native.NativeGroupHeaders` to `vllm serve`.
+The middleware reads the version from the unchanged
+`VLLM_PLAIT_TP_GROUP_CONFIG` launch descriptor. This entry point supports an
+API instance with one committed TP group. A request carrying a different
+version receives HTTP 409 before model dispatch. Matching responses carry
+the engine's group version, including `/health` and streaming responses.
+
+Give each epoch its own HTTP origin and write the map to a JSON file.
+
+```json
+{
+  "1": "http://192.0.2.21:8000",
+  "2": "http://192.0.2.22:8000"
+}
+```
+
+```sh
+python scripts/serve-aggregated.py --model "$MODEL_ALIAS" --group-id "$GROUP_ID" \
+  --native-routes "$ROUTES" --control-seed "$SEED" --control-listen "$LOCAL_LISTEN"
+```
+
+The ingress polls ordered `Observe` reads and opens each new request against
+the latest observed `Active` epoch. Replace the route file atomically when
+adding an endpoint. An observed active epoch without a usable origin pauses
+new admissions until its binding is available. The ingress refreshes every
+500 ms and expires its last route after eight seconds without a fresh read.
+Retain the old engine until ingress observers have cut over and its admitted
+requests have drained. Each admitted stream retains its upstream connection
+and version across a route change.
+
+The installed vLLM test used one client URL for a four-vendor TP4 and its
+CUDA and ROCm TP2 successor. With the new binding withheld, `/health`
+returned HTTP 503 after the ingress observed the switch. Publishing the
+binding let the same URL serve new requests from TP2. Its eight token IDs
+matched TP4, and the original TP4 stream returned all 24 tokens and `[DONE]`.
+
 #### Cancel a committed communicator
 
 Communicators created through the control-plane join keep their control

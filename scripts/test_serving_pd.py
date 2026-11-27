@@ -25,6 +25,7 @@ from serving_group import (
 )
 from serving_launch import GREEDY_KV_RESUME, SEEDED_KV_RESUME, host_command, resident_spec
 from serving_load import Load
+from serving_native import NativeGroupHeaders
 from serving_replay import RECOVERY_HEADER, RECOVERY_MODE, RESUME_KV_MODE, sse
 
 
@@ -273,7 +274,74 @@ class CalibrationTest(unittest.TestCase):
         self.assertEqual([point["passes"] for point in points], [True, False, True])
 
 
+class NativeMiddlewareTest(unittest.IsolatedAsyncioTestCase):
+    async def test_checks_version_before_admission_and_tags_a_stream(self):
+        invoked = []
+
+        async def app(scope, _receive, send):
+            invoked.append(scope)
+            await send({"type": "http.response.start", "status": 200,
+                        "headers": [(b"x-plait-admission", b"rejected")]})
+            await send({"type": "http.response.body", "body": b"first", "more_body": True})
+            await send({"type": "http.response.body", "body": b"second"})
+
+        with tempfile.TemporaryDirectory() as folder:
+            descriptor = Path(folder) / "binding.json"
+            descriptor.write_text(json.dumps({"tp_groups": [{"version": DECODE}]}))
+            with patch.dict(os.environ, {
+                "VLLM_USE_PLAIT": "1", "VLLM_PLAIT_TP_GROUP_CONFIG": str(descriptor),
+            }):
+                middleware = NativeGroupHeaders(app)
+
+        async def request(version):
+            messages = []
+
+            async def send(message):
+                messages.append(message)
+
+            scope = {"type": "http", "headers": [(VERSION_HEADER.lower().encode(), version.encode())]}
+            await middleware(scope, None, send)
+            return messages
+
+        rejected = await request(SPARE)
+        self.assertEqual(rejected[0]["status"], 409)
+        self.assertIn((b"x-plait-admission", b"rejected"), rejected[0]["headers"])
+        self.assertEqual(invoked, [])
+
+        accepted = await request(DECODE)
+        self.assertEqual(accepted[0]["status"], 200)
+        self.assertIn((b"x-plait-group-version", DECODE.encode()), accepted[0]["headers"])
+        self.assertNotIn((b"x-plait-admission", b"rejected"), accepted[0]["headers"])
+        self.assertEqual([message["body"] for message in accepted[1:]], [b"first", b"second"])
+        self.assertEqual(len(invoked), 1)
+
+
 class DirectoryTest(unittest.TestCase):
+    def test_native_route_waits_for_the_active_versions_binding(self):
+        group = bytes(16)
+
+        def view(epoch):
+            return {"result": {"Ok": {
+                "version": {"group": list(group), "epoch": epoch}, "phase": "Active",
+            }}}
+
+        control = Mock()
+        control.request.side_effect = [view(1), view(2), view(1), view(2)]
+        with tempfile.TemporaryDirectory() as folder:
+            config = Path(folder) / "routes.json"
+            config.write_text('{"1":"http://127.0.0.1:8001"}')
+            directory = INGRESS["NativeGroupDirectory"]("test", group, control, config)
+            directory.refresh()
+            self.assertEqual(directory.endpoint().epoch, 1)
+            directory.refresh()
+            self.assertIsNone(directory.endpoint())
+            directory.refresh()
+            self.assertIsNone(directory.endpoint())
+            config.write_text('{"2":"http://127.0.0.1:8002"}')
+            directory.refresh()
+            self.assertEqual(directory.endpoint().epoch, 2)
+            self.assertEqual(control.request.call_args.args[0]["request"], "observe")
+
     def test_aggregate_route_never_reopens_a_replaced_or_closed_epoch(self):
         group = bytes(16)
 

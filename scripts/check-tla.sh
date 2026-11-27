@@ -45,6 +45,7 @@ tlc -deadlock -config specs/PlaitHostedPdReconfigure.cfg specs/PlaitHostedPdReco
 tlc -deadlock -config specs/PlaitHostedPdRecovery.cfg specs/PlaitHostedPdRecovery.tla
 tlc -deadlock -config specs/PlaitHostedPipeline.cfg specs/PlaitHostedPipeline.tla
 tlc -deadlock -config specs/PlaitServingIngress.cfg specs/PlaitServingIngress.tla
+tlc -deadlock -config specs/PlaitNativeServingIngress.cfg specs/PlaitServingIngress.tla
 tlc -deadlock -config specs/PlaitCompletionReplay.cfg specs/PlaitCompletionReplay.tla
 tlc -deadlock -config specs/PlaitCompletionKvResume.cfg specs/PlaitCompletionReplay.tla
 tlc -deadlock -config specs/PlaitPlannedStreamHandoff.cfg specs/PlaitPlannedStreamHandoff.tla

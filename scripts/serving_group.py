@@ -49,8 +49,11 @@ class Rejected(ControlError):
 
 
 class Control:
-    def __init__(self, binary: str, peers: list[str], listen: str, *, seeds: tuple[str, ...] | list[str] = ()) -> None:
-        self.argv = [binary, "serving", "--listen", listen]
+    def __init__(
+        self, binary: str, peers: list[str], listen: str, *,
+        seeds: tuple[str, ...] | list[str] = (), command: str = "serving",
+    ) -> None:
+        self.argv = [binary, command, "--listen", listen]
         for peer in peers:
             self.argv.extend(("--peer", peer))
         for seed in seeds:
