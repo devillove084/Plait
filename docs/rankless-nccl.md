@@ -1387,7 +1387,8 @@ bindings, and communicator manifests. The manifests bind the measurements
 to the particular device grants and endpoint tickets. A restored profile
 must still be current and describe healthy, matching group versions.
 With a state path configured, a new profile is saved before it can trigger
-a switch. Supply a fresh incumbent profile in `modes` if the stored one
+a switch. An empty `modes` list lets a resumed ingress use the restored
+baseline. Supply a fresh incumbent profile in `modes` if the stored one
 expires.
 
 A functional deployment verified this sequence with a CUDA aggregate,
