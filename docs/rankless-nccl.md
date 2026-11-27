@@ -150,6 +150,33 @@ The caller supplies and invalidates measurements. Publish stable estimates
 at the control-plane rate required by the planner. Upgrade the voting nodes
 before enabling the measured-compute requests.
 
+##### Collect rates during vLLM TP startup
+
+With the matching vLLM fork and Plait wheel, add a `compute_calibration`
+object to a TP group in the `VLLM_PLAIT_TP_GROUP_CONFIG` descriptor.
+
+```json
+{
+  "compute_calibration": {"m": 64, "n": 1024, "k": 1024, "dtype": "float16"}
+}
+```
+
+Each worker runs a local `torch.mm` on its assigned device after the
+communicator warm-up. The timed batches include operator launch and device
+synchronization. They use preallocated tensors and run without peer
+communication. The rate counts two operations per scalar multiply-add and
+uses the median of seven samples. The fork derives the calibration ID from
+the benchmark version, data type, and shape. It logs the ID, applied
+revision, and rate for use in a `plan` request.
+
+The worker reads the revision before measuring and publishes against its
+exact grant. A concurrent update, closed group, or invalid fence prevents
+publication. The engine logs a skipped measurement and continues startup
+when the control request or benchmark fails. The latest applied reading
+remains available after device release while the same incarnation is
+registered. Collect separate rates when the workload's precision or GEMM
+shape changes. The startup benchmark supports FP16 and BF16 GEMM.
+
 #### Run resident link probes
 
 Add `--link-probe "$NODE_IP:0"` to `plait-node run` on each participating host.

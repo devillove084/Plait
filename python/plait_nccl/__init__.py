@@ -61,6 +61,21 @@ class CommHandle:
         """Report local peer communicator failure, including grant revocation."""
         return self._handle.peer_failed
 
+    def compute_rate_revision(self, host: str, seeds: list[str], calibration: str) -> int:
+        """Read the measurement revision for this communicator's device."""
+        address = f"[{host}]:0" if ":" in host else f"{host}:0"
+        return self._handle.compute_rate(address, seeds, calibration)
+
+    def publish_compute_rate(
+        self, host: str, seeds: list[str], calibration: str,
+        expected_revision: int, operations_per_second: int,
+    ) -> int:
+        """Publish a measurement under this communicator's device grant."""
+        address = f"[{host}]:0" if ":" in host else f"{host}:0"
+        return self._handle.compute_rate(
+            address, seeds, calibration, (expected_revision, operations_per_second),
+        )
+
     def all_reduce(self, send: int, recv: int, count: int, dtype: int, op: int) -> int:
         return self._handle.all_reduce(send, recv, count, dtype, op)
 

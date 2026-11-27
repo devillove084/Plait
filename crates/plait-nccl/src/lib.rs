@@ -2300,6 +2300,19 @@ impl CommHandle {
         Ok(Self { ptr })
     }
 
+    #[pyo3(signature = (address, seeds, calibration, update=None, timeout_ms=5000))]
+    fn compute_rate(
+        &self,
+        py: Python<'_>,
+        address: &str,
+        seeds: Vec<String>,
+        calibration: &str,
+        update: Option<(u64, u64)>,
+        timeout_ms: u32,
+    ) -> PyResult<u64> {
+        python_control::compute_rate(self, py, address, seeds, calibration, update, timeout_ms)
+    }
+
     #[getter]
     fn rank(&self) -> i32 {
         unsafe { (*self.ptr).rank as i32 }

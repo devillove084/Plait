@@ -162,6 +162,60 @@ async fn connect(
     Ok(Comm::rankless_from_peers(group, device, runtime))
 }
 
+#[cfg(feature = "python")]
+pub(super) async fn compute_rate_revision(
+    listen: SocketAddr,
+    seeds: Vec<SocketAddr>,
+    grant: WorkerGrant,
+    calibration: NodeId,
+    update: Option<(u64, std::num::NonZeroU64)>,
+) -> io::Result<u64> {
+    use plait_core::group::GroupOutcome;
+
+    let mut control = Rendezvous::new(listen, seeds).await?;
+    if let Some((expected_revision, operations_per_second)) = update {
+        let operation = GroupOperation {
+            id: OpId::new(NodeId::random(), 1),
+            action: GroupAction::PublishGrantedComputeRate {
+                grant,
+                calibration,
+                expected_revision,
+                operations_per_second,
+            },
+        };
+        let result = control
+            .call(|client, voter| {
+                let operation = operation.clone();
+                Box::pin(async move { client.apply_group(voter, &operation).await })
+            })
+            .await;
+        return match result {
+            Ok(GroupOutcome::ComputeRate(rate)) => Ok(rate.revision),
+            Err(error) => Err(io::Error::other(format!(
+                "compute rate rejected: {error:?}"
+            ))),
+            Ok(_) => Err(io::Error::other("unexpected compute rate receipt")),
+        };
+    }
+    let reply = control
+        .call(|client, voter| {
+            Box::pin(client.query_group(
+                voter,
+                GroupLookup::ComputeRate {
+                    device: grant.device,
+                    calibration,
+                },
+            ))
+        })
+        .await;
+    match reply {
+        GroupReply::ComputeRate(rate) => Ok(rate
+            .filter(|rate| rate.incarnation == grant.incarnation)
+            .map_or(0, |rate| rate.revision)),
+        _ => Err(io::Error::other("unexpected compute rate reply")),
+    }
+}
+
 fn control_runtime() -> io::Result<&'static Runtime> {
     static EXECUTOR: OnceLock<io::Result<Runtime>> = OnceLock::new();
     EXECUTOR

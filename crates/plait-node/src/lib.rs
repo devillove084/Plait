@@ -487,6 +487,10 @@ impl NodeState {
                             rates: runtime.compute_rates(calibration),
                         }
                     }
+                    GroupLookup::ComputeRate {
+                        device,
+                        calibration,
+                    } => GroupReply::ComputeRate(runtime.compute_rate(device, calibration)),
                 };
                 let _ = self
                     .transport

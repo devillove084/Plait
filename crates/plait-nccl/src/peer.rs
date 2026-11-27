@@ -174,6 +174,8 @@ struct GrantBinding {
     devices: Vec<DeviceId>,
     digest: [u8; 32],
     handshake_digest: [u8; 32],
+    #[cfg(feature = "python")]
+    local_grant: plait_core::group::WorkerGrant,
 }
 
 type WireLanes = [Option<TcpStream>; 2];
@@ -410,6 +412,12 @@ impl PeerGroup {
     pub(crate) fn manifest_digest(&self) -> Option<[u8; 32]> {
         let binding = self.binding.as_ref()?;
         (!self.is_failed()).then_some(binding.digest)
+    }
+
+    #[cfg(feature = "python")]
+    pub(crate) fn local_grant(&self) -> Option<plait_core::group::WorkerGrant> {
+        let binding = self.binding.as_ref()?;
+        (!self.is_failed()).then_some(binding.local_grant)
     }
 
     fn link(&self, slot: usize) -> &Link {

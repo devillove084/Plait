@@ -307,6 +307,12 @@ pub enum GroupAction {
         compared_active: bool,
         rates: Vec<ComputeRate>,
     },
+    PublishGrantedComputeRate {
+        grant: WorkerGrant,
+        calibration: NodeId,
+        expected_revision: u64,
+        operations_per_second: NonZeroU64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -372,7 +378,14 @@ pub enum GroupLookup {
     LinkProbes,
     GrantStatus(WorkerGrant),
     Standby(GroupId),
-    PlacementWithRates { group: GroupId, calibration: NodeId },
+    PlacementWithRates {
+        group: GroupId,
+        calibration: NodeId,
+    },
+    ComputeRate {
+        device: DeviceId,
+        calibration: NodeId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -387,6 +400,7 @@ pub enum GroupReply {
         inventory: PlacementInventory,
         rates: Vec<ComputeRate>,
     },
+    ComputeRate(Option<ComputeRate>),
 }
 
 /// A replica's applied view of an exact communicator grant.
@@ -433,6 +447,10 @@ impl GroupOperation {
             }
             GroupAction::AdvertiseWorker { profile, .. } => {
                 keys.insert(Key::Device(profile.id));
+            }
+            GroupAction::PublishGrantedComputeRate { grant, .. } => {
+                reads.insert(Key::ServingGroup(grant.version.group));
+                keys.insert(Key::Device(grant.device));
             }
             GroupAction::Prepare {
                 group, resources, ..

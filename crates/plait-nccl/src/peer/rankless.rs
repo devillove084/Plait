@@ -76,6 +76,8 @@ impl RanklessListener {
             devices,
             digest,
             handshake_digest,
+            #[cfg(feature = "python")]
+            local_grant: self.grant,
         };
         let endpoints = members.into_iter().map(|member| member.endpoint).collect();
         self.listener

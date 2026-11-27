@@ -131,6 +131,18 @@ impl ServingState {
             .collect()
     }
 
+    pub(crate) fn compute_rate(
+        &self,
+        device: DeviceId,
+        calibration: NodeId,
+    ) -> Option<ComputeRate> {
+        self.peer_groups
+            .rates
+            .get(&device)?
+            .get(&calibration)
+            .copied()
+    }
+
     pub(crate) fn placement_inventory(&self, group: GroupId) -> PlacementInventory {
         let history = self.peer_groups.history.get(&group);
         let latest = history
@@ -338,6 +350,39 @@ impl ServingState {
                 expected_revision,
                 operations_per_second,
             ),
+            GroupAction::PublishGrantedComputeRate {
+                grant,
+                calibration,
+                expected_revision,
+                operations_per_second,
+            } => {
+                let view = self
+                    .peer_groups
+                    .get(grant.version)
+                    .ok_or(GroupError::UnknownVersion(grant.version))?;
+                if !matches!(
+                    view.phase,
+                    GroupPhase::Preparing | GroupPhase::Ready | GroupPhase::Active
+                ) {
+                    return Err(GroupError::InvalidPhase(view.phase));
+                }
+                view.check_grant(grant)?;
+                if self
+                    .workers
+                    .get(&grant.device)
+                    .and_then(|worker| worker.grant)
+                    != Some(grant)
+                {
+                    return Err(GroupError::GrantMismatch);
+                }
+                self.publish_compute_rate(
+                    calibration,
+                    grant.device,
+                    grant.incarnation,
+                    expected_revision,
+                    Some(operations_per_second),
+                )
+            }
             GroupAction::PrepareWithRates {
                 group,
                 expected_epoch,
@@ -435,12 +480,8 @@ impl ServingState {
             if !devices.remove(&device) || rate.operations_per_second.is_none() {
                 return Err(GroupError::InvalidPlan);
             }
-            let current = self
-                .peer_groups
-                .rates
-                .get(&device)
-                .and_then(|entries| entries.get(&calibration));
-            if current != Some(rate) {
+            let current = self.compute_rate(device, calibration);
+            if current != Some(*rate) {
                 return Err(GroupError::StaleComputeRate {
                     device,
                     revision: current.map_or(0, |entry| entry.revision),
@@ -1258,7 +1299,24 @@ mod tests {
             state.peer_group_transition(&action(vec![rates[1]])),
             Err(GroupError::InvalidPlan)
         );
-        let faster = update(&mut state, a, 1, 300);
+        let publish = |grant, expected_revision| GroupAction::PublishGrantedComputeRate {
+            grant,
+            calibration,
+            expected_revision,
+            operations_per_second: NonZeroU64::new(300).unwrap(),
+        };
+        let wrong_fence = WorkerGrant {
+            fence: grant.fence + 1,
+            ..grant
+        };
+        assert_eq!(
+            state.peer_group_transition(&publish(wrong_fence, 1)),
+            Err(GroupError::GrantMismatch)
+        );
+        let Ok(GroupOutcome::ComputeRate(faster)) = state.peer_group_transition(&publish(grant, 1))
+        else {
+            panic!("expected a measurement from the active grant");
+        };
         let stale = GroupOperation {
             id: OpId::new(host, 1),
             action: action(rates.to_vec()),
@@ -1308,6 +1366,14 @@ mod tests {
             })
         ));
         assert_eq!(state.peer_grant_status(grant), GrantStatus::Held);
+        state
+            .quiesce_peer_group(active, GroupPhase::Draining)
+            .unwrap();
+        assert_eq!(
+            state.peer_group_transition(&publish(grant, faster.revision)),
+            Err(GroupError::InvalidPhase(GroupPhase::Draining))
+        );
+        assert_eq!(state.compute_rate(a, calibration), Some(faster));
     }
 
     #[test]

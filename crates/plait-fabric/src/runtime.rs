@@ -149,6 +149,10 @@ impl Runtime {
         self.serving.compute_rates(calibration)
     }
 
+    pub fn compute_rate(&self, device: DeviceId, calibration: NodeId) -> Option<ComputeRate> {
+        self.serving.compute_rate(device, calibration)
+    }
+
     pub fn link_probes(&self) -> Vec<plait_core::link::ProbeRegistration> {
         self.serving.link_probes()
     }
