@@ -740,20 +740,18 @@ impl EndpointContext<'_> {
         ranks: &BTreeMap<NodeId, u64>,
         pipeline: Option<(&PipelineProfile, NodeId)>,
     ) -> Option<Endpoint> {
+        let evidence = self.evidence.for_role(role);
         let (mut traffic, weights) = if let Some((profile, api_host)) = pipeline {
             let lanes = profile.lanes(api_host, ranks)?;
             capacity = lower_capacity(capacity, profile.capacity(&lanes));
             (
-                profile.traffic(&lanes, self.evidence)?,
+                profile.traffic(&lanes, evidence)?,
                 profile.kv_weights(&lanes),
             )
         } else {
             let tensor_parallel = u32::try_from(ranks.values().sum::<u64>()).ok()?;
             (
-                self.evidence
-                    .estimate_tp(tensor_parallel, ranks)
-                    .ok()?
-                    .traffic,
+                evidence.estimate_tp(tensor_parallel, ranks).ok()?.traffic,
                 ranks.clone(),
             )
         };
@@ -1289,6 +1287,7 @@ mod tests {
             max_sample_age_ms: 10_000,
             tp_rtt_budget: None,
             tp_profiles: BTreeMap::new(),
+            pd_tp_profiles: Default::default(),
         };
         let links = BTreeMap::from([
             ((store, retiring), sample(retiring, 100_000)),
@@ -1422,6 +1421,7 @@ mod tests {
             max_sample_age_ms: 50,
             tp_rtt_budget: None,
             tp_profiles: BTreeMap::new(),
+            pd_tp_profiles: Default::default(),
         };
         let links = BTreeMap::from([
             ((store, slow), sample(slow, 100)),
@@ -1461,12 +1461,15 @@ mod tests {
             max_sample_age_ms: 25,
             tp_rtt_budget: None,
             tp_profiles: BTreeMap::new(),
+            pd_tp_profiles: Default::default(),
         };
         let links = BTreeMap::from([
             ((a, b), sample(b, 1000)),
             ((b, a), sample(a, 1000)),
             ((a, store), sample(store, 1000)),
             ((b, store), sample(store, 1000)),
+            ((store, a), sample(a, 1000)),
+            ((store, b), sample(b, 1000)),
         ]);
         let evidence = LinkEvidence::new(&policy, 1020, &links);
         let context = EndpointContext {
@@ -1495,16 +1498,25 @@ mod tests {
         assert_eq!(shared.rate_limit(), 2.5);
 
         let constrained_policy = HostedLinkPolicy {
-            tp_profiles: BTreeMap::from([(
-                2,
-                crate::serving::HostedTpLinkProfile {
-                    bytes_per_rank_pair: 100,
-                    tp_rtt_budget: Some(crate::serving::HostedTpRttBudget {
-                        serial_rounds: 57,
-                        max_wait_ns: 100,
-                    }),
-                },
-            )]),
+            pd_tp_profiles: crate::serving::HostedPdTpProfiles {
+                prefill: BTreeMap::from([(
+                    2,
+                    crate::serving::HostedTpLinkProfile {
+                        bytes_per_rank_pair: 100,
+                        tp_rtt_budget: Some(crate::serving::HostedTpRttBudget {
+                            serial_rounds: 57,
+                            max_wait_ns: 100,
+                        }),
+                    },
+                )]),
+                decode: BTreeMap::from([(
+                    2,
+                    crate::serving::HostedTpLinkProfile {
+                        bytes_per_rank_pair: 600,
+                        tp_rtt_budget: None,
+                    },
+                )]),
+            },
             ..policy.clone()
         };
         let constrained = EndpointContext {
@@ -1523,6 +1535,14 @@ mod tests {
                 .traffic
                 .rate_limit(),
             5.0,
+        );
+        assert_eq!(
+            constrained
+                .endpoint(version, ServingRole::Decode, capacity, &ranks, None)
+                .unwrap()
+                .traffic
+                .rate_limit(),
+            1000.0 / 700.0,
         );
     }
 }

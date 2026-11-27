@@ -628,6 +628,7 @@ mod tests {
             bytes_per_rank_pair: Some(100),
             tp_rtt_budget: None,
             tp_profiles: BTreeMap::new(),
+            pd_tp_profiles: Default::default(),
         };
         let links = BTreeMap::from([((p, a), sample(a, 10_000)), ((a, d), sample(d, 10_000))]);
         let plan = |snap: &HostedServingPlanning,
@@ -744,6 +745,7 @@ mod tests {
             bytes_per_rank_pair: Some(100),
             tp_rtt_budget: None,
             tp_profiles: BTreeMap::new(),
+            pd_tp_profiles: Default::default(),
         };
         let context = EndpointContext {
             evidence: LinkEvidence::new(&policy, forecast.now_ms, &links),
@@ -807,6 +809,7 @@ mod tests {
             bytes_per_rank_pair: Some(100),
             tp_rtt_budget: None,
             tp_profiles: BTreeMap::new(),
+            pd_tp_profiles: Default::default(),
         };
         let evidence = LinkEvidence::new(&policy, 1000, &link);
         let load = forecast(50.0);
@@ -860,6 +863,7 @@ mod tests {
             bytes_per_rank_pair: Some(100),
             tp_rtt_budget: None,
             tp_profiles: BTreeMap::new(),
+            pd_tp_profiles: Default::default(),
         };
         let links = BTreeMap::from([((p, a), sample(a, 10_000)), ((a, d), sample(d, 10_000))]);
         let Some(ServingAction::PrepareHostedServing { plan, .. }) = plan_hosted_serving(
@@ -918,6 +922,7 @@ mod tests {
             bytes_per_rank_pair: Some(100),
             tp_rtt_budget: None,
             tp_profiles: BTreeMap::new(),
+            pd_tp_profiles: Default::default(),
         };
         let links = BTreeMap::new();
         assert!(

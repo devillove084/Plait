@@ -118,6 +118,8 @@ pub(super) fn generate_layouts(
     target: PoolTarget<'_>,
 ) -> Result<Vec<(ServingCandidate, HostedRecipe)>, &'static str> {
     evidence.policy.validate()?;
+    let role = target.role();
+    let evidence = evidence.for_role(role);
     let allow_local = !matches!(target, PoolTarget::LegacyAggregate);
     pool.validate(allow_local)?;
     let history = resources
@@ -150,7 +152,7 @@ pub(super) fn generate_layouts(
                 prefix_caching: pool.prefix_caching,
             };
             let mut plan = GroupPlan {
-                role: target.role(),
+                role,
                 model: checkpoint.to_owned(),
                 tensor_parallel: size.tensor_parallel,
                 pipeline_parallel: 1,
@@ -213,7 +215,7 @@ pub(super) fn generate_layouts(
                 prefix_caching: pool.prefix_caching,
             };
             let mut plan = GroupPlan {
-                role: target.role(),
+                role,
                 model: checkpoint.to_owned(),
                 tensor_parallel: pipeline.tensor_parallel,
                 pipeline_parallel: pipeline.stages.len() as u32,
@@ -674,6 +676,7 @@ mod tests {
             max_sample_age_ms: 20,
             tp_rtt_budget: None,
             tp_profiles: BTreeMap::new(),
+            pd_tp_profiles: Default::default(),
         };
         let mut links = BTreeMap::new();
         for from in [a, b, c] {
@@ -737,6 +740,7 @@ mod tests {
                     tp_rtt_budget: budget.tp_rtt_budget,
                 },
             )]),
+            pd_tp_profiles: Default::default(),
         };
         assert_eq!(
             generate_hosted_candidates(

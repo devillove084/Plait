@@ -1724,6 +1724,41 @@ a port consume the same budget. Capacity and startup estimates are
 supplied per role and TP size. Re-run the command with refreshed inputs
 to make another planning decision.
 
+When the roles have different communication patterns at the same TP
+width, set `link_policy.pd_tp_profiles`. Each role maps decimal TP widths
+to a byte estimate for one request and an optional RTT window for that
+role. For example, the prefill RTT window can cover the prompt pass and
+the decode RTT window can cover one generation step.
+
+```json
+{
+  "max_sample_age_ms": 5000,
+  "pd_tp_profiles": {
+    "prefill": {
+      "2": {
+        "bytes_per_rank_pair": 4194304,
+        "tp_rtt_budget": {"serial_rounds": 64, "max_wait_ns": 500000000}
+      }
+    },
+    "decode": {
+      "2": {
+        "bytes_per_rank_pair": 1048576,
+        "tp_rtt_budget": {"serial_rounds": 32, "max_wait_ns": 100000000}
+      }
+    }
+  }
+}
+```
+
+The planner looks for the candidate's role and target TP width first, then
+the shared `tp_profiles` entry for that width, then the top-level default.
+The first match supplies the entire byte and RTT profile. Cross-host
+placements need a matching entry or a default. Pipeline stages use their
+own TP width under the enclosing role. The incumbent's port accounting
+also uses the role profile, and the RTT admission check applies during
+replacement search. With a strict policy, include the profiles needed to
+account for both the incumbent and the proposed layouts.
+
 The response's `selection` reports the baseline and any preferred
 layout. A selected layout is submitted through managed P/D staging.
 The voters recheck route and resource versions when applying it. Retry

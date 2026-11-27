@@ -393,6 +393,7 @@ mod tests {
             max_sample_age_ms: 10,
             tp_rtt_budget: None,
             tp_profiles: BTreeMap::new(),
+            pd_tp_profiles: Default::default(),
         };
         let evidence = LinkEvidence::new(&policy, 10, &links);
         let layouts = search_pipeline(&profile, &hosts, evidence);
@@ -430,6 +431,7 @@ mod tests {
             max_sample_age_ms: 10,
             tp_rtt_budget: None,
             tp_profiles: BTreeMap::new(),
+            pd_tp_profiles: Default::default(),
         };
         assert!(
             profile
@@ -465,6 +467,7 @@ mod tests {
                     tp_rtt_budget: None,
                 },
             )]),
+            pd_tp_profiles: Default::default(),
         };
         let traffic = pipeline
             .traffic(&[a, b], LinkEvidence::new(&policy, 10, &links))

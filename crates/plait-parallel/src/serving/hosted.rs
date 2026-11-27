@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use plait_core::NodeId;
-use plait_core::serving::{GroupPlan, HostedLinkSample};
+use plait_core::serving::{GroupPlan, HostedLinkSample, ServingRole};
 use serde::{Deserialize, Deserializer, Serialize};
 
 mod pd;
@@ -28,6 +28,31 @@ pub struct HostedLinkPolicy {
         deserialize_with = "deserialize_tp_profiles"
     )]
     pub tp_profiles: BTreeMap<u32, HostedTpLinkProfile>,
+    #[serde(default, skip_serializing_if = "HostedPdTpProfiles::is_empty")]
+    pub pd_tp_profiles: HostedPdTpProfiles,
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostedPdTpProfiles {
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "deserialize_tp_profiles"
+    )]
+    pub prefill: BTreeMap<u32, HostedTpLinkProfile>,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "deserialize_tp_profiles"
+    )]
+    pub decode: BTreeMap<u32, HostedTpLinkProfile>,
+}
+
+impl HostedPdTpProfiles {
+    fn is_empty(&self) -> bool {
+        self.prefill.is_empty() && self.decode.is_empty()
+    }
 }
 
 fn deserialize_tp_profiles<'de, D>(
@@ -99,7 +124,9 @@ pub fn limit_hosted_links(
     for device in plan.workers.keys() {
         *ranks.entry(device.node).or_default() += 1;
     }
-    Ok(LinkEvidence::new(policy, now_ms, links).limit_tp(plan.tensor_parallel, &ranks))
+    Ok(LinkEvidence::new(policy, now_ms, links)
+        .for_role(plan.role)
+        .limit_tp(plan.tensor_parallel, &ranks))
 }
 
 impl HostedLinkPolicy {
@@ -109,10 +136,17 @@ impl HostedLinkPolicy {
         }
         if let Some(default) = self.default_profile() {
             default.validate()?;
-        } else if self.tp_rtt_budget.is_some() || self.tp_profiles.is_empty() {
+        } else if self.tp_rtt_budget.is_some()
+            || (self.tp_profiles.is_empty() && self.pd_tp_profiles.is_empty())
+        {
             return Err("hosted link policy requires default traffic or per-TP profiles");
         }
-        for (&width, profile) in &self.tp_profiles {
+        for (&width, profile) in self
+            .tp_profiles
+            .iter()
+            .chain(&self.pd_tp_profiles.prefill)
+            .chain(&self.pd_tp_profiles.decode)
+        {
             if width == 0 {
                 return Err("hosted TP link profile requires a positive TP width");
             }
@@ -129,9 +163,14 @@ impl HostedLinkPolicy {
             })
     }
 
-    fn profile(&self, tensor_parallel: u32) -> Option<HostedTpLinkProfile> {
-        self.tp_profiles
-            .get(&tensor_parallel)
+    fn profile(&self, role: ServingRole, tensor_parallel: u32) -> Option<HostedTpLinkProfile> {
+        let role_profile = match role {
+            ServingRole::Prefill => self.pd_tp_profiles.prefill.get(&tensor_parallel),
+            ServingRole::Decode => self.pd_tp_profiles.decode.get(&tensor_parallel),
+            ServingRole::Aggregated => None,
+        };
+        role_profile
+            .or_else(|| self.tp_profiles.get(&tensor_parallel))
             .copied()
             .or_else(|| self.default_profile())
     }
@@ -164,6 +203,7 @@ struct LinkEvidence<'a> {
     now_ms: u64,
     links: &'a BTreeMap<(NodeId, NodeId), HostedLinkSample>,
     enforce_tp_wait: bool,
+    role: ServingRole,
 }
 
 struct TpEstimate {
@@ -182,7 +222,12 @@ impl<'a> LinkEvidence<'a> {
             now_ms,
             links,
             enforce_tp_wait: true,
+            role: ServingRole::Aggregated,
         }
+    }
+
+    fn for_role(self, role: ServingRole) -> Self {
+        Self { role, ..self }
     }
 
     fn without_tp_wait(self) -> Self {
@@ -220,7 +265,7 @@ impl<'a> LinkEvidence<'a> {
         }
         let profile = self
             .policy
-            .profile(tensor_parallel)
+            .profile(self.role, tensor_parallel)
             .ok_or(HostedLinkLimit::MissingTpProfile { tensor_parallel })?;
         let tp_rtt_budget = profile.tp_rtt_budget.filter(|_| self.enforce_tp_wait);
         let mut peak_rtt_ns = 0;
@@ -431,6 +476,7 @@ mod tests {
             max_sample_age_ms: 50,
             tp_rtt_budget: None,
             tp_profiles: BTreeMap::new(),
+            pd_tp_profiles: Default::default(),
         };
         assert_eq!(
             limit_hosted_links(&plan, &policy, 1049, &links).unwrap(),
@@ -470,6 +516,7 @@ mod tests {
                 max_wait_ns: 27,
             }),
             tp_profiles: BTreeMap::new(),
+            pd_tp_profiles: Default::default(),
         };
         assert_eq!(
             LinkEvidence::new(&policy, 11, &links).limit_tp(6, &ranks),
@@ -535,6 +582,7 @@ mod tests {
                     tp_rtt_budget: None,
                 },
             )]),
+            pd_tp_profiles: Default::default(),
         };
         let evidence = LinkEvidence::new(&policy, 10, &links);
         assert_eq!(
@@ -564,6 +612,53 @@ mod tests {
         assert_eq!(
             evidence.limit_tp(4, &BTreeMap::from([(a, 4)])),
             HostedLinkLimit::Local
+        );
+    }
+
+    #[test]
+    fn a_missing_role_profile_uses_the_shared_width_before_the_default() {
+        let prefill = HostedTpLinkProfile {
+            bytes_per_rank_pair: 12,
+            tp_rtt_budget: None,
+        };
+        let mut policy = HostedLinkPolicy {
+            bytes_per_rank_pair: None,
+            max_sample_age_ms: 10,
+            tp_rtt_budget: None,
+            tp_profiles: BTreeMap::new(),
+            pd_tp_profiles: HostedPdTpProfiles {
+                prefill: BTreeMap::from([(2, prefill)]),
+                ..HostedPdTpProfiles::default()
+            },
+        };
+        assert!(policy.validate().is_ok());
+        assert!(policy.profile(ServingRole::Decode, 2).is_none());
+        let shared = HostedTpLinkProfile {
+            bytes_per_rank_pair: 5,
+            ..prefill
+        };
+        policy.tp_profiles.insert(2, shared);
+        policy.bytes_per_rank_pair = Some(3);
+        assert_eq!(
+            policy
+                .profile(ServingRole::Prefill, 2)
+                .unwrap()
+                .bytes_per_rank_pair,
+            12
+        );
+        assert_eq!(
+            policy
+                .profile(ServingRole::Decode, 2)
+                .unwrap()
+                .bytes_per_rank_pair,
+            5
+        );
+        assert_eq!(
+            policy
+                .profile(ServingRole::Decode, 4)
+                .unwrap()
+                .bytes_per_rank_pair,
+            3
         );
     }
 }
