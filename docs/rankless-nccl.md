@@ -289,6 +289,17 @@ node rank 0 and append `--headless` on the other hosts. The small-model test set
 `--kv-cache-memory-bytes 268435456` on each worker. It selected `TRITON_ATTN`
 on CUDA, ROCm, and HGGC and used the Ascend plugin's attention backend on CANN.
 
+On a PPU host using the vendor Triton runtime, make the SDK's `ppu-smi`
+available to the vLLM worker before launch. Select the native compiler with
+`TRITON_DEFAULT_BACKEND=ppu`. The vLLM worker still uses the vendor
+PyTorch CUDA-compatible device interface. The Triton compiler targets
+`ppu` for its attention kernels.
+
+```sh
+export PATH="$PPU_SDK/ppu-smi/bin:$PPU_SDK/bin:$PATH"
+export TRITON_DEFAULT_BACKEND=ppu
+```
+
 Confirm one ready grant per worker and an HTTP 200 from `/health` on the
 API host. Apply `Activate` to the native group version, then send the same
 greedy completion request to the TP4 endpoint and a single-device baseline.
@@ -362,6 +373,14 @@ down its collective and point-to-point sockets. Pending socket operations
 return errors, and subsequent calls fail locally. Python callers can read
 `CommHandle.peer_failed`. Other group versions retain their connections.
 A missing reply or an unknown grant view prompts another query.
+
+If vLLM raises during a model or sampler step, its worker closes the
+affected Plait TP communicator and preserves the exception in the worker
+log. Peers blocked in that group wake with a transport error. The worker
+rejects subsequent model RPCs on the closed handle before execution. With
+the matching Plait wheel, the watcher reports the execution failure under
+the worker's exact grant. An eligible standby can then take over through the
+same ordered revocation path.
 
 Use `Drain` to stop admitting work at the deployment layer while admitted
 requests finish. `Draining` preserves communication. `Release` still

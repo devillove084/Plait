@@ -2332,6 +2332,12 @@ impl CommHandle {
         unsafe { &*self.ptr }.cancel_peers();
     }
 
+    fn report_execution_failure(&self) {
+        if let Transport::Peers(group) = &unsafe { &*self.ptr }.transport {
+            group.fail(GroupFault::Device);
+        }
+    }
+
     fn all_reduce(
         &self,
         py: Python<'_>,

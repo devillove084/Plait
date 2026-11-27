@@ -61,6 +61,11 @@ class CommHandle:
         """Report local peer communicator failure, including grant revocation."""
         return self._handle.peer_failed
 
+    def report_execution_failure(self) -> None:
+        """Close the peer group and report a failed execution under its grant."""
+        report = getattr(self._handle, "report_execution_failure", self._handle.abort)
+        report()
+
     def compute_rate_revision(self, host: str, seeds: list[str], calibration: str) -> int:
         """Read the measurement revision for this communicator's device."""
         address = f"[{host}]:0" if ":" in host else f"{host}:0"
