@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::peer_plan::Membership;
+use super::peer_plan::{BudgetEpoch, Membership};
 use super::{Key, Writer};
 
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
@@ -73,6 +73,10 @@ pub(super) struct Snapshot<'a> {
     peers: BTreeMap<IpAddr, PeerSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     peer_budget_plan: Option<&'a Membership>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peer_budget_epoch: Option<&'a BudgetEpoch>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    peer_budget_admission_closed: bool,
     #[serde(flatten)]
     counters: &'a Counters,
 }
@@ -155,6 +159,8 @@ struct State {
     global: Bucket,
     peers: BTreeMap<IpAddr, PeerBuckets>,
     plan: Option<Membership>,
+    epoch: Option<BudgetEpoch>,
+    admission_closed: bool,
     started: Instant,
     updated: Instant,
     reads: HashMap<(Key, Writer), ReadLease>,
@@ -225,6 +231,27 @@ impl State {
     }
 }
 
+fn buckets(
+    limit: Option<Limit>,
+    peers: BTreeMap<IpAddr, PeerLimit>,
+    cold: bool,
+) -> (Bucket, BTreeMap<IpAddr, PeerBuckets>) {
+    let mut global = Bucket::new(limit);
+    let mut peers: BTreeMap<_, _> = peers
+        .into_iter()
+        .map(|(ip, limit)| (ip, PeerBuckets::new(limit)))
+        .collect();
+    if cold {
+        // Restart and plan activation must earn a burst from fresh credit.
+        global.credits = 0;
+        for peer in peers.values_mut() {
+            peer.read.credits = 0;
+            peer.write.credits = 0;
+        }
+    }
+    (global, peers)
+}
+
 impl Checkpoints {
     pub(super) fn new(
         limit: Option<Limit>,
@@ -232,28 +259,56 @@ impl Checkpoints {
         now: Instant,
         plan: Option<Membership>,
     ) -> Self {
-        let mut global = Bucket::new(limit);
-        let mut peers: BTreeMap<_, _> = peers
-            .into_iter()
-            .map(|(ip, limit)| (ip, PeerBuckets::new(limit)))
-            .collect();
-        if plan.is_some() {
-            // Restarting a store may not mint another burst of a shared link.
-            global.credits = 0;
-            for peer in peers.values_mut() {
-                peer.read.credits = 0;
-                peer.write.credits = 0;
-            }
-        }
+        let (global, peers) = buckets(limit, peers, plan.is_some());
         Self(Mutex::new(State {
             global,
             peers,
             plan,
+            epoch: None,
+            admission_closed: false,
             started: now,
             updated: now,
             reads: HashMap::new(),
             counters: Counters::default(),
         }))
+    }
+
+    pub(super) fn set_epoch(&self, epoch: BudgetEpoch) {
+        let mut state = self.0.lock().expect("checkpoint budget");
+        state.admission_closed = epoch.target_plan_id.is_some();
+        state.epoch = Some(epoch);
+    }
+
+    pub(super) fn close_admission(&self) {
+        self.0.lock().expect("checkpoint budget").admission_closed = true;
+    }
+
+    pub(super) fn mark_epoch_uncertain(&self) {
+        let mut state = self.0.lock().expect("checkpoint budget");
+        state.admission_closed = true;
+        state.epoch = None;
+    }
+
+    pub(super) fn drained(&self, now: Instant) -> bool {
+        let mut state = self.0.lock().expect("checkpoint budget");
+        state.refresh(now);
+        state.admission_closed && state.global.pending == 0
+    }
+
+    pub(super) fn install_plan(
+        &self,
+        plan: Membership,
+        peers: BTreeMap<IpAddr, PeerLimit>,
+        epoch: BudgetEpoch,
+        now: Instant,
+    ) {
+        let mut state = self.0.lock().expect("checkpoint budget");
+        assert!(state.admission_closed && state.global.pending == 0 && state.reads.is_empty());
+        (state.global, state.peers) = buckets(state.global.limit, peers, true);
+        state.updated = now.max(state.updated);
+        state.plan = Some(plan);
+        state.epoch = Some(epoch);
+        state.admission_closed = false;
     }
 
     pub(super) fn reserve_read(
@@ -267,7 +322,8 @@ impl Checkpoints {
         let mut state = self.0.lock().expect("checkpoint budget");
         state.refresh(now);
         let id = (key, writer);
-        if state.reads.len() >= MAX_LEASES
+        if state.admission_closed
+            || state.reads.len() >= MAX_LEASES
             || state.reads.contains_key(&id)
             || peers.as_ref().is_some_and(|peers| {
                 peers
@@ -346,7 +402,8 @@ impl Checkpoints {
     pub(super) fn write(&self, peer: IpAddr, bytes: u64, now: Instant) -> Option<Transfer<'_>> {
         let mut state = self.0.lock().expect("checkpoint budget");
         state.refresh(now);
-        if !state.global.fits(bytes)
+        if state.admission_closed
+            || !state.global.fits(bytes)
             || (state.peers_are_restricted()
                 && !state
                     .peers
@@ -406,6 +463,8 @@ impl Checkpoints {
                 })
                 .collect(),
             peer_budget_plan: state.plan.as_ref(),
+            peer_budget_epoch: state.epoch.as_ref(),
+            peer_budget_admission_closed: state.admission_closed,
             counters: &state.counters,
         })
         .expect("serializable checkpoint metrics")

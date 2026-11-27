@@ -916,10 +916,45 @@ With all stores listening, run
 `plait-node kv-store --audit-checkpoint-peer-budget-plan PATH`. It
 verifies the installed plan ID and actual read and write shares at every
 endpoint. A successful audit prints the common ID and member list.
-The budget holds while the configured endpoints run their assigned shares
-under the common plan. Complete the retirement of an old allocation before
-bringing a different allocation into use. The audit observes the running
-configuration. Shares are fixed for the lifetime of each store process.
+With static configuration, retire the old allocation before starting stores
+with a different plan.
+
+#### Replace peer shares online
+
+Start each store with `--checkpoint-peer-budget-plan OLD.json` and
+`--checkpoint-budget-control DIR` to enable online changes. Use a durable,
+private directory per endpoint. The first launch installs generation 0.
+Later launches recover the installed plan and any pending change from the
+same directory. The local Unix socket accepts changes from the store owner.
+Activation reads peer status from the plan's TCP endpoints on the trusted
+store network. Keep the same endpoints throughout a change.
+
+Run the following on each store host, with `0` replaced by the currently
+installed generation.
+
+```shell
+plait-node kv-store --prepare-checkpoint-peer-budget-plan DIR 0 OLD.json NEW.json
+plait-node kv-store --activate-checkpoint-peer-budget-plan DIR 0 OLD.json NEW.json
+```
+
+1. Prepare all members. Each store closes new optional reservations and
+   persists the target. Already granted reads and writes can finish. The
+   normal P/D prompt handoff and the stored KV stay available.
+2. Use `plait-node kv-store --stats ENDPOINT` to see the target in
+   `peer_budget_epoch.target_plan_id` and outstanding work in `pending_bytes`.
+   Each activation checks every old member. A member must report zero pending
+   bytes for the same target or show that it already activated that successor.
+   Retry if a peer is unavailable or still draining.
+3. Audit `NEW.json` after activation. The result includes the common
+   `generation`. The new buckets start empty and refill at the new rates.
+   Use the generation to interpret per-peer counters, which reset when
+   a new plan is installed. Store-level counters continue across changes.
+
+A prepare can revise a draining target. If any member has already activated,
+prepare the remaining members for that same successor. A retry for the
+installed successor returns its epoch. A write failure closes optional
+admission and withdraws the local proof. Repair the disk issue and restart
+with the same control directory to recover the last durable state.
 
 ## Execute a collective
 

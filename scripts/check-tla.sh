@@ -33,6 +33,8 @@ tlc -deadlock -config specs/PlaitHostedCheckpointBudget.cfg specs/PlaitHostedChe
 tlc -deadlock -config specs/PlaitCheckpointAdmission.cfg specs/PlaitCheckpointAdmission.tla
 tlc -deadlock -config specs/PlaitCheckpointPeers.cfg specs/PlaitCheckpointPeers.tla
 tlc -deadlock -config specs/PlaitCheckpointPeerPlan.cfg specs/PlaitCheckpointPeerPlan.tla
+tlc -deadlock -config specs/PlaitCheckpointBudgetSwitch.cfg specs/PlaitCheckpointBudgetSwitch.tla
+tlc -deadlock -config specs/PlaitCheckpointBudgetSwitchThree.cfg specs/PlaitCheckpointBudgetSwitch.tla
 tlc -deadlock -config specs/PlaitHostedModeSelection.cfg specs/PlaitHostedModeSelection.tla
 tlc -deadlock -config specs/PlaitExecutionMaintenance.cfg specs/PlaitExecutionMaintenance.tla
 tlc -deadlock -config specs/PlaitHostedPdBudget.cfg specs/PlaitHostedPdBudget.tla

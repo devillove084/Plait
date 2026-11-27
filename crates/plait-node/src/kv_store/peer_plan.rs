@@ -13,25 +13,25 @@ use super::checkpoints::{Limit, MAX_PEERS, PeerLimit};
 use super::{DEADLINE, read_stats, unicast_peer};
 
 const MAX_STORES: usize = 128;
-const MAX_PLAN_BYTES: u64 = 8 << 20;
+pub(super) const MAX_PLAN_BYTES: u64 = 8 << 20;
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Peer {
     address: IpAddr,
     limit: PeerLimit,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Store {
     endpoint: SocketAddr,
     peers: Vec<Peer>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Document {
+pub(super) struct Document {
     peers: Vec<Peer>,
     stores: Vec<Store>,
 }
@@ -43,6 +43,7 @@ struct Allocation {
 }
 
 pub(super) struct PeerPlan {
+    document: Document,
     allocation: Allocation,
     id: String,
 }
@@ -53,11 +54,18 @@ pub(super) struct Membership {
     endpoint: SocketAddr,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(super) struct BudgetEpoch {
+    pub(super) generation: u64,
+    pub(super) previous_plan_id: Option<String>,
+    pub(super) target_plan_id: Option<String>,
+}
+
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
-fn canonical_endpoint(endpoint: SocketAddr) -> SocketAddr {
+pub(super) fn canonical_endpoint(endpoint: SocketAddr) -> SocketAddr {
     match endpoint {
         SocketAddr::V6(value) if value.ip().to_ipv4_mapped().is_some() => {
             SocketAddr::new(endpoint.ip().to_canonical(), endpoint.port())
@@ -66,12 +74,12 @@ fn canonical_endpoint(endpoint: SocketAddr) -> SocketAddr {
     }
 }
 
-fn peer_map(entries: Vec<Peer>) -> io::Result<BTreeMap<IpAddr, PeerLimit>> {
+fn peer_map(entries: &[Peer]) -> io::Result<BTreeMap<IpAddr, PeerLimit>> {
     if entries.len() > MAX_PEERS {
         return Err(invalid("invalid number of peers in checkpoint plan"));
     }
     let mut peers = BTreeMap::new();
-    for Peer { address, limit } in entries {
+    for &Peer { address, limit } in entries {
         let ip = address.to_canonical();
         if !unicast_peer(ip) || !limit.read.valid_share() || !limit.write.valid_share() {
             return Err(invalid(format!("invalid checkpoint budget for peer {ip}")));
@@ -107,8 +115,8 @@ impl PeerPlan {
         Self::validate(serde_json::from_slice(&body)?)
     }
 
-    fn validate(document: Document) -> io::Result<Self> {
-        let peers = peer_map(document.peers)?;
+    pub(super) fn validate(document: Document) -> io::Result<Self> {
+        let peers = peer_map(&document.peers)?;
         if peers.is_empty() {
             return Err(invalid("checkpoint plan needs at least one peer budget"));
         }
@@ -117,8 +125,8 @@ impl PeerPlan {
         }
         let mut remaining = peers.clone();
         let mut stores = BTreeMap::new();
-        for Store { endpoint, peers } in document.stores {
-            let endpoint = canonical_endpoint(endpoint);
+        for Store { endpoint, peers } in &document.stores {
+            let endpoint = canonical_endpoint(*endpoint);
             if endpoint.port() == 0 || !unicast_peer(endpoint.ip()) {
                 return Err(invalid(format!(
                     "invalid checkpoint store endpoint {endpoint}"
@@ -152,7 +160,36 @@ impl PeerPlan {
         hash.update(b"plait-checkpoint-peer-plan-v1");
         hash.update(serde_json::to_vec(&allocation)?);
         let id = format!("{:x}", hash.finalize());
-        Ok(Self { allocation, id })
+        Ok(Self {
+            document,
+            allocation,
+            id,
+        })
+    }
+
+    pub(super) fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub(super) fn document(&self) -> &Document {
+        &self.document
+    }
+
+    pub(super) fn validate_successor(&self, target: &Self) -> io::Result<()> {
+        if self.id == target.id {
+            return Err(invalid("checkpoint budget successor must change the plan"));
+        }
+        if self
+            .allocation
+            .stores
+            .keys()
+            .ne(target.allocation.stores.keys())
+        {
+            return Err(invalid(
+                "checkpoint budget successor must retain the store endpoints",
+            ));
+        }
+        Ok(())
     }
 
     pub(super) fn share_for(
@@ -174,23 +211,84 @@ impl PeerPlan {
         ))
     }
 
-    pub(super) async fn audit(&self) -> io::Result<String> {
+    fn reports(&self, skip: Option<SocketAddr>) -> JoinSet<io::Result<(SocketAddr, Report)>> {
         let mut jobs = JoinSet::new();
         for &endpoint in self.allocation.stores.keys() {
+            if skip == Some(endpoint) {
+                continue;
+            }
             jobs.spawn(async move {
-                (
-                    endpoint,
-                    tokio::time::timeout(DEADLINE, read_stats(endpoint)).await,
-                )
+                let context = |err: &dyn std::error::Error| {
+                    io::Error::other(format!("checkpoint store {endpoint}: {err}"))
+                };
+                let body = tokio::time::timeout(DEADLINE, read_stats(endpoint))
+                    .await
+                    .map_err(|err| context(&err))?
+                    .map_err(|err| context(&err))?;
+                let report = serde_json::from_str(&body).map_err(|err| context(&err))?;
+                Ok((endpoint, report))
             });
         }
+        jobs
+    }
+
+    pub(super) async fn require_drained(
+        &self,
+        local_endpoint: SocketAddr,
+        generation: u64,
+        target: &Self,
+    ) -> io::Result<()> {
+        let next = generation
+            .checked_add(1)
+            .ok_or_else(|| invalid("checkpoint budget generation exhausted"))?;
+        let mut jobs = self.reports(Some(canonical_endpoint(local_endpoint)));
         while let Some(result) = jobs.join_next().await {
-            let (endpoint, response) = result.map_err(io::Error::other)?;
-            let body = response
-                .map_err(|err| io::Error::other(format!("checkpoint store {endpoint}: {err}")))?
-                .map_err(|err| io::Error::other(format!("checkpoint store {endpoint}: {err}")))?;
-            let report: Report = serde_json::from_str(&body)
-                .map_err(|err| invalid(format!("checkpoint store {endpoint}: {err}")))?;
+            let (endpoint, report) = result.map_err(io::Error::other)??;
+            let drained = report.peer_budget_epoch.as_ref().is_some_and(|epoch| {
+                let matches_plan = |id: &str| {
+                    report
+                        .peer_budget_plan
+                        .as_ref()
+                        .is_some_and(|plan| plan.endpoint == endpoint && plan.id == id)
+                };
+                (epoch.generation == generation
+                    && matches_plan(self.id())
+                    && epoch.target_plan_id.as_deref() == Some(target.id())
+                    && report.peer_budget_admission_closed
+                    && report.pending_bytes == Some(0))
+                    || (epoch.generation == next
+                        && matches_plan(target.id())
+                        && epoch.previous_plan_id.as_deref() == Some(self.id()))
+            });
+            if !drained {
+                return Err(invalid(format!(
+                    "checkpoint store {endpoint} has not drained generation {generation} for {}",
+                    target.id()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) async fn audit(&self) -> io::Result<String> {
+        let mut jobs = self.reports(None);
+        let mut expected_generation = None;
+        while let Some(result) = jobs.join_next().await {
+            let (endpoint, report) = result.map_err(io::Error::other)??;
+            let generation = report
+                .peer_budget_epoch
+                .as_ref()
+                .map(|epoch| epoch.generation);
+            if report.peer_budget_admission_closed
+                || report
+                    .peer_budget_epoch
+                    .is_some_and(|epoch| epoch.target_plan_id.is_some())
+                || *expected_generation.get_or_insert(generation) != generation
+            {
+                return Err(invalid(format!(
+                    "checkpoint store {endpoint} is draining or on a different budget generation"
+                )));
+            }
             let (expected, peers) = self.share_for(endpoint)?;
             let actual: BTreeMap<_, _> = report
                 .peers
@@ -211,17 +309,24 @@ impl PeerPlan {
                 )));
             }
         }
-        Ok(serde_json::json!({
+        let mut summary = serde_json::json!({
             "id": self.id,
             "stores": self.allocation.stores.keys().collect::<Vec<_>>(),
-        })
-        .to_string())
+        });
+        if let Some(Some(generation)) = expected_generation {
+            summary["generation"] = generation.into();
+        }
+        Ok(summary.to_string())
     }
 }
 
 #[derive(Deserialize)]
 struct Report {
     peer_budget_plan: Option<Membership>,
+    peer_budget_epoch: Option<BudgetEpoch>,
+    #[serde(default)]
+    peer_budget_admission_closed: bool,
+    pending_bytes: Option<u64>,
     peers: BTreeMap<IpAddr, ReportedShare>,
 }
 
@@ -335,5 +440,55 @@ mod tests {
         let store = Checkpoints::new(None, shares, start, Some(member));
         assert!(store.write(peer, 1, late).is_none());
         assert!(!store.reserve_read([1; 32], [2; 16], 1, None, late));
+    }
+
+    #[test]
+    fn switch_waits_for_grants_and_does_not_transfer_old_credit() {
+        let endpoint = "192.0.2.5:7952".parse().unwrap();
+        let peer = "192.0.2.3".parse().unwrap();
+        let start = Instant::now();
+        let old = parse(fixture()).unwrap();
+        let mut data = fixture();
+        data["stores"].as_array_mut().unwrap().rotate_left(1);
+        data["stores"][0]["endpoint"] = json!("192.0.2.5:7952");
+        data["stores"][1]["endpoint"] = json!("192.0.2.6:7952");
+        let new = parse(data).unwrap();
+        let (member, shares) = old.share_for(endpoint).unwrap();
+        let store = Checkpoints::new(None, shares, start, Some(member));
+        let ready = start + Duration::from_secs(1);
+        let key = [1; 32];
+        let writer = [2; 16];
+        assert!(store.reserve_read(key, writer, 4, Some(BTreeMap::from([(peer, 4)])), ready));
+        let upload = store.write(peer, 4, ready).unwrap();
+        store.set_epoch(BudgetEpoch {
+            generation: 0,
+            previous_plan_id: None,
+            target_plan_id: Some(new.id.clone()),
+        });
+        assert!(!store.reserve_read(key, [3; 16], 1, Some(BTreeMap::from([(peer, 1)])), ready));
+        upload.complete();
+        assert!(store.write(peer, 1, ready).is_none());
+        assert!(!store.drained(ready));
+        let download = store.read(key, writer, peer, 4, ready).unwrap();
+        assert!(!store.drained(ready));
+        download.complete();
+        assert!(store.drained(ready));
+
+        let (member, shares) = new.share_for(endpoint).unwrap();
+        let switched = ready + Duration::from_secs(1);
+        store.install_plan(
+            member,
+            shares,
+            BudgetEpoch {
+                generation: 1,
+                previous_plan_id: Some(old.id),
+                target_plan_id: None,
+            },
+            switched,
+        );
+        assert!(store.write(peer, 1, switched).is_none());
+        let later = switched + Duration::from_millis(100);
+        store.write(peer, 6, later).unwrap().complete();
+        assert!(store.read(key, writer, peer, 1, later).is_none());
     }
 }
