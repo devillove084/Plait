@@ -9,18 +9,25 @@
 </p>
 
 <p align="center">
-  Rust 2024 · leaderless ordering · no rank 0 · TP/PP/EP/DP/CP/SP · heterogeneous accelerators · GPU peer-memory collectives
+  Rust 2024 · leaderless metadata · versioned groups · heterogeneous accelerators · GPU peer-memory collectives
 </p>
 
-Plait is a research runtime for distributed tensor work. It replaces the fixed
-process group and rank-zero driver of a traditional collective with a
-leaderless ordered log. Every node has a stable `NodeId`, every contribution is
-an ordered command, and every replica applies the same state transition.
+Plait is a rankless runtime for heterogeneous collective communication and
+distributed tensor execution. Its NCCL-compatible interface carries tensor
+traffic. Its native control plane uses stable node identities, versioned
+execution groups, and ordered resource grants so an affected group can be
+replaced independently.
 
-This is not a production training system. The control plane, fused runtime,
-GPU peer-memory collectives, heterogeneous planner, and formal models are
-implemented and tested. Cross-host GPUDirect RDMA, durable state, authentication,
-and production-scale validation are not.
+Plait schedules communication and tensor work within the device, layout, and
+dependency constraints given by callers. The inference engine and its deployment
+layer choose the model's parallel strategy and Prefill/Decode placement. They
+also own KV storage, request migration, and token replay. The vLLM integration
+exercises those engine capabilities against Plait's transport and metadata.
+
+The research runtime includes the control plane, local metadata journals,
+tensor reduction, GPU peer-memory collectives, and heterogeneous placement.
+Cross-host GPUDirect RDMA, deployment authentication, and production-scale
+validation remain open.
 
 ## Why this design
 
@@ -168,6 +175,8 @@ The vLLM fork uses peer transport for TP collectives and PP activations when
 `VLLM_USE_PLAIT=1` is set.
 Each worker exchanges endpoint metadata over Gloo and sends tensors directly
 to its peers. [Peer transport and startup](docs/rankless-nccl.md)
+
+### vLLM reference integration
 
 Managed replacements reuse complete prompt KV blocks across TP sizes and PP
 layouts with the vLLM fork's `PlaitKvConnector` and `plait-node kv-store`.
