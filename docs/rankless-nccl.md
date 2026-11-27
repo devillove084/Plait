@@ -1764,6 +1764,20 @@ layout. A selected layout is submitted through managed P/D staging.
 The voters recheck route and resource versions when applying it. Retry
 an ambiguous submission using the same operation ID and request.
 
+To change the Decode TP width on spare devices, keep the existing Decode
+group ID in the pool and supply the target TP width and installed
+profile. Include current capacity for both active roles in the forecast.
+Keep the model and prompt KV contract compatible with the retained Prefill.
+When the replacement becomes ready, the directory can publish the new
+Decode epoch with the existing Prefill epoch.
+
+The ingress binds an admitted stream to that Decode epoch. The old Decode
+closes admission when it observes `Draining`. Its API launcher waits for
+admitted work to finish or for `--drain-timeout` to expire, then stops its
+workers. Followers wait for the API host's stop report. Retirement releases
+the old grants after all workers report stopped. Set the drain grace to
+cover the admitted requests the deployment needs to preserve.
+
 ### Drive P/D planning from ingress load
 
 Start each managed P/D ingress with `--load-listen IP:PORT` on a private
