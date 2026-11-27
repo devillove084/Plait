@@ -667,6 +667,9 @@ fn execute_peer_collective(
         Ok(output) => output,
         Err(error) => return set_error(error.to_string()),
     };
+    if let Err(error) = group.live() {
+        return set_error(error.to_string());
+    }
     if !output.is_empty() && host_to_device(comm.runtime.as_ref(), recv as u64, &output).is_err() {
         group.fail();
         return NCCL_UNHANDLED_CUDA_ERROR;
@@ -2302,6 +2305,11 @@ impl CommHandle {
     #[getter]
     fn world(&self) -> i32 {
         unsafe { (*self.ptr).world as i32 }
+    }
+
+    #[getter]
+    fn peer_failed(&self) -> Option<bool> {
+        unsafe { &*self.ptr }.peers_failed()
     }
 
     fn abort(&self) {

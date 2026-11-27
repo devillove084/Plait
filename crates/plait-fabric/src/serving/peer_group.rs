@@ -3,9 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use plait_core::group::{
-    ActivePlacement, GroupAction, GroupError, GroupId, GroupManifest, GroupMember, GroupOperation,
-    GroupOutcome, GroupPhase, GroupReceipt, GroupResult, GroupVersion, GroupView, PeerEndpoint,
-    PlacementHost, PlacementInventory, PlacementWorker, ResourcePlan, WorkerGrant,
+    ActivePlacement, GrantStatus, GroupAction, GroupError, GroupId, GroupManifest, GroupMember,
+    GroupOperation, GroupOutcome, GroupPhase, GroupReceipt, GroupResult, GroupVersion, GroupView,
+    PeerEndpoint, PlacementHost, PlacementInventory, PlacementWorker, ResourcePlan, WorkerGrant,
 };
 use plait_core::link::{ProbeEndpoint, ProbeRegistration};
 use plait_core::serving::{ExecutionDrainTarget, ServingError};
@@ -174,6 +174,16 @@ impl ServingState {
 
     pub(crate) fn peer_group_view(&self, version: GroupVersion) -> Option<GroupView> {
         self.peer_groups.get(version).map(Version::view)
+    }
+
+    pub(crate) fn peer_grant_status(&self, grant: WorkerGrant) -> GrantStatus {
+        let Some(view) = self.peer_groups.get(grant.version) else {
+            return GrantStatus::Unknown;
+        };
+        view.phase.grant_status(
+            view.grants.get(&grant.device) == Some(&grant),
+            view.released.contains(&grant.device),
+        )
     }
 
     pub(crate) fn peer_group_receipt(&self, operation: OpId) -> Option<&GroupReceipt> {
@@ -885,7 +895,28 @@ mod tests {
         );
         state.ready_peer_group(second, digest).unwrap();
         state.activate_peer_group(old).unwrap();
+        assert_eq!(state.peer_grant_status(first), GrantStatus::Held);
+        assert_eq!(
+            state.peer_grant_status(WorkerGrant {
+                fence: first.fence + 1,
+                ..first
+            }),
+            GrantStatus::Ended
+        );
+        assert_eq!(
+            state.peer_grant_status(WorkerGrant {
+                version: new,
+                ..first
+            }),
+            GrantStatus::Unknown
+        );
+        state.quiesce_peer_group(old, GroupPhase::Draining).unwrap();
+        assert_eq!(state.peer_grant_status(first), GrantStatus::Held);
+        state.release_peer_worker(first).unwrap();
+        assert_eq!(state.peer_grant_status(first), GrantStatus::Ended);
+        assert_eq!(state.peer_grant_status(second), GrantStatus::Held);
         state.quiesce_peer_group(old, GroupPhase::Revoked).unwrap();
+        assert_eq!(state.peer_grant_status(second), GrantStatus::Ended);
         assert!(state.peer_group_view(old).unwrap().manifest.is_none());
         assert_eq!(
             state.ready_peer_group(second, digest),
@@ -899,6 +930,8 @@ mod tests {
         assert!(successor.fence > first.fence);
         state.release_peer_worker(first).unwrap();
         assert_eq!(state.workers[&a].grant, Some(successor));
+        assert_eq!(state.peer_grant_status(first), GrantStatus::Ended);
+        assert_eq!(state.peer_grant_status(successor), GrantStatus::Held);
         assert_eq!(state.hosts[&host].reserved, memory(16));
         state.release_peer_worker(second).unwrap();
         assert_eq!(

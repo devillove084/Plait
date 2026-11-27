@@ -184,8 +184,9 @@ slot order. Each peer validates the full manifest during the socket handshake.
 
 The replicated group API reserves devices, collects endpoint records, and
 publishes the canonical manifest. Each participant confirms the digest of
-its connected communicator before the group can activate. Revoked groups
-release individual device grants after each owner confirms teardown.
+its connected communicator before the group can activate. Communicators joined
+through the control plane close their sockets when a voter reports that their
+grant has ended. A device grant is released after its owner confirms teardown.
 [Replicated group metadata](docs/rankless-nccl.md#publish-a-manifest-through-the-control-plane)
 
 The native planner matches placement to device capabilities, per-device
@@ -308,6 +309,7 @@ release the result after the matching completion has executed in the control pla
 | [Peer collectives](specs/PlaitPeerCollective.tla) | Round pairing, replicated and sharded reduction, and completion of an independent communicator when a participant in another group is lost. |
 | [Rankless peer join](specs/PlaitRanklessPeerJoin.tla) | Socket handshakes bind the group version and grant view. Cancellation closes the participant's links. |
 | [Logical slot layout](specs/PlaitRanklessLayout.tla) | A participant reports ready after connecting to all members with a common slot layout. |
+| [Peer revocation](specs/PlaitPeerRevocation.tla) | Observing that an exact grant has ended closes that communicator and wakes a pending call. A draining group can keep its links. |
 | [Replicated group manifest](specs/PlaitGroupManifest.tla) | Activation follows complete endpoint and handshake evidence. Retrying an old release preserves any successor grant. |
 | [Native group placement](specs/PlaitGroupPlacement.tla) | A planned reservation checks the version, incumbent, and resource availability against concurrent changes. |
 | [Native probe sessions](specs/PlaitProbePlacement.tla) | A planned reservation checks both endpoint revisions if a probe restarts after measurement. |

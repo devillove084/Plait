@@ -477,6 +477,9 @@ impl NodeState {
                         GroupReply::Placement(runtime.placement_inventory(group))
                     }
                     GroupLookup::LinkProbes => GroupReply::LinkProbes(runtime.link_probes()),
+                    GroupLookup::GrantStatus(grant) => {
+                        GroupReply::GrantStatus(runtime.peer_grant_status(grant))
+                    }
                 };
                 let _ = self
                     .transport

@@ -326,6 +326,7 @@ pub enum GroupLookup {
     Receipt(OpId),
     Placement(GroupId),
     LinkProbes,
+    GrantStatus(WorkerGrant),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -334,6 +335,37 @@ pub enum GroupReply {
     Receipt(Option<GroupReceipt>),
     Placement(PlacementInventory),
     LinkProbes(Vec<ProbeRegistration>),
+    GrantStatus(GrantStatus),
+}
+
+/// A replica's applied view of an exact communicator grant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GrantStatus {
+    Unknown,
+    Held,
+    Ended,
+}
+
+impl GroupView {
+    pub fn grant_status(&self, grant: WorkerGrant) -> GrantStatus {
+        if self.version != grant.version {
+            return GrantStatus::Unknown;
+        }
+        self.phase.grant_status(
+            self.grants.contains(&grant),
+            self.released.contains(&grant.device),
+        )
+    }
+}
+
+impl GroupPhase {
+    pub fn grant_status(self, has_grant: bool, released: bool) -> GrantStatus {
+        if has_grant && !released && !matches!(self, Self::Revoked | Self::Retired) {
+            GrantStatus::Held
+        } else {
+            GrantStatus::Ended
+        }
+    }
 }
 
 impl GroupOperation {

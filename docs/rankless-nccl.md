@@ -202,6 +202,27 @@ Rust clients can use `join_committed_group` with the `plait-nccl/control`
 feature for the same sequence. C clients can publish and join through the
 native group APIs and existing C ABI.
 
+#### Cancel a committed communicator
+
+Communicators created through the control-plane join keep their control
+client for the lifetime of the handle. The client checks the local grant
+every 250 ms, rotating through the configured voters. The compact lookup
+checks the group epoch, device incarnation, and fence. With an older voter
+the client uses the existing group version view.
+
+Apply `Revoke` to stop a version's communication. When a communicator
+observes the applied revocation or the release of its own grant, it shuts
+down its collective and point-to-point sockets. Pending socket operations
+return errors, and subsequent calls fail locally. Python callers can read
+`CommHandle.peer_failed`. Other group versions retain their connections.
+A missing reply or an unknown grant view prompts another query.
+
+Use `Drain` to stop admitting work at the deployment layer while admitted
+requests finish. `Draining` preserves communication. `Release` still
+requires the device owner to finish teardown, including any device work
+already in progress. The observer closes sockets and leaves release to the
+owner.
+
 ### Assign different numbers of workers per host
 
 For four TP workers across three hosts, start the same model on each host.

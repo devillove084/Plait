@@ -5,16 +5,19 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use plait_core::group::{
-    GroupAction, GroupLookup, GroupOperation, GroupPhase, GroupReply, GroupVersion, GroupView,
+    GrantStatus, GroupAction, GroupLookup, GroupOperation, GroupPhase, GroupReply, GroupVersion,
+    GroupView, WorkerGrant,
 };
 use plait_core::{DeviceId, NodeId, OpId};
 use plait_net::control::{Client, discover_voters};
-use tokio::time::{Instant, sleep, timeout_at};
+use tokio::runtime::Runtime;
+use tokio::time::{Instant, MissedTickBehavior, interval, sleep, timeout, timeout_at};
 
-use crate::{BackendKind, Comm, RanklessComm, RanklessListener, create_runtime};
+use crate::{BackendKind, Comm, PeerGroup, RanklessComm, RanklessListener, create_runtime};
 
 /// A caller's local device grant identity and the desired collective slot order.
 pub struct JoinGroup {
@@ -76,7 +79,11 @@ async fn connect(
         listen,
         seeds,
     } = request;
-    let mut control = Rendezvous::new(listen, seeds).await?;
+    let executor = control_runtime()?;
+    let mut control = executor
+        .spawn(Rendezvous::new(listen, seeds))
+        .await
+        .map_err(io::Error::other)??;
     let session = NodeId::random();
     let view = control
         .call(|client, voter| {
@@ -136,9 +143,8 @@ async fn connect(
     })
     .await
     .map_err(io::Error::other)??;
-    let comm = Comm::rankless_from_peers(group, device, runtime);
-    let digest = comm
-        .peer_manifest_digest()
+    let digest = group
+        .manifest_digest()
         .ok_or_else(|| io::Error::other("peer group failed during startup"))?;
     control
         .apply(&GroupOperation {
@@ -149,7 +155,23 @@ async fn connect(
             },
         })
         .await?;
-    Ok(comm)
+    let watch = executor.spawn(control.watch(Arc::downgrade(&group), grant));
+    group.watch_grant(watch.abort_handle());
+    Ok(Comm::rankless_from_peers(group, device, runtime))
+}
+
+fn control_runtime() -> io::Result<&'static Runtime> {
+    static EXECUTOR: OnceLock<io::Result<Runtime>> = OnceLock::new();
+    EXECUTOR
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(1)
+                .thread_name("plait-peer-control")
+                .build()
+        })
+        .as_ref()
+        .map_err(|error| io::Error::new(error.kind(), error.to_string()))
 }
 
 fn check_open(view: &GroupView) -> io::Result<()> {
@@ -167,6 +189,9 @@ fn check_open(view: &GroupView) -> io::Result<()> {
 }
 
 const POLL: Duration = Duration::from_millis(100);
+const WATCH_INTERVAL: Duration = Duration::from_millis(250);
+const WATCH_QUERY_TIMEOUT: Duration = Duration::from_millis(750);
+const WATCH_DISCOVERY_INTERVAL: Duration = Duration::from_secs(10);
 type PeerCall<'a, T> = Pin<Box<dyn Future<Output = io::Result<T>> + Send + 'a>>;
 
 struct Rendezvous {
@@ -209,6 +234,75 @@ impl Rendezvous {
         }
     }
 
+    async fn watch(mut self, group: Weak<PeerGroup>, grant: WorkerGrant) {
+        let mut ticks = interval(WATCH_INTERVAL);
+        ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut refresh_at = Instant::now() + WATCH_DISCOVERY_INTERVAL;
+        let mut legacy = BTreeSet::new();
+        loop {
+            ticks.tick().await;
+            let status = self.poll_grant(grant, &mut legacy).await;
+            if status == GrantStatus::Ended {
+                if let Some(group) = group.upgrade() {
+                    group.fail();
+                }
+                return;
+            }
+            if status == GrantStatus::Unknown || Instant::now() >= refresh_at {
+                self.refresh().await;
+                refresh_at = Instant::now() + WATCH_DISCOVERY_INTERVAL;
+            }
+        }
+    }
+
+    async fn poll_grant(
+        &mut self,
+        grant: WorkerGrant,
+        legacy: &mut BTreeSet<NodeId>,
+    ) -> GrantStatus {
+        for _ in 0..self.voters.len() {
+            let voter = self.voters[0];
+            self.voters.rotate_left(1);
+            if !legacy.contains(&voter) {
+                let response = timeout(
+                    WATCH_QUERY_TIMEOUT,
+                    self.client.query_group(voter, GroupLookup::GrantStatus(grant)),
+                )
+                .await;
+                match response {
+                    Ok(Ok(GroupReply::GrantStatus(GrantStatus::Unknown))) => continue,
+                    Ok(Ok(GroupReply::GrantStatus(status))) => return status,
+                    // Older voters close the connection on an unknown query variant.
+                    Ok(Err(error)) if error.kind() == io::ErrorKind::ConnectionAborted => {}
+                    _ => continue,
+                }
+            }
+            let response = timeout(
+                WATCH_QUERY_TIMEOUT,
+                self.client.query_group(voter, GroupLookup::Version(grant.version)),
+            )
+            .await;
+            if let Ok(Ok(GroupReply::Version(view))) = response {
+                legacy.insert(voter);
+                let status = view.map_or(GrantStatus::Unknown, |view| view.grant_status(grant));
+                if status != GrantStatus::Unknown {
+                    return status;
+                }
+            }
+        }
+        GrantStatus::Unknown
+    }
+
+    async fn refresh(&mut self) {
+        if let Ok(voters) = discover_voters(&self.seeds).await {
+            self.voters.clear();
+            for (id, address) in voters {
+                self.client.add_peer(id, address);
+                self.voters.push(id);
+            }
+        }
+    }
+
     async fn call<T>(
         &mut self,
         invoke: impl for<'a> Fn(&'a mut Client, NodeId) -> PeerCall<'a, T>,
@@ -220,13 +314,7 @@ impl Rendezvous {
                     return result;
                 }
             }
-            self.voters.clear();
-            if let Ok(voters) = discover_voters(&self.seeds).await {
-                for (id, address) in voters {
-                    self.client.add_peer(id, address);
-                    self.voters.push(id);
-                }
-            }
+            self.refresh().await;
             sleep(POLL).await;
         }
     }

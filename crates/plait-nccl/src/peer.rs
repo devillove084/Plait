@@ -164,6 +164,8 @@ impl Listener {
             sequence: Mutex::new(0),
             failed: AtomicBool::new(false),
             binding,
+            #[cfg(feature = "control")]
+            grant_watch: std::sync::OnceLock::new(),
         }))
     }
 }
@@ -345,6 +347,8 @@ pub(crate) struct PeerGroup {
     sequence: Mutex<u64>,
     failed: AtomicBool,
     binding: Option<GrantBinding>,
+    #[cfg(feature = "control")]
+    grant_watch: std::sync::OnceLock<tokio::task::AbortHandle>,
 }
 
 impl PeerGroup {
@@ -381,6 +385,17 @@ impl PeerGroup {
                 let _ = link.collective.shutdown(Shutdown::Both);
                 let _ = link.direct.shutdown(Shutdown::Both);
             }
+            #[cfg(feature = "control")]
+            if let Some(task) = self.grant_watch.get() {
+                task.abort();
+            }
+        }
+    }
+
+    #[cfg(feature = "control")]
+    pub(crate) fn watch_grant(&self, task: tokio::task::AbortHandle) {
+        if self.grant_watch.set(task.clone()).is_err() || self.is_failed() {
+            task.abort();
         }
     }
 

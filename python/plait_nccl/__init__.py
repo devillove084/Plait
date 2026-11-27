@@ -56,6 +56,11 @@ class CommHandle:
     def world(self) -> int:
         return self._world
 
+    @property
+    def peer_failed(self) -> bool | None:
+        """Report local peer communicator failure, including grant revocation."""
+        return self._handle.peer_failed
+
     def all_reduce(self, send: int, recv: int, count: int, dtype: int, op: int) -> int:
         return self._handle.all_reduce(send, recv, count, dtype, op)
 
