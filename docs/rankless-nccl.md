@@ -1163,6 +1163,17 @@ Recovery retains the visible prefix in the running ingress process and
 rebuilds KV by recomputation on the replacement. The same connection
 must remain open throughout recovery.
 
+For a native group whose replacement can rank tokens differently, select
+`X-Plait-Stream-Recovery: resume-prefix` on the same greedy streaming
+endpoint. Run the vLLM V2 model runner with speculative decoding disabled.
+The ingress supplies the already-visible token IDs as output history.
+The replacement rebuilds its context from the original prompt and that
+history, then computes the next token. The mode uses the engine's local
+prefill path. The ingress requires the replacement to acknowledge the
+history length and match the prompt, visible token IDs, and visible text
+before forwarding its suffix. The client receives one completion ID and
+the original output-token budget applies across attempts.
+
 An engine-loss test used two native TP1 epochs running Qwen3-0.6B FP16 on
 separate CUDA devices. After the first token event, the test killed the old
 engine and reported the failure against its grant. Plait promoted the ready
