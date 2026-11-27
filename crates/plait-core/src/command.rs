@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use crate::device::{ComputeRequirement, DeviceId, DeviceProfile};
+use crate::group::GroupOperation;
 use crate::identity::NodeId;
 use crate::serving::{GroupId, RouteSetId, ServingOperation};
 use crate::tensor::{ShardId, TensorId, TensorKey};
@@ -164,6 +165,7 @@ pub enum Command {
     Compute(ComputeTask),
     Membership(MembershipChange),
     Serving(Box<ServingOperation>),
+    Group(Box<GroupOperation>),
 }
 
 impl Key {
@@ -269,6 +271,11 @@ impl Command {
                 accesses.extend(operation.accesses());
                 accesses
             }
+            Self::Group(operation) => {
+                let mut accesses = vec![read_config];
+                accesses.extend(operation.accesses());
+                accesses
+            }
         }
     }
 
@@ -342,6 +349,7 @@ impl Command {
             ),
             Self::Membership(change) => format!("membership {change:?}"),
             Self::Serving(operation) => format!("serving {:?}", operation.id),
+            Self::Group(operation) => format!("group {:?}", operation.id),
         }
     }
 }

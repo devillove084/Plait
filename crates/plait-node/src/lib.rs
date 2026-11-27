@@ -10,6 +10,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use plait_consensus::{Options, Replica};
+use plait_core::group::{GroupLookup, GroupReply};
 use plait_core::serving::{ServingAction, ServingLookup, ServingOperation, ServingView};
 use plait_core::{
     AcceleratorKind, ClusterConfig, Command, ComputeRequirement, ComputeTask, DeviceId, FuseKind,
@@ -461,6 +462,33 @@ impl NodeState {
             Wire::Ping => {
                 let _ = self.transport.send(from, Wire::Pong).await;
             }
+            Wire::GroupQuery {
+                request,
+                lookup,
+                reply_to,
+            } => {
+                self.transport.set_peer(from, reply_to);
+                let runtime = self.replica.machine();
+                let view = match lookup {
+                    GroupLookup::Version(version) => {
+                        GroupReply::Version(runtime.peer_group(version))
+                    }
+                    GroupLookup::Receipt(id) => {
+                        GroupReply::Receipt(runtime.peer_group_receipt(id).cloned())
+                    }
+                };
+                let _ = self
+                    .transport
+                    .send(
+                        from,
+                        Wire::GroupQueryReply {
+                            request,
+                            lookup,
+                            view: Box::new(view),
+                        },
+                    )
+                    .await;
+            }
             Wire::ServingQuery {
                 request,
                 lookup,
@@ -614,7 +642,8 @@ impl NodeState {
             | Wire::Ack { .. }
             | Wire::QueryReply { .. }
             | Wire::ServingQueryReply { .. }
-            | Wire::ServingGroupObserved { .. } => {}
+            | Wire::ServingGroupObserved { .. }
+            | Wire::GroupQueryReply { .. } => {}
         }
         Ok(())
     }

@@ -55,6 +55,7 @@ int32_t plaitPeerConnect(PlaitPeerListener **listener, const PlaitPeerMember *me
 int32_t plaitPeerListenerDestroy(PlaitPeerListener *listener);
 int32_t plaitPeerDeviceSlot(const struct ncclComm *comm, const PlaitPeerDevice *device,
                             int32_t *slot);
+int32_t plaitPeerManifestDigest(const struct ncclComm *comm, uint8_t digest[32]);
 
 /* Cancel outstanding socket I/O. Wait for active calls before destroying the
    communicator with ncclCommDestroy or releasing its buffers. */

@@ -12,8 +12,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use plait_core::DeviceId;
-use plait_core::group::GroupVersion;
-use sha2::{Digest, Sha256};
+pub use plait_core::group::PeerEndpoint as Endpoint;
+use plait_core::group::{GroupVersion, peer_digest};
+use sha2::Digest;
 
 use crate::{DataType, ReduceOp, reduce_bytes, reduce_fp8_to_f32};
 
@@ -26,12 +27,6 @@ const DIRECT_LANE: u8 = 1;
 const REPLICATED_EXCHANGE: u8 = 2;
 const REPLICATED_BYTES_PER_RANK: usize = 64 * 1024;
 const TWO_RANK_REPLICATED_LIMIT: usize = 1024 * 1024;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Endpoint {
-    pub address: SocketAddr,
-    pub ticket: [u8; 16],
-}
 
 pub struct Listener {
     socket: TcpListener,
@@ -129,7 +124,14 @@ impl Listener {
             slot,
             timeout,
             deadline,
-            manifest: manifest_digest(self.version, &members, binding.as_ref()),
+            manifest: binding.as_ref().map_or_else(
+                || {
+                    peer_digest(self.version, members.iter().copied())
+                        .finalize()
+                        .into()
+                },
+                |binding| binding.digest,
+            ),
         };
         let mut connections = (0..members.len()).map(|_| [None, None]).collect::<Vec<_>>();
         let (incoming, local_and_outgoing) = connections.split_at_mut(slot);
@@ -159,7 +161,7 @@ impl Listener {
             timeout,
             sequence: Mutex::new(0),
             failed: AtomicBool::new(false),
-            devices: binding.map(|binding| binding.devices),
+            binding,
         }))
     }
 }
@@ -253,42 +255,6 @@ fn configure(stream: &TcpStream, timeout: Duration) -> io::Result<()> {
     stream.set_write_timeout(Some(timeout))
 }
 
-fn manifest_digest(
-    version: Option<GroupVersion>,
-    members: &[Endpoint],
-    binding: Option<&GrantBinding>,
-) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    match version {
-        Some(version) => {
-            digest.update([1]);
-            digest.update(version.group.0.as_bytes());
-            digest.update(version.epoch.to_le_bytes());
-        }
-        None => digest.update([0]),
-    }
-    for member in members {
-        match member.address {
-            SocketAddr::V4(address) => {
-                digest.update([4]);
-                digest.update(address.ip().octets());
-            }
-            SocketAddr::V6(address) => {
-                digest.update([6]);
-                digest.update(address.ip().octets());
-                digest.update(address.scope_id().to_le_bytes());
-            }
-        }
-        digest.update(member.address.port().to_le_bytes());
-        digest.update(member.ticket);
-    }
-    if let Some(binding) = binding {
-        digest.update(b"plait-peer-device-grants-v1");
-        digest.update(binding.digest);
-    }
-    digest.finalize().into()
-}
-
 fn greeting(manifest: &[u8; 32], source: usize, target: usize, lane: u8) -> [u8; 45] {
     let mut bytes = [0; 45];
     bytes[..4].copy_from_slice(b"PLP2");
@@ -375,7 +341,7 @@ pub(crate) struct PeerGroup {
     timeout: Duration,
     sequence: Mutex<u64>,
     failed: AtomicBool,
-    devices: Option<Vec<DeviceId>>,
+    binding: Option<GrantBinding>,
 }
 
 impl PeerGroup {
@@ -399,7 +365,7 @@ impl PeerGroup {
     }
 
     pub(crate) fn device_slot(&self, device: DeviceId) -> Option<usize> {
-        self.devices.as_ref()?.binary_search(&device).ok()
+        self.binding.as_ref()?.devices.binary_search(&device).ok()
     }
 
     pub fn fail(&self) {
@@ -409,6 +375,11 @@ impl PeerGroup {
                 let _ = link.direct.shutdown(Shutdown::Both);
             }
         }
+    }
+
+    pub(crate) fn manifest_digest(&self) -> Option<[u8; 32]> {
+        let binding = self.binding.as_ref()?;
+        (!self.is_failed()).then_some(binding.digest)
     }
 
     fn link(&self, slot: usize) -> &Link {

@@ -21,6 +21,7 @@ mod hosted_pd;
 mod hosted_pd_transition;
 mod hosted_serving;
 mod maintenance;
+mod peer_group;
 use decoder::{DecoderState, RecoveryPolicy};
 use host_launch::{HostLaunch, HostedSwitch};
 
@@ -74,6 +75,7 @@ struct W4Switch {
 #[derive(Clone, Default)]
 pub(crate) struct ServingState {
     groups: BTreeMap<GroupId, GroupHistory>,
+    peer_groups: peer_group::PeerGroups,
     hosts: BTreeMap<NodeId, HostState>,
     workers: BTreeMap<DeviceId, WorkerState>,
     receipts: BTreeMap<OpId, ServingReceipt>,
@@ -1024,6 +1026,9 @@ impl ServingState {
         reservations: &mut Reservations,
     ) -> Result<GroupView, ServingError> {
         plan.validate()?;
+        if self.peer_groups.has_group(group) {
+            return Err(ServingError::InvalidPlan);
+        }
         if let Some((transition, _)) = self
             .deferred_pd_placements()
             .find(|(_, placement)| placement.group == group)
@@ -1052,9 +1057,30 @@ impl ServingState {
                 .ok_or(ServingError::SequenceExhausted)?,
         };
 
+        let grants = self.reserve_resources(version, &plan.workers, &plan.hosts, reservations)?;
+
+        Ok(GroupView {
+            version,
+            phase: GroupPhase::Preparing,
+            plan: plan.clone(),
+            grants,
+            ready: BTreeSet::new(),
+            stopped: BTreeSet::new(),
+            launch_owner: None,
+            endpoint: None,
+        })
+    }
+
+    fn reserve_resources(
+        &self,
+        version: GroupVersion,
+        workers: &BTreeMap<DeviceId, plait_core::group::WorkerDemand>,
+        hosts: &BTreeMap<NodeId, HostMemory>,
+        reservations: &mut Reservations,
+    ) -> Result<BTreeMap<DeviceId, WorkerGrant>, ServingError> {
         // Build the complete set of grants and new counters before mutating any reservation.
         let mut grants = BTreeMap::new();
-        for (&device, demand) in &plan.workers {
+        for (&device, demand) in workers {
             if let Some(target) = self.execution_drain_for(device) {
                 return Err(ServingError::ExecutionTargetDraining(target));
             }
@@ -1090,7 +1116,7 @@ impl ServingState {
                 },
             );
         }
-        for (&host, demand) in &plan.hosts {
+        for (&host, demand) in hosts {
             self.require_execution_host(host)?;
             let state = self
                 .hosts
@@ -1110,16 +1136,21 @@ impl ServingState {
             reservations.hosts.insert(host, reserved);
         }
 
-        Ok(GroupView {
-            version,
-            phase: GroupPhase::Preparing,
-            plan: plan.clone(),
-            grants,
-            ready: BTreeSet::new(),
-            stopped: BTreeSet::new(),
-            launch_owner: None,
-            endpoint: None,
-        })
+        Ok(grants)
+    }
+
+    fn install_host_reservations(&mut self, hosts: BTreeMap<NodeId, HostMemory>) {
+        for (host, reserved) in hosts {
+            self.hosts.get_mut(&host).expect("validated host").reserved = reserved;
+        }
+    }
+
+    fn install_grants(&mut self, grants: &BTreeMap<DeviceId, WorkerGrant>) {
+        for (&device, &grant) in grants {
+            let worker = self.workers.get_mut(&device).expect("validated worker");
+            worker.fence = grant.fence;
+            worker.grant = Some(grant);
+        }
     }
 
     fn install_groups(
@@ -1127,16 +1158,10 @@ impl ServingState {
         views: impl IntoIterator<Item = GroupView>,
         reservations: Reservations,
     ) {
-        for (host, reserved) in reservations.hosts {
-            self.hosts.get_mut(&host).expect("validated host").reserved = reserved;
-        }
+        self.install_host_reservations(reservations.hosts);
         for view in views {
             let version = view.version;
-            for (&device, &grant) in &view.grants {
-                let worker = self.workers.get_mut(&device).expect("validated worker");
-                worker.fence = grant.fence;
-                worker.grant = Some(grant);
-            }
+            self.install_grants(&view.grants);
             self.groups
                 .entry(version.group)
                 .or_default()

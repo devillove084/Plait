@@ -33,6 +33,42 @@ buffers. Build a new communicator from the next group's grants and tickets
 when the control plane changes membership. Independent communicators continue
 using their own sockets and sequence state.
 
+### Publish a manifest through the control plane
+
+The native group API uses the same device fences and host memory ledger as
+hosted execution. Its placement specifies a group ID, the expected epoch,
+worker incarnations, and per-device and per-host resource demand. Any voter
+can accept a proposal. To send newline-delimited requests, start a client with
+`plait-node group --listen 192.0.2.10:0 --seed 192.0.2.11:7950`.
+Rust callers can use `plait_core::group` and `plait_node::Client`.
+
+1. Register capacity with `SetHostMemory` and `RegisterWorker`. Use the
+   `prepare` request to reserve a version. Its `workers` and `hosts` fields
+   are lists of `(identity, demand)` pairs. The version's view contains the
+   granted fences and incarnations.
+2. Each participant opens a listener and submits `PublishEndpoint` with its
+   local grant and endpoint record. A published endpoint is immutable for the
+   lifetime of the version. The version exposes a manifest after every grant
+   has an endpoint. Clients can poll `view` and use `observe` to order a fresh
+   read against group mutations.
+3. Each participant joins using the observed manifest, then submits `Ready`
+   with its grant and `plaitPeerManifestDigest` from the connected handle.
+   The control plane accepts `Activate` after every member confirms the same
+   manifest. Use `observe` without an explicit epoch to resolve the group
+   for new work, and check that the returned phase is still `Active`.
+4. `Drain` and `Revoke` remove the version from new admissions. After a worker
+   finishes or cancels its calls and closes access to its device and buffers,
+   submit `Release` with its exact grant. The device becomes eligible for a
+   new fence immediately. The host's reservation remains until its last grant
+   in that version is released. Later retries for a released grant preserve
+   any successor reservation.
+
+The `apply` request takes an `operation` containing an `id` and a serialized
+`GroupAction`. Keep the operation ID when retrying an ambiguous result.
+Voters with `run --state-dir` preserve applied group metadata through restart.
+Callers use current metadata and device completion to decide when existing
+handles can be reclaimed.
+
 ### Bootstrap from vLLM
 
 Start the vLLM workers with the same TP layout and the vendor's PyTorch

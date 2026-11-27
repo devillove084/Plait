@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use plait_consensus::{InstanceId, StateMachine};
+use plait_core::group::{GroupOperation, GroupReceipt, GroupResult, GroupView as PeerGroupView};
 use plait_core::serving::{
     DecoderCheckpoint, DecoderClaim, DecoderDirectory, DecoderDrainStatus, DecoderFailover,
     DecoderReplayPage, DecoderRouteWork, DecoderSwitch, ExecutionHostLiveness, GroupVersion,
@@ -56,6 +57,10 @@ pub enum Event {
         operation: OpId,
         result: ServingResult,
     },
+    GroupApplied {
+        operation: OpId,
+        result: GroupResult,
+    },
     Error(String),
 }
 
@@ -77,9 +82,15 @@ pub struct Runtime {
     devices: BTreeMap<DeviceId, DeviceProfile>,
     placements: BTreeMap<OpId, DeviceId>,
     serving: ServingState,
-    deferred_serving: Option<Vec<ServingOperation>>,
+    deferred_control: Option<Vec<ControlOperation>>,
     applied: BTreeSet<InstanceId>,
     events: Vec<Event>,
+}
+
+#[derive(Clone)]
+enum ControlOperation {
+    Serving(ServingOperation),
+    Group(GroupOperation),
 }
 
 impl Runtime {
@@ -113,6 +124,14 @@ impl Runtime {
 
     pub fn serving_group(&self, version: GroupVersion) -> Option<&GroupView> {
         self.serving.group(version)
+    }
+
+    pub fn peer_group(&self, version: GroupVersion) -> Option<PeerGroupView> {
+        self.serving.peer_group_view(version)
+    }
+
+    pub fn peer_group_receipt(&self, id: OpId) -> Option<&GroupReceipt> {
+        self.serving.peer_group_receipt(id)
     }
 
     pub fn serving_receipt(&self, operation: OpId) -> Option<&ServingReceipt> {
@@ -393,6 +412,15 @@ impl Runtime {
                 }
                 Ok(())
             }
+            Command::Group(operation) => {
+                if self
+                    .peer_group_receipt(operation.id)
+                    .is_some_and(|receipt| receipt.operation != **operation)
+                {
+                    return Err("group operation id already used for another action".to_owned());
+                }
+                Ok(())
+            }
             Command::Nop | Command::Membership(_) => Ok(()),
         }
     }
@@ -425,10 +453,17 @@ impl Runtime {
             Command::Compute(task) => self.compute(task.clone()),
             Command::Membership(change) => self.membership(change),
             Command::Serving(operation) => {
-                if let Some(changes) = &mut self.deferred_serving {
-                    changes.push((**operation).clone());
+                if let Some(changes) = &mut self.deferred_control {
+                    changes.push(ControlOperation::Serving((**operation).clone()));
                 } else {
                     self.apply_serving(operation);
+                }
+            }
+            Command::Group(operation) => {
+                if let Some(changes) = &mut self.deferred_control {
+                    changes.push(ControlOperation::Group((**operation).clone()));
+                } else {
+                    self.apply_group(operation);
                 }
             }
         }
@@ -437,6 +472,14 @@ impl Runtime {
     fn apply_serving(&mut self, operation: &ServingOperation) {
         let result = self.serving.apply(operation);
         self.events.push(Event::ServingApplied {
+            operation: operation.id,
+            result,
+        });
+    }
+
+    fn apply_group(&mut self, operation: &GroupOperation) {
+        let result = self.serving.apply_peer_group(operation);
+        self.events.push(Event::GroupApplied {
             operation: operation.id,
             result,
         });
@@ -763,7 +806,7 @@ impl StateMachine for Runtime {
     /// same replicated state and applies one complete SCC; the parent then
     /// merges the resulting maps in deterministic batch order.
     fn fork_batch(&self) -> Option<Self> {
-        // Replay only this batch's serving commands at merge time. A cloned
+        // Replay this batch's ordered resource commands at merge time. A cloned
         // reservation table would overwrite decisions made by earlier batches.
         Some(Self {
             ops: self.ops.clone(),
@@ -774,7 +817,7 @@ impl StateMachine for Runtime {
             devices: self.devices.clone(),
             placements: self.placements.clone(),
             applied: self.applied.clone(),
-            deferred_serving: Some(Vec::new()),
+            deferred_control: Some(Vec::new()),
             ..Self::default()
         })
     }
@@ -788,8 +831,11 @@ impl StateMachine for Runtime {
         self.members.extend(other.members);
         self.devices.extend(other.devices);
         self.placements.extend(other.placements);
-        for operation in other.deferred_serving.take().unwrap_or_default() {
-            self.apply_serving(&operation);
+        for operation in other.deferred_control.take().unwrap_or_default() {
+            match operation {
+                ControlOperation::Serving(operation) => self.apply_serving(&operation),
+                ControlOperation::Group(operation) => self.apply_group(&operation),
+            }
         }
         self.events.append(&mut other.events);
     }

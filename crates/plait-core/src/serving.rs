@@ -8,14 +8,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{Access, DeviceId, Key, Mode, NodeId, OpId};
 
-pub use crate::group::{GroupId, GroupVersion, WorkerGrant};
-
-/// A pin consumes both the pinning quota and the host's total memory quota.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HostMemory {
-    pub bytes: u64,
-    pub pinned_bytes: u64,
-}
+pub use crate::group::{GroupId, GroupPhase, GroupVersion, HostMemory, WorkerDemand, WorkerGrant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServingRole {
@@ -373,12 +366,6 @@ pub struct HostedPlanning {
     pub occupied: Vec<HostedPortUse>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkerDemand {
-    pub incarnation: u64,
-    pub device_bytes: u64,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupPlan {
     pub role: ServingRole,
@@ -485,16 +472,6 @@ impl W4GroupLayout {
             output_columns: self.output_columns,
         })
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum GroupPhase {
-    Preparing,
-    Ready,
-    Active,
-    Draining,
-    Revoked,
-    Retired,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

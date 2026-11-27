@@ -3,6 +3,11 @@ use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use plait_core::group::{
+    GroupAction, GroupError, GroupId as PeerGroupId, GroupLookup, GroupOperation, GroupOutcome,
+    GroupReply, GroupResult, GroupView as PeerGroupView,
+};
+
 use plait_core::serving::{
     GroupId, GroupView, ServingError, ServingLookup, ServingOperation, ServingResult, ServingView,
 };
@@ -16,6 +21,90 @@ pub struct Client {
 }
 
 impl Client {
+    /// Read metadata already applied by the addressed replica.
+    pub async fn query_group(
+        &mut self,
+        node: NodeId,
+        lookup: GroupLookup,
+    ) -> io::Result<GroupReply> {
+        self.exchange(
+            node,
+            "group query timed out",
+            |request, reply_to| Wire::GroupQuery {
+                request,
+                lookup,
+                reply_to,
+            },
+            |request, reply| match reply {
+                Wire::GroupQueryReply {
+                    request: answer,
+                    lookup: target,
+                    view,
+                } if request == answer && lookup == target => Some(Ok(*view)),
+                _ => None,
+            },
+        )
+        .await
+    }
+
+    /// Submit a group command and wait for the matching applied receipt.
+    pub async fn apply_group(
+        &mut self,
+        node: NodeId,
+        operation: &GroupOperation,
+    ) -> io::Result<GroupResult> {
+        self.submit(node, Command::Group(Box::new(operation.clone())))
+            .await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let GroupReply::Receipt(Some(receipt)) = self
+                    .query_group(node, GroupLookup::Receipt(operation.id))
+                    .await?
+                {
+                    if &receipt.operation != operation {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "group operation id already used for another action",
+                        ));
+                    }
+                    return Ok(receipt.result);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "group receipt timed out"))?
+    }
+
+    /// Order a group observation before fetching the version from that replica.
+    /// Use a fresh operation ID for each observation outside of retries.
+    pub async fn observe_group(
+        &mut self,
+        node: NodeId,
+        id: OpId,
+        group: PeerGroupId,
+        epoch: Option<u64>,
+    ) -> io::Result<Result<PeerGroupView, GroupError>> {
+        let action = GroupAction::Observe { group, epoch };
+        match self
+            .apply_group(node, &GroupOperation { id, action })
+            .await?
+        {
+            Ok(GroupOutcome::Version { version, .. }) => {
+                if let GroupReply::Version(Some(view)) = self
+                    .query_group(node, GroupLookup::Version(version))
+                    .await?
+                {
+                    return Ok(Ok(view));
+                }
+                Err(io::Error::other(
+                    "group observation is missing its applied version",
+                ))
+            }
+            Err(error) => Ok(Err(error)),
+            Ok(_) => Err(io::Error::other("unexpected group observation receipt")),
+        }
+    }
     pub async fn new() -> io::Result<Self> {
         Self::new_on("127.0.0.1:0").await
     }

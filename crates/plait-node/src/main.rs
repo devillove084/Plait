@@ -10,6 +10,7 @@ use plait_node::{
 };
 
 mod device_release;
+mod group_cli;
 mod hosted_probe;
 mod kv_store;
 mod serving_cli;
@@ -129,6 +130,7 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         "serving" => serving_cli::run(args).await,
+        "group" => group_cli::run(args).await,
         "verify-host-release" => device_release::run(args).await,
         "capture-host-release" => device_release::capture(args).await,
         "kv-store" => kv_store::run(args).await,
@@ -255,7 +257,7 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         other => Err(format!(
-            "unknown command {other}; expected run, serving, kv-store, tensor, demo, dsa, parallel, rdma-selftest, devices, hetero, gpu-demo, gpu-bench, gpu-rdma, or id"
+            "unknown command {other}; expected run, group, serving, kv-store, tensor, demo, dsa, parallel, rdma-selftest, devices, hetero, gpu-demo, gpu-bench, gpu-rdma, or id"
         )
         .into()),
     }

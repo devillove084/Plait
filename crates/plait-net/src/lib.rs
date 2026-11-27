@@ -16,6 +16,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::{Sink, SinkExt, StreamExt};
 use plait_consensus::{Message, Snapshot};
+use plait_core::group::{GroupLookup, GroupReply};
 use plait_core::serving::{GroupId, GroupView, ServingError, ServingLookup, ServingView};
 use plait_core::{Command, NodeId, OpId};
 use serde::{Deserialize, Serialize};
@@ -97,6 +98,16 @@ pub enum Wire {
     },
     DiscoverVoter,
     VoterIdentity(NodeId),
+    GroupQuery {
+        request: u64,
+        lookup: GroupLookup,
+        reply_to: String,
+    },
+    GroupQueryReply {
+        request: u64,
+        lookup: GroupLookup,
+        view: Box<GroupReply>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

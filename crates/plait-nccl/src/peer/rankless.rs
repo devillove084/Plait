@@ -5,16 +5,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use plait_core::group::WorkerGrant;
-use sha2::{Digest, Sha256};
+pub use plait_core::group::GroupMember as RanklessMember;
+use plait_core::group::{GroupManifest, WorkerGrant};
 
-use super::{Endpoint, GrantBinding, Listener, PeerGroup};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RanklessMember {
-    pub grant: WorkerGrant,
-    pub endpoint: Endpoint,
-}
+use super::{GrantBinding, Listener, PeerGroup};
 
 pub struct RanklessListener {
     listener: Listener,
@@ -36,49 +30,34 @@ impl RanklessListener {
 
     pub(crate) fn connect(
         self,
-        mut members: Vec<RanklessMember>,
+        members: Vec<RanklessMember>,
         timeout: Duration,
     ) -> io::Result<Arc<PeerGroup>> {
-        members.sort_unstable_by_key(|member| member.grant.device);
-        if members
-            .windows(2)
-            .any(|pair| pair[0].grant.device == pair[1].grant.device)
-            || members
-                .iter()
-                .any(|member| member.grant.version != self.grant.version)
-        {
-            return Err(invalid(
-                "duplicate device or wrong group version in the peer manifest",
-            ));
-        }
-        let slot = members
+        let manifest = GroupManifest::new(self.grant.version, members)
+            .ok_or_else(|| invalid("invalid peer group manifest"))?;
+        let slot = manifest
+            .members
             .binary_search_by_key(&self.grant.device, |member| member.grant.device)
             .ok()
-            .filter(|&slot| members[slot] == self.member())
+            .filter(|&slot| manifest.members[slot] == self.member())
             .ok_or_else(|| {
                 invalid("the local device grant and endpoint must match the peer manifest")
             })?;
-        let mut digest = Sha256::new();
-        let mut devices = Vec::with_capacity(members.len());
-        let mut endpoints = Vec::with_capacity(members.len());
-        for member in members {
-            let grant = member.grant;
-            digest.update(grant.device.node.as_bytes());
-            digest.update(grant.device.ordinal.to_le_bytes());
-            digest.update(grant.incarnation.to_le_bytes());
-            digest.update(grant.fence.to_le_bytes());
-            devices.push(grant.device);
-            endpoints.push(member.endpoint);
-        }
-        self.listener.connect_bound(
-            slot,
-            endpoints,
-            Some(GrantBinding {
-                devices,
-                digest: digest.finalize().into(),
-            }),
-            timeout,
-        )
+        let binding = GrantBinding {
+            devices: manifest
+                .members
+                .iter()
+                .map(|member| member.grant.device)
+                .collect(),
+            digest: manifest.digest(),
+        };
+        let endpoints = manifest
+            .members
+            .into_iter()
+            .map(|member| member.endpoint)
+            .collect();
+        self.listener
+            .connect_bound(slot, endpoints, Some(binding), timeout)
     }
 }
 

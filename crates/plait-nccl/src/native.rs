@@ -265,3 +265,22 @@ pub unsafe extern "C" fn plaitPeerFailed(comm: *const Comm, failed: *mut i32) ->
     }
     NCCL_SUCCESS
 }
+
+/// # Safety
+/// The communicator remains live and `digest` points to 32 writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn plaitPeerManifestDigest(
+    comm: *const Comm,
+    digest: *mut [u8; 32],
+) -> NcclResult {
+    if comm.is_null() || digest.is_null() {
+        return NCCL_INVALID_ARGUMENT;
+    }
+    let Some(value) = unsafe { &*comm }.peer_manifest_digest() else {
+        return NCCL_UNSUPPORTED;
+    };
+    unsafe {
+        digest.write(value);
+    }
+    NCCL_SUCCESS
+}

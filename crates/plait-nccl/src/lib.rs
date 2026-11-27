@@ -403,6 +403,13 @@ impl Comm {
         }
     }
 
+    pub fn peer_manifest_digest(&self) -> Option<[u8; 32]> {
+        match &self.transport {
+            Transport::Peers(group) => group.manifest_digest(),
+            Transport::Star { .. } => None,
+        }
+    }
+
     /// Close the peer sockets and refuse new calls. The caller must wait for
     /// active calls to return before destroying the handle or its buffers.
     pub fn cancel_peers(&self) -> bool {

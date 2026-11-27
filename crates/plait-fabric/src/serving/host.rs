@@ -115,11 +115,18 @@ impl ServingState {
     }
 
     pub(crate) fn execution_versions_on(&self, host: NodeId) -> BTreeSet<GroupVersion> {
-        self.versions_on(host, |grant| {
+        let mut versions = self.versions_on(host, |grant| {
             self.resident_owner(grant).is_some()
                 || self.host_has_launch(grant.version, host)
                 || self.hosted_pool_versions.contains(&grant.version)
-        })
+        });
+        versions.extend(
+            self.workers
+                .range(DeviceId::new(host, 0)..=DeviceId::new(host, u32::MAX))
+                .filter_map(|(_, worker)| worker.grant.map(|grant| grant.version))
+                .filter(|&version| self.peer_version_is_live(version)),
+        );
+        versions
     }
 
     pub(crate) fn resident_versions_on(&self, host: NodeId) -> BTreeSet<GroupVersion> {
@@ -171,8 +178,13 @@ impl ServingState {
             },
         );
         for &version in groups {
-            self.fail_resident_version(version)
-                .expect("affected groups checked");
+            if self.peer_version_is_live(version) {
+                self.quiesce_peer_group(version, GroupPhase::Revoked)
+                    .expect("affected groups checked");
+            } else {
+                self.fail_resident_version(version)
+                    .expect("affected groups checked");
+            }
         }
         self.hosted_probes.remove(&host);
         self.hosted_inventories.remove(&host);
