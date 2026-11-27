@@ -711,6 +711,35 @@ The deployment layer uses that result for new admissions and the engine owns
 in-flight requests and KV. The revoked group keeps its device fences until its
 owners confirm teardown and submit `Release`.
 
+### Run dense AWQ with integer activations
+
+Set `VLLM_PLAIT_W4_LIBRARY` in each vLLM worker's environment to the Plait W4
+library built for its device architecture and runtime. Set
+`VLLM_PLAIT_W4_ACTIVATION_BITS` to `4` or `8`, then start the fork with
+`--quantization awq --dtype half --enforce-eager`. In a managed deployment,
+both variables can go in that host's engine `env`.
+
+Use the CUDA (`PLAIT_W4_CUDA_INTEGER_MMA`), HIP (`PLAIT_W4_HIP_INTEGER_DOT`),
+or PPU (`PLAIT_W4_PPU_INTEGER_MMA`) build of `kernels/w4a16_cuda.cu`, and
+check that it exports `plait_w4_stream_workspace_v1` and
+`plait_w4_stream_launch_v1`. Build against the device runtime used by that
+worker's PyTorch installation. Check the worker startup logs for
+`Plait dense AWQ uses W4A4` or `Plait dense AWQ uses W4A8`.
+
+The loader repacks each local AWQ weight shard once. The forward pass
+quantizes FP16 input and queues integer GEMM on the current PyTorch stream.
+The two kernels share device scratch supplied by PyTorch. Each worker
+produces FP16 output in the engine's original tensor layout, so all workers
+in a TP group use the same collective tensor shape and dtype.
+
+Device checks on CUDA, ROCm, and PPU covered both precisions, a non-default
+stream, odd group tails, and a short workspace. Single-device vLLM runs
+completed Qwen3-0.6B generation on ROCm with W4A8 and on PPU with W4A4.
+A managed TP2 run used W4A4 on CUDA and W4A8 on ROCm. The two device grants
+were active, and two greedy HTTP completions returned the same eight token
+IDs. The experiments used vendor-specific vLLM wheels with the fork's updated
+Python modules and weights converted to the AWQ format for functional testing.
+
 ### Assign different numbers of workers per host
 
 For four TP workers across three hosts, start the same model on each host.

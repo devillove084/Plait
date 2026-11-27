@@ -182,6 +182,10 @@ HGGC workers with the vLLM multiprocess executor. All four workers reported
 their grants ready, and the HTTP response's eight token IDs matched a single-device
 baseline. [Four-vendor serving verification](docs/rankless-nccl.md#verify-four-vendor-tp4-over-http)
 
+A two-host TP2 group served a dense AWQ model with W4A4 on CUDA and W4A8 on
+ROCm. Both workers used the same native Plait communicator.
+[Integer activation setup](docs/rankless-nccl.md#run-dense-awq-with-integer-activations)
+
 The deployment ingress resolves the active native epoch. The engine validates
 the requested version before admission. Existing streams keep their upstream
 connection.
@@ -359,6 +363,7 @@ release the result after the matching completion has executed in the control pla
 | --- | --- |
 | [Kernel primitives](specs/PlaitKernelPrimitives.tla) | Signed decoding, packed coordinate mapping, and exact integer dot products with accumulator bounds. |
 | [W4A4](specs/PlaitW4A4.tla) and [W4A8 / W4A16](specs/PlaitW4Operators.tla) | INT32 zero-point correction and tail reads for W4A4, byte-wise subtraction for W4A8, and packed indexing and dequantization before rounding for W4A16. |
+| [Caller-owned W4 stream](specs/PlaitW4CallerStream.tla) | Quantization precedes GEMM, queued work retains access to its scratch range, and a non-finite activation affects only its output row. TLC checked 7,263 distinct states. |
 | [Asynchronous reduction](specs/PlaitAsyncReduction.tla) | W4A4 device completion, stale-event rejection, and deterministic folding. An independent operation completes even while a producer or pull in another operation stalls. |
 | [Ordered publication](specs/PlaitOrderedPublication.tla) | Completion and revocation in the agreed command order, receipt identity on retry, and recovery from a replica's durable command prefix. |
 | [Peer collectives](specs/PlaitPeerCollective.tla) | Independent link progress within scatter and gather, compatibility with paired rounds, and completion of a separate communicator after participant loss. |

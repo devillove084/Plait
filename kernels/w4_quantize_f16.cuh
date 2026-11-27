@@ -16,7 +16,7 @@ __device__ __forceinline__ uint32_t lane_max(uint32_t value, uint32_t distance) 
 template <uint32_t Bits>
 __device__ __forceinline__ uint8_t encode(__half value, float scale) {
     constexpr int limit = Bits == 4 ? 7 : 127;
-    if (scale == 0.0f) return 0;
+    if (!(scale > 0.0f)) return 0;
     const int rounded = __float2int_rn(__fdiv_rn(__half2float(value), scale));
     return uint8_t(max(-limit, min(limit, rounded)));
 }
@@ -43,11 +43,13 @@ __global__ void group_scales(const __half *input, uint8_t *codes, float *scales,
             magnitude = lane_max(magnitude, distance);
         }
         const bool finite = magnitude < 0x7c00u;
-        // Zero is reserved for a rejected group; a valid all-zero group has scale 1.
-        const float scale = !finite ? 0.0f : magnitude == 0 ? 1.0f :
+        // Session callers receive a rejection flag. Borrowed-stream callers
+        // observe a NaN output row without an intermediate host readback.
+        const float scale = !finite ? (invalid ? 0.0f : __int_as_float(0x7fc00000)) :
+            magnitude == 0 ? 1.0f :
             __fdiv_rn(__half2float(__ushort_as_half(uint16_t(magnitude))), limit);
         if (lane == 0) {
-            if (!finite) atomicExch(invalid, 1u);
+            if (!finite && invalid) atomicExch(invalid, 1u);
             scales[task] = scale;
         }
         if constexpr (Pack && Bits == 8) {
