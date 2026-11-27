@@ -60,14 +60,20 @@ Publish ==
     /\ revision' = revision + 1 /\ stage' = Idle
     /\ UNCHANGED <<lost, spares, releaseProof, grants>>
 
-Next == Prepare \/ Supersede \/ Cancel \/ Publish
+Routable(g) == g \notin lost \/ epochs[g] = 2
+LivePaths == {path \in Paths : Routable(path[1]) /\ Routable(path[2])}
+
+\* Requests can use the recovered directory without changing recovery state.
+Serve ==
+    /\ published # Unpublished /\ LivePaths = Paths
+    /\ UNCHANGED vars
+
+Next == Prepare \/ Supersede \/ Cancel \/ Publish \/ Serve
         \/ \E g \in Groups : Fail(g) \/ RegisterSpare(g) \/ VerifyOldRelease(g) \/ Ready(g)
 
 Spec == Init /\ [][Next]_vars
 
-Routable(g) == g \notin lost \/ epochs[g] = 2
-LivePaths == {path \in Paths : Routable(path[1]) /\ Routable(path[2])}
-
+NoUnfinishedDeadlock == published = Unpublished => ENABLED Next
 HealthyVersionsPreserved == \A g \in Groups \ lost : epochs[g] = 1
 OldReleaseRequiresProof == releaseProof \subseteq lost /\ grants = Groups \ releaseProof
 
