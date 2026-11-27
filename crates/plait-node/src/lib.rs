@@ -413,14 +413,7 @@ impl NodeState {
                 let result = if !can_propose {
                     Err("this node is not a voter".to_owned())
                 } else {
-                    match self.replica.machine().validate(&command) {
-                        Err(error) => Err(error),
-                        Ok(()) => self
-                            .replica
-                            .propose(command, now)
-                            .map(|_| String::new())
-                            .map_err(|error| error.to_string()),
-                    }
+                    self.submit(command, now)
                 };
                 let (ok, message) = match result {
                     Ok(message) => (true, message),
@@ -758,6 +751,26 @@ impl NodeState {
         }
     }
 
+    fn submit(&mut self, command: Command, now: u64) -> Result<String, String> {
+        let runtime = self.replica.machine();
+        if let Command::Serving(operation) = &command
+            && retired_decoder_action(&operation.action)
+        {
+            // Gate client proposals here so committed history and in-flight
+            // consensus instances retain their deterministic apply behavior.
+            return match runtime.serving_receipt(operation.id) {
+                Some(receipt) if receipt.operation == **operation => Ok(String::new()),
+                Some(_) => Err("serving operation id already used for another action".into()),
+                None => Err("the native decoder is retired; submit inference to the engine".into()),
+            };
+        }
+        runtime.validate(&command)?;
+        self.replica
+            .propose(command, now)
+            .map(|_| String::new())
+            .map_err(|error| error.to_string())
+    }
+
     fn propose(&mut self, command: Command, now: u64) {
         if let Err(error) = self.replica.propose(command, now) {
             eprintln!("{}: proposal failed: {error}", self.id);
@@ -775,6 +788,39 @@ impl NodeState {
             }
         }
     }
+}
+
+// Expiration and cancellation remain available to close work from old journals.
+fn retired_decoder_action(action: &ServingAction) -> bool {
+    matches!(
+        action,
+        ServingAction::DecoderReady { .. }
+            | ServingAction::DecoderReadyManaged { .. }
+            | ServingAction::PublishDecoderRoutes { .. }
+            | ServingAction::PublishDecoderStandbys { .. }
+            | ServingAction::FailoverDecoder { .. }
+            | ServingAction::StageDecoderSwitch { .. }
+            | ServingAction::CommitDecoderSwitch { .. }
+            | ServingAction::PrepareDecoderSwitch { .. }
+            | ServingAction::PrepareDecoderSwitchFromPool { .. }
+            | ServingAction::PrepareWeightedDecoderSwitch { .. }
+            | ServingAction::ConfigureDecoderWeights { .. }
+            | ServingAction::AdmitDecoder { .. }
+            | ServingAction::AdmitDecoderRouted { .. }
+            | ServingAction::AdmitDecoderWithRecovery { .. }
+            | ServingAction::AdmitDecoderWithRetry { .. }
+            | ServingAction::AdmitDecoderReplay { .. }
+            | ServingAction::AdmitResumableDecoder { .. }
+            | ServingAction::SubmitDecoder { .. }
+            | ServingAction::SubmitDecoderRouted { .. }
+            | ServingAction::AppendDecoderOutput { .. }
+            | ServingAction::TakeoverDecoder { .. }
+            | ServingAction::TakeoverDecoderWithRetry { .. }
+            | ServingAction::RecoverDecoderWork { .. }
+            | ServingAction::RestartDecoderWork { .. }
+            | ServingAction::RebindDecoderEntry { .. }
+            | ServingAction::AdvanceDecoder { .. }
+    )
 }
 
 /// Start three TCP nodes, propose a fused sum through different nodes, and

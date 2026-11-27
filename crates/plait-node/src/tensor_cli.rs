@@ -19,7 +19,7 @@ mod w4;
 
 use control::{ControlPeers, GroupControl};
 
-const OPERATIONS: &str = "tensor requires publish, publish-w4, worker-w4, dispatch-w4, submit-w4, decoder-w4, generate-pd, replay-pd, resume-pd, profile-w4, select-w4, plan-w4, or sum";
+const OPERATIONS: &str = "tensor requires publish, publish-w4, worker-w4, dispatch-w4, submit-w4, profile-w4, select-w4, plan-w4, or sum";
 
 #[derive(Deserialize)]
 struct Publish {
@@ -74,10 +74,6 @@ pub(super) async fn run(
         "worker-w4" => w4::run_worker(serde_json::from_str(&config)?).await,
         "dispatch-w4" => runtime::dispatch(config.parse()?).await,
         "submit-w4" => runtime::submit_w4(config.parse()?).await,
-        "decoder-w4" => w4::run_decoder(serde_json::from_str(&config)?).await,
-        "generate-pd" => w4::generate_pd(serde_json::from_str(&config)?).await,
-        "replay-pd" => w4::replay_pd(serde_json::from_str(&config)?).await,
-        "resume-pd" => w4::resume_pd(serde_json::from_str(&config)?).await,
         "profile-w4" => w4::profile(serde_json::from_str(&config)?),
         "sum" => sum(serde_json::from_str(&config)?).await,
         _ => Err(OPERATIONS.into()),

@@ -5,6 +5,19 @@ The vLLM fork uses Plait's peer transport for tensor parallel groups when
 to collectives with its local accelerator. CUDA, ROCm, Huawei CANN, and PPU
 HGGC workers share the same wire format.
 
+The vLLM fork provides request admission, KV transfer, and stream recovery.
+Its KV page store runs as a separate process. The Plait node journal stores
+group state and operation receipts. [vLLM KV page store][vllm-kv-store]
+
+Drain and retire any original Rust decoder groups before upgrading. The
+`tensor decoder-w4`, `tensor generate-pd`, `tensor replay-pd`, and
+`tensor resume-pd` commands have been removed. Existing journals still replay
+their decoder records and return committed receipts. The legacy expiration
+and cancellation operations and the usual device-release checks remain
+available for cleanup after an upgrade.
+
+[vllm-kv-store]: https://github.com/devillove084/vllm/tree/plait/v0.31-runtime/tools/plait/kv-store
+
 ## Start a peer group
 
 ### Join by device identity
@@ -1805,10 +1818,10 @@ uses host staging over TCP. The cache starts empty after a store restart.
 
 #### Align different Prefill and Decode pipelines
 
-Upgrade the store to a `plait-node` build that accepts `PLAITKV3` before
-starting a multi-stage Prefill or Decode group. Use the matching vLLM fork
-on the group's hosts. Choose TP, PP and `VLLM_PP_LAYER_PARTITION` for each
-role independently. Within one group, the hosts agree on the layer split
+Use a build of the fork's `vllm-plait-kv-store` that accepts `PLAITKV3`
+before starting a multi-stage Prefill or Decode group. Use the matching
+vLLM fork on the group's hosts. Choose TP, PP and `VLLM_PP_LAYER_PARTITION`
+for each role independently. Within one group, the hosts agree on the layer split
 before loading the model. The two roles use the same weights, KV dtype,
 block size and store namespace.
 

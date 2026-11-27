@@ -7,12 +7,7 @@ use plait_core::serving::{
 };
 use serde::{Deserialize, Serialize};
 
-mod decoder;
 mod hosted;
-pub use decoder::pool::{DecoderPool, generate_decoder_layouts};
-pub use decoder::{
-    DecoderLayoutCandidate, DecoderPlacement, DecoderSelection, select_decoder_layout,
-};
 pub use hosted::{
     HostedLinkLimit, HostedLinkPolicy, HostedModePolicy, HostedPdDecision, HostedPdIncumbents,
     HostedPdPool, HostedPdSelection, HostedPool, generate_hosted_candidates, limit_hosted_links,

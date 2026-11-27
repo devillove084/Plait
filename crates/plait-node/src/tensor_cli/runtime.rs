@@ -8,9 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use plait_core::serving::{
-    DecoderRouteWork, EXECUTION_PULSE_MS, GroupPhase, GroupView, HostMemory, ResidentOwner,
-    RouteSetId, ServingAction, ServingError, ServingLookup, ServingOperation, ServingView,
-    W4ShardLayout, WorkerGrant,
+    EXECUTION_PULSE_MS, GroupPhase, GroupView, HostMemory, ResidentOwner, ServingAction,
+    ServingLookup, ServingOperation, ServingView, W4ShardLayout, WorkerGrant,
 };
 use plait_core::tensor::KPartial;
 use plait_core::{DeviceId, NodeId, OpId};
@@ -56,22 +55,6 @@ struct Device {
 #[derive(Deserialize)]
 struct Artifact {
     launch_digest: [u8; 32],
-    #[serde(flatten)]
-    program: Program,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum Program {
-    W4(W4Artifact),
-    Decoder {
-        decoder_config: PathBuf,
-        weights: Option<PathBuf>,
-    },
-}
-
-#[derive(Deserialize)]
-struct W4Artifact {
     k_range: [u32; 2],
     group_size: u32,
     output_columns: u32,
@@ -398,11 +381,6 @@ async fn reconcile(
         }
         return Ok(());
     }
-    if matches!(view.phase, GroupPhase::Ready | GroupPhase::Active)
-        && matches!(state, State::Running(_, process) if process.is_decoder())
-    {
-        reconcile_decoder_routes(control, &view.plan.model).await?;
-    }
     match view.phase {
         GroupPhase::Preparing | GroupPhase::Ready => {
             if view.ready.contains(&id) {
@@ -416,18 +394,6 @@ async fn reconcile(
                 return Ok(());
             };
             if matches!(state, State::Idle) {
-                if matches!(artifact.program, Program::Decoder { .. })
-                    && (view.grants.len() != 1
-                        || !matches!(
-                            view.plan.role,
-                            plait_core::serving::ServingRole::Prefill
-                                | plait_core::serving::ServingRole::Decode
-                        ))
-                {
-                    return Err(io::Error::other(
-                        "native decoder needs a single-device Prefill or Decode group",
-                    ));
-                }
                 apply(
                     control,
                     ServingAction::ClaimResident {
@@ -446,7 +412,7 @@ async fn reconcile(
                     }
                 }
             }
-            if let (State::Running(_, process), Program::W4(layout)) = (state, &artifact.program) {
+            if let State::Running(_, process) = state {
                 process.check_running()?;
                 apply(
                     control,
@@ -455,9 +421,9 @@ async fn reconcile(
                         launch_digest: artifact.launch_digest,
                         addr: dispatch_addr,
                         shard: W4ShardLayout {
-                            k_range: layout.k_range,
-                            group_size: layout.group_size,
-                            output_columns: layout.output_columns,
+                            k_range: artifact.k_range,
+                            group_size: artifact.group_size,
+                            output_columns: artifact.output_columns,
                         },
                     },
                 )
@@ -479,50 +445,10 @@ async fn reconcile(
             }
         }
         GroupPhase::Retired => unreachable!("retired grant resets the local slot"),
-        GroupPhase::Draining => {
-            if matches!(state, State::Running(_, process) if process.is_decoder()) {
-                expire_decoder(control, grant.version, &view.plan.model).await?;
-            } else {
-                expire_w4(control, grant.version).await?;
-            }
-        }
+        GroupPhase::Draining => expire_w4(control, grant.version).await?,
         GroupPhase::Active => {}
     }
     Ok(())
-}
-
-async fn reconcile_decoder_routes(control: &mut GroupControl, model: &str) -> io::Result<()> {
-    let lookup = ServingLookup::DecoderRouteWork(RouteSetId::for_model(model));
-    let ServingView::DecoderRouteWork(work) = control.query(lookup).await? else {
-        return Err(io::Error::other("expected decoder route work"));
-    };
-    let action = match work {
-        Some(DecoderRouteWork::Failover(intent)) => ServingAction::FailoverDecoder {
-            model: model.to_owned(),
-            intent,
-        },
-        Some(DecoderRouteWork::Switch(intent)) => ServingAction::CommitDecoderSwitch {
-            model: model.to_owned(),
-            intent,
-        },
-        None => return Ok(()),
-    };
-    let operation = ServingOperation {
-        id: OpId::new(NodeId::random(), 1),
-        action,
-    };
-    match control.apply(&operation).await? {
-        Ok(_)
-        | Err(
-            ServingError::StaleDirectory { .. }
-            | ServingError::InvalidDirectory
-            | ServingError::InvalidRoute(_)
-            | ServingError::InvalidPhase(_)
-            | ServingError::StaleEpoch { .. }
-            | ServingError::ActiveEpochChanged { .. },
-        ) => Ok(()),
-        Err(error) => Err(io::Error::other(format!("{error:?}"))),
-    }
 }
 
 async fn recover(
@@ -602,39 +528,6 @@ async fn check_release(program: &Path, grant: WorkerGrant) -> io::Result<()> {
         return Err(io::Error::other(format!(
             "device release check exited with {status}"
         )));
-    }
-    Ok(())
-}
-
-async fn expire_decoder(
-    control: &mut GroupControl,
-    version: plait_core::serving::GroupVersion,
-    model: &str,
-) -> io::Result<()> {
-    let ServingView::DecoderDrain(Some(status)) =
-        control.query(ServingLookup::DecoderDrain(version)).await?
-    else {
-        return Ok(());
-    };
-    if let Some((deadline, path)) = status.next_expiry
-        && deadline <= super::w4::now_ms()?
-    {
-        let origin = NodeId::derive(&format!(
-            "plait/decoder/expire/{}/{}/{}/{}",
-            path.prefill.group.0, path.prefill.epoch, path.decode.group.0, path.decode.epoch
-        ));
-        let operation = ServingOperation {
-            id: OpId::new(origin, deadline),
-            action: ServingAction::ExpireDecoder {
-                model: model.to_owned(),
-                path,
-                through_ms: deadline,
-            },
-        };
-        control
-            .apply(&operation)
-            .await?
-            .map_err(|error| io::Error::other(format!("{error:?}")))?;
     }
     Ok(())
 }

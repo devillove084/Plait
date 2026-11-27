@@ -19,7 +19,6 @@ use serde_json::{Value, json};
 
 mod hosted;
 mod hosted_pd;
-mod replanning;
 
 #[derive(Deserialize)]
 #[serde(tag = "request", rename_all = "snake_case")]
@@ -147,14 +146,6 @@ enum Request {
         id: OpId,
         forecast: ServingForecast,
         candidates: Vec<W4CandidateInput>,
-    },
-    ReplanPd {
-        id: OpId,
-        expected_revision: u64,
-        forecast: ServingForecast,
-        #[serde(default)]
-        candidates: Vec<replanning::Input>,
-        pool: Option<plait_parallel::serving::DecoderPool>,
     },
 }
 
@@ -595,24 +586,6 @@ async fn handle(
             forecast,
             candidates,
         } => replan_w4(client, peers, id, forecast, candidates).await,
-        Request::ReplanPd {
-            id,
-            expected_revision,
-            forecast,
-            candidates,
-            pool,
-        } => {
-            replanning::run(
-                client,
-                peers,
-                id,
-                expected_revision,
-                forecast,
-                candidates,
-                pool,
-            )
-            .await
-        }
         Request::Inspect { version } => {
             let ServingView::Group(view) =
                 query(client, peers, ServingLookup::Group(version)).await?
