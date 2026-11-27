@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 
 use super::super::{ServingCandidate, ServingForecast, SloProfile, valid_rate};
 use super::pipeline::{PipelineProfile, search_pipeline};
-use super::{HostedLinkLimit, HostedLinkPolicy, LinkEvidence};
+use super::{
+    HostedLinkLimit, HostedLinkPolicy, HostedTpLinkProfile, LinkEvidence, deserialize_tp_profiles,
+    limit_with_evidence,
+};
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -24,10 +27,41 @@ pub struct HostedPool {
     ports: PortRange,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     replicated_egress_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    all_reduce_profiles: Vec<AllReduceProfile>,
     #[serde(default)]
     sizes: Vec<SizeProfile>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pipelines: Vec<PipelineProfile>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AllReduceProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replicated_egress_bytes: Option<u64>,
+    #[serde(deserialize_with = "deserialize_tp_profiles")]
+    tp_profiles: BTreeMap<u32, HostedTpLinkProfile>,
+}
+
+#[derive(Clone, Copy)]
+struct AllReduceChoice<'a> {
+    bytes: Option<u64>,
+    profiles: Option<&'a BTreeMap<u32, HostedTpLinkProfile>>,
+}
+
+impl AllReduceChoice<'_> {
+    fn name(self, profile: &str) -> Option<String> {
+        match self.bytes {
+            Some(bytes) => hosted_all_reduce_profile(profile, bytes),
+            None => Some(profile.to_owned()),
+        }
+    }
+
+    fn supports(self, width: u32) -> bool {
+        self.profiles
+            .is_none_or(|profiles| profiles.contains_key(&width))
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -111,6 +145,26 @@ pub fn generate_hosted_candidates(
     )
 }
 
+pub fn limit_hosted_pool_tp_links(
+    plan: &GroupPlan,
+    recipe: &HostedRecipe,
+    pool: &HostedPool,
+    policy: &HostedLinkPolicy,
+    now_ms: u64,
+    links: &BTreeMap<(NodeId, NodeId), HostedLinkSample>,
+) -> Result<HostedLinkLimit, &'static str> {
+    if plan.pipeline_parallel != 1 {
+        return Err("direct hosted link quotes require a TP-only group");
+    }
+    let profiles = pool
+        .recipe_link_profiles(&recipe.profile, plan.tensor_parallel, 1)
+        .ok_or("hosted candidate lacks its AllReduce link profile")?;
+    limit_with_evidence(
+        plan,
+        LinkEvidence::new(policy, now_ms, links).with_tp_profiles(profiles),
+    )
+}
+
 pub(super) fn generate_layouts(
     resources: &ServingResources,
     planning: &HostedPlanning,
@@ -121,17 +175,43 @@ pub(super) fn generate_layouts(
 ) -> Result<Vec<(ServingCandidate, HostedRecipe)>, &'static str> {
     evidence.policy.validate()?;
     let role = target.role();
-    let evidence = evidence.for_role(role);
     let allow_local = !matches!(target, PoolTarget::LegacyAggregate);
     pool.validate(allow_local)?;
-    let history = resources
+    let mut candidates = Vec::new();
+    for choice in pool.all_reduce_choices() {
+        let context = evidence.for_role(role).with_tp_profiles(choice.profiles);
+        candidates.extend(generate_for_choice(
+            resources, planning, checkpoint, pool, context, target, choice,
+        )?);
+    }
+    Ok(candidates)
+}
+
+fn generate_for_choice(
+    resources: &ServingResources,
+    planning: &HostedPlanning,
+    checkpoint: &str,
+    pool: &HostedPool,
+    evidence: LinkEvidence<'_>,
+    target: PoolTarget<'_>,
+    choice: AllReduceChoice<'_>,
+) -> Result<Vec<(ServingCandidate, HostedRecipe)>, &'static str> {
+    let role = target.role();
+    let allow_local = !matches!(target, PoolTarget::LegacyAggregate);
+    let expected_epoch = resources
         .groups
         .iter()
-        .find(|group| group.latest.group == pool.group);
-    let expected_epoch = history.map_or(0, |group| group.latest.epoch);
+        .find(|group| group.latest.group == pool.group)
+        .map_or(0, |group| group.latest.epoch);
     let mut candidates = Vec::new();
-    let profile = pool.profile_name().expect("validated hosted profile");
-    for size in &pool.sizes {
+    let profile = choice
+        .name(&pool.profile)
+        .expect("validated hosted profile");
+    for size in pool
+        .sizes
+        .iter()
+        .filter(|size| choice.supports(size.tensor_parallel))
+    {
         let hosts = available_hosts(resources, planning, &profile, &pool.ports, size);
         for layout in search_layouts(&hosts, size.tensor_parallel, evidence, allow_local) {
             let api_host = layout.api_host.expect("layout has a host with free ports");
@@ -192,10 +272,18 @@ pub(super) fn generate_layouts(
             ));
         }
     }
-    for pipeline in &pool.pipelines {
-        let profile = pool
-            .pipeline_name(pipeline)
-            .expect("validated pipeline profile");
+    for pipeline in pool
+        .pipelines
+        .iter()
+        .filter(|entry| choice.supports(entry.tensor_parallel))
+    {
+        let profile = choice
+            .name(
+                &pipeline
+                    .qualified_name()
+                    .expect("validated pipeline profile"),
+            )
+            .expect("validated hosted AllReduce profile");
         let hosts = inventory_hosts(resources, planning, &profile, &pool.ports);
         for layout in search_pipeline(pipeline, &hosts, evidence) {
             let [master_port, http_port, backend_port] = hosts[&layout.api_host]
@@ -269,19 +357,41 @@ fn bind_launch(
 }
 
 impl HostedPool {
-    fn with_all_reduce(&self, profile: &str) -> Option<String> {
-        match self.replicated_egress_bytes {
-            Some(bytes) => hosted_all_reduce_profile(profile, bytes),
-            None => Some(profile.to_owned()),
+    fn all_reduce_choices(&self) -> impl Iterator<Item = AllReduceChoice<'_>> {
+        let fixed = self
+            .all_reduce_profiles
+            .is_empty()
+            .then_some(AllReduceChoice {
+                bytes: self.replicated_egress_bytes,
+                profiles: None,
+            });
+        fixed
+            .into_iter()
+            .chain(self.all_reduce_profiles.iter().map(|row| AllReduceChoice {
+                bytes: row.replicated_egress_bytes,
+                profiles: Some(&row.tp_profiles),
+            }))
+    }
+
+    pub(super) fn recipe_link_profiles(
+        &self,
+        profile: &str,
+        tp: u32,
+        pp: u32,
+    ) -> Option<Option<&BTreeMap<u32, HostedTpLinkProfile>>> {
+        if pp == 1 {
+            self.choice_for(&self.profile, profile, tp)
+                .map(|choice| choice.profiles)
+        } else {
+            let entry = self.pipeline(profile, tp, pp)?;
+            self.choice_for(&entry.qualified_name()?, profile, tp)
+                .map(|choice| choice.profiles)
         }
     }
 
-    fn profile_name(&self) -> Option<String> {
-        self.with_all_reduce(&self.profile)
-    }
-
-    fn pipeline_name(&self, pipeline: &PipelineProfile) -> Option<String> {
-        self.with_all_reduce(&pipeline.qualified_name()?)
+    fn choice_for(&self, base: &str, profile: &str, tp: u32) -> Option<AllReduceChoice<'_>> {
+        self.all_reduce_choices()
+            .find(|choice| choice.supports(tp) && choice.name(base).as_deref() == Some(profile))
     }
 
     pub(super) fn group(&self) -> GroupId {
@@ -293,9 +403,7 @@ impl HostedPool {
     }
 
     pub(super) fn capacity(&self, profile: &str, tensor_parallel: u32) -> Option<SloProfile> {
-        if self.profile_name().as_deref() != Some(profile) {
-            return None;
-        }
+        self.choice_for(&self.profile, profile, tensor_parallel)?;
         self.sizes
             .iter()
             .find(|size| size.tensor_parallel == tensor_parallel)
@@ -311,7 +419,9 @@ impl HostedPool {
         self.pipelines.iter().find(|entry| {
             entry.tensor_parallel == tensor_parallel
                 && entry.stages.len() == pipeline_parallel as usize
-                && self.pipeline_name(entry).as_deref() == Some(profile)
+                && entry
+                    .qualified_name()
+                    .is_some_and(|base| self.choice_for(&base, profile, tensor_parallel).is_some())
         })
     }
 
@@ -319,13 +429,14 @@ impl HostedPool {
         !self.pipelines.is_empty()
     }
 
+    pub(super) fn has_all_reduce_profiles(&self) -> bool {
+        !self.all_reduce_profiles.is_empty()
+    }
+
     pub(super) fn validate(&self, allow_local: bool) -> Result<(), &'static str> {
         let end = u32::from(self.ports.first) + u32::from(self.ports.count);
         if self.ports.first == 0 || self.ports.count < 3 || end > u32::from(u16::MAX) + 1 {
             return Err("hosted pool requires a port range with at least three valid ports");
-        }
-        if self.profile_name().is_none() {
-            return Err("invalid hosted AllReduce profile");
         }
         let mut degrees = BTreeSet::new();
         if (self.sizes.is_empty() && self.pipelines.is_empty())
@@ -343,7 +454,7 @@ impl HostedPool {
         }
         let mut shapes = BTreeSet::new();
         for pipeline in &self.pipelines {
-            let name = self.pipeline_name(pipeline);
+            let name = pipeline.qualified_name();
             if !allow_local
                 || !pipeline.validate()
                 || name.is_none()
@@ -352,6 +463,44 @@ impl HostedPool {
                 return Err(
                     "hosted P/D pool requires distinct supported pipelines and valid stage budgets",
                 );
+            }
+        }
+        self.validate_all_reduce_profiles(&degrees)?;
+        Ok(())
+    }
+
+    fn validate_all_reduce_profiles(&self, widths: &BTreeSet<u32>) -> Result<(), &'static str> {
+        if self.replicated_egress_bytes.is_some() && self.has_all_reduce_profiles() {
+            return Err("hosted all_reduce_profiles cannot be combined with a fixed cap");
+        }
+        let mut caps = BTreeSet::new();
+        for choice in self.all_reduce_choices() {
+            if !caps.insert(choice.bytes)
+                || choice.name(&self.profile).is_none()
+                || self.pipelines.iter().any(|entry| {
+                    entry
+                        .qualified_name()
+                        .and_then(|base| choice.name(&base))
+                        .is_none()
+                })
+            {
+                return Err("hosted AllReduce profiles require distinct caps and valid names");
+            }
+            if let Some(profiles) = choice.profiles {
+                if profiles.is_empty() {
+                    return Err("hosted AllReduce profiles require at least one TP width");
+                }
+                for (&width, profile) in profiles {
+                    if !widths.contains(&width)
+                        && !self
+                            .pipelines
+                            .iter()
+                            .any(|entry| entry.tensor_parallel == width)
+                    {
+                        return Err("hosted AllReduce profile has no matching TP width");
+                    }
+                    profile.validate()?;
+                }
             }
         }
         Ok(())
@@ -377,6 +526,7 @@ impl HostedPool {
                 count: 6,
             },
             replicated_egress_bytes: None,
+            all_reduce_profiles: Vec::new(),
             sizes: vec![SizeProfile {
                 tensor_parallel: 1,
                 device_bytes: 8,
@@ -396,6 +546,21 @@ impl HostedPool {
     pub(super) fn with_capacity(mut self, tp: u32, rps: f64) -> Self {
         self.sizes[0].tensor_parallel = tp;
         self.sizes[0].capacity.rps = rps;
+        self
+    }
+
+    pub(super) fn with_all_reduce_profiles(
+        mut self,
+        width: u32,
+        choices: impl IntoIterator<Item = (Option<u64>, HostedTpLinkProfile)>,
+    ) -> Self {
+        self.all_reduce_profiles = choices
+            .into_iter()
+            .map(|(replicated_egress_bytes, profile)| AllReduceProfile {
+                replicated_egress_bytes,
+                tp_profiles: BTreeMap::from([(width, profile)]),
+            })
+            .collect();
         self
     }
 }
@@ -669,6 +834,7 @@ mod tests {
             group,
             profile: "weights".into(),
             replicated_egress_bytes: None,
+            all_reduce_profiles: Vec::new(),
             api_model: "model".into(),
             max_model_len: 1024,
             gpu_memory_bps: 8000,

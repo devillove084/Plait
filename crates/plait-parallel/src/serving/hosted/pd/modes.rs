@@ -346,7 +346,15 @@ fn endpoint(
     } else {
         (pool.capacity(name, tp)?, None)
     };
-    context.incumbent(assignment.version, role, capacity, ranks, pipeline)
+    let link_profiles = pool.recipe_link_profiles(name, tp, pp)?;
+    context.incumbent(
+        assignment.version,
+        role,
+        capacity,
+        ranks,
+        pipeline,
+        link_profiles,
+    )
 }
 
 fn route_rate(
@@ -767,6 +775,7 @@ mod tests {
                         valid_until_ms: 5000,
                     },
                     &BTreeMap::from([(host, 1)]),
+                    None,
                     None,
                 )
                 .unwrap()

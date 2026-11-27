@@ -9,7 +9,8 @@ use plait_core::{NodeId, OpId};
 use plait_node::Client;
 use plait_parallel::serving::{
     HostedLinkLimit, HostedLinkPolicy, HostedPool, ServingCandidate, ServingForecast,
-    generate_hosted_candidates, limit_hosted_links, select_serving_candidate,
+    generate_hosted_candidates, limit_hosted_links, limit_hosted_pool_tp_links,
+    select_serving_candidate,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -145,9 +146,21 @@ pub(super) async fn replan(
     let link_limits = if let Some(policy) = &link_policy {
         candidates
             .iter_mut()
-            .map(|candidate| {
-                let limit = limit_hosted_links(&candidate.plan, policy, forecast.now_ms, &samples)
-                    .map_err(invalid_input)?;
+            .zip(&recipes)
+            .map(|(candidate, recipe)| {
+                let limit = if let Some(pool) = &pool {
+                    limit_hosted_pool_tp_links(
+                        &candidate.plan,
+                        recipe.as_ref().expect("pool candidate has a recipe"),
+                        pool,
+                        policy,
+                        forecast.now_ms,
+                        &samples,
+                    )
+                } else {
+                    limit_hosted_links(&candidate.plan, policy, forecast.now_ms, &samples)
+                }
+                .map_err(invalid_input)?;
                 match limit {
                     HostedLinkLimit::Local => {}
                     HostedLinkLimit::MissingTpProfile { .. }

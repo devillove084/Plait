@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use super::super::{ServingCandidate, ServingForecast, SloProfile, validate_placement};
 use super::pipeline::{PipelineProfile, lower_capacity};
 use super::pool::{HostedPool, PoolTarget, generate_layouts};
-use super::{HostedLinkPolicy, LinkEvidence, Traffic};
+use super::{HostedLinkPolicy, HostedTpLinkProfile, LinkEvidence, Traffic};
 
 mod modes;
 mod reconfigure;
@@ -316,15 +316,28 @@ pub fn plan_hosted_pd_with_assignments(
         let Some(&capacity) = profiles.get(&instance.version) else {
             continue;
         };
-        let pipeline = if let Some(assignments) = incumbents.assignments {
+        let (pipeline, link_profiles) = if let Some(assignments) = incumbents.assignments {
             let assignment = assignments
                 .get(&instance.version)
                 .ok_or("active hosted P/D group lacks its committed launch assignment")?;
             let pp = active_pipeline_parallel(instance, assignment)
                 .ok_or("active hosted P/D assignment does not match the planning snapshot")?;
-            if pp > 1 {
-                let calibration = pool
-                    .slot(instance.version.group, instance.role)
+            let slot = pool.slot(instance.version.group, instance.role);
+            let link_profiles = slot
+                .filter(|slot| slot.pool.has_all_reduce_profiles())
+                .map(|slot| {
+                    slot.pool
+                        .recipe_link_profiles(
+                            &assignment.recipe.profile,
+                            assignment.tensor_parallel,
+                            pp,
+                        )
+                        .ok_or("active hosted P/D group lacks its committed AllReduce link profile")
+                })
+                .transpose()?
+                .flatten();
+            let pipeline = if pp > 1 {
+                let calibration = slot
                     .and_then(|slot| {
                         slot.pool.pipeline(
                             &assignment.recipe.profile,
@@ -336,14 +349,19 @@ pub fn plan_hosted_pd_with_assignments(
                 Some((calibration, assignment.recipe.api_host))
             } else {
                 None
-            }
+            };
+            (pipeline, link_profiles)
         } else {
-            if pool.slots.iter().any(|slot| slot.pool.has_pipelines()) {
+            if pool
+                .slots
+                .iter()
+                .any(|slot| slot.pool.has_pipelines() || slot.pool.has_all_reduce_profiles())
+            {
                 return Err(
-                    "active hosted P/D groups require launch assignments for pipeline planning",
+                    "active hosted P/D groups require launch assignments for calibrated placement",
                 );
             }
-            None
+            (None, None)
         };
         if let Some(endpoint) = context.incumbent(
             instance.version,
@@ -351,6 +369,7 @@ pub fn plan_hosted_pd_with_assignments(
             capacity,
             &instance.ranks,
             pipeline,
+            link_profiles,
         ) {
             active.insert(instance.version.group, endpoint);
         }
@@ -699,10 +718,11 @@ impl EndpointContext<'_> {
         capacity: SloProfile,
         ranks: &BTreeMap<NodeId, u64>,
         pipeline: Option<(&PipelineProfile, NodeId)>,
+        link_profiles: Option<&BTreeMap<u32, HostedTpLinkProfile>>,
     ) -> Option<Endpoint> {
         // Keep the measured baseline available while evaluating a replacement.
         self.evidence = self.evidence.without_tp_wait();
-        self.endpoint(version, role, capacity, ranks, pipeline)
+        self.endpoint(version, role, capacity, ranks, pipeline, link_profiles)
     }
 
     fn candidate(
@@ -729,7 +749,19 @@ impl EndpointContext<'_> {
         } else {
             None
         };
-        self.endpoint(version, plan.role, candidate.capacity, &ranks, pipeline)
+        let link_profiles = pool.recipe_link_profiles(
+            &recipe.profile,
+            plan.tensor_parallel,
+            plan.pipeline_parallel,
+        )?;
+        self.endpoint(
+            version,
+            plan.role,
+            candidate.capacity,
+            &ranks,
+            pipeline,
+            link_profiles,
+        )
     }
 
     fn endpoint(
@@ -739,8 +771,9 @@ impl EndpointContext<'_> {
         mut capacity: SloProfile,
         ranks: &BTreeMap<NodeId, u64>,
         pipeline: Option<(&PipelineProfile, NodeId)>,
+        link_profiles: Option<&BTreeMap<u32, HostedTpLinkProfile>>,
     ) -> Option<Endpoint> {
-        let evidence = self.evidence.for_role(role);
+        let evidence = self.evidence.for_role(role).with_tp_profiles(link_profiles);
         let (mut traffic, weights) = if let Some((profile, api_host)) = pipeline {
             let lanes = profile.lanes(api_host, ranks)?;
             capacity = lower_capacity(capacity, profile.capacity(&lanes));
@@ -1111,11 +1144,11 @@ fn available(
 mod tests {
     use super::*;
     use crate::serving::GroupProfile;
-    use plait_core::DeviceId;
     use plait_core::serving::{
         ActiveGroup, GroupPhase, GroupResources, HostMemory, HostResources, HostedInventory,
-        HostedPdInstance, WorkerGrant, WorkerResources,
+        HostedPdInstance, WorkerGrant, WorkerResources, hosted_all_reduce_profile,
     };
+    use plait_core::{DeviceId, OpId};
 
     fn node(id: u8) -> NodeId {
         NodeId::from_bytes([id; 16])
@@ -1129,6 +1162,211 @@ mod tests {
             bytes_per_second,
             rtt_ns: 10,
         }
+    }
+
+    #[test]
+    fn tp_budget_reacts_to_directed_rtt_and_charges_the_committed_incumbent() {
+        use crate::serving::HostedTpRttBudget;
+
+        let [store, left, right] = [1, 2, 3].map(node);
+        let prefill = GroupId(node(7));
+        let decode = GroupId(node(8));
+        let cap = 384 * 1024;
+        let qualified = hosted_all_reduce_profile("prefill", cap).unwrap();
+        let hosts = [(store, 1), (left, 2), (right, 2)];
+        let mut snapshot = HostedPdPlanning {
+            revision: 0,
+            managed: true,
+            pending: None,
+            active: Vec::new(),
+            paths: Vec::new(),
+            inventory: HostedPlanning {
+                hosts: hosts
+                    .into_iter()
+                    .map(|(host, cards)| HostedInventory {
+                        host,
+                        address: std::net::Ipv4Addr::new(192, 0, 2, host.as_bytes()[0]).into(),
+                        devices: (0..cards).map(|ordinal| (ordinal, 1)).collect(),
+                        profiles: if host == store {
+                            BTreeSet::from(["decode".into()])
+                        } else {
+                            BTreeSet::from(["prefill".into(), qualified.clone()])
+                        },
+                    })
+                    .collect(),
+                occupied: Vec::new(),
+            },
+            resources: ServingResources {
+                hosts: hosts
+                    .into_iter()
+                    .map(|(host, _)| HostResources {
+                        host,
+                        capacity: HostMemory {
+                            bytes: 64,
+                            pinned_bytes: 8,
+                        },
+                        reserved: HostMemory::default(),
+                    })
+                    .collect(),
+                workers: hosts
+                    .into_iter()
+                    .flat_map(|(host, cards)| {
+                        (0..cards).map(move |ordinal| WorkerResources {
+                            device: DeviceId::new(host, ordinal),
+                            incarnation: 1,
+                            device_bytes: 32,
+                            grant: None,
+                        })
+                    })
+                    .collect(),
+                groups: Vec::new(),
+            },
+        };
+        let mut forecast = ServingForecast {
+            checkpoints: None,
+            model: "weights".into(),
+            demand_rps: 200.0,
+            now_ms: 1000,
+            horizon_ms: 2000,
+            minimum_gain_requests: 0.0,
+            groups: Vec::new(),
+            paths: Vec::new(),
+            link_bytes_per_second: BTreeMap::new(),
+        };
+        let link = |bytes_per_rank_pair, serial_rounds| HostedTpLinkProfile {
+            bytes_per_rank_pair,
+            tp_rtt_budget: Some(HostedTpRttBudget {
+                serial_rounds,
+                max_wait_ns: 150,
+            }),
+        };
+        let pool = HostedPdPool {
+            checkpoint_traffic: None,
+            kv: HostedPdKv {
+                store: "192.0.2.1:7952".parse().unwrap(),
+                namespace: "weights".into(),
+                block_size: 128,
+            },
+            kv_bytes_per_request: 1000,
+            store_bytes_per_second: 1_000_000,
+            store_valid_until_ms: 5000,
+            slots: vec![
+                RoleSlot {
+                    role: ServingRole::Prefill,
+                    pool: HostedPool::fixture(prefill, "prefill", "api")
+                        .with_capacity(4, 200.0)
+                        .with_all_reduce_profiles(
+                            4,
+                            [(None, link(125, 2)), (Some(cap), link(250, 1))],
+                        ),
+                },
+                RoleSlot {
+                    role: ServingRole::Decode,
+                    pool: HostedPool::fixture(decode, "decode", "api").with_capacity(1, 200.0),
+                },
+            ],
+            allow_scale_down: false,
+            reconfigure: None,
+        };
+        let policy = HostedLinkPolicy {
+            bytes_per_rank_pair: Some(1),
+            max_sample_age_ms: 100,
+            tp_rtt_budget: None,
+            tp_profiles: BTreeMap::new(),
+            pd_tp_profiles: Default::default(),
+        };
+        let mut links = BTreeMap::from([
+            ((left, right), sample(right, 100_000)),
+            ((right, left), sample(left, 100_000)),
+            ((left, store), sample(store, 1_000_000)),
+            ((right, store), sample(store, 1_000_000)),
+        ]);
+        let choose = |snapshot: &HostedPdPlanning, links: &BTreeMap<_, _>| {
+            plan_hosted_pd("api", snapshot, &forecast, &pool, &policy, links)
+                .unwrap()
+                .selected
+        };
+        let low = choose(&snapshot, &links).unwrap();
+        assert_eq!(low.placements[0].recipe.profile, "prefill");
+        assert_eq!(low.steady_rps, 100.0);
+        links.get_mut(&(right, left)).unwrap().rtt_ns = 100;
+        let high = choose(&snapshot, &links).unwrap();
+        assert_eq!(high.placements[0].recipe.profile, qualified);
+        let expected_rate = 100_000.0 / 1500.0;
+        assert!((high.steady_rps - expected_rate).abs() < 1e-9);
+        let inventory = &mut snapshot.inventory.hosts[2].profiles;
+        assert!(inventory.remove(&qualified));
+        assert!(choose(&snapshot, &links).is_none());
+        snapshot.inventory.hosts[2]
+            .profiles
+            .insert(qualified.clone());
+        links.get_mut(&(right, left)).unwrap().sampled_at_ms = 899;
+        assert!(choose(&snapshot, &links).is_none());
+        *links.get_mut(&(right, left)).unwrap() = sample(left, 100_000);
+
+        // The lower RTT now favors default in a fresh search. The committed
+        // capped assignment must still be charged for its own wire volume.
+        snapshot.paths = high.paths;
+        let mut assignments = BTreeMap::new();
+        for placement in high.placements {
+            let version = GroupVersion {
+                group: placement.group,
+                epoch: 1,
+            };
+            let plan = placement.plan;
+            let role = plan.role;
+            let mut ranks = BTreeMap::new();
+            for device in plan.workers.keys() {
+                *ranks.entry(device.node).or_insert(0) += 1;
+            }
+            snapshot.active.push(HostedPdInstance {
+                version,
+                role,
+                model: plan.model.clone(),
+                kv: pool.kv.clone(),
+                ranks,
+            });
+            assignments.insert(
+                version,
+                HostedAssignment {
+                    version,
+                    model: plan.model,
+                    tensor_parallel: plan.tensor_parallel,
+                    phase: GroupPhase::Active,
+                    holder: None,
+                    recipe: placement.recipe,
+                },
+            );
+            forecast.groups.push(GroupProfile {
+                version,
+                capacity: SloProfile {
+                    rps: 200.0,
+                    valid_until_ms: 5000,
+                },
+            });
+        }
+        snapshot.pending = Some(OpId::new(node(9), 1));
+        let assess = |assignments: &BTreeMap<_, _>| {
+            plan_hosted_pd_with_assignments(
+                "api",
+                &snapshot,
+                &forecast,
+                &pool,
+                &policy,
+                &links,
+                HostedPdIncumbents {
+                    assignments: Some(assignments),
+                    releases: &[],
+                },
+            )
+        };
+        assert!((assess(&assignments).unwrap().baseline_rps - expected_rate).abs() < 1e-9);
+        let running = assignments
+            .values_mut()
+            .find(|a| a.version.group == prefill)
+            .unwrap();
+        running.recipe.profile = "unpriced-cap".into();
+        assert!(assess(&assignments).is_err());
     }
 
     #[test]
@@ -1490,7 +1728,7 @@ mod tests {
         };
         let ranks = BTreeMap::from([(a, 1), (b, 1)]);
         let source = context
-            .endpoint(version, role, capacity, &ranks, None)
+            .endpoint(version, role, capacity, &ranks, None, None)
             .unwrap();
         assert_eq!(source.traffic.rate_limit(), 5.0);
         let mut shared = source.traffic.clone();
@@ -1525,12 +1763,12 @@ mod tests {
         };
         assert!(
             constrained
-                .endpoint(version, role, capacity, &ranks, None)
+                .endpoint(version, role, capacity, &ranks, None, None)
                 .is_none()
         );
         assert_eq!(
             constrained
-                .incumbent(version, role, capacity, &ranks, None)
+                .incumbent(version, role, capacity, &ranks, None, None)
                 .unwrap()
                 .traffic
                 .rate_limit(),
@@ -1538,7 +1776,7 @@ mod tests {
         );
         assert_eq!(
             constrained
-                .endpoint(version, ServingRole::Decode, capacity, &ranks, None)
+                .endpoint(version, ServingRole::Decode, capacity, &ranks, None, None)
                 .unwrap()
                 .traffic
                 .rate_limit(),

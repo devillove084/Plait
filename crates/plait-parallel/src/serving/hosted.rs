@@ -12,7 +12,7 @@ pub use pd::{
     plan_hosted_evacuation, plan_hosted_pd, plan_hosted_pd_recovery,
     plan_hosted_pd_with_assignments, plan_hosted_pd_with_releases, plan_hosted_serving,
 };
-pub use pool::{HostedPool, generate_hosted_candidates};
+pub use pool::{HostedPool, generate_hosted_candidates, limit_hosted_pool_tp_links};
 
 #[derive(Clone, Deserialize, Serialize)]
 pub struct HostedLinkPolicy {
@@ -119,12 +119,19 @@ pub fn limit_hosted_links(
     now_ms: u64,
     links: &BTreeMap<(NodeId, NodeId), HostedLinkSample>,
 ) -> Result<HostedLinkLimit, &'static str> {
-    policy.validate()?;
+    limit_with_evidence(plan, LinkEvidence::new(policy, now_ms, links))
+}
+
+fn limit_with_evidence(
+    plan: &GroupPlan,
+    evidence: LinkEvidence<'_>,
+) -> Result<HostedLinkLimit, &'static str> {
+    evidence.policy.validate()?;
     let mut ranks = BTreeMap::<NodeId, u64>::new();
     for device in plan.workers.keys() {
         *ranks.entry(device.node).or_default() += 1;
     }
-    Ok(LinkEvidence::new(policy, now_ms, links)
+    Ok(evidence
         .for_role(plan.role)
         .limit_tp(plan.tensor_parallel, &ranks))
 }
@@ -204,6 +211,7 @@ struct LinkEvidence<'a> {
     links: &'a BTreeMap<(NodeId, NodeId), HostedLinkSample>,
     enforce_tp_wait: bool,
     role: ServingRole,
+    tp_profiles: Option<&'a BTreeMap<u32, HostedTpLinkProfile>>,
 }
 
 struct TpEstimate {
@@ -223,11 +231,25 @@ impl<'a> LinkEvidence<'a> {
             links,
             enforce_tp_wait: true,
             role: ServingRole::Aggregated,
+            tp_profiles: None,
         }
     }
 
     fn for_role(self, role: ServingRole) -> Self {
         Self { role, ..self }
+    }
+
+    fn with_tp_profiles<'b>(
+        self,
+        tp_profiles: Option<&'b BTreeMap<u32, HostedTpLinkProfile>>,
+    ) -> LinkEvidence<'b>
+    where
+        'a: 'b,
+    {
+        LinkEvidence {
+            tp_profiles,
+            ..self
+        }
     }
 
     fn without_tp_wait(self) -> Self {
@@ -263,10 +285,11 @@ impl<'a> LinkEvidence<'a> {
                 wait_ns: None,
             });
         }
-        let profile = self
-            .policy
-            .profile(self.role, tensor_parallel)
-            .ok_or(HostedLinkLimit::MissingTpProfile { tensor_parallel })?;
+        let profile = match self.tp_profiles {
+            Some(profiles) => profiles.get(&tensor_parallel).copied(),
+            None => self.policy.profile(self.role, tensor_parallel),
+        }
+        .ok_or(HostedLinkLimit::MissingTpProfile { tensor_parallel })?;
         let tp_rtt_budget = profile.tp_rtt_budget.filter(|_| self.enforce_tp_wait);
         let mut peak_rtt_ns = 0;
         for (&source, &senders) in ranks {
