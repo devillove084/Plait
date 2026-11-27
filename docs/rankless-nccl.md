@@ -467,6 +467,14 @@ the configured slots. Keep enough slots for all overlapping engines.
 An optional `compute_calibration` object in the deployment file enables the
 same GEMM startup measurement on each new engine.
 
+To place the model in pipeline stages, set `pipeline_layers` in the shared
+deployment file. Each key is a group width and its value assigns consecutive
+model layers to the devices in grant order. For a 28-layer model,
+`"pipeline_layers": {"2": [11, 17]}` launches width two as PP2 × TP1.
+Widths without a configured partition continue to use tensor parallelism.
+The descriptor binds the full version to the selected collective axis.
+The engine verifies the layer partition during startup, before activation.
+
 Run one route publisher alongside the ingress, or add `--routes` to the
 launcher on that host. Both processes use the same route file.
 
@@ -500,6 +508,22 @@ Each launcher reports an unexpected child exit against an exact grant in the
 affected version. Automatic retirement tracks the process groups started by
 the running launcher. A launcher crash can leave grants held until the
 deployment operator establishes that the old process group has stopped.
+
+#### Measure peer collective phases
+
+Set `PLAIT_NCCL_PHASE_LOG` to a local file before starting the worker.
+Plait appends one tab-separated row per successful host-staged peer
+collective. Each duration uses nanoseconds.
+
+```text
+pid  slot  world  operation  dtype  input_bytes  sync_ns  download_ns  collective_ns  wire_ns  fold_ns  upload_ns
+```
+
+`operation` and `dtype` use the numeric peer descriptor values. For FP16
+AllReduce they are 1 and 6. `collective_ns` includes `wire_ns` and
+`fold_ns`, plus local coordination and buffer work. The socket exchange
+can include time waiting for other workers to reach the same operation.
+Stream synchronization can include device work issued before the collective.
 
 #### Cancel a committed communicator
 

@@ -27,6 +27,7 @@ mod kernel;
 mod native;
 mod p2p;
 mod peer;
+mod profile;
 #[cfg(feature = "python")]
 mod python_control;
 mod shm;
@@ -651,7 +652,9 @@ fn execute_peer_collective(
     bytes: usize,
     stream: *mut std::ffi::c_void,
 ) -> NcclResult {
-    if let Err(error) = synchronize_stream(comm, stream) {
+    let log = profile::log();
+    let mut phases = profile::Phases::new(log.is_some());
+    if let Err(error) = phases.sync.measure(|| synchronize_stream(comm, stream)) {
         return error;
     }
     let mut input = vec![0u8; bytes];
@@ -661,21 +664,36 @@ fn execute_peer_collective(
             group.cancel();
             return NCCL_UNHANDLED_CUDA_ERROR;
         }
-        if device_to_host(comm.runtime.as_ref(), send as u64, &mut input).is_err() {
+        if phases
+            .download
+            .measure(|| device_to_host(comm.runtime.as_ref(), send as u64, &mut input))
+            .is_err()
+        {
             group.fail(GroupFault::Device);
             return NCCL_UNHANDLED_CUDA_ERROR;
         }
     }
-    let output = match group.execute(op, &input) {
+    let output = match phases
+        .collective
+        .measure(|| group.execute_timed(op, &input, &mut phases.wire, &mut phases.fold))
+    {
         Ok(output) => output,
         Err(error) => return set_error(error.to_string()),
     };
     if let Err(error) = group.live() {
         return set_error(error.to_string());
     }
-    if !output.is_empty() && host_to_device(comm.runtime.as_ref(), recv as u64, &output).is_err() {
+    if !output.is_empty()
+        && phases
+            .upload
+            .measure(|| host_to_device(comm.runtime.as_ref(), recv as u64, &output))
+            .is_err()
+    {
         group.fail(GroupFault::Device);
         return NCCL_UNHANDLED_CUDA_ERROR;
+    }
+    if let Some(log) = log {
+        phases.record(log, comm.rank, comm.world, op, bytes);
     }
     NCCL_SUCCESS
 }

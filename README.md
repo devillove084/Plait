@@ -221,7 +221,8 @@ recommendations. Deployment starts the successor and decides when to activate it
 
 The vLLM fork can start engines from those grants. Its route publisher
 checks both communicator and engine readiness, prepares the HTTP origin,
-and then activates the new group.
+and then activates the new group. Deployment can assign a complete grant
+group to either a tensor-parallel replica or a pipeline with one worker per stage.
 [Automatic vLLM group deployment](docs/rankless-nccl.md#launch-and-activate-groups-from-the-vllm-fork)
 
 ### vLLM reference integration

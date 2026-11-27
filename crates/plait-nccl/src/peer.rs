@@ -16,6 +16,7 @@ pub use plait_core::group::PeerEndpoint as Endpoint;
 use plait_core::group::{GroupFault, GroupVersion, peer_digest};
 use sha2::Digest;
 
+use crate::profile::Timer;
 use crate::{DataType, ReduceOp, reduce_bytes, reduce_fp8_to_f32};
 
 mod frame;
@@ -296,7 +297,7 @@ pub(crate) enum Collective {
 }
 
 impl Collective {
-    fn wire(self) -> (u8, DataType, ReduceOp, usize) {
+    pub(crate) fn wire(self) -> (u8, DataType, ReduceOp, usize) {
         match self {
             Self::AllReduce(dtype, op) => (1, dtype, op, 0),
             Self::AllGather(dtype) => (2, dtype, ReduceOp::Sum, 0),
@@ -458,10 +459,26 @@ impl PeerGroup {
         }
     }
 
+    #[cfg(test)]
     pub fn execute(&self, collective: Collective, input: &[u8]) -> io::Result<Vec<u8>> {
+        self.execute_timed(
+            collective,
+            input,
+            &mut Timer::new(false),
+            &mut Timer::new(false),
+        )
+    }
+
+    pub(crate) fn execute_timed(
+        &self,
+        collective: Collective,
+        input: &[u8],
+        wire: &mut Timer,
+        fold: &mut Timer,
+    ) -> io::Result<Vec<u8>> {
         let mut sequence = self.sequence.lock().unwrap();
         self.live()?;
-        let result = self.run(collective, *sequence, input);
+        let result = self.run(collective, *sequence, input, wire, fold);
         match &result {
             Ok(_) => *sequence += 1,
             Err(error) if error.kind() == io::ErrorKind::Unsupported => self.cancel(),
@@ -470,7 +487,14 @@ impl PeerGroup {
         result
     }
 
-    fn run(&self, collective: Collective, sequence: u64, input: &[u8]) -> io::Result<Vec<u8>> {
+    fn run(
+        &self,
+        collective: Collective,
+        sequence: u64,
+        input: &[u8],
+        wire: &mut Timer,
+        fold: &mut Timer,
+    ) -> io::Result<Vec<u8>> {
         let world = self.links.len();
         let bytes = input.len();
         let header = collective.header(sequence, bytes, 0);
@@ -503,17 +527,17 @@ impl PeerGroup {
                     ))
                 },
             );
-            frame::exchange_all(peers, &header, self.timeout)?;
-            return Ok(collective.reduce(&inputs));
+            wire.measure(|| frame::exchange_all(peers, &header, self.timeout))?;
+            return Ok(fold.measure(|| collective.reduce(&inputs)));
         }
         match collective {
             Collective::AllReduce(..)
             | Collective::ReduceScatter(..)
             | Collective::AllReduceFp8ToF32 => {
                 let ranges = shard_ranges(bytes, dtype.bytes(), world);
-                let inputs = self.contributions(&header, input, &ranges)?;
+                let inputs = self.contributions(&header, input, &ranges, wire)?;
                 let fp8 = matches!(collective, Collective::AllReduceFp8ToF32);
-                let reduced = collective.reduce(&inputs);
+                let reduced = fold.measure(|| collective.reduce(&inputs));
                 if matches!(collective, Collective::ReduceScatter(..)) {
                     return Ok(reduced);
                 }
@@ -528,6 +552,7 @@ impl PeerGroup {
                     &reduced,
                     &mut output,
                     ranges.iter().map(|range| range.len() * output_width),
+                    wire,
                 )?;
                 Ok(output)
             }
@@ -541,6 +566,7 @@ impl PeerGroup {
                     input,
                     &mut output,
                     std::iter::repeat_n(bytes, world),
+                    wire,
                 )?;
                 Ok(output)
             }
@@ -548,10 +574,10 @@ impl PeerGroup {
                 let mut output = input.to_vec();
                 if self.slot == endpoint {
                     for peer in self.partners() {
-                        self.exchange(peer, &header, input, &mut [])?;
+                        wire.measure(|| self.exchange(peer, &header, input, &mut []))?;
                     }
                 } else {
-                    self.exchange(endpoint, &header, &[], &mut output)?;
+                    wire.measure(|| self.exchange(endpoint, &header, &[], &mut output))?;
                 }
                 Ok(output)
             }
@@ -560,11 +586,13 @@ impl PeerGroup {
                     let mut contributions = vec![vec![0; bytes]; world];
                     contributions[self.slot].copy_from_slice(input);
                     for peer in self.partners() {
-                        self.exchange(peer, &header, &[], &mut contributions[peer])?;
+                        wire.measure(|| {
+                            self.exchange(peer, &header, &[], &mut contributions[peer])
+                        })?;
                     }
-                    Ok(reduce_bytes(op, dtype, &contributions))
+                    Ok(fold.measure(|| reduce_bytes(op, dtype, &contributions)))
                 } else {
-                    self.exchange(endpoint, &header, input, &mut [])?;
+                    wire.measure(|| self.exchange(endpoint, &header, input, &mut []))?;
                     Ok(Vec::new())
                 }
             }
@@ -576,6 +604,7 @@ impl PeerGroup {
         header: &[u8; 24],
         input: &[u8],
         ranges: &[Range<usize>],
+        wire: &mut Timer,
     ) -> io::Result<Vec<Vec<u8>>> {
         let own = ranges[self.slot].clone();
         let mut contributions = vec![vec![0; own.len()]; self.links.len()];
@@ -593,7 +622,7 @@ impl PeerGroup {
                     received.as_mut_slice(),
                 ))
             });
-        frame::exchange_all(peers, header, self.timeout)?;
+        wire.measure(|| frame::exchange_all(peers, header, self.timeout))?;
         Ok(contributions)
     }
 
@@ -603,6 +632,7 @@ impl PeerGroup {
         input: &[u8],
         mut output: &mut [u8],
         shard_lengths: impl Iterator<Item = usize>,
+        wire: &mut Timer,
     ) -> io::Result<()> {
         let peers =
             self.links
@@ -619,7 +649,7 @@ impl PeerGroup {
                         None
                     }
                 });
-        frame::exchange_all(peers, header, self.timeout)
+        wire.measure(|| frame::exchange_all(peers, header, self.timeout))
     }
 
     pub fn send(self: &Arc<Self>, peer: usize, dtype: DataType, input: Vec<u8>) -> io::Result<()> {
