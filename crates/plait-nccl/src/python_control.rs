@@ -7,7 +7,8 @@ use plait_core::{DeviceId, NodeId};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-use crate::{CommHandle, JoinGroup, Transport, backend_from_env, join_committed_group};
+use crate::control::join_committed_group_with_egress;
+use crate::{CommHandle, JoinGroup, Transport, backend_from_env};
 
 fn control_addresses(address: &str, seeds: Vec<String>) -> PyResult<(SocketAddr, Vec<SocketAddr>)> {
     let listen = address
@@ -80,6 +81,7 @@ pub(super) fn parse_version(version: &str) -> PyResult<GroupVersion> {
 }
 
 #[pyfunction]
+#[pyo3(signature = (address, seeds, version, devices, slot, device, timeout_ms, replicated_egress_bytes=None))]
 pub(super) fn join_versioned_group(
     py: Python<'_>,
     address: &str,
@@ -89,6 +91,7 @@ pub(super) fn join_versioned_group(
     slot: usize,
     device: usize,
     timeout_ms: u32,
+    replicated_egress_bytes: Option<u64>,
 ) -> PyResult<CommHandle> {
     let (listen, seeds) = control_addresses(address, seeds)?;
     let layout = devices
@@ -114,7 +117,13 @@ pub(super) fn join_versioned_group(
             .enable_all()
             .build()?;
         runtime
-            .block_on(join_committed_group(request, backend, device, timeout))
+            .block_on(join_committed_group_with_egress(
+                request,
+                backend,
+                device,
+                timeout,
+                replicated_egress_bytes,
+            ))
             .map(|comm| CommHandle {
                 ptr: comm.into_raw(),
             })

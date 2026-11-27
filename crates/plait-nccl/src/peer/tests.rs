@@ -48,26 +48,35 @@ fn mismatched_group_epochs_cannot_connect_with_the_same_endpoint_manifest() {
 #[test]
 fn allreduce_bounds_the_replicated_exchange_and_keeps_the_same_fold() {
     let op = Collective::AllReduce(DataType::Float32, ReduceOp::Sum);
-    assert!(use_replicated_exchange(op, TWO_RANK_REPLICATED_LIMIT, 2));
+    assert!(use_replicated_exchange(
+        op,
+        TWO_RANK_REPLICATED_LIMIT,
+        2,
+        None
+    ));
     assert!(!use_replicated_exchange(
         op,
         TWO_RANK_REPLICATED_LIMIT + 4,
-        2
+        2,
+        None
     ));
     assert!(use_replicated_exchange(
         op,
         REPLICATED_BYTES_PER_RANK / 4,
-        5
+        5,
+        None
     ));
     assert!(!use_replicated_exchange(
         op,
         REPLICATED_BYTES_PER_RANK / 4 + 4,
-        5
+        5,
+        None
     ));
     assert!(!use_replicated_exchange(
         Collective::ReduceScatter(DataType::Float32, ReduceOp::Sum),
         4,
-        4
+        4,
+        None
     ));
 
     thread::scope(|scope| {
@@ -271,7 +280,7 @@ fn sharded_fp8_allreduce_preserves_uneven_output_ranges() {
     let input: Vec<_> = (0..count)
         .map(|index| if index % 2 == 0 { 0x38 } else { 0x40 })
         .collect();
-    assert!(!use_replicated_exchange(op, input.len(), 3));
+    assert!(!use_replicated_exchange(op, input.len(), 3, None));
     let expected: Vec<_> = (0..count)
         .flat_map(|index| (if index % 2 == 0 { 3f32 } else { 6f32 }).to_ne_bytes())
         .collect();
@@ -681,6 +690,37 @@ fn different_slot_orders_cannot_connect_with_the_same_grants() {
         );
         assert!(dialer.join().unwrap());
     });
+}
+
+#[test]
+fn explicit_replicated_egress_limit_must_match_on_both_peers() {
+    let devices = [1, 2].map(|id| DeviceId::new(NodeId::from_bytes([id; 16]), 0));
+    let version = GroupVersion {
+        group: GroupId(NodeId::derive("egress limit agreement")),
+        epoch: 1,
+    };
+    for other in [None, Some(0), Some(384 * 1024)] {
+        let (mut listeners, members) = rankless_listeners(version, &devices);
+        let mut right = listeners.pop().unwrap();
+        let mut left = listeners.pop().unwrap();
+        let limit = 384 * 1024;
+        left.set_replicated_egress_bytes(limit);
+        if let Some(limit) = other {
+            right.set_replicated_egress_bytes(limit);
+        }
+        thread::scope(|scope| {
+            let timeout = Duration::from_secs(2);
+            let left_members = members.clone();
+            let dialer = scope.spawn(move || left.connect(left_members, None, timeout, timeout));
+            let right = right.connect(members, None, timeout, timeout);
+            for group in [dialer.join().unwrap(), right] {
+                assert_eq!(group.is_ok(), other == Some(limit));
+                if let Ok(group) = group {
+                    assert_eq!(group.replicated_egress_bytes, Some(limit));
+                }
+            }
+        });
+    }
 }
 
 fn all_reduce_i32(comm: &Comm, value: i32, output: &mut i32) -> i32 {

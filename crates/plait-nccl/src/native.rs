@@ -298,6 +298,20 @@ pub unsafe extern "C" fn plaitPeerListen(
 }
 
 /// # Safety
+/// A non-null listener must be live and exclusively owned by the caller.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn plaitPeerSetReplicatedEgressBytes(
+    listener: *mut RanklessListener,
+    bytes: u64,
+) -> NcclResult {
+    let Some(listener) = (unsafe { listener.as_mut() }) else {
+        return NCCL_INVALID_ARGUMENT;
+    };
+    listener.set_replicated_egress_bytes(bytes);
+    NCCL_SUCCESS
+}
+
+/// # Safety
 /// The listener is exclusively owned. The manifest refers to `count` initialized
 /// members. The output does not alias the listener or manifest.
 #[unsafe(no_mangle)]

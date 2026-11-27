@@ -37,6 +37,16 @@ pub async fn join_committed_group(
     device: usize,
     timeout: Duration,
 ) -> io::Result<RanklessComm> {
+    join_committed_group_with_egress(request, backend, device, timeout, None).await
+}
+
+pub(crate) async fn join_committed_group_with_egress(
+    request: JoinGroup,
+    backend: BackendKind,
+    device: usize,
+    timeout: Duration,
+    replicated_egress_bytes: Option<u64>,
+) -> io::Result<RanklessComm> {
     let layout: BTreeSet<_> = request.layout.iter().copied().collect();
     if layout.len() != request.layout.len()
         || !layout.contains(&request.member)
@@ -59,7 +69,15 @@ pub async fn join_committed_group(
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid group join timeout"))?;
     timeout_at(
         deadline,
-        connect(request, layout, backend, device, deadline, timeout),
+        connect(
+            request,
+            layout,
+            backend,
+            device,
+            deadline,
+            timeout,
+            replicated_egress_bytes,
+        ),
     )
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Plait group join timed out"))?
@@ -72,6 +90,7 @@ async fn connect(
     device: usize,
     deadline: Instant,
     timeout: Duration,
+    replicated_egress_bytes: Option<u64>,
 ) -> io::Result<RanklessComm> {
     let JoinGroup {
         version,
@@ -115,7 +134,10 @@ async fn connect(
         .find(|grant| grant.device == member)
         .ok_or_else(|| io::Error::other("this device has no grant for this group"))?;
     let runtime = create_runtime(backend, device).map_err(io::Error::other)?;
-    let listener = RanklessListener::bind(listen, *session.as_bytes(), grant)?;
+    let mut listener = RanklessListener::bind(listen, *session.as_bytes(), grant)?;
+    if let Some(bytes) = replicated_egress_bytes {
+        listener.set_replicated_egress_bytes(bytes);
+    }
     control
         .apply(&GroupOperation {
             id: OpId::new(session, 2),

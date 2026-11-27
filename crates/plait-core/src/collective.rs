@@ -10,13 +10,25 @@ pub enum PeerAllReducePlan {
 }
 
 pub fn peer_all_reduce_plan(bytes: u64, workers: usize) -> PeerAllReducePlan {
-    let replicated = if workers == 2 {
+    let egress_limit = if workers == 2 {
         // A full exchange moves the same payload as scatter plus gather with
         // two workers. Cap the amount the host reduction has to hold.
-        bytes <= TWO_WORKER_REPLICATED_LIMIT
+        TWO_WORKER_REPLICATED_LIMIT
     } else {
-        bytes.saturating_mul(workers.saturating_sub(1) as u64) <= REPLICATED_BYTES_PER_WORKER
+        REPLICATED_BYTES_PER_WORKER
     };
+    peer_all_reduce_plan_with_egress(bytes, workers, egress_limit)
+}
+
+/// Limit the payload sent by each worker during one replicated exchange.
+pub fn peer_all_reduce_plan_with_egress(
+    bytes: u64,
+    workers: usize,
+    egress_limit: u64,
+) -> PeerAllReducePlan {
+    let replicated = bytes
+        .checked_mul(workers.saturating_sub(1) as u64)
+        .is_some_and(|egress| egress <= egress_limit);
     if replicated {
         PeerAllReducePlan::Replicated
     } else {
@@ -29,4 +41,23 @@ pub fn peer_all_reduce_plan(bytes: u64, workers: usize) -> PeerAllReducePlan {
 pub fn peer_shard_elements(elements: u64, workers: usize, slot: usize) -> u64 {
     let workers = workers as u64;
     elements / workers + u64::from((slot as u64) < elements % workers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replicated_egress_limit_charges_each_other_slot_and_rejects_overflow() {
+        use PeerAllReducePlan::{Replicated, ScatterGather};
+
+        assert_eq!(peer_all_reduce_plan_with_egress(128, 4, 384), Replicated);
+        assert_eq!(peer_all_reduce_plan_with_egress(129, 4, 384), ScatterGather);
+        assert_eq!(peer_all_reduce_plan_with_egress(0, 4, 0), Replicated);
+        assert_eq!(peer_all_reduce_plan_with_egress(1, 4, 0), ScatterGather);
+        assert_eq!(
+            peer_all_reduce_plan_with_egress(u64::MAX, 3, u64::MAX),
+            ScatterGather
+        );
+    }
 }

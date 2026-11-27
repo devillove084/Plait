@@ -243,14 +243,19 @@ class NCCLLibrary:
         version: str,
         devices: list[tuple[str, int]],
         slot: int,
+        *,
+        replicated_egress_bytes: int | None = None,
     ) -> CommHandle:
         """Join committed devices in the caller's logical collective order."""
         address = f"[{host}]:0" if ":" in host else f"{host}:0"
         timeout_ms = int(os.environ.get("PLAIT_NCCL_TIMEOUT_MS", "120000"))
         if self.device is None:
             raise ValueError("a versioned group requires the local accelerator index")
+        options = {}
+        if replicated_egress_bytes is not None:
+            options["replicated_egress_bytes"] = replicated_egress_bytes
         comm = CommHandle(_plait_nccl.join_versioned_group(
-            address, seeds, version, devices, slot, self.device, timeout_ms,
+            address, seeds, version, devices, slot, self.device, timeout_ms, **options,
         ))
         self._comms.add(comm)
         return comm

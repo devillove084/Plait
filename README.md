@@ -379,6 +379,7 @@ release the result after the matching completion has executed in the control pla
 | [Ordered publication](specs/PlaitOrderedPublication.tla) | Completion and revocation in the agreed command order, receipt identity on retry, and recovery from a replica's durable command prefix. |
 | [Peer collectives](specs/PlaitPeerCollective.tla) | Independent link progress within scatter and gather, compatibility with paired rounds, and completion of a separate communicator after participant loss. |
 | [Peer AllReduce pricing](specs/PlaitPeerAllReducePricing.tla) | Separate ingress and egress budgets, one RTT charge per exchange, exact shard traffic, and rejection of a quote with a missing direction. TLC checked 32 states across six representative cases. |
+| [Peer AllReduce budget](specs/PlaitPeerAllReduceBudget.tla) | A new version verifies the egress budget and slot layout before joining. A failed candidate leaves the existing epoch usable. Default peers remain wire-compatible. TLC checked 4,472 distinct states. |
 | [Rankless peer join](specs/PlaitRanklessPeerJoin.tla) | Socket handshakes bind the group version and grant view. Cancellation closes the participant's links. |
 | [Logical slot layout](specs/PlaitRanklessLayout.tla) | A participant reports ready after connecting to all members with a common slot layout. |
 | [Peer revocation](specs/PlaitPeerRevocation.tla) | Observing that an exact grant has ended closes that communicator and wakes a pending call. A draining group can keep its links. |

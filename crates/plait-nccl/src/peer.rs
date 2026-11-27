@@ -12,7 +12,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use plait_core::DeviceId;
-use plait_core::collective::{PeerAllReducePlan, peer_all_reduce_plan, peer_shard_elements};
+use plait_core::collective::{
+    PeerAllReducePlan, peer_all_reduce_plan, peer_all_reduce_plan_with_egress, peer_shard_elements,
+};
 pub use plait_core::group::PeerEndpoint as Endpoint;
 use plait_core::group::{GroupFault, GroupVersion, peer_digest};
 use sha2::Digest;
@@ -34,6 +36,7 @@ pub struct Listener {
     endpoint: Endpoint,
     version: Option<GroupVersion>,
     staging_ceiling: usize,
+    replicated_egress_bytes: Option<u64>,
 }
 
 impl Listener {
@@ -76,6 +79,7 @@ impl Listener {
             endpoint,
             version,
             staging_ceiling: usize::MAX,
+            replicated_egress_bytes: None,
         })
     }
 
@@ -168,6 +172,7 @@ impl Listener {
             slot,
             links,
             timeout,
+            replicated_egress_bytes: self.replicated_egress_bytes,
             order: Mutex::new(CollectiveOrder::default()),
             turn: Condvar::new(),
             requests,
@@ -340,17 +345,27 @@ impl Collective {
     }
 }
 
-fn use_replicated_exchange(collective: Collective, bytes: usize, world: usize) -> bool {
+fn use_replicated_exchange(
+    collective: Collective,
+    bytes: usize,
+    world: usize,
+    egress: Option<u64>,
+) -> bool {
+    let plan = match egress {
+        Some(egress) => peer_all_reduce_plan_with_egress(bytes as u64, world, egress),
+        None => peer_all_reduce_plan(bytes as u64, world),
+    };
     matches!(
         collective,
         Collective::AllReduce(..) | Collective::AllReduceFp8ToF32
-    ) && peer_all_reduce_plan(bytes as u64, world) == PeerAllReducePlan::Replicated
+    ) && plan == PeerAllReducePlan::Replicated
 }
 
 pub(crate) struct PeerGroup {
     slot: usize,
     links: Vec<Option<Link>>,
     timeout: Duration,
+    replicated_egress_bytes: Option<u64>,
     order: Mutex<CollectiveOrder>,
     turn: Condvar,
     pub(crate) requests: requests::Dispatcher,
@@ -563,7 +578,7 @@ impl PeerGroup {
                 "unsupported host reduction",
             ));
         }
-        if use_replicated_exchange(collective, bytes, world) {
+        if use_replicated_exchange(collective, bytes, world, self.replicated_egress_bytes) {
             let header = collective.header(sequence, bytes, REPLICATED_EXCHANGE);
             if world == 2
                 && let Collective::AllReduce(dtype, op) = collective

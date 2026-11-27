@@ -47,6 +47,11 @@ int32_t plaitPeerListen(const char *address, const PlaitPeerGroupVersion *versio
                         const PlaitPeerGrant *grant, const uint8_t ticket[16],
                         PlaitPeerListener **listener, PlaitPeerMember *member);
 
+/* Before connecting, set the total payload a worker can send in a replicated
+   AllReduce. Every member must specify the same value. Zero restricts
+   replication to exchanges with zero egress. Omit for the default policy. */
+int32_t plaitPeerSetReplicatedEgressBytes(PlaitPeerListener *listener, uint64_t bytes);
+
 /* Accept the full manifest in any order. The join attempt consumes the listener
    and sets its pointer to NULL. Invalid input rejected before the join leaves it
    owned by the caller. The communicator uses the existing NCCL collectives. */

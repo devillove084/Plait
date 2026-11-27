@@ -458,6 +458,14 @@ physical grant. The ordinal passed to the device runtime follows the process's
 visibility mask. A deployment with multiple TP subgroups provides one entry per
 TP subgroup.
 
+Set `replicated_egress_bytes` on a specific group descriptor to use a measured
+AllReduce budget. The value counts one worker's payload across all its peers in
+one replicated AllReduce. All descriptors for the same group version must agree.
+The handshake checks the value along with the manifest and slot order. A change
+requires a new communicator. Omit the field to use the default policy and join
+peers that predate this option. The placement estimator currently prices that
+default policy.
+
 Each worker independently resolves its grant, publishes its endpoint, and reads
 the complete manifest through a voter. The peer handshake binds the manifest and
 the descriptor's device order, so AllGather output and ReduceScatter shards
@@ -468,7 +476,9 @@ publish a new listener. The engine retains its CPU process groups and PP startup
 
 Rust clients can use `join_committed_group` with the `plait-nccl/control`
 feature for the same sequence. C clients can publish and join through the
-native group APIs and existing C ABI.
+native group APIs and call `plaitPeerSetReplicatedEgressBytes` between
+`plaitPeerListen` and `plaitPeerConnect`. Zero egress permits only empty
+replicated exchanges when the group has at least two members.
 
 #### Verify four-vendor TP4 over HTTP
 
