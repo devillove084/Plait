@@ -1372,6 +1372,12 @@ The next process starts from the exact incumbent profile supplied in
 `modes`. Supply a fresh profile there for an incumbent whose cached
 measurement has expired.
 
+A functional deployment verified this sequence with a CUDA aggregate,
+ROCm Prefill, and PPU Decode serving the same FP16 checkpoint. HTTP demand
+started the two candidates, and the private benchmark supplied the measured
+profile used for cutover. Requests continued on the incumbent until the
+switch, and generation matched across the two layouts.
+
 ### Hand off prompt KV between independent Prefill and Decode groups
 
 Use the vLLM fork at `9122df3da` or later on `plait/v0.31-runtime`.
