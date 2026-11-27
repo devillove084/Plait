@@ -264,6 +264,13 @@ pub struct GroupPreparation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedSetView {
+    pub prepare: OpId,
+    pub members: Vec<(GroupVersion, GroupPhase)>,
+    pub activated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GroupAction {
     SetHostMemory {
         host: NodeId,
@@ -365,6 +372,10 @@ pub enum GroupAction {
         preparations: Vec<GroupPreparation>,
         guards: Vec<(GroupId, Option<u64>)>,
     },
+    AbortFailedSet {
+        prepare: OpId,
+        versions: Vec<GroupVersion>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -385,6 +396,7 @@ pub enum GroupOutcome {
     ComputeRate(ComputeRate),
     ActiveSet(Vec<(GroupId, Option<u64>)>),
     PreparedSet(Vec<GroupVersion>),
+    AbortedSet(Vec<GroupVersion>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -428,6 +440,9 @@ pub enum GroupError {
         group: GroupId,
         current: Option<u64>,
     },
+    UnknownPreparation(OpId),
+    PreparationActivated,
+    PreparationHealthy,
 }
 
 pub type GroupResult = Result<GroupOutcome, GroupError>;
@@ -455,6 +470,7 @@ pub enum GroupLookup {
         calibration: NodeId,
     },
     Recipe(GroupVersion),
+    LatestPreparation(GroupId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -471,6 +487,7 @@ pub enum GroupReply {
     },
     ComputeRate(Option<ComputeRate>),
     Recipe(Option<GroupRecipe>),
+    Preparation(Option<PreparedSetView>),
 }
 
 /// A replica's applied view of an exact communicator grant.
@@ -536,6 +553,14 @@ impl GroupOperation {
                         reads.extend(evidence.rates.iter().map(|rate| Key::Device(rate.device)));
                     }
                 }
+            }
+            GroupAction::AbortFailedSet { prepare, versions } => {
+                reads.insert(Key::ServingOperation(*prepare));
+                keys.extend(
+                    versions
+                        .iter()
+                        .map(|version| Key::ServingGroup(version.group)),
+                );
             }
             GroupAction::PublishGrantedComputeRate { grant, .. } => {
                 reads.insert(Key::ServingGroup(grant.version.group));

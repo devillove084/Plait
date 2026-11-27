@@ -35,6 +35,9 @@ enum Request {
     Standby {
         group: GroupId,
     },
+    Preparation {
+        group: GroupId,
+    },
     Links,
     Plan {
         group: GroupId,
@@ -138,6 +141,28 @@ async fn handle(client: &mut Client, voters: &[NodeId], request: Request) -> io:
                 }
             }
             return Err(last);
+        }
+        Request::Preparation { group } => {
+            let mut last = io::Error::other("no reachable voter");
+            let mut missing = false;
+            for &peer in voters {
+                match client
+                    .query_group(peer, GroupLookup::LatestPreparation(group))
+                    .await
+                {
+                    Ok(GroupReply::Preparation(Some(view))) => {
+                        return Ok(json!({ "preparation": view }));
+                    }
+                    Ok(GroupReply::Preparation(None)) => missing = true,
+                    Ok(_) => last = io::Error::other("expected group preparation"),
+                    Err(error) => last = error,
+                }
+            }
+            return if missing {
+                Ok(json!({ "preparation": null }))
+            } else {
+                Err(last)
+            };
         }
         Request::Links => {
             let probes = link_probes(client, voters).await?;

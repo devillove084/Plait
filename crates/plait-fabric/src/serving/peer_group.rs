@@ -7,7 +7,8 @@ use plait_core::group::{
     ActivePlacement, ComputeRate, GrantStatus, GroupAction, GroupError, GroupId, GroupManifest,
     GroupMember, GroupOperation, GroupOutcome, GroupPhase, GroupPreparation, GroupReceipt,
     GroupRecipe, GroupResult, GroupTransition, GroupVersion, GroupView, PeerEndpoint,
-    PlacementHost, PlacementInventory, PlacementWorker, RateEvidence, ResourcePlan, WorkerGrant,
+    PlacementHost, PlacementInventory, PlacementWorker, PreparedSetView, RateEvidence,
+    ResourcePlan, WorkerGrant,
 };
 use plait_core::link::{ProbeEndpoint, ProbeRegistration};
 use plait_core::serving::{ExecutionDrainTarget, ServingError};
@@ -48,6 +49,8 @@ impl History {
 struct Version {
     version: GroupVersion,
     recipe: Option<NodeId>,
+    preparation: Option<OpId>,
+    ever_activated: bool,
     phase: GroupPhase,
     resources: ResourcePlan,
     grants: BTreeMap<DeviceId, WorkerGrant>,
@@ -85,6 +88,7 @@ impl Version {
 
     fn set_phase(&mut self, phase: GroupPhase) {
         self.phase = phase;
+        self.ever_activated |= phase == GroupPhase::Active;
         if matches!(
             phase,
             GroupPhase::Draining | GroupPhase::Revoked | GroupPhase::Retired
@@ -248,6 +252,47 @@ impl ServingState {
         self.peer_groups.receipts.get(&operation)
     }
 
+    pub(crate) fn latest_peer_preparation(&self, group: GroupId) -> Option<PreparedSetView> {
+        let (_, latest) = self
+            .peer_groups
+            .history
+            .get(&group)?
+            .versions
+            .last_key_value()?;
+        let prepare = latest.preparation?;
+        let versions = self
+            .prepared_versions(prepare)
+            .expect("recorded prepare-set receipt");
+        let mut activated = false;
+        let members = versions
+            .iter()
+            .map(|&version| {
+                let view = self
+                    .peer_groups
+                    .get(version)
+                    .expect("recorded prepared version");
+                activated |= view.ever_activated;
+                (version, view.phase)
+            })
+            .collect();
+        Some(PreparedSetView {
+            prepare,
+            members,
+            activated,
+        })
+    }
+
+    fn prepared_versions(&self, prepare: OpId) -> Result<&[GroupVersion], GroupError> {
+        let Some(GroupReceipt {
+            result: Ok(GroupOutcome::PreparedSet(versions)),
+            ..
+        }) = self.peer_group_receipt(prepare)
+        else {
+            return Err(GroupError::UnknownPreparation(prepare));
+        };
+        Ok(versions)
+    }
+
     pub(crate) fn apply_peer_group(&mut self, operation: &GroupOperation) -> GroupResult {
         if let Some(receipt) = self.peer_group_receipt(operation.id) {
             return if &receipt.operation == operation {
@@ -257,6 +302,14 @@ impl ServingState {
             };
         }
         let result = self.peer_group_transition(&operation.action);
+        if let Ok(GroupOutcome::PreparedSet(versions)) = &result {
+            for &version in versions {
+                self.peer_groups
+                    .get_mut(version)
+                    .expect("committed preparation")
+                    .preparation = Some(operation.id);
+            }
+        }
         self.peer_groups.receipts.insert(
             operation.id,
             GroupReceipt {
@@ -323,6 +376,10 @@ impl ServingState {
                 ref preparations,
                 ref guards,
             } => self.prepare_peer_set(preparations, guards),
+            GroupAction::AbortFailedSet {
+                prepare,
+                ref versions,
+            } => self.abort_failed_peer_set(prepare, versions),
             GroupAction::AdvertiseWorker {
                 ref profile,
                 incarnation,
@@ -694,6 +751,36 @@ impl ServingState {
         Ok(())
     }
 
+    fn abort_failed_peer_set(&mut self, prepare: OpId, versions: &[GroupVersion]) -> GroupResult {
+        if self.prepared_versions(prepare)? != versions {
+            return Err(GroupError::InvalidPlan);
+        }
+        let mut failed = false;
+        let mut candidates = Vec::new();
+        for &version in versions {
+            let view = self
+                .peer_groups
+                .get(version)
+                .expect("recorded prepared version");
+            if view.ever_activated {
+                return Err(GroupError::PreparationActivated);
+            }
+            match view.phase {
+                GroupPhase::Revoked | GroupPhase::Retired => failed = true,
+                GroupPhase::Ready | GroupPhase::Preparing => candidates.push(version),
+                phase => return Err(GroupError::InvalidPhase(phase)),
+            }
+        }
+        if !failed {
+            return Err(GroupError::PreparationHealthy);
+        }
+        for version in candidates {
+            self.quiesce_peer_group(version, GroupPhase::Revoked)
+                .expect("prechecked candidate");
+        }
+        Ok(GroupOutcome::AbortedSet(versions.to_vec()))
+    }
+
     fn reserve_peer_group(
         &self,
         group: GroupId,
@@ -735,6 +822,8 @@ impl ServingState {
         Ok(Version {
             version,
             recipe: None,
+            preparation: None,
+            ever_activated: false,
             phase: GroupPhase::Preparing,
             resources: resources.clone(),
             grants,
@@ -1250,6 +1339,142 @@ mod tests {
                 plan.recipe
             );
         }
+    }
+
+    #[test]
+    fn abort_failed_set_preserves_published_epochs_and_holds_grants_until_release() {
+        let mut state = ServingState::default();
+        let host = NodeId::derive("shared host");
+        let capacity = HostMemory {
+            bytes: 40,
+            pinned_bytes: 16,
+        };
+        let demand = HostMemory {
+            bytes: 8,
+            pinned_bytes: 4,
+        };
+        state.set_host_memory(host, capacity).unwrap();
+        let preparations: Vec<_> = ["first", "second"]
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, name)| {
+                let device = DeviceId::new(host, ordinal as u32);
+                state.register_worker(device, 1, 16).unwrap();
+                GroupPreparation {
+                    group: GroupId(NodeId::derive(name)),
+                    expected_epoch: 0,
+                    expected_active: None,
+                    resources: ResourcePlan {
+                        workers: BTreeMap::from([(
+                            device,
+                            WorkerDemand {
+                                incarnation: 1,
+                                device_bytes: 8,
+                            },
+                        )]),
+                        hosts: BTreeMap::from([(host, demand)]),
+                    },
+                    recipe: None,
+                    probes: vec![],
+                    rates: None,
+                }
+            })
+            .collect();
+        let prepare = OpId {
+            origin: host,
+            counter: 1,
+        };
+        let op = GroupOperation {
+            id: prepare,
+            action: GroupAction::PrepareSet {
+                preparations: preparations.clone(),
+                guards: vec![],
+            },
+        };
+        let Ok(GroupOutcome::PreparedSet(versions)) = state.apply_peer_group(&op) else {
+            panic!("expected a prepared set");
+        };
+        let [first, second] = versions.as_slice() else {
+            panic!("expected a pair")
+        };
+        let abort = GroupAction::AbortFailedSet {
+            prepare,
+            versions: versions.clone(),
+        };
+        assert_eq!(
+            state.peer_group_transition(&abort),
+            Err(GroupError::PreparationHealthy)
+        );
+        assert_eq!(
+            state.latest_peer_preparation(second.group).unwrap().prepare,
+            prepare
+        );
+        let first_grant = ready_single_worker(&mut state, *first);
+        let second_grant = ready_single_worker(&mut state, *second);
+
+        let mut previously_active = state.clone();
+        previously_active.activate_peer_group(*first).unwrap();
+        previously_active.report_peer_failure(first_grant).unwrap();
+        previously_active.release_peer_worker(first_grant).unwrap();
+        assert!(
+            previously_active
+                .latest_peer_preparation(second.group)
+                .unwrap()
+                .activated
+        );
+        assert_eq!(
+            previously_active.peer_group_transition(&abort),
+            Err(GroupError::PreparationActivated)
+        );
+        assert_eq!(
+            previously_active.peer_group_view(*second).unwrap().phase,
+            GroupPhase::Ready
+        );
+
+        state.report_peer_failure(first_grant).unwrap();
+        state.release_peer_worker(first_grant).unwrap();
+        state
+            .prepare_peer_group(first.group, 1, &preparations[0].resources)
+            .unwrap();
+        let successor = GroupVersion {
+            group: first.group,
+            epoch: 2,
+        };
+        let successor_grant = state.peer_group_view(successor).unwrap().grants[0];
+        assert_eq!(
+            state.peer_group_transition(&GroupAction::AbortFailedSet {
+                prepare,
+                versions: vec![successor, *second],
+            }),
+            Err(GroupError::InvalidPlan)
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                state.peer_group_transition(&abort),
+                Ok(GroupOutcome::AbortedSet(versions.clone()))
+            );
+        }
+        assert_eq!(
+            state.peer_group_view(*second).unwrap().phase,
+            GroupPhase::Revoked
+        );
+        assert_eq!(
+            state.workers[&second_grant.device].grant,
+            Some(second_grant)
+        );
+        assert_eq!(
+            state.hosts[&host].reserved,
+            HostMemory {
+                bytes: 16,
+                pinned_bytes: 8
+            }
+        );
+        state.release_peer_worker(second_grant).unwrap();
+        assert_eq!(state.hosts[&host].reserved, demand);
+        assert_eq!(
+            state.workers[&successor_grant.device].grant,
+            Some(successor_grant)
+        );
     }
 
     #[test]

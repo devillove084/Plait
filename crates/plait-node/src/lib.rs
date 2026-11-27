@@ -484,6 +484,9 @@ impl NodeState {
                         GroupReply::GrantStatus(runtime.peer_grant_status(grant))
                     }
                     GroupLookup::Standby(group) => GroupReply::Standby(runtime.peer_standby(group)),
+                    GroupLookup::LatestPreparation(group) => {
+                        GroupReply::Preparation(runtime.latest_peer_preparation(group))
+                    }
                     GroupLookup::PlacementWithRates { group, calibration } => {
                         GroupReply::PlacementWithRates {
                             inventory: runtime.placement_inventory(group),

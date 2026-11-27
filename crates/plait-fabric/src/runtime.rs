@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use plait_consensus::{InstanceId, StateMachine};
 use plait_core::group::{
     ComputeRate, GrantStatus, GroupOperation, GroupReceipt, GroupResult,
-    GroupView as PeerGroupView, PlacementInventory,
+    GroupView as PeerGroupView, PlacementInventory, PreparedSetView,
 };
 use plait_core::serving::{
     DecoderCheckpoint, DecoderClaim, DecoderDirectory, DecoderDrainStatus, DecoderFailover,
@@ -146,6 +146,13 @@ impl Runtime {
 
     pub fn peer_standby(&self, group: plait_core::group::GroupId) -> Option<GroupVersion> {
         self.serving.peer_standby(group)
+    }
+
+    pub fn latest_peer_preparation(
+        &self,
+        group: plait_core::group::GroupId,
+    ) -> Option<PreparedSetView> {
+        self.serving.latest_peer_preparation(group)
     }
 
     pub fn placement_inventory(&self, group: plait_core::group::GroupId) -> PlacementInventory {

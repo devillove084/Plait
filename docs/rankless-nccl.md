@@ -1309,6 +1309,17 @@ derives each HTTP origin from the committed group and its deployment's
 port range. A P/D candidate appears after both groups reach `Ready`.
 The incumbent stays live throughout preparation.
 
+Upgrade the voters and the ingress's `plait-node` binary together for
+on-demand provisioning. During reconciliation the ingress reads each
+candidate's latest preparation receipt through the `preparation` request.
+After a member is revoked or retired before activation, one ordered
+`AbortFailedSet` revokes the remaining candidates in that preparation.
+Plait checks the exact member epochs and rejects the abort if any member
+has ever activated. Grants and host reservations remain charged until the
+owners confirm release. A later preparation can then reuse eligible
+devices with new fences. If a grant has no release confirmation, it stays
+held even after the candidate is revoked.
+
 Measure the candidate through a separate private ingress with `--routes`
 for the candidate endpoints and `--kv-transport plait`. Add its measured
 SLO profile to `modes` with the exact discovered versions and the actual
@@ -1366,11 +1377,18 @@ On completion, the policy checks the candidate's bindings, grant count,
 readiness, SLO expiry, and the observed active set again. It discards results
 when these checks fail. A measured candidate must win the same stable
 window comparison as a manually profiled candidate. Its profile remains
-available as the incumbent baseline after cutover, in the same process
-until it expires or its calibration settings or route revision change.
-The next process starts from the exact incumbent profile supplied in
-`modes`. Supply a fresh profile there for an incumbent whose cached
-measurement has expired.
+available as the incumbent baseline after cutover until it expires or its
+calibration settings or route revision change.
+
+Pass `--mode-state /var/lib/vllm/plait-capacity.json` with `--mode-policy`
+to preserve those measurements across ingress process restarts. The file
+stores the profile and fingerprints of the calibration settings, route
+bindings, and communicator manifests. The manifests bind the measurements
+to the particular device grants and endpoint tickets. A restored profile
+must still be current and describe healthy, matching group versions.
+With a state path configured, a new profile is saved before it can trigger
+a switch. Supply a fresh incumbent profile in `modes` if the stored one
+expires.
 
 A functional deployment verified this sequence with a CUDA aggregate,
 ROCm Prefill, and PPU Decode serving the same FP16 checkpoint. HTTP demand
