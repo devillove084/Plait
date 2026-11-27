@@ -142,10 +142,11 @@ registration revisions again in case they change after the planner reads them.
 ### Bootstrap from vLLM
 
 Start the vLLM workers with the same TP layout and the vendor's PyTorch
-runtime on each worker. The fork uses Gloo to exchange endpoints and for
-its existing CPU control operations. Set `VLLM_HOST_IP` to the address
-that the other workers can reach when automatic address selection chooses
-the wrong interface. The Rust layer binds a TCP port assigned by the OS.
+runtime on each worker. The default peer bootstrap exchanges endpoints
+over Gloo, which also carries the engine's CPU control operations. Set
+`VLLM_HOST_IP` to the address the other workers can reach when automatic
+address selection chooses the wrong interface. The Rust layer binds a TCP
+port assigned by the OS.
 `PLAIT_NCCL_TIMEOUT_MS` sets the TCP bootstrap and socket I/O timeouts and
 defaults to 120 seconds.
 
@@ -159,6 +160,47 @@ The managed launcher sets `PLAIT_TP_GROUP_VERSION` from its committed launch
 claim. Plait includes the group ID and epoch in the manifest digest. Peers
 with different group versions fail the handshake. A managed replacement
 and its predecessor can hold separate communicators at the same time.
+
+### Join a committed TP group from vLLM
+
+Reserve a native execution group first. Use a Plait Python package built with
+the control-plane join and set `VLLM_USE_PLAIT=1` and
+`VLLM_PLAIT_TP_GROUP_CONFIG` to the launch descriptor's path on every host.
+Each host sets its own `host_id` and uses the same `seeds` and `tp_groups`.
+
+```json
+{
+  "host_id": "00000000000000000000000000000002",
+  "seeds": ["192.0.2.11:7950", "192.0.2.12:7950", "192.0.2.13:7950"],
+  "tp_groups": [{
+    "version": "00000000000000000000000000000003@1",
+    "ranks": [0, 1],
+    "devices": [
+      ["00000000000000000000000000000002", 3],
+      ["00000000000000000000000000000001", 1]
+    ]
+  }]
+}
+```
+
+The corresponding elements in `ranks` and `devices` give each model shard
+its stable device ID. The launcher sets the device mask so the local worker
+runs on that device. The device ordinal in the descriptor identifies the
+physical grant. The ordinal passed to the device runtime follows the process's
+visibility mask. A deployment with multiple TP subgroups provides one entry per
+TP subgroup.
+
+Each worker independently resolves its grant, publishes its endpoint, and reads
+the complete manifest through a voter. The peer handshake binds the manifest and
+the descriptor's device order, so AllGather output and ReduceScatter shards
+follow the engine's slots. Workers report `Ready` for the communicator after
+connecting. The deployment controller can activate the version once transport
+and engine readiness are both confirmed. Use a new epoch when a worker must
+publish a new listener. The engine retains its CPU process groups and PP startup.
+
+Rust clients can use `join_committed_group` with the `plait-nccl/control`
+feature for the same sequence. C clients can publish and join through the
+native group APIs and existing C ABI.
 
 ### Assign different numbers of workers per host
 

@@ -20,14 +20,11 @@ use plait_fabric::Runtime;
 use plait_net::{TcpTransport, Wire};
 use serde::{Deserialize, Serialize};
 
-mod client;
-mod discovery;
 mod execution_host;
 mod observation;
 mod storage;
-pub use client::{Client, QueryResult};
-pub use discovery::discover_voters;
 use observation::PendingObservation;
+pub use plait_net::control::{Client, QueryResult, discover_voters};
 pub use storage::StorageMode;
 use storage::{Image, Journal};
 

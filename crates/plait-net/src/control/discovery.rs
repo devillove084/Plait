@@ -3,8 +3,8 @@ use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use crate::probe_voter;
 use plait_core::NodeId;
-use plait_net::probe_voter;
 use tokio::task::JoinSet;
 
 /// Probe only the configured addresses. Discovery supplies transport routes;

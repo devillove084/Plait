@@ -186,6 +186,25 @@ class NCCLLibrary:
         self._comms.add(comm)
         return comm
 
+    def join_versioned_group(
+        self,
+        host: str,
+        seeds: list[str],
+        version: str,
+        devices: list[tuple[str, int]],
+        slot: int,
+    ) -> CommHandle:
+        """Join committed devices in the caller's logical collective order."""
+        address = f"[{host}]:0" if ":" in host else f"{host}:0"
+        timeout_ms = int(os.environ.get("PLAIT_NCCL_TIMEOUT_MS", "120000"))
+        if self.device is None:
+            raise ValueError("a versioned group requires the local accelerator index")
+        comm = CommHandle(_plait_nccl.join_versioned_group(
+            address, seeds, version, devices, slot, self.device, timeout_ms,
+        ))
+        self._comms.add(comm)
+        return comm
+
     def ncclAllReduce(self, sendbuff, recvbuff, count: int, datatype: int, op: int, comm: CommHandle, stream) -> None:
         send = _ptr(sendbuff)
         recv = _ptr(recvbuff)

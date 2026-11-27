@@ -438,7 +438,11 @@ fn rankless_listeners(
     (listeners, members)
 }
 
-fn rankless_comms(version: GroupVersion, devices: &[DeviceId]) -> Vec<RanklessComm> {
+fn rankless_comms(
+    version: GroupVersion,
+    devices: &[DeviceId],
+    order: Option<&[DeviceId]>,
+) -> Vec<RanklessComm> {
     let (listeners, members) = rankless_listeners(version, devices);
     thread::scope(|scope| {
         let jobs: Vec<_> = listeners
@@ -451,8 +455,10 @@ fn rankless_comms(version: GroupVersion, devices: &[DeviceId]) -> Vec<RanklessCo
                     Comm::connect_rankless_with_runtime(
                         listener,
                         members,
+                        order,
                         devices[index].ordinal as usize,
                         Box::new(HostDevice),
+                        Duration::from_secs(2),
                         Duration::from_secs(2),
                     )
                     .unwrap()
@@ -461,6 +467,63 @@ fn rankless_comms(version: GroupVersion, devices: &[DeviceId]) -> Vec<RanklessCo
             .collect();
         jobs.into_iter().map(|job| job.join().unwrap()).collect()
     })
+}
+
+#[test]
+fn explicit_slot_layout_preserves_engine_allgather_order() {
+    let [a, b, c] = [1, 2, 3].map(|id| DeviceId::new(NodeId::from_bytes([id; 16]), 0));
+    let version = GroupVersion {
+        group: GroupId(NodeId::derive("slot layout")),
+        epoch: 1,
+    };
+    let peers = rankless_comms(version, &[a, b, c], Some(&[c, a, b]));
+    thread::scope(|scope| {
+        for (peer, value) in peers.iter().zip([10i32, 20, 30]) {
+            scope.spawn(move || {
+                assert_eq!(peer.peer_slot(c), Some(0));
+                assert_eq!(peer.peer_slot(a), Some(1));
+                assert_eq!(peer.peer_slot(b), Some(2));
+                let mut output = [0i32; 3];
+                assert_eq!(
+                    ncclAllGather(
+                        std::ptr::from_ref(&value).cast(),
+                        output.as_mut_ptr().cast(),
+                        1,
+                        DataType::Int32 as i32,
+                        peer.as_ptr(),
+                        7 as *mut c_void,
+                    ),
+                    NCCL_SUCCESS
+                );
+                assert_eq!(output, [30, 10, 20]);
+            });
+        }
+    });
+}
+
+#[test]
+fn different_slot_orders_cannot_connect_with_the_same_grants() {
+    let devices = [1, 2].map(|id| DeviceId::new(NodeId::from_bytes([id; 16]), 0));
+    let version = GroupVersion {
+        group: GroupId(NodeId::derive("slot mismatch")),
+        epoch: 1,
+    };
+    let (mut listeners, members) = rankless_listeners(version, &devices);
+    let right = listeners.pop().unwrap();
+    let left = listeners.pop().unwrap();
+    thread::scope(|scope| {
+        let timeout = Duration::from_millis(500);
+        let left_members = members.clone();
+        let dialer =
+            scope.spawn(move || left.connect(left_members, None, timeout, timeout).is_err());
+        let reversed = [devices[1], devices[0]];
+        assert!(
+            right
+                .connect(members, Some(&reversed), timeout, timeout)
+                .is_err()
+        );
+        assert!(dialer.join().unwrap());
+    });
 }
 
 fn all_reduce_i32(comm: &Comm, value: i32, output: &mut i32) -> i32 {
@@ -490,8 +553,8 @@ fn rankless_replacement_preserves_device_identity_and_isolates_the_old_failure()
         group: GroupId(NodeId::derive("native independent group")),
         epoch: 1,
     };
-    let mut original = rankless_comms(old, &[c, a, b]);
-    let running = rankless_comms(independent, &[c, b]);
+    let mut original = rankless_comms(old, &[c, a, b], None);
+    let running = rankless_comms(independent, &[c, b], None);
     assert_eq!(original[0].peer_slot(a), Some(0));
     assert_eq!(original[0].peer_slot(b), Some(1));
     assert_eq!(original[0].peer_slot(c), Some(2));
@@ -516,7 +579,7 @@ fn rankless_replacement_preserves_device_identity_and_isolates_the_old_failure()
         }
     });
 
-    let next = rankless_comms(new, &[replacement, c, b]);
+    let next = rankless_comms(new, &[replacement, c, b], None);
     thread::scope(|scope| {
         for comm in &next {
             scope.spawn(move || {
@@ -549,8 +612,8 @@ fn peer_handshake_rejects_different_grants_with_identical_endpoints() {
     stale[1].grant.fence += 1;
     thread::scope(|scope| {
         let timeout = Duration::from_secs(2);
-        let left = scope.spawn(move || left.connect(stale, timeout).is_err());
-        assert!(right.connect(members, timeout).is_err());
+        let left = scope.spawn(move || left.connect(stale, None, timeout, timeout).is_err());
+        assert!(right.connect(members, None, timeout, timeout).is_err());
         assert!(left.join().unwrap());
     });
 }
@@ -562,7 +625,7 @@ fn cancel_wakes_an_active_peer_call_and_rejects_reuse() {
         epoch: 1,
     };
     let devices = [1, 2].map(|index| DeviceId::new(NodeId::from_bytes([index; 16]), 0));
-    let mut peers = rankless_comms(version, &devices);
+    let mut peers = rankless_comms(version, &devices, None);
     let idle = peers.pop().unwrap();
     let waiting = peers.pop().unwrap();
     let Transport::Peers(remote) = &idle.transport else {

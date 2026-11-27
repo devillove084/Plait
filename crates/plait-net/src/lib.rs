@@ -26,6 +26,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::codec::{Framed, FramedWrite, LengthDelimitedCodec};
 
+pub mod control;
 pub mod tensor;
 
 const MAX_FRAME: usize = 64 * 1024 * 1024;

@@ -8,11 +8,11 @@ use plait_core::group::{
     GroupReply, GroupResult, GroupView as PeerGroupView,
 };
 
+use crate::{GroupObservation, TcpTransport, Wire};
 use plait_core::serving::{
     GroupId, GroupView, ServingError, ServingLookup, ServingOperation, ServingResult, ServingView,
 };
 use plait_core::{Command, NodeId, OpId};
-use plait_net::{GroupObservation, TcpTransport, Wire};
 
 pub struct Client {
     transport: TcpTransport,

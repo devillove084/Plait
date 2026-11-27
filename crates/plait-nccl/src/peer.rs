@@ -86,7 +86,7 @@ impl Listener {
         members: Vec<Endpoint>,
         timeout: Duration,
     ) -> io::Result<Arc<PeerGroup>> {
-        self.connect_bound(slot, members, None, timeout)
+        self.connect_bound(slot, members, None, timeout, timeout)
     }
 
     fn connect_bound(
@@ -95,8 +95,10 @@ impl Listener {
         members: Vec<Endpoint>,
         binding: Option<GrantBinding>,
         timeout: Duration,
+        bootstrap_timeout: Duration,
     ) -> io::Result<Arc<PeerGroup>> {
         if timeout.is_zero()
+            || bootstrap_timeout.is_zero()
             || members.len() > i32::MAX as usize
             || members.get(slot) != Some(&self.endpoint)
             || members
@@ -118,7 +120,7 @@ impl Listener {
             return Err(io::Error::other("invalid peer group manifest"));
         }
         let deadline = Instant::now()
-            .checked_add(timeout)
+            .checked_add(bootstrap_timeout)
             .ok_or_else(|| io::Error::other("invalid peer bootstrap timeout"))?;
         let bootstrap = Bootstrap {
             slot,
@@ -130,7 +132,7 @@ impl Listener {
                         .finalize()
                         .into()
                 },
-                |binding| binding.digest,
+                |binding| binding.handshake_digest,
             ),
         };
         let mut connections = (0..members.len()).map(|_| [None, None]).collect::<Vec<_>>();
@@ -169,6 +171,7 @@ impl Listener {
 struct GrantBinding {
     devices: Vec<DeviceId>,
     digest: [u8; 32],
+    handshake_digest: [u8; 32],
 }
 
 type WireLanes = [Option<TcpStream>; 2];
@@ -365,7 +368,11 @@ impl PeerGroup {
     }
 
     pub(crate) fn device_slot(&self, device: DeviceId) -> Option<usize> {
-        self.binding.as_ref()?.devices.binary_search(&device).ok()
+        self.binding
+            .as_ref()?
+            .devices
+            .iter()
+            .position(|&id| id == device)
     }
 
     pub fn fail(&self) {

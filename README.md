@@ -172,13 +172,14 @@ errors=0
 
 `crates/plait-nccl` provides a PyO3 NCCL-compatible communicator for vLLM.
 The vLLM fork uses peer transport for TP collectives and PP activations when
-`VLLM_USE_PLAIT=1` is set.
-Each worker exchanges endpoint metadata over Gloo and sends tensors directly
-to its peers. [Peer transport and startup](docs/rankless-nccl.md)
+`VLLM_USE_PLAIT=1` is set. A TP launch can read device grants and endpoints
+from Plait's control plane by setting `VLLM_PLAIT_TP_GROUP_CONFIG`.
+The engine's logical slot order is checked during the peer handshake.
+[Join a committed TP group](docs/rankless-nccl.md#join-a-committed-tp-group-from-vllm)
 
 Native C and Rust callers can bind a communicator directly to an execution
-group version and its device grants. Stable identities determine the temporary
-slots, and each peer validates the full manifest during the socket handshake.
+group version and its device grants. Stable identities determine the default
+slot order. Each peer validates the full manifest during the socket handshake.
 [Native peer bootstrap](docs/rankless-nccl.md#join-by-device-identity)
 
 The replicated group API reserves devices, collects endpoint records, and
@@ -306,6 +307,7 @@ release the result after the matching completion has executed in the control pla
 | [Ordered publication](specs/PlaitOrderedPublication.tla) | Completion and revocation in the agreed command order, receipt identity on retry, and recovery from a replica's durable command prefix. |
 | [Peer collectives](specs/PlaitPeerCollective.tla) | Round pairing, replicated and sharded reduction, and completion of an independent communicator when a participant in another group is lost. |
 | [Rankless peer join](specs/PlaitRanklessPeerJoin.tla) | Socket handshakes bind the group version and grant view. Cancellation closes the participant's links. |
+| [Logical slot layout](specs/PlaitRanklessLayout.tla) | A participant reports ready after connecting to all members with a common slot layout. |
 | [Replicated group manifest](specs/PlaitGroupManifest.tla) | Activation follows complete endpoint and handshake evidence. Retrying an old release preserves any successor grant. |
 | [Native group placement](specs/PlaitGroupPlacement.tla) | A planned reservation checks the version, incumbent, and resource availability against concurrent changes. |
 | [Native probe sessions](specs/PlaitProbePlacement.tla) | A planned reservation checks both endpoint revisions if a probe restarts after measurement. |

@@ -18,15 +18,21 @@ use cudarc::driver::CudaContext;
 use half::{bf16, f16};
 
 mod backend;
+#[cfg(feature = "control")]
+mod control;
 mod cross;
 mod ipc;
 mod kernel;
 mod native;
 mod p2p;
 mod peer;
+#[cfg(feature = "python")]
+mod python_control;
 mod shm;
 
 use backend::{CudaRuntime, DeviceRuntime, HostCopyRuntime, HuaweiRuntime, PpuRuntime};
+#[cfg(feature = "control")]
+pub use control::{JoinGroup, join_committed_group};
 use peer::{Collective, PeerGroup};
 pub use peer::{
     Endpoint as PeerEndpoint, Listener as PeerListener, RanklessListener, RanklessMember,
@@ -376,24 +382,57 @@ impl Comm {
         timeout: Duration,
     ) -> Result<RanklessComm, String> {
         let runtime = create_runtime(backend, device)?;
-        Self::connect_rankless_with_runtime(listener, members, device, runtime, timeout)
+        Self::connect_rankless_with_runtime(
+            listener, members, None, device, runtime, timeout, timeout,
+        )
+    }
+
+    /// Use the caller's logical slot order while retaining stable device grants.
+    pub fn connect_rankless_layout(
+        listener: RanklessListener,
+        members: Vec<RanklessMember>,
+        layout: &[plait_core::DeviceId],
+        backend: BackendKind,
+        device: usize,
+        timeout: Duration,
+    ) -> Result<RanklessComm, String> {
+        let runtime = create_runtime(backend, device)?;
+        Self::connect_rankless_with_runtime(
+            listener,
+            members,
+            Some(layout),
+            device,
+            runtime,
+            timeout,
+            timeout,
+        )
     }
 
     fn connect_rankless_with_runtime(
         listener: RanklessListener,
         members: Vec<RanklessMember>,
+        layout: Option<&[plait_core::DeviceId]>,
         device: usize,
         runtime: Box<dyn DeviceRuntime>,
         timeout: Duration,
+        bootstrap_timeout: Duration,
     ) -> Result<RanklessComm, String> {
         let group = listener
-            .connect(members, timeout)
+            .connect(members, layout, timeout, bootstrap_timeout)
             .map_err(|error| error.to_string())?;
+        Ok(Self::rankless_from_peers(group, device, runtime))
+    }
+
+    fn rankless_from_peers(
+        group: Arc<PeerGroup>,
+        device: usize,
+        runtime: Box<dyn DeviceRuntime>,
+    ) -> RanklessComm {
         let slot = group.slot();
         let world = group.world();
-        Ok(RanklessComm(Box::new(Self::with_peers(
+        RanklessComm(Box::new(Self::with_peers(
             group, slot, world, device, runtime,
-        ))))
+        )))
     }
 
     pub fn peer_slot(&self, device: plait_core::DeviceId) -> Option<usize> {
@@ -2509,20 +2548,11 @@ impl PyPeerListener {
         })?;
         let listener = match version {
             None => PeerListener::bind(address, ticket),
-            Some(version) => {
-                use plait_core::NodeId;
-                use plait_core::group::{GroupId, GroupVersion};
-
-                let version_error = || {
-                    pyo3::exceptions::PyValueError::new_err(
-                        "expected a group version in the form <hex id>@<epoch>",
-                    )
-                };
-                let (group, epoch) = version.split_once('@').ok_or_else(version_error)?;
-                let group = GroupId(NodeId::from_hex(group).map_err(|_| version_error())?);
-                let epoch = epoch.parse::<u64>().map_err(|_| version_error())?;
-                PeerListener::bind_in_epoch(address, ticket, GroupVersion { group, epoch })
-            }
+            Some(version) => PeerListener::bind_in_epoch(
+                address,
+                ticket,
+                python_control::parse_version(version)?,
+            ),
         };
         listener
             .map(|listener| Self(Some(listener)))
@@ -2634,6 +2664,10 @@ fn join(id: &[u8], device: usize) -> PyResult<CommHandle> {
 fn _plait_nccl(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<CommHandle>()?;
     module.add_class::<PyPeerListener>()?;
+    module.add_function(wrap_pyfunction!(
+        python_control::join_versioned_group,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(take_last_error, module)?)?;
     module.add_function(wrap_pyfunction!(unique_id, module)?)?;
     module.add_function(wrap_pyfunction!(new_group, module)?)?;
