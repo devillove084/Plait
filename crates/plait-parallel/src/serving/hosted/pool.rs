@@ -4,7 +4,7 @@ use plait_core::NodeId;
 use plait_core::serving::{
     GroupId, GroupPlan, HostMemory, HostedAddress, HostedLinkSample, HostedPdKv, HostedPdLaunch,
     HostedPlanning, HostedPortUse, HostedRecipe, ServingResources, ServingRole, WorkerDemand,
-    WorkerResources,
+    WorkerResources, hosted_all_reduce_profile,
 };
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +22,8 @@ pub struct HostedPool {
     gpu_memory_bps: u16,
     prefix_caching: bool,
     ports: PortRange,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replicated_egress_bytes: Option<u64>,
     #[serde(default)]
     sizes: Vec<SizeProfile>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -128,15 +130,16 @@ pub(super) fn generate_layouts(
         .find(|group| group.latest.group == pool.group);
     let expected_epoch = history.map_or(0, |group| group.latest.epoch);
     let mut candidates = Vec::new();
+    let profile = pool.profile_name().expect("validated hosted profile");
     for size in &pool.sizes {
-        let hosts = available_hosts(resources, planning, pool, size);
+        let hosts = available_hosts(resources, planning, &profile, &pool.ports, size);
         for layout in search_layouts(&hosts, size.tensor_parallel, evidence, allow_local) {
             let api_host = layout.api_host.expect("layout has a host with free ports");
             let [master_port, http_port, backend_port] = hosts[&api_host]
                 .ports
                 .expect("ports were selected for API host");
             let recipe = HostedRecipe {
-                profile: pool.profile.clone(),
+                profile: profile.clone(),
                 api_host,
                 hosts: layout
                     .ranks
@@ -190,8 +193,8 @@ pub(super) fn generate_layouts(
         }
     }
     for pipeline in &pool.pipelines {
-        let profile = pipeline
-            .qualified_name()
+        let profile = pool
+            .pipeline_name(pipeline)
             .expect("validated pipeline profile");
         let hosts = inventory_hosts(resources, planning, &profile, &pool.ports);
         for layout in search_pipeline(pipeline, &hosts, evidence) {
@@ -266,6 +269,21 @@ fn bind_launch(
 }
 
 impl HostedPool {
+    fn with_all_reduce(&self, profile: &str) -> Option<String> {
+        match self.replicated_egress_bytes {
+            Some(bytes) => hosted_all_reduce_profile(profile, bytes),
+            None => Some(profile.to_owned()),
+        }
+    }
+
+    fn profile_name(&self) -> Option<String> {
+        self.with_all_reduce(&self.profile)
+    }
+
+    fn pipeline_name(&self, pipeline: &PipelineProfile) -> Option<String> {
+        self.with_all_reduce(&pipeline.qualified_name()?)
+    }
+
     pub(super) fn group(&self) -> GroupId {
         self.group
     }
@@ -275,7 +293,7 @@ impl HostedPool {
     }
 
     pub(super) fn capacity(&self, profile: &str, tensor_parallel: u32) -> Option<SloProfile> {
-        if self.profile != profile {
+        if self.profile_name().as_deref() != Some(profile) {
             return None;
         }
         self.sizes
@@ -293,7 +311,7 @@ impl HostedPool {
         self.pipelines.iter().find(|entry| {
             entry.tensor_parallel == tensor_parallel
                 && entry.stages.len() == pipeline_parallel as usize
-                && entry.qualified_name().as_deref() == Some(profile)
+                && self.pipeline_name(entry).as_deref() == Some(profile)
         })
     }
 
@@ -305,6 +323,9 @@ impl HostedPool {
         let end = u32::from(self.ports.first) + u32::from(self.ports.count);
         if self.ports.first == 0 || self.ports.count < 3 || end > u32::from(u16::MAX) + 1 {
             return Err("hosted pool requires a port range with at least three valid ports");
+        }
+        if self.profile_name().is_none() {
+            return Err("invalid hosted AllReduce profile");
         }
         let mut degrees = BTreeSet::new();
         if (self.sizes.is_empty() && self.pipelines.is_empty())
@@ -322,9 +343,11 @@ impl HostedPool {
         }
         let mut shapes = BTreeSet::new();
         for pipeline in &self.pipelines {
+            let name = self.pipeline_name(pipeline);
             if !allow_local
                 || !pipeline.validate()
-                || !shapes.insert((pipeline.qualified_name(), pipeline.tensor_parallel))
+                || name.is_none()
+                || !shapes.insert((name, pipeline.tensor_parallel))
             {
                 return Err(
                     "hosted P/D pool requires distinct supported pipelines and valid stage budgets",
@@ -353,6 +376,7 @@ impl HostedPool {
                 first: 20000,
                 count: 6,
             },
+            replicated_egress_bytes: None,
             sizes: vec![SizeProfile {
                 tensor_parallel: 1,
                 device_bytes: 8,
@@ -379,10 +403,11 @@ impl HostedPool {
 fn available_hosts(
     resources: &ServingResources,
     planning: &HostedPlanning,
-    pool: &HostedPool,
+    profile: &str,
+    ports: &PortRange,
     size: &SizeProfile,
 ) -> BTreeMap<NodeId, AvailableHost> {
-    inventory_hosts(resources, planning, &pool.profile, &pool.ports)
+    inventory_hosts(resources, planning, profile, ports)
         .into_iter()
         .filter_map(|(host, available)| {
             let mut workers: Vec<_> = available
@@ -643,6 +668,7 @@ mod tests {
         let pool = HostedPool {
             group,
             profile: "weights".into(),
+            replicated_egress_bytes: None,
             api_model: "model".into(),
             max_model_len: 1024,
             gpu_memory_bps: 8000,
@@ -715,6 +741,33 @@ mod tests {
                 bytes: 15,
                 pinned_bytes: 2
             }
+        );
+        let mut capped = HostedPool::fixture(group, "weights", "model").with_capacity(4, 8.0);
+        capped.replicated_egress_bytes = Some(0);
+        let qualified = hosted_all_reduce_profile("weights", 0).unwrap();
+        let mut inventory = planning.clone();
+        for host in inventory.hosts.iter_mut().filter(|host| host.host != c) {
+            host.profiles.insert(qualified.clone());
+        }
+        let candidates = |inventory: &HostedPlanning| {
+            generate_hosted_candidates(&resources, inventory, &forecast, &capped, &policy, &links)
+                .unwrap()
+        };
+        // The four-worker layout requires all three hosts, including C.
+        assert!(candidates(&inventory).is_empty());
+        inventory
+            .hosts
+            .iter_mut()
+            .find(|host| host.host == c)
+            .unwrap()
+            .profiles
+            .insert(qualified.clone());
+        let candidates = candidates(&inventory);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].1.profile, qualified);
+        assert_ne!(
+            candidates[0].0.plan.launch_digest,
+            candidate.plan.launch_digest
         );
         let budget = HostedLinkPolicy {
             tp_rtt_budget: Some(HostedTpRttBudget {

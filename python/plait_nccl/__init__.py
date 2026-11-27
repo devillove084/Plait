@@ -210,17 +210,27 @@ class NCCLLibrary:
         self._comms.add(comm)
         return comm
 
-    def connect_peers(self, host: str, slot: int, exchange_endpoints) -> CommHandle:
+    def connect_peers(
+        self,
+        host: str,
+        slot: int,
+        exchange_endpoints,
+        *,
+        replicated_egress_bytes: int | None = None,
+    ) -> CommHandle:
         """Exchange per-device endpoints, then connect the peer communicator."""
         address = f"[{host}]:0" if ":" in host else f"{host}:0"
         ticket = secrets.token_bytes(16)
         listener = None
         try:
+            options = {}
+            if replicated_egress_bytes is not None:
+                options["replicated_egress_bytes"] = replicated_egress_bytes
             listener = _plait_nccl.PeerListener(
-                address, ticket, os.environ.get("PLAIT_TP_GROUP_VERSION")
+                address, ticket, os.environ.get("PLAIT_TP_GROUP_VERSION"), **options
             )
             local = (listener.endpoint(), ticket)
-        except (AttributeError, OSError, ValueError) as exc:
+        except (AttributeError, OSError, TypeError, ValueError, OverflowError) as exc:
             local = str(exc)
         members = exchange_endpoints(local)
         for peer, member in enumerate(members):

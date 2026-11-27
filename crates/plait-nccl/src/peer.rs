@@ -17,7 +17,7 @@ use plait_core::collective::{
 };
 pub use plait_core::group::PeerEndpoint as Endpoint;
 use plait_core::group::{GroupFault, GroupVersion, peer_digest};
-use sha2::Digest;
+use sha2::{Digest, Sha256};
 
 use crate::profile::Timer;
 use crate::{DataType, ReduceOp, host_reduce, reduce_bytes, reduce_fp8_to_f32, reduce_slices};
@@ -87,6 +87,10 @@ impl Listener {
         self.endpoint
     }
 
+    pub(crate) fn set_replicated_egress_bytes(&mut self, bytes: u64) {
+        self.replicated_egress_bytes = Some(bytes);
+    }
+
     pub(crate) fn connect(
         self,
         slot: usize,
@@ -130,18 +134,26 @@ impl Listener {
         let deadline = Instant::now()
             .checked_add(bootstrap_timeout)
             .ok_or_else(|| io::Error::other("invalid peer bootstrap timeout"))?;
+        let mut manifest = binding.as_ref().map_or_else(
+            || {
+                peer_digest(self.version, members.iter().copied())
+                    .finalize()
+                    .into()
+            },
+            |binding| binding.handshake_digest,
+        );
+        if let Some(bytes) = self.replicated_egress_bytes {
+            let mut digest = Sha256::new();
+            digest.update(b"plait-peer-all-reduce-egress-v1");
+            digest.update(manifest);
+            digest.update(bytes.to_le_bytes());
+            manifest = digest.finalize().into();
+        }
         let bootstrap = Bootstrap {
             slot,
             timeout,
             deadline,
-            manifest: binding.as_ref().map_or_else(
-                || {
-                    peer_digest(self.version, members.iter().copied())
-                        .finalize()
-                        .into()
-                },
-                |binding| binding.handshake_digest,
-            ),
+            manifest,
         };
         let mut connections = (0..members.len()).map(|_| [None, None]).collect::<Vec<_>>();
         let (incoming, local_and_outgoing) = connections.split_at_mut(slot);

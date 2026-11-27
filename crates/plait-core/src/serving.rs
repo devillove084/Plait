@@ -145,6 +145,30 @@ pub fn hosted_pipeline_profile(profile: &str, layers: &[u32]) -> Option<String> 
     (name.len() <= 128).then_some(name)
 }
 
+/// Inventory name for a hosted engine profile with an explicit AllReduce cap.
+pub const HOSTED_ALL_REDUCE_PROFILE_PREFIX: &str = "plait.ar.";
+
+/// Bind a base or pipeline profile to a replicated AllReduce payload cap.
+pub fn hosted_all_reduce_profile(profile: &str, bytes: u64) -> Option<String> {
+    if profile.is_empty()
+        || profile.len() > 128
+        || profile.starts_with(HOSTED_ALL_REDUCE_PROFILE_PREFIX)
+        || !profile
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"plait-hosted-all-reduce-profile-v1");
+    digest.update(profile.as_bytes());
+    digest.update(bytes.to_le_bytes());
+    Some(format!(
+        "{HOSTED_ALL_REDUCE_PROFILE_PREFIX}{:x}",
+        digest.finalize()
+    ))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedAssignment {
     pub version: GroupVersion,

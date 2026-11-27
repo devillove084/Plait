@@ -9,8 +9,9 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use plait_core::serving::{
-    GroupPhase, GroupVersion, HostMemory, HostedInventory, HostedManagedAssignment, ServingAction,
-    ServingLookup, ServingView, hosted_pipeline_profile,
+    GroupPhase, GroupVersion, HOSTED_ALL_REDUCE_PROFILE_PREFIX, HostMemory, HostedInventory,
+    HostedManagedAssignment, ServingAction, ServingLookup, ServingView, hosted_all_reduce_profile,
+    hosted_pipeline_profile,
 };
 use plait_core::{DeviceId, NodeId};
 use serde::{Deserialize, Serialize};
@@ -60,6 +61,10 @@ struct EngineProfile {
     env: BTreeMap<String, String>,
     #[serde(default, skip_serializing)]
     pipeline_layers: Option<Vec<u32>>,
+    #[serde(default, skip_serializing)]
+    replicated_egress_budgets: BTreeSet<u64>,
+    #[serde(skip)]
+    replicated_egress_bytes: Option<u64>,
     #[serde(default)]
     stream_checkpoints: bool,
     #[serde(default)]
@@ -75,6 +80,31 @@ struct EngineProfile {
 struct Launch {
     child: Child,
     _lease: ChildStdin,
+}
+
+fn add_all_reduce_profiles(profiles: &mut BTreeMap<String, EngineProfile>) -> io::Result<()> {
+    let mut qualified = BTreeMap::new();
+    for (name, profile) in profiles.iter() {
+        if name.starts_with(HOSTED_ALL_REDUCE_PROFILE_PREFIX) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "hosted profile names starting with plait.ar. are reserved",
+            ));
+        }
+        for &bytes in &profile.replicated_egress_budgets {
+            let name = hosted_all_reduce_profile(name, bytes).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid hosted AllReduce profile",
+                )
+            })?;
+            let mut implementation = profile.clone();
+            implementation.replicated_egress_bytes = Some(bytes);
+            qualified.insert(name, implementation);
+        }
+    }
+    profiles.extend(qualified);
+    Ok(())
 }
 
 pub(crate) async fn run(
@@ -143,6 +173,7 @@ pub(crate) async fn run(
         ));
     }
     config.profiles.extend(pipeline_profiles);
+    add_all_reduce_profiles(&mut config.profiles)?;
     for profile in config.profiles.values() {
         if let Some(driver) = &profile.release_driver
             && (profile.verify_release.is_some()
@@ -411,6 +442,9 @@ async fn launch(
         .stdin(Stdio::piped());
     if !recipe.prefix_caching {
         command.arg("--no-prefix-caching");
+    }
+    if let Some(bytes) = profile.replicated_egress_bytes {
+        command.args(["--replicated-egress-bytes", &bytes.to_string()]);
     }
     for peer in peers {
         command.args(["--control-peer", peer]);

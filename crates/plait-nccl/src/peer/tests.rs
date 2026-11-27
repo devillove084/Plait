@@ -723,6 +723,38 @@ fn explicit_replicated_egress_limit_must_match_on_both_peers() {
     }
 }
 
+#[test]
+fn hosted_peer_handshake_binds_explicit_zero_and_nonzero_egress() {
+    for (left_limit, right_limit) in [
+        (None, None),
+        (Some(0), None),
+        (Some(0), Some(0)),
+        (Some(0), Some(1)),
+        (Some(1), Some(1)),
+    ] {
+        let (mut listeners, members) = listeners(2);
+        let mut right = listeners.pop().unwrap();
+        let mut left = listeners.pop().unwrap();
+        for (listener, bytes) in [(&mut left, left_limit), (&mut right, right_limit)] {
+            if let Some(bytes) = bytes {
+                listener.set_replicated_egress_bytes(bytes);
+            }
+        }
+        thread::scope(|scope| {
+            let timeout = Duration::from_millis(500);
+            let left_members = members.clone();
+            let dialer = scope.spawn(move || left.connect(0, left_members, timeout));
+            let right = right.connect(1, members, timeout);
+            for group in [dialer.join().unwrap(), right] {
+                assert_eq!(group.is_ok(), left_limit == right_limit);
+                if let Ok(group) = group {
+                    assert_eq!(group.replicated_egress_bytes, left_limit);
+                }
+            }
+        });
+    }
+}
+
 fn all_reduce_i32(comm: &Comm, value: i32, output: &mut i32) -> i32 {
     ncclAllReduce(
         (&value as *const i32).cast(),

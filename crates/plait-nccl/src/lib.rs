@@ -2696,8 +2696,13 @@ struct PyPeerListener(Option<PeerListener>);
 #[pymethods]
 impl PyPeerListener {
     #[new]
-    #[pyo3(signature = (address, ticket, version=None))]
-    fn new(address: &str, ticket: [u8; 16], version: Option<&str>) -> PyResult<Self> {
+    #[pyo3(signature = (address, ticket, version=None, *, replicated_egress_bytes=None))]
+    fn new(
+        address: &str,
+        ticket: [u8; 16],
+        version: Option<&str>,
+        replicated_egress_bytes: Option<u64>,
+    ) -> PyResult<Self> {
         let address = address.parse().map_err(|error: std::net::AddrParseError| {
             pyo3::exceptions::PyValueError::new_err(error.to_string())
         })?;
@@ -2710,7 +2715,12 @@ impl PyPeerListener {
             ),
         };
         listener
-            .map(|listener| Self(Some(listener)))
+            .map(|mut listener| {
+                if let Some(bytes) = replicated_egress_bytes {
+                    listener.set_replicated_egress_bytes(bytes);
+                }
+                Self(Some(listener))
+            })
             .map_err(|error| pyo3::exceptions::PyOSError::new_err(error.to_string()))
     }
 

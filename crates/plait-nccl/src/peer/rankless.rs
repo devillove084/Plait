@@ -33,7 +33,7 @@ impl RanklessListener {
 
     /// Set the per-worker replicated AllReduce payload cap before connecting.
     pub(crate) fn set_replicated_egress_bytes(&mut self, bytes: u64) {
-        self.listener.replicated_egress_bytes = Some(bytes);
+        self.listener.set_replicated_egress_bytes(bytes);
     }
 
     #[cfg(feature = "control")]
@@ -71,7 +71,7 @@ impl RanklessListener {
                 invalid("the local device grant and endpoint must match the peer manifest")
             })?;
         let devices: Vec<_> = members.iter().map(|member| member.grant.device).collect();
-        let mut handshake_digest = if has_custom_order {
+        let handshake_digest = if has_custom_order {
             let mut binding = Sha256::new();
             binding.update(b"plait-peer-slot-layout-v1");
             binding.update(digest);
@@ -83,13 +83,6 @@ impl RanklessListener {
         } else {
             digest
         };
-        if let Some(bytes) = self.listener.replicated_egress_bytes {
-            let mut binding = Sha256::new();
-            binding.update(b"plait-peer-all-reduce-egress-v1");
-            binding.update(handshake_digest);
-            binding.update(bytes.to_le_bytes());
-            handshake_digest = binding.finalize().into();
-        }
         let binding = GrantBinding {
             devices,
             digest,

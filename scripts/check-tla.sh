@@ -34,6 +34,7 @@ tlc -deadlock -config specs/PlaitHostedModeSelection.cfg specs/PlaitHostedModeSe
 tlc -deadlock -config specs/PlaitExecutionMaintenance.cfg specs/PlaitExecutionMaintenance.tla
 tlc -deadlock -config specs/PlaitHostedPdBudget.cfg specs/PlaitHostedPdBudget.tla
 tlc -deadlock -config specs/PlaitHostedPipelinePlacement.cfg specs/PlaitHostedPipelinePlacement.tla
+tlc -deadlock -config specs/PlaitHostedAllReduceProfile.cfg specs/PlaitHostedAllReduceProfile.tla
 tlc -deadlock -config specs/PlaitHostedPdScale.cfg specs/PlaitHostedPdScale.tla
 tlc -deadlock -config specs/PlaitHostedPdTransition.cfg specs/PlaitHostedPdTransition.tla
 tlc -deadlock -config specs/PlaitHostedPdReconfigure.cfg specs/PlaitHostedPdReconfigure.tla
