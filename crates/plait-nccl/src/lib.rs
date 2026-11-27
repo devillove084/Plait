@@ -855,13 +855,9 @@ pub(crate) fn reduce_slices(op: ReduceOp, dtype: DataType, buffers: &[&[u8]]) ->
             output
         }
         DataType::Float16 => {
-            let pair_sum = match buffers {
-                [left, right] if matches!(op, ReduceOp::Sum) => {
-                    host_reduce::sum_fp16_pair(left, right)
-                }
-                _ => None,
-            };
-            if let Some(sum) = pair_sum {
+            if matches!(op, ReduceOp::Sum)
+                && let Some(sum) = host_reduce::sum_fp16(buffers)
+            {
                 return sum;
             }
             let mut values = vec![0.0f32; bytes / 2];
@@ -892,6 +888,11 @@ pub(crate) fn reduce_slices(op: ReduceOp, dtype: DataType, buffers: &[&[u8]]) ->
             output
         }
         DataType::Bfloat16 => {
+            if matches!(op, ReduceOp::Sum)
+                && let Some(sum) = host_reduce::sum_bf16(buffers)
+            {
+                return sum;
+            }
             let mut values = vec![0.0f32; bytes / 2];
             for (index, chunk) in buffers[0].chunks_exact(2).enumerate() {
                 values[index] = bf16::from_bits(u16::from_ne_bytes([chunk[0], chunk[1]])).to_f32();
@@ -2879,40 +2880,61 @@ mod tests {
     }
 
     #[test]
-    fn bulk_fp16_pair_sum_matches_scalar_bits() {
-        let words: Vec<_> = (0..=u16::MAX)
-            .filter(|word| word & 0x7c00 != 0x7c00)
-            .collect();
-        let mut left: Vec<_> = words.iter().flat_map(|word| word.to_ne_bytes()).collect();
-        let right: Vec<_> = words
-            .iter()
-            .rev()
-            .cycle()
-            .skip(173)
-            .take(words.len())
-            .flat_map(|word| word.to_ne_bytes())
-            .collect();
-
-        // Remove a word to exercise a partial conversion block.
-        let right = &right[..right.len() - 2];
-        left.truncate(right.len());
-        let compare_with_scalar_chunks = |left: &[u8]| {
-            let expected: Vec<_> = left
-                .chunks(256)
-                .zip(right.chunks(256))
-                .flat_map(|(l, r)| reduce_slices(ReduceOp::Sum, DataType::Float16, &[l, r]))
+    fn bulk_half_sum_matches_scalar_bits_in_slot_order() {
+        for (dtype, exponent) in [(DataType::Float16, 0x7c00), (DataType::Bfloat16, 0x7f80)] {
+            let words: Vec<_> = (0..=u16::MAX)
+                .filter(|word| word & exponent != exponent)
                 .collect();
-            assert_eq!(
-                reduce_slices(ReduceOp::Sum, DataType::Float16, &[left, right]),
-                expected
-            );
-        };
-        assert!(host_reduce::sum_fp16_pair(&left, right).is_some());
-        compare_with_scalar_chunks(&left);
+            // A partial conversion block also has to retain the slot order.
+            let elements = words.len() - 1;
+            let bytes = elements * 2;
+            let mut buffers: Vec<Vec<u8>> = (0..16)
+                .map(|slot| {
+                    (0..elements)
+                        .flat_map(|index| words[(index + slot * 173) % words.len()].to_ne_bytes())
+                        .collect()
+                })
+                .collect();
+            // Reordering these four contributions would change the rounded sum.
+            for (buffer, value) in
+                buffers
+                    .iter_mut()
+                    .zip([32768.0, 2f32.powi(-24), -32768.0, 2f32.powi(-24)])
+            {
+                let word = match dtype {
+                    DataType::Float16 => f16::from_f32(value).to_bits(),
+                    DataType::Bfloat16 => bf16::from_f32(value).to_bits(),
+                    _ => unreachable!(),
+                };
+                buffer[..2].copy_from_slice(&word.to_ne_bytes());
+            }
+            let check = |buffers: &[Vec<u8>], finite| {
+                for count in [2, 3, 4, 8, 16] {
+                    let peers = &buffers[..count];
+                    let slices: Vec<_> = peers.iter().map(Vec::as_slice).collect();
+                    let fast = match dtype {
+                        DataType::Float16 => host_reduce::sum_fp16(&slices),
+                        DataType::Bfloat16 => host_reduce::sum_bf16(&slices),
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(fast.is_some(), finite);
+                    let expected: Vec<_> = (0..bytes)
+                        .step_by(256)
+                        .flat_map(|offset| {
+                            let end = (offset + 256).min(bytes);
+                            let chunk: Vec<_> =
+                                peers.iter().map(|peer| &peer[offset..end]).collect();
+                            reduce_slices(ReduceOp::Sum, dtype, &chunk)
+                        })
+                        .collect();
+                    assert_eq!(reduce_slices(ReduceOp::Sum, dtype, &slices), expected);
+                }
+            };
+            check(&buffers, true);
 
-        left[..2].copy_from_slice(&0x7e03u16.to_ne_bytes());
-        assert!(host_reduce::sum_fp16_pair(&left, right).is_none());
-        compare_with_scalar_chunks(&left);
+            buffers[1][..2].copy_from_slice(&(exponent | 3).to_ne_bytes());
+            check(&buffers, false);
+        }
     }
 
     #[test]

@@ -2232,4 +2232,7 @@ The vLLM fork's `PlaitCommunicator` calls the peer bootstrap directly.
 
 The peer host reduction supports FP32, FP16, BF16, and E4M3, and integer
 sums. FP16 and BF16 accumulate in FP32 before the output is rounded.
+Finite FP16 and BF16 sums use bounded conversion blocks for contributions
+of at least 8 KiB. Each element accumulates in slot order. Small and
+nonfinite inputs use the scalar reduction.
 Use an eager vLLM engine for this path.
