@@ -118,7 +118,13 @@ impl PipelineProfile {
             for &host in stage {
                 *ranks.entry(host).or_default() += 1;
             }
-            traffic.include(&evidence.estimate_tp(&ranks).ok()?.traffic, 1.0);
+            traffic.include(
+                &evidence
+                    .estimate_tp(self.tensor_parallel, &ranks)
+                    .ok()?
+                    .traffic,
+                1.0,
+            );
         }
         for (sender, receiver) in stages.clone().zip(stages.clone().skip(1)) {
             for (&from, &to) in sender.iter().zip(receiver) {
@@ -382,15 +388,13 @@ mod tests {
             ((api, earlier), sample(earlier, 1000)),
             ((earlier, api), sample(api, 1000)),
         ]);
-        let evidence = LinkEvidence {
-            policy: HostedLinkPolicy {
-                bytes_per_rank_pair: 100,
-                max_sample_age_ms: 10,
-                tp_rtt_budget: None,
-            },
-            now_ms: 10,
-            links: &links,
+        let policy = HostedLinkPolicy {
+            bytes_per_rank_pair: Some(100),
+            max_sample_age_ms: 10,
+            tp_rtt_budget: None,
+            tp_profiles: BTreeMap::new(),
         };
+        let evidence = LinkEvidence::new(&policy, 10, &links);
         let layouts = search_pipeline(&profile, &hosts, evidence);
         let [layout] = layouts.as_slice() else {
             panic!("expected one feasible pipeline")
@@ -422,32 +426,19 @@ mod tests {
             ((c, b), sample(b, 1000)),
         ]);
         let policy = HostedLinkPolicy {
-            bytes_per_rank_pair: 100,
+            bytes_per_rank_pair: Some(100),
             max_sample_age_ms: 10,
             tp_rtt_budget: None,
+            tp_profiles: BTreeMap::new(),
         };
         assert!(
             profile
-                .traffic(
-                    &[a, b, c],
-                    LinkEvidence {
-                        policy,
-                        now_ms: 10,
-                        links: &links
-                    }
-                )
+                .traffic(&[a, b, c], LinkEvidence::new(&policy, 10, &links))
                 .is_none()
         );
         links.insert((c, a), sample(a, 300));
         let traffic = profile
-            .traffic(
-                &[a, b, c],
-                LinkEvidence {
-                    policy,
-                    now_ms: 10,
-                    links: &links,
-                },
-            )
+            .traffic(&[a, b, c], LinkEvidence::new(&policy, 10, &links))
             .unwrap();
         assert_eq!(traffic.rate_limit(), 30.0);
         assert_eq!(traffic.valid_until_ms, 15);
@@ -455,5 +446,29 @@ mod tests {
             profile.kv_weights(&[a, b, c]),
             BTreeMap::from([(a, 4), (b, 5), (c, 7)])
         );
+    }
+
+    #[test]
+    fn partial_pipeline_stage_uses_its_target_tp_width() {
+        let [a, b] = [1, 2].map(node);
+        let mut pipeline = profile();
+        pipeline.tensor_parallel = 4;
+        let links = BTreeMap::from([((a, b), sample(b, 1000)), ((b, a), sample(a, 1000))]);
+        let policy = HostedLinkPolicy {
+            bytes_per_rank_pair: None,
+            max_sample_age_ms: 10,
+            tp_rtt_budget: None,
+            tp_profiles: BTreeMap::from([(
+                4,
+                crate::serving::HostedTpLinkProfile {
+                    bytes_per_rank_pair: 100,
+                    tp_rtt_budget: None,
+                },
+            )]),
+        };
+        let traffic = pipeline
+            .traffic(&[a, b], LinkEvidence::new(&policy, 10, &links))
+            .unwrap();
+        assert_eq!(traffic.rate_limit(), 10.0);
     }
 }

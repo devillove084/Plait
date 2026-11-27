@@ -1078,8 +1078,8 @@ changes. The planner only uses samples that match the directory's
 source and destination sessions.
 
 To apply these measurements, add a `link_policy` to `replan_hosted`.
-Supply `bytes_per_rank_pair`, the estimated bytes sent per request
-between each directed pair of TP workers, and `max_sample_age_ms`.
+Set `max_sample_age_ms` and supply the estimated request traffic for a
+directed pair of TP workers as `bytes_per_rank_pair`.
 For each pair of hosts, the planner multiplies the byte estimate by
 the number of sending and receiving rank pairs. It sums traffic through
 each host's send and receive port and uses the slowest measured path
@@ -1094,6 +1094,37 @@ For example, `{"serial_rounds":57,"max_wait_ns":500000000}` allows up to
 on the critical path after accounting for overlap. The estimate multiplies
 the largest fresh directed RTT by this count. For PP candidates the check
 applies to each stage's TP group. Local TP groups have zero inter-host RTT.
+
+For a pool with several TP widths, put each calibration in `tp_profiles`
+under its decimal TP width. Each entry supplies the bytes and its optional
+RTT budget. The search uses the target width even before it has assigned
+all the workers. Pipeline placement uses the stage's TP width.
+
+```json
+{
+  "max_sample_age_ms": 5000,
+  "tp_profiles": {
+    "2": {
+      "bytes_per_rank_pair": 32768,
+      "tp_rtt_budget": {"serial_rounds": 16, "max_wait_ns": 100000000}
+    },
+    "4": {
+      "bytes_per_rank_pair": 16384,
+      "tp_rtt_budget": {"serial_rounds": 32, "max_wait_ns": 100000000}
+    }
+  }
+}
+```
+
+The top-level byte estimate and optional RTT budget serve as the complete
+fallback for widths absent from `tp_profiles`. An explicit width uses its
+own entry as a unit. With per-width profiles alone, a cross-host candidate
+with an unlisted width returns `MissingTpProfile` when supplied explicitly
+and is skipped during automatic placement. Local TP groups need no
+inter-host calibration. P/D planning budgets incumbent traffic with its
+applicable profile and applies RTT admission to proposed replacements.
+When using per-width profiles alone for a P/D transition, include the TP
+widths that currently serve cross-host traffic as well as the target widths.
 
 Calibrate the RTT window and traffic volume with the engine that will run
 the candidate. For serial generation, send the same prompt with output

@@ -234,7 +234,7 @@ pub fn plan_hosted_pd(
     snapshot: &HostedPdPlanning,
     forecast: &ServingForecast,
     pool: &HostedPdPool,
-    policy: HostedLinkPolicy,
+    policy: &HostedLinkPolicy,
     links: &BTreeMap<(NodeId, NodeId), HostedLinkSample>,
 ) -> Result<HostedPdSelection, &'static str> {
     plan_hosted_pd_with_releases(model, snapshot, forecast, pool, policy, links, &[])
@@ -245,7 +245,7 @@ pub fn plan_hosted_pd_with_releases(
     snapshot: &HostedPdPlanning,
     forecast: &ServingForecast,
     pool: &HostedPdPool,
-    policy: HostedLinkPolicy,
+    policy: &HostedLinkPolicy,
     links: &BTreeMap<(NodeId, NodeId), HostedLinkSample>,
     releases: &[HostedPdRelease],
 ) -> Result<HostedPdSelection, &'static str> {
@@ -274,7 +274,7 @@ pub fn plan_hosted_pd_with_assignments(
     snapshot: &HostedPdPlanning,
     forecast: &ServingForecast,
     pool: &HostedPdPool,
-    policy: HostedLinkPolicy,
+    policy: &HostedLinkPolicy,
     links: &BTreeMap<(NodeId, NodeId), HostedLinkSample>,
     incumbents: HostedPdIncumbents<'_>,
 ) -> Result<HostedPdSelection, &'static str> {
@@ -287,11 +287,7 @@ pub fn plan_hosted_pd_with_assignments(
     if !snapshot.managed {
         return Err("hosted P/D planning requires a managed route directory");
     }
-    let evidence = LinkEvidence {
-        policy,
-        now_ms: forecast.now_ms,
-        links,
-    };
+    let evidence = LinkEvidence::new(policy, forecast.now_ms, links);
     let store_host = pool.store_host(&snapshot.inventory)?;
     let context = EndpointContext {
         evidence,
@@ -705,7 +701,7 @@ impl EndpointContext<'_> {
         pipeline: Option<(&PipelineProfile, NodeId)>,
     ) -> Option<Endpoint> {
         // Keep the measured baseline available while evaluating a replacement.
-        self.evidence.policy.tp_rtt_budget = None;
+        self.evidence = self.evidence.without_tp_wait();
         self.endpoint(version, role, capacity, ranks, pipeline)
     }
 
@@ -752,8 +748,12 @@ impl EndpointContext<'_> {
                 profile.kv_weights(&lanes),
             )
         } else {
+            let tensor_parallel = u32::try_from(ranks.values().sum::<u64>()).ok()?;
             (
-                self.evidence.estimate_tp(ranks).ok()?.traffic,
+                self.evidence
+                    .estimate_tp(tensor_parallel, ranks)
+                    .ok()?
+                    .traffic,
                 ranks.clone(),
             )
         };
@@ -1285,9 +1285,10 @@ mod tests {
             reconfigure: Some(Reconfiguration { drain_ms: 100 }),
         };
         let policy = HostedLinkPolicy {
-            bytes_per_rank_pair: 10,
+            bytes_per_rank_pair: Some(10),
             max_sample_age_ms: 10_000,
             tp_rtt_budget: None,
+            tp_profiles: BTreeMap::new(),
         };
         let links = BTreeMap::from([
             ((store, retiring), sample(retiring, 100_000)),
@@ -1300,8 +1301,10 @@ mod tests {
             hosts: BTreeMap::from([(retiring, budget)]),
         }];
         let decide = |pool: &HostedPdPool, release: &[HostedPdRelease]| {
-            plan_hosted_pd_with_releases("api", &snapshot, &forecast, pool, policy, &links, release)
-                .unwrap()
+            plan_hosted_pd_with_releases(
+                "api", &snapshot, &forecast, pool, &policy, &links, release,
+            )
+            .unwrap()
         };
         assert!(decide(&pool, &[]).selected.is_none());
         let result = decide(&pool, &release);
@@ -1415,15 +1418,16 @@ mod tests {
             reconfigure: None,
         };
         let policy = HostedLinkPolicy {
-            bytes_per_rank_pair: 10,
+            bytes_per_rank_pair: Some(10),
             max_sample_age_ms: 50,
             tp_rtt_budget: None,
+            tp_profiles: BTreeMap::new(),
         };
         let links = BTreeMap::from([
             ((store, slow), sample(slow, 100)),
             ((store, fast), sample(fast, 1000)),
         ]);
-        let choice = plan_hosted_pd("api", &snapshot, &forecast, &pool, policy, &links)
+        let choice = plan_hosted_pd("api", &snapshot, &forecast, &pool, &policy, &links)
             .unwrap()
             .selected
             .unwrap();
@@ -1442,7 +1446,7 @@ mod tests {
 
         let reversed = BTreeMap::from([((fast, store), sample(store, 1000))]);
         assert!(
-            plan_hosted_pd("api", &snapshot, &forecast, &pool, policy, &reversed)
+            plan_hosted_pd("api", &snapshot, &forecast, &pool, &policy, &reversed)
                 .unwrap()
                 .selected
                 .is_none()
@@ -1453,9 +1457,10 @@ mod tests {
     fn shared_port_accounts_for_tp_and_kv_on_the_same_direction() {
         let [store, a, b] = [1, 2, 3].map(node);
         let policy = HostedLinkPolicy {
-            bytes_per_rank_pair: 100,
+            bytes_per_rank_pair: Some(100),
             max_sample_age_ms: 25,
             tp_rtt_budget: None,
+            tp_profiles: BTreeMap::new(),
         };
         let links = BTreeMap::from([
             ((a, b), sample(b, 1000)),
@@ -1463,11 +1468,7 @@ mod tests {
             ((a, store), sample(store, 1000)),
             ((b, store), sample(store, 1000)),
         ]);
-        let evidence = LinkEvidence {
-            policy,
-            now_ms: 1020,
-            links: &links,
-        };
+        let evidence = LinkEvidence::new(&policy, 1020, &links);
         let context = EndpointContext {
             evidence,
             store_host: Some(store),
@@ -1493,11 +1494,23 @@ mod tests {
         shared.include(&source.traffic, 1.0);
         assert_eq!(shared.rate_limit(), 2.5);
 
-        let mut constrained = context;
-        constrained.evidence.policy.tp_rtt_budget = Some(crate::serving::HostedTpRttBudget {
-            serial_rounds: 57,
-            max_wait_ns: 100,
-        });
+        let constrained_policy = HostedLinkPolicy {
+            tp_profiles: BTreeMap::from([(
+                2,
+                crate::serving::HostedTpLinkProfile {
+                    bytes_per_rank_pair: 100,
+                    tp_rtt_budget: Some(crate::serving::HostedTpRttBudget {
+                        serial_rounds: 57,
+                        max_wait_ns: 100,
+                    }),
+                },
+            )]),
+            ..policy.clone()
+        };
+        let constrained = EndpointContext {
+            evidence: LinkEvidence::new(&constrained_policy, 1020, &links),
+            ..context
+        };
         assert!(
             constrained
                 .endpoint(version, role, capacity, &ranks, None)

@@ -282,6 +282,7 @@ async fn run_model(policy: Policy, peers: ControlPeers) -> io::Result<()> {
         link_policy,
     } = policy;
     let pool = Arc::new(pool);
+    let link_policy = Arc::new(link_policy);
     let serving_modes = serving_modes.map(Arc::new);
     let cooldown = Duration::from_millis(cooldown_ms);
     let mut control = loop {
@@ -308,7 +309,7 @@ async fn run_model(policy: Policy, peers: ControlPeers) -> io::Result<()> {
                         &checkpoint,
                         recovery,
                         pool.clone(),
-                        link_policy,
+                        link_policy.clone(),
                     )
                     .await
                     {
@@ -375,7 +376,7 @@ async fn run_model(policy: Policy, peers: ControlPeers) -> io::Result<()> {
                 snapshot,
                 pool.clone(),
                 serving_modes.clone(),
-                link_policy,
+                link_policy.clone(),
                 ServingForecast {
                     model: checkpoint.clone(),
                     demand_rps,
@@ -402,7 +403,7 @@ async fn run_model(policy: Policy, peers: ControlPeers) -> io::Result<()> {
                     releases: snapshot.releases,
                 },
                 pool.clone(),
-                link_policy,
+                link_policy.clone(),
             )
             .await
         };
@@ -453,7 +454,7 @@ async fn recover(
     checkpoint: &str,
     recovery: HostedPdRecovery,
     pool: Arc<HostedPdPool>,
-    link_policy: HostedLinkPolicy,
+    link_policy: Arc<HostedLinkPolicy>,
 ) -> io::Result<()> {
     if recovery.planning.pending.is_some() {
         return Ok(());
@@ -468,7 +469,7 @@ async fn recover(
             now_ms,
             &recovery,
             &pool,
-            link_policy,
+            &link_policy,
             &links,
         )
     })
@@ -499,7 +500,7 @@ async fn decide(
     minimum_gain_requests: f64,
     snapshot: HostedPdReconfiguration,
     pool: Arc<HostedPdPool>,
-    link_policy: HostedLinkPolicy,
+    link_policy: Arc<HostedLinkPolicy>,
 ) -> io::Result<Option<Proposal>> {
     let HostedPdReconfiguration {
         planning: snapshot,
@@ -537,7 +538,7 @@ async fn decide(
             &snapshot,
             &forecast,
             &pool,
-            link_policy,
+            &link_policy,
             &links,
             HostedPdIncumbents {
                 assignments: Some(&assignments),
@@ -577,7 +578,7 @@ async fn decide_modes(
     snapshot: HostedEvacuationPlanning,
     pool: Arc<HostedPdPool>,
     modes: Option<Arc<HostedModePolicy>>,
-    policy: HostedLinkPolicy,
+    policy: Arc<HostedLinkPolicy>,
     mut forecast: ServingForecast,
 ) -> io::Result<Option<Proposal>> {
     let links = collect_links(control, &snapshot.current.split).await?;
@@ -590,7 +591,7 @@ async fn decide_modes(
             &forecast,
             &pool,
             modes.as_deref(),
-            policy,
+            &policy,
             &links,
         )
         .map_err(io::Error::other)

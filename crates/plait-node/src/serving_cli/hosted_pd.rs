@@ -50,7 +50,7 @@ pub(super) async fn replan(
         expected_revision,
         &forecast,
         &pool,
-        link_policy,
+        &link_policy,
     ))?;
     let request_sha256 = Sha256::digest(request).into();
     if let Some(previous) = replay(client, peers.clone(), id, request_sha256).await? {
@@ -120,7 +120,7 @@ pub(super) async fn replan(
         &snapshot,
         &forecast,
         &pool,
-        link_policy,
+        &link_policy,
         &links,
         HostedPdIncumbents {
             assignments: Some(&assignments),

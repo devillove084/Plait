@@ -54,7 +54,7 @@ pub fn plan_hosted_serving(
     forecast: &ServingForecast,
     pool: &HostedPdPool,
     modes: &HostedModePolicy,
-    policy: HostedLinkPolicy,
+    policy: &HostedLinkPolicy,
     links: &BTreeMap<(NodeId, NodeId), HostedLinkSample>,
 ) -> Result<Option<ServingAction>, &'static str> {
     plan(
@@ -74,7 +74,7 @@ pub fn plan_hosted_evacuation(
     forecast: &ServingForecast,
     pool: &HostedPdPool,
     modes: Option<&HostedModePolicy>,
-    policy: HostedLinkPolicy,
+    policy: &HostedLinkPolicy,
     links: &BTreeMap<(NodeId, NodeId), HostedLinkSample>,
 ) -> Result<Option<ServingAction>, &'static str> {
     let maintenance = (!snapshot.withdrawing.is_empty()).then_some(snapshot);
@@ -95,7 +95,7 @@ fn plan(
     forecast: &ServingForecast,
     pool: &HostedPdPool,
     modes: Option<&HostedModePolicy>,
-    policy: HostedLinkPolicy,
+    policy: &HostedLinkPolicy,
     links: &BTreeMap<(NodeId, NodeId), HostedLinkSample>,
 ) -> Result<Option<ServingAction>, &'static str> {
     forecast.validate()?;
@@ -122,11 +122,7 @@ fn plan(
     }
 
     let context = EndpointContext {
-        evidence: LinkEvidence {
-            policy,
-            now_ms: forecast.now_ms,
-            links,
-        },
+        evidence: LinkEvidence::new(policy, forecast.now_ms, links),
         store_host: pool.store_host(&snapshot.split.inventory).ok(),
         kv_bytes: pool.kv_bytes_per_request,
         checkpoint: pool.observed_checkpoint_traffic(forecast),
@@ -629,8 +625,9 @@ mod tests {
         }
         let policy = HostedLinkPolicy {
             max_sample_age_ms: 40,
-            bytes_per_rank_pair: 100,
+            bytes_per_rank_pair: Some(100),
             tp_rtt_budget: None,
+            tp_profiles: BTreeMap::new(),
         };
         let links = BTreeMap::from([((p, a), sample(a, 10_000)), ((a, d), sample(d, 10_000))]);
         let plan = |snap: &HostedServingPlanning,
@@ -643,7 +640,7 @@ mod tests {
                 &forecast(demand),
                 &pool,
                 modes,
-                policy,
+                &policy,
                 links,
             )
             .unwrap()
@@ -707,7 +704,7 @@ mod tests {
             in_flight: 1,
         });
         let select = |load: &ServingForecast| {
-            plan_hosted_serving("model", &split, load, &pool, &modes, policy, &links).unwrap()
+            plan_hosted_serving("model", &split, load, &pool, &modes, &policy, &links).unwrap()
         };
         assert!(matches!(
             select(&load),
@@ -742,16 +739,14 @@ mod tests {
             fraction: 0.2,
             in_flight: 3,
         });
+        let policy = HostedLinkPolicy {
+            max_sample_age_ms: 100,
+            bytes_per_rank_pair: Some(100),
+            tp_rtt_budget: None,
+            tp_profiles: BTreeMap::new(),
+        };
         let context = EndpointContext {
-            evidence: LinkEvidence {
-                policy: HostedLinkPolicy {
-                    max_sample_age_ms: 100,
-                    bytes_per_rank_pair: 100,
-                    tp_rtt_budget: None,
-                },
-                now_ms: forecast.now_ms,
-                links: &links,
-            },
+            evidence: LinkEvidence::new(&policy, forecast.now_ms, &links),
             store_host: Some(store),
             kv_bytes: 100,
             checkpoint: pool.observed_checkpoint_traffic(&forecast),
@@ -809,14 +804,11 @@ mod tests {
         let link = BTreeMap::from([((a, b), sample(b, 1000))]);
         let policy = HostedLinkPolicy {
             max_sample_age_ms: 40,
-            bytes_per_rank_pair: 100,
+            bytes_per_rank_pair: Some(100),
             tp_rtt_budget: None,
+            tp_profiles: BTreeMap::new(),
         };
-        let evidence = LinkEvidence {
-            policy,
-            now_ms: 1000,
-            links: &link,
-        };
+        let evidence = LinkEvidence::new(&policy, 1000, &link);
         let load = forecast(50.0);
         let make = |i, role, bytes| {
             let mut traffic = Traffic::new();
@@ -865,8 +857,9 @@ mod tests {
         snapshot.committed.push(live);
         let policy = HostedLinkPolicy {
             max_sample_age_ms: 40,
-            bytes_per_rank_pair: 100,
+            bytes_per_rank_pair: Some(100),
             tp_rtt_budget: None,
+            tp_profiles: BTreeMap::new(),
         };
         let links = BTreeMap::from([((p, a), sample(a, 10_000)), ((a, d), sample(d, 10_000))]);
         let Some(ServingAction::PrepareHostedServing { plan, .. }) = plan_hosted_serving(
@@ -875,7 +868,7 @@ mod tests {
             &forecast(12.0),
             &pool,
             &modes,
-            policy,
+            &policy,
             &links,
         )
         .unwrap() else {
@@ -922,8 +915,9 @@ mod tests {
         load.minimum_gain_requests = 1000.0;
         let policy = HostedLinkPolicy {
             max_sample_age_ms: 40,
-            bytes_per_rank_pair: 100,
+            bytes_per_rank_pair: Some(100),
             tp_rtt_budget: None,
+            tp_profiles: BTreeMap::new(),
         };
         let links = BTreeMap::new();
         assert!(
@@ -933,7 +927,7 @@ mod tests {
                 &load,
                 &pool,
                 &modes,
-                policy,
+                &policy,
                 &links
             )
             .unwrap()
@@ -946,7 +940,7 @@ mod tests {
                 &load,
                 &pool,
                 Some(&modes),
-                policy,
+                &policy,
                 &links,
             )
             .unwrap()
@@ -975,7 +969,7 @@ mod tests {
                 &load,
                 &pool,
                 Some(&modes),
-                policy,
+                &policy,
                 &links
             )
             .unwrap()

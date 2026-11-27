@@ -1,19 +1,28 @@
 ---- MODULE PlaitHostedLinkEvidence ----
 EXTENDS Naturals
 
-CONSTANT EnforceTpRttBudget
+CONSTANTS EnforceTpRttBudget, UseTargetTpWidth, HasDefaultTpProfile
 
 \* A planner reads a directory snapshot and one sample in each direction.
 \* Published samples can outlive a receiver or sender session.
 Hosts == {"a", "b"}
 Other(h) == CHOOSE peer \in Hosts : peer # h
 MaxAge == 2
-SerialRounds == 2
-TpWaitBudget == 4
+TpWidths == {2, 4, 8}
+NoProfile == [rounds |-> 0, wait |-> 0, bytes |-> 0]
+DefaultProfile == [rounds |-> 1, wait |-> 2, bytes |-> 3]
+ProfileFor(width) ==
+    CASE width = 2 -> [rounds |-> 1, wait |-> 3, bytes |-> 2]
+      [] width = 4 -> [rounds |-> 2, wait |-> 4, bytes |-> 5]
+      [] OTHER -> IF HasDefaultTpProfile THEN DefaultProfile ELSE NoProfile
+\* A multihost search prefix can already have two ranks even for a wider target.
+SearchProfile(width) == ProfileFor(IF UseTargetTpWidth THEN width ELSE 2)
+
 SampleRtts == {1, 2, 3}
 NoSample == [time |-> 0, source |-> 0, target |-> 0, rtt |-> 0]
 NoDecision == [time |-> 0, directory |-> [h \in Hosts |-> 0],
-               used |-> [h \in Hosts |-> NoSample]]
+               used |-> [h \in Hosts |-> NoSample],
+               width |-> 0, profile |-> NoProfile]
 
 VARIABLES clock, sessions, samples, decision
 vars == <<clock, sessions, samples, decision>>
@@ -42,17 +51,22 @@ Valid(h) ==
     /\ samples[h].source = sessions[h] /\ samples[h].target = sessions[Other(h)]
     /\ clock - samples[h].time < MaxAge
 
-WithinRttBudget(observed) ==
-    \A h \in Hosts : observed[h].rtt * SerialRounds <= TpWaitBudget
+WithinRttBudget(observed, profile) ==
+    \A h \in Hosts : observed[h].rtt * profile.rounds <= profile.wait
 
-Select ==
-    /\ decision = NoDecision
-    /\ \A h \in Hosts : Valid(h)
-    /\ EnforceTpRttBudget => WithinRttBudget(samples)
-    /\ decision' = [time |-> clock, directory |-> sessions, used |-> samples]
-    /\ UNCHANGED <<clock, sessions, samples>>
+Select(width) ==
+    LET profile == SearchProfile(width)
+    IN /\ decision = NoDecision
+       /\ profile # NoProfile
+       /\ \A h \in Hosts : Valid(h)
+       /\ EnforceTpRttBudget => WithinRttBudget(samples, profile)
+       /\ decision' = [time |-> clock, directory |-> sessions, used |-> samples,
+                        width |-> width, profile |-> profile]
+       /\ UNCHANGED <<clock, sessions, samples>>
 
-Next == Tick \/ Select \/ \E h \in Hosts : Restart(h) \/ \E rtt \in SampleRtts : Measure(h, rtt)
+Next == \/ Tick
+        \/ \E width \in TpWidths : Select(width)
+        \/ \E h \in Hosts : Restart(h) \/ \E rtt \in SampleRtts : Measure(h, rtt)
 Spec == Init /\ [][Next]_vars
 
 FreshDirections == decision # NoDecision =>
@@ -65,5 +79,10 @@ MatchingSessions == decision # NoDecision =>
        /\ decision.used[h].source = decision.directory[h]
        /\ decision.used[h].target = decision.directory[Other(h)]
 
-BoundedTpWait == decision # NoDecision => WithinRttBudget(decision.used)
+UsesTargetTpProfile == decision # NoDecision =>
+    /\ ProfileFor(decision.width) # NoProfile
+    /\ decision.profile = ProfileFor(decision.width)
+
+BoundedTpWait == decision # NoDecision =>
+    WithinRttBudget(decision.used, ProfileFor(decision.width))
 ====

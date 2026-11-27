@@ -89,7 +89,7 @@ pub(super) async fn replan(
         ));
     }
     forecast.now_ms = 0;
-    let request = match (&pool, link_policy) {
+    let request = match (&pool, &link_policy) {
         (Some(pool), Some(policy)) => {
             serde_json::to_vec(&("hosted-pool-v1", &forecast, pool, activation, policy))?
         }
@@ -103,7 +103,7 @@ pub(super) async fn replan(
     }
     let resources = query_resources(client, peers.clone()).await?;
     let (mut candidates, recipes, samples): (Vec<_>, Vec<_>, _) =
-        if let (Some(pool), Some(policy)) = (&pool, link_policy) {
+        if let (Some(pool), Some(policy)) = (&pool, &link_policy) {
             let planning = planning(client, peers.clone()).await?;
             let hosts = planning
                 .hosts
@@ -142,7 +142,7 @@ pub(super) async fn replan(
             (candidates, recipes, samples)
         };
     forecast.now_ms = hosted_probe::now_ms()?;
-    let link_limits = if let Some(policy) = link_policy {
+    let link_limits = if let Some(policy) = &link_policy {
         candidates
             .iter_mut()
             .map(|candidate| {
@@ -150,7 +150,8 @@ pub(super) async fn replan(
                     .map_err(invalid_input)?;
                 match limit {
                     HostedLinkLimit::Local => {}
-                    HostedLinkLimit::MissingLink { .. }
+                    HostedLinkLimit::MissingTpProfile { .. }
+                    | HostedLinkLimit::MissingLink { .. }
                     | HostedLinkLimit::ExceedsTpRttBudget { .. } => {
                         candidate.capacity.valid_until_ms = 0;
                     }
@@ -334,5 +335,39 @@ mod tests {
         let policy: HostedLinkPolicy = serde_json::from_str(old).unwrap();
         assert!(policy.tp_rtt_budget.is_none());
         assert_eq!(serde_json::to_string(&policy).unwrap(), old);
+    }
+
+    #[test]
+    fn width_profiles_have_a_canonical_request_order() {
+        let with_rtt = r#"{"bytes_per_rank_pair":1024,"max_sample_age_ms":5000,"tp_rtt_budget":{"serial_rounds":12,"max_wait_ns":30000}}"#;
+        let legacy: HostedLinkPolicy = serde_json::from_str(with_rtt).unwrap();
+        assert_eq!(serde_json::to_string(&legacy).unwrap(), with_rtt);
+
+        let input = r#"{"max_sample_age_ms":5000,"tp_profiles":{"4":{"bytes_per_rank_pair":200},"2":{"bytes_per_rank_pair":100}}}"#;
+        let policy: HostedLinkPolicy = serde_json::from_str(input).unwrap();
+        assert_eq!(
+            serde_json::to_string(&policy).unwrap(),
+            r#"{"max_sample_age_ms":5000,"tp_profiles":{"2":{"bytes_per_rank_pair":100},"4":{"bytes_per_rank_pair":200}}}"#
+        );
+
+        let request = json!({
+            "request": "replan_hosted",
+            "id": OpId::new(NodeId::derive("client"), 1),
+            "forecast": {
+                "model": "weights", "demand_rps": 1, "now_ms": 0, "horizon_ms": 1000,
+                "minimum_gain_requests": 1, "groups": [], "paths": [],
+                "link_bytes_per_second": {},
+            },
+            "link_policy": policy,
+        });
+        let crate::serving_cli::Request::ReplanHosted { input } =
+            serde_json::from_value(request).unwrap()
+        else {
+            panic!("expected a hosted replan request");
+        };
+        assert_eq!(
+            input.link_policy.unwrap().tp_profiles[&4].bytes_per_rank_pair,
+            200
+        );
     }
 }

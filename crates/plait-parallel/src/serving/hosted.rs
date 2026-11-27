@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use plait_core::NodeId;
 use plait_core::serving::{GroupPlan, HostedLinkSample};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 mod pd;
 mod pipeline;
@@ -14,11 +14,45 @@ pub use pd::{
 };
 pub use pool::{HostedPool, generate_hosted_candidates};
 
-#[derive(Clone, Copy, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct HostedLinkPolicy {
+    /// Default bytes per directed pair when a TP width has no explicit profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_per_rank_pair: Option<u64>,
+    pub max_sample_age_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tp_rtt_budget: Option<HostedTpRttBudget>,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "deserialize_tp_profiles"
+    )]
+    pub tp_profiles: BTreeMap<u32, HostedTpLinkProfile>,
+}
+
+fn deserialize_tp_profiles<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<u32, HostedTpLinkProfile>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    BTreeMap::<String, HostedTpLinkProfile>::deserialize(deserializer)?
+        .into_iter()
+        .map(|(key, profile)| {
+            let width = key.parse::<u32>().map_err(serde::de::Error::custom)?;
+            if width.to_string() != key {
+                return Err(serde::de::Error::custom("expected a decimal TP width key"));
+            }
+            Ok((width, profile))
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostedTpLinkProfile {
     /// Estimated wire bytes per request for each directed pair of TP workers.
     pub bytes_per_rank_pair: u64,
-    pub max_sample_age_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tp_rtt_budget: Option<HostedTpRttBudget>,
 }
@@ -34,6 +68,9 @@ pub struct HostedTpRttBudget {
 #[derive(Debug, PartialEq, Serialize)]
 pub enum HostedLinkLimit {
     Local,
+    MissingTpProfile {
+        tensor_parallel: u32,
+    },
     MissingLink {
         source: NodeId,
         target: NodeId,
@@ -53,7 +90,7 @@ pub enum HostedLinkLimit {
 
 pub fn limit_hosted_links(
     plan: &GroupPlan,
-    policy: HostedLinkPolicy,
+    policy: &HostedLinkPolicy,
     now_ms: u64,
     links: &BTreeMap<(NodeId, NodeId), HostedLinkSample>,
 ) -> Result<HostedLinkLimit, &'static str> {
@@ -62,13 +99,48 @@ pub fn limit_hosted_links(
     for device in plan.workers.keys() {
         *ranks.entry(device.node).or_default() += 1;
     }
-    Ok(limit_hosted_ranks(&ranks, policy, now_ms, links))
+    Ok(LinkEvidence::new(policy, now_ms, links).limit_tp(plan.tensor_parallel, &ranks))
 }
 
 impl HostedLinkPolicy {
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.max_sample_age_ms == 0 {
+            return Err("hosted link policy requires a positive sample age");
+        }
+        if let Some(default) = self.default_profile() {
+            default.validate()?;
+        } else if self.tp_rtt_budget.is_some() || self.tp_profiles.is_empty() {
+            return Err("hosted link policy requires default traffic or per-TP profiles");
+        }
+        for (&width, profile) in &self.tp_profiles {
+            if width == 0 {
+                return Err("hosted TP link profile requires a positive TP width");
+            }
+            profile.validate()?;
+        }
+        Ok(())
+    }
+
+    fn default_profile(&self) -> Option<HostedTpLinkProfile> {
+        self.bytes_per_rank_pair
+            .map(|bytes_per_rank_pair| HostedTpLinkProfile {
+                bytes_per_rank_pair,
+                tp_rtt_budget: self.tp_rtt_budget,
+            })
+    }
+
+    fn profile(&self, tensor_parallel: u32) -> Option<HostedTpLinkProfile> {
+        self.tp_profiles
+            .get(&tensor_parallel)
+            .copied()
+            .or_else(|| self.default_profile())
+    }
+}
+
+impl HostedTpLinkProfile {
     fn validate(self) -> Result<(), &'static str> {
-        if self.bytes_per_rank_pair == 0 || self.max_sample_age_ms == 0 {
-            return Err("hosted link policy requires positive traffic and sample age");
+        if self.bytes_per_rank_pair == 0 {
+            return Err("hosted TP link profile requires positive traffic");
         }
         if self
             .tp_rtt_budget
@@ -80,31 +152,6 @@ impl HostedLinkPolicy {
     }
 }
 
-fn limit_hosted_ranks(
-    ranks: &BTreeMap<NodeId, u64>,
-    policy: HostedLinkPolicy,
-    now_ms: u64,
-    links: &BTreeMap<(NodeId, NodeId), HostedLinkSample>,
-) -> HostedLinkLimit {
-    if ranks.len() < 2 {
-        return HostedLinkLimit::Local;
-    }
-    match (LinkEvidence {
-        policy,
-        now_ms,
-        links,
-    })
-    .estimate_tp(ranks)
-    {
-        Ok(estimate) => HostedLinkLimit::Measured {
-            rps: estimate.traffic.rate_limit(),
-            valid_until_ms: estimate.traffic.valid_until_ms,
-            estimated_tp_wait_ns: estimate.wait_ns,
-        },
-        Err(limit) => limit,
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Direction {
     Out,
@@ -113,9 +160,10 @@ enum Direction {
 
 #[derive(Clone, Copy)]
 struct LinkEvidence<'a> {
-    policy: HostedLinkPolicy,
+    policy: &'a HostedLinkPolicy,
     now_ms: u64,
     links: &'a BTreeMap<(NodeId, NodeId), HostedLinkSample>,
+    enforce_tp_wait: bool,
 }
 
 struct TpEstimate {
@@ -123,24 +171,72 @@ struct TpEstimate {
     wait_ns: Option<u64>,
 }
 
-impl LinkEvidence<'_> {
-    fn estimate_tp(&self, ranks: &BTreeMap<NodeId, u64>) -> Result<TpEstimate, HostedLinkLimit> {
+impl<'a> LinkEvidence<'a> {
+    fn new(
+        policy: &'a HostedLinkPolicy,
+        now_ms: u64,
+        links: &'a BTreeMap<(NodeId, NodeId), HostedLinkSample>,
+    ) -> Self {
+        Self {
+            policy,
+            now_ms,
+            links,
+            enforce_tp_wait: true,
+        }
+    }
+
+    fn without_tp_wait(self) -> Self {
+        Self {
+            enforce_tp_wait: false,
+            ..self
+        }
+    }
+
+    fn limit_tp(&self, tensor_parallel: u32, ranks: &BTreeMap<NodeId, u64>) -> HostedLinkLimit {
+        if ranks.len() < 2 {
+            return HostedLinkLimit::Local;
+        }
+        match self.estimate_tp(tensor_parallel, ranks) {
+            Ok(estimate) => HostedLinkLimit::Measured {
+                rps: estimate.traffic.rate_limit(),
+                valid_until_ms: estimate.traffic.valid_until_ms,
+                estimated_tp_wait_ns: estimate.wait_ns,
+            },
+            Err(limit) => limit,
+        }
+    }
+
+    fn estimate_tp(
+        &self,
+        tensor_parallel: u32,
+        ranks: &BTreeMap<NodeId, u64>,
+    ) -> Result<TpEstimate, HostedLinkLimit> {
         let mut traffic = Traffic::new();
+        if ranks.len() < 2 {
+            return Ok(TpEstimate {
+                traffic,
+                wait_ns: None,
+            });
+        }
+        let profile = self
+            .policy
+            .profile(tensor_parallel)
+            .ok_or(HostedLinkLimit::MissingTpProfile { tensor_parallel })?;
+        let tp_rtt_budget = profile.tp_rtt_budget.filter(|_| self.enforce_tp_wait);
         let mut peak_rtt_ns = 0;
         for (&source, &senders) in ranks {
             for (&target, &receivers) in ranks.iter().filter(|&(&target, _)| target != source) {
-                let bytes =
-                    self.policy.bytes_per_rank_pair as f64 * senders as f64 * receivers as f64;
+                let bytes = profile.bytes_per_rank_pair as f64 * senders as f64 * receivers as f64;
                 let rtt_ns = self
                     .add(&mut traffic, source, target, bytes)
                     .map_err(|(source, target)| HostedLinkLimit::MissingLink { source, target })?;
-                if self.policy.tp_rtt_budget.is_some() && rtt_ns == 0 {
+                if tp_rtt_budget.is_some() && rtt_ns == 0 {
                     return Err(HostedLinkLimit::MissingLink { source, target });
                 }
                 peak_rtt_ns = peak_rtt_ns.max(rtt_ns);
             }
         }
-        let wait_ns = if let Some(budget) = self.policy.tp_rtt_budget {
+        let wait_ns = if let Some(budget) = tp_rtt_budget {
             Some(
                 peak_rtt_ns
                     .checked_mul(budget.serial_rounds)
@@ -331,12 +427,13 @@ mod tests {
             }
         }
         let policy = HostedLinkPolicy {
-            bytes_per_rank_pair: 1_000_000,
+            bytes_per_rank_pair: Some(1_000_000),
             max_sample_age_ms: 50,
             tp_rtt_budget: None,
+            tp_profiles: BTreeMap::new(),
         };
         assert_eq!(
-            limit_hosted_links(&plan, policy, 1049, &links).unwrap(),
+            limit_hosted_links(&plan, &policy, 1049, &links).unwrap(),
             HostedLinkLimit::Measured {
                 rps: 25.0,
                 valid_until_ms: 1050,
@@ -345,7 +442,7 @@ mod tests {
         );
         links.get_mut(&(c, a)).unwrap().sampled_at_ms = 999;
         assert_eq!(
-            limit_hosted_links(&plan, policy, 1049, &links).unwrap(),
+            limit_hosted_links(&plan, &policy, 1049, &links).unwrap(),
             HostedLinkLimit::MissingLink {
                 source: c,
                 target: a
@@ -366,15 +463,16 @@ mod tests {
         };
         let mut links = BTreeMap::from([((a, b), sample(b, 5)), ((b, a), sample(a, 9))]);
         let policy = HostedLinkPolicy {
-            bytes_per_rank_pair: 100,
+            bytes_per_rank_pair: Some(100),
             max_sample_age_ms: 40,
             tp_rtt_budget: Some(HostedTpRttBudget {
                 serial_rounds: 3,
                 max_wait_ns: 27,
             }),
+            tp_profiles: BTreeMap::new(),
         };
         assert_eq!(
-            limit_hosted_ranks(&ranks, policy, 11, &links),
+            LinkEvidence::new(&policy, 11, &links).limit_tp(6, &ranks),
             HostedLinkLimit::Measured {
                 rps: 1250.0,
                 valid_until_ms: 50,
@@ -383,7 +481,7 @@ mod tests {
         );
         links.get_mut(&(b, a)).unwrap().rtt_ns = 10;
         assert_eq!(
-            limit_hosted_ranks(&ranks, policy, 11, &links),
+            LinkEvidence::new(&policy, 11, &links).limit_tp(6, &ranks),
             HostedLinkLimit::ExceedsTpRttBudget {
                 peak_rtt_ns: 10,
                 serial_rounds: 3,
@@ -392,15 +490,80 @@ mod tests {
         );
         links.get_mut(&(b, a)).unwrap().rtt_ns = 0;
         assert_eq!(
-            limit_hosted_ranks(&ranks, policy, 11, &links),
+            LinkEvidence::new(&policy, 11, &links).limit_tp(6, &ranks),
             HostedLinkLimit::MissingLink {
                 source: b,
                 target: a
             },
         );
         assert_eq!(
-            limit_hosted_ranks(&BTreeMap::from([(a, 6)]), policy, 11, &links),
+            LinkEvidence::new(&policy, 11, &links).limit_tp(6, &BTreeMap::from([(a, 6)])),
             HostedLinkLimit::Local,
+        );
+    }
+
+    #[test]
+    fn a_width_profile_replaces_both_parts_of_the_default_budget() {
+        let [a, b] = ["source", "target"].map(NodeId::derive);
+        let ranks = BTreeMap::from([(a, 1), (b, 1)]);
+        let links = [(a, b), (b, a)]
+            .into_iter()
+            .map(|(from, target)| {
+                (
+                    (from, target),
+                    HostedLinkSample {
+                        target,
+                        target_session: target,
+                        sampled_at_ms: 1,
+                        bytes_per_second: 12_000,
+                        rtt_ns: 10,
+                    },
+                )
+            })
+            .collect();
+        let mut policy = HostedLinkPolicy {
+            bytes_per_rank_pair: Some(500),
+            max_sample_age_ms: 20,
+            tp_rtt_budget: Some(HostedTpRttBudget {
+                serial_rounds: 3,
+                max_wait_ns: 20,
+            }),
+            tp_profiles: BTreeMap::from([(
+                2,
+                HostedTpLinkProfile {
+                    bytes_per_rank_pair: 100,
+                    tp_rtt_budget: None,
+                },
+            )]),
+        };
+        let evidence = LinkEvidence::new(&policy, 10, &links);
+        assert_eq!(
+            evidence.limit_tp(2, &ranks),
+            HostedLinkLimit::Measured {
+                rps: 120.0,
+                valid_until_ms: 21,
+                estimated_tp_wait_ns: None,
+            }
+        );
+        assert_eq!(
+            evidence.limit_tp(4, &ranks),
+            HostedLinkLimit::ExceedsTpRttBudget {
+                peak_rtt_ns: 10,
+                serial_rounds: 3,
+                max_wait_ns: 20,
+            }
+        );
+        policy.bytes_per_rank_pair = None;
+        policy.tp_rtt_budget = None;
+        assert!(policy.validate().is_ok());
+        let evidence = LinkEvidence::new(&policy, 10, &links);
+        assert_eq!(
+            evidence.limit_tp(4, &ranks),
+            HostedLinkLimit::MissingTpProfile { tensor_parallel: 4 }
+        );
+        assert_eq!(
+            evidence.limit_tp(4, &BTreeMap::from([(a, 4)])),
+            HostedLinkLimit::Local
         );
     }
 }

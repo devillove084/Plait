@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::super::{ServingCandidate, ServingForecast, SloProfile, valid_rate};
 use super::pipeline::{PipelineProfile, search_pipeline};
-use super::{HostedLinkLimit, HostedLinkPolicy, LinkEvidence, limit_hosted_ranks};
+use super::{HostedLinkLimit, HostedLinkPolicy, LinkEvidence};
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -95,14 +95,10 @@ pub fn generate_hosted_candidates(
     planning: &HostedPlanning,
     forecast: &ServingForecast,
     pool: &HostedPool,
-    policy: HostedLinkPolicy,
+    policy: &HostedLinkPolicy,
     links: &BTreeMap<(NodeId, NodeId), HostedLinkSample>,
 ) -> Result<Vec<(ServingCandidate, HostedRecipe)>, &'static str> {
-    let evidence = LinkEvidence {
-        policy,
-        now_ms: forecast.now_ms,
-        links,
-    };
+    let evidence = LinkEvidence::new(policy, forecast.now_ms, links);
     generate_layouts(
         resources,
         planning,
@@ -132,14 +128,7 @@ pub(super) fn generate_layouts(
     let mut candidates = Vec::new();
     for size in &pool.sizes {
         let hosts = available_hosts(resources, planning, pool, size);
-        for layout in search_layouts(
-            &hosts,
-            size.tensor_parallel,
-            evidence.policy,
-            evidence.now_ms,
-            evidence.links,
-            allow_local,
-        ) {
+        for layout in search_layouts(&hosts, size.tensor_parallel, evidence, allow_local) {
             let api_host = layout.api_host.expect("layout has a host with free ports");
             let [master_port, http_port, backend_port] = hosts[&api_host]
                 .ports
@@ -509,9 +498,7 @@ fn free_ports(host: NodeId, range: &PortRange, occupied: &[HostedPortUse]) -> Op
 fn search_layouts(
     hosts: &BTreeMap<NodeId, AvailableHost>,
     tensor_parallel: u32,
-    policy: HostedLinkPolicy,
-    now: u64,
-    links: &BTreeMap<(NodeId, NodeId), HostedLinkSample>,
+    evidence: LinkEvidence<'_>,
     allow_local: bool,
 ) -> Vec<Layout> {
     let mut search = Search::from([(
@@ -530,9 +517,10 @@ fn search_layouts(
                 for layout in layouts {
                     let mut layout = layout.clone();
                     layout.ranks.insert(host, u64::from(count));
-                    layout.link_rps = match limit_hosted_ranks(&layout.ranks, policy, now, links) {
+                    layout.link_rps = match evidence.limit_tp(tensor_parallel, &layout.ranks) {
                         HostedLinkLimit::Local => f64::INFINITY,
-                        HostedLinkLimit::MissingLink { .. }
+                        HostedLinkLimit::MissingTpProfile { .. }
+                        | HostedLinkLimit::MissingLink { .. }
                         | HostedLinkLimit::ExceedsTpRttBudget { .. } => continue,
                         HostedLinkLimit::Measured { rps, .. } => rps,
                     };
@@ -682,9 +670,10 @@ mod tests {
             pipelines: Vec::new(),
         };
         let policy = HostedLinkPolicy {
-            bytes_per_rank_pair: 100,
+            bytes_per_rank_pair: Some(100),
             max_sample_age_ms: 20,
             tp_rtt_budget: None,
+            tp_profiles: BTreeMap::new(),
         };
         let mut links = BTreeMap::new();
         for from in [a, b, c] {
@@ -702,7 +691,7 @@ mod tests {
             }
         }
         let layouts =
-            generate_hosted_candidates(&resources, &planning, &forecast, &pool, policy, &links)
+            generate_hosted_candidates(&resources, &planning, &forecast, &pool, &policy, &links)
                 .unwrap();
         assert_eq!(layouts.len(), 1);
         let (candidate, recipe) = &layouts[0];
@@ -729,23 +718,48 @@ mod tests {
                 serial_rounds: 57,
                 max_wait_ns: 6_000,
             }),
-            ..policy
+            ..policy.clone()
         };
         assert_eq!(
-            generate_hosted_candidates(&resources, &planning, &forecast, &pool, budget, &links)
+            generate_hosted_candidates(&resources, &planning, &forecast, &pool, &budget, &links)
                 .unwrap()
                 .len(),
             1,
         );
+        let calibrated = HostedLinkPolicy {
+            bytes_per_rank_pair: None,
+            max_sample_age_ms: 20,
+            tp_rtt_budget: None,
+            tp_profiles: BTreeMap::from([(
+                4,
+                crate::serving::HostedTpLinkProfile {
+                    bytes_per_rank_pair: 100,
+                    tp_rtt_budget: budget.tp_rtt_budget,
+                },
+            )]),
+        };
+        assert_eq!(
+            generate_hosted_candidates(
+                &resources,
+                &planning,
+                &forecast,
+                &pool,
+                &calibrated,
+                &links
+            )
+            .unwrap()
+            .len(),
+            1,
+        );
         links.get_mut(&(b, a)).unwrap().rtt_ns = 120;
         assert!(
-            generate_hosted_candidates(&resources, &planning, &forecast, &pool, budget, &links)
+            generate_hosted_candidates(&resources, &planning, &forecast, &pool, &budget, &links)
                 .unwrap()
                 .is_empty()
         );
         links.remove(&(b, a));
         assert!(
-            generate_hosted_candidates(&resources, &planning, &forecast, &pool, policy, &links)
+            generate_hosted_candidates(&resources, &planning, &forecast, &pool, &policy, &links)
                 .unwrap()
                 .is_empty()
         );

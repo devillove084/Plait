@@ -34,7 +34,7 @@ pub fn plan_hosted_pd_recovery(
     now_ms: u64,
     recovery: &HostedPdRecovery,
     pool: &HostedPdPool,
-    policy: HostedLinkPolicy,
+    policy: &HostedLinkPolicy,
     links: &BTreeMap<(NodeId, NodeId), HostedLinkSample>,
 ) -> Result<Option<ServingAction>, &'static str> {
     let snapshot = &recovery.planning;
@@ -50,11 +50,7 @@ pub fn plan_hosted_pd_recovery(
     policy.validate()?;
     pool.validate(model, now_ms)?;
     let store_host = pool.store_host(&snapshot.inventory)?;
-    let evidence = LinkEvidence {
-        policy,
-        now_ms,
-        links,
-    };
+    let evidence = LinkEvidence::new(policy, now_ms, links);
     let context = EndpointContext {
         evidence,
         store_host: Some(store_host),
