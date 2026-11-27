@@ -18,7 +18,7 @@ use plait_core::group::{GroupFault, GroupVersion, peer_digest};
 use sha2::Digest;
 
 use crate::profile::Timer;
-use crate::{DataType, ReduceOp, reduce_bytes, reduce_fp8_to_f32, reduce_slices};
+use crate::{DataType, ReduceOp, host_reduce, reduce_bytes, reduce_fp8_to_f32, reduce_slices};
 
 mod frame;
 mod rankless;
@@ -707,6 +707,11 @@ impl PeerGroup {
                 [remote, local]
             };
             fold.measure(|| {
+                if dtype == DataType::Float16
+                    && host_reduce::try_sum_fp16_pair_into(ordered[0], ordered[1], result)
+                {
+                    return;
+                }
                 result.copy_from_slice(&reduce_slices(op, dtype, &ordered));
             });
         })?;
