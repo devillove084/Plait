@@ -1329,6 +1329,49 @@ verified the path from HTTP arrivals to joint reservation and atomic switch.
 The incumbent remained active while only one target was ready, and the
 planner excluded a faster device outside the declared hosts.
 
+##### Run candidate calibration automatically
+
+Add `calibration` to the mode policy. Use a local tokenizer for the same
+checkpoint as the deployment.
+Leave the initial layout's measured capacity in `modes`.
+
+```json
+{
+  "model": "/models/example-model",
+  "input_tokens": 144,
+  "output_tokens": 32,
+  "rates": [2.0, 4.0, 6.0],
+  "seeds": [7, 19],
+  "ttft_ms": 500,
+  "tpot_ms": 60,
+  "prompts": 32,
+  "warmups": 2,
+  "attainment": 0.95,
+  "valid_for": 1800,
+  "timeout_seconds": 300,
+  "retry_seconds": 30
+}
+```
+
+Each trial uses the configured request and token counts. The benchmark
+returns the last contiguous offered rate whose repeated trials satisfy
+the SLO, capped by their lowest measured goodput. The policy starts one
+benchmark at a time against a loopback ingress that forwards exclusively
+to the complete ready candidate. Active groups keep serving on the
+production ingress. Benchmark arrivals stay outside its demand counters.
+The benchmark uses the configured candidate hosts and the existing KV
+store, so account for any shared resource load when choosing rates.
+
+On completion, the policy checks the candidate's bindings, grant count,
+readiness, SLO expiry, and the observed active set again. It discards results
+when these checks fail. A measured candidate must win the same stable
+window comparison as a manually profiled candidate. Its profile remains
+available as the incumbent baseline after cutover, in the same process
+until it expires or its calibration settings or route revision change.
+The next process starts from the exact incumbent profile supplied in
+`modes`. Supply a fresh profile there for an incumbent whose cached
+measurement has expired.
+
 ### Hand off prompt KV between independent Prefill and Decode groups
 
 Use the vLLM fork at `9122df3da` or later on `plait/v0.31-runtime`.
