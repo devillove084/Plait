@@ -150,12 +150,15 @@ impl Listener {
         let mut links = Vec::with_capacity(members.len());
         for [collective, direct] in connections {
             let link = match (collective, direct) {
-                (Some(collective), Some(direct)) => Some(Link {
-                    collective,
-                    direct_write: Mutex::new(None),
-                    direct_read: Mutex::new(()),
-                    direct,
-                }),
+                (Some(collective), Some(direct)) => {
+                    collective.set_nonblocking(true)?;
+                    Some(Link {
+                        collective,
+                        direct_write: Mutex::new(None),
+                        direct_read: Mutex::new(()),
+                        direct,
+                    })
+                }
                 (None, None) => None,
                 _ => return Err(io::Error::other("peer group is missing a wire lane")),
             };
@@ -463,15 +466,14 @@ impl PeerGroup {
         outgoing: &[u8],
         incoming: &mut [u8],
     ) -> io::Result<()> {
-        let stream = &self.link(peer).collective;
-        // Order complete frames so large writes cannot block each other.
-        if self.slot < peer {
-            frame::write(stream, header, outgoing)?;
-            frame::read(stream, peer, header, incoming)
-        } else {
-            frame::read(stream, peer, header, incoming)?;
-            frame::write(stream, header, outgoing)
-        }
+        frame::exchange_pair(
+            peer,
+            &self.link(peer).collective,
+            header,
+            outgoing,
+            incoming,
+            self.timeout,
+        )
     }
 
     #[cfg(test)]
@@ -563,6 +565,18 @@ impl PeerGroup {
         }
         if use_replicated_exchange(collective, bytes, world) {
             let header = collective.header(sequence, bytes, REPLICATED_EXCHANGE);
+            if world == 2
+                && let Collective::AllReduce(dtype, op) = collective
+            {
+                let mut remote = vec![0; bytes];
+                wire.measure(|| self.exchange(1 - self.slot, &header, input, &mut remote))?;
+                let inputs = if self.slot == 0 {
+                    [input, remote.as_slice()]
+                } else {
+                    [remote.as_slice(), input]
+                };
+                return Ok(fold.measure(|| reduce_slices(op, dtype, &inputs)));
+            }
             let mut inputs = vec![vec![0; bytes]; world];
             inputs[self.slot].copy_from_slice(input);
             let peers = self.links.iter().zip(&mut inputs).enumerate().filter_map(

@@ -120,7 +120,7 @@ fn replicated_exchange_drains_two_writers_with_small_send_buffers() {
                 if slot == 1 {
                     thread::sleep(Duration::from_millis(20));
                 }
-                // A following sharded op uses the restored blocking lane.
+                // The next sharded operation reuses the same collective lane.
                 assert_eq!(
                     peer.execute(
                         Collective::ReduceScatter(DataType::Uint8, ReduceOp::Sum),
@@ -138,6 +138,7 @@ fn replicated_exchange_drains_two_writers_with_small_send_buffers() {
 fn paired_scatter_sends_a_reduced_prefix_before_the_tail_arrives() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let local = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    local.set_nonblocking(true).unwrap();
     let (mut remote, _) = listener.accept().unwrap();
     let timeout = Duration::from_secs(3);
     configure(&remote, timeout).unwrap();
@@ -218,6 +219,7 @@ fn sharded_exchange_progresses_on_other_links_while_one_peer_waits() {
     fn sockets() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let local = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        local.set_nonblocking(true).unwrap();
         let remote = listener.accept().unwrap().0;
         remote
             .set_read_timeout(Some(Duration::from_secs(3)))
@@ -795,6 +797,7 @@ fn cancel_wakes_an_active_peer_call_and_rejects_reuse() {
         });
         // Read the operation header before cancelling so the call is in flight.
         let mut stream = &remote.link(0).collective;
+        stream.set_nonblocking(false).unwrap();
         let mut header = [0; 24];
         stream.read_exact(&mut header).unwrap();
         assert!(waiting.cancel_peers());
@@ -1033,9 +1036,9 @@ fn cancellation_drains_pending_requests_without_writing_output() {
         unreachable!()
     };
     let mut header = [0; 24];
-    (&remote.link(0).collective)
-        .read_exact(&mut header)
-        .unwrap();
+    let mut stream = &remote.link(0).collective;
+    stream.set_nonblocking(false).unwrap();
+    stream.read_exact(&mut header).unwrap();
     let Transport::Peers(group) = &waiting.transport else {
         unreachable!()
     };

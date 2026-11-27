@@ -2110,6 +2110,10 @@ reduces the complete inputs in slot order. The planner uses this path up to
 1 MiB of input for two workers. For larger groups it caps the replicated
 traffic per worker at 64 KiB.
 
+The collective sockets enter nonblocking mode at group setup. In a two-worker
+replicated all-reduce, each worker exchanges one frame with its peer. It uses
+its existing staged input and allocates space for the remote contribution.
+
 Larger all-reduces divide the tensor into contiguous shards and assign one
 shard to each slot. Each worker concurrently sends contributions to the peers
 that own those shards and receives contributions to its own shard. It reduces

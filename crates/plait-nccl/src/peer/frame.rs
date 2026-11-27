@@ -19,6 +19,7 @@ pub(super) fn write(mut stream: &TcpStream, header: &[u8], data: &[u8]) -> io::R
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn read(
     mut stream: &TcpStream,
     peer: usize,
@@ -31,8 +32,8 @@ pub(super) fn read(
     stream.read_exact(data)
 }
 
-// The collective sequence lock owns these lanes. Point-to-point traffic uses
-// separate sockets with their own blocking mode.
+// The collective sequence lock owns permanently nonblocking lanes.
+// Point-to-point traffic uses separate blocking sockets.
 pub(super) fn exchange_all<'a>(
     peers: impl Iterator<Item = (usize, &'a TcpStream, &'a [u8], &'a mut [u8])>,
     header: &[u8; 24],
@@ -48,18 +49,39 @@ pub(super) fn exchange_all<'a>(
             progress: Progress::default(),
         })
         .collect();
-    let mut enabled = 0;
-    let mut result = (|| {
-        for transfer in &transfers {
-            transfer.stream.set_nonblocking(true)?;
-            enabled += 1;
+    transfer_all(&mut transfers, header, deadline)
+}
+
+pub(super) fn exchange_pair(
+    peer: usize,
+    stream: &TcpStream,
+    header: &[u8; 24],
+    outgoing: &[u8],
+    incoming: &mut [u8],
+    timeout: Duration,
+) -> io::Result<()> {
+    let deadline = phase_deadline(timeout)?;
+    let mut transfer = Transfer {
+        peer,
+        stream,
+        outgoing,
+        incoming,
+        progress: Progress::default(),
+    };
+    loop {
+        let events = transfer.progress(header)?;
+        if events == 0 {
+            return Ok(());
         }
-        transfer_all(&mut transfers, header, deadline)
-    })();
-    for transfer in &transfers[..enabled] {
-        result = result.and(transfer.stream.set_nonblocking(false));
+        wait_ready(
+            &mut [libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events,
+                revents: 0,
+            }],
+            deadline,
+        )?;
     }
-    result
 }
 
 struct Transfer<'a> {
@@ -173,18 +195,6 @@ impl ScatterGather<'_> {
         timeout: Duration,
         wire: &mut Timer,
         mut reduce_block: impl FnMut(usize, &[u8], &mut [u8]),
-    ) -> io::Result<()> {
-        let stream = self.stream;
-        stream.set_nonblocking(true)?;
-        let result = self.exchange(timeout, wire, &mut reduce_block);
-        result.and(stream.set_nonblocking(false))
-    }
-
-    fn exchange(
-        self,
-        timeout: Duration,
-        wire: &mut Timer,
-        reduce_block: &mut impl FnMut(usize, &[u8], &mut [u8]),
     ) -> io::Result<()> {
         let mut deadline = phase_deadline(timeout)?;
         let mut scatter = Progress::default();
