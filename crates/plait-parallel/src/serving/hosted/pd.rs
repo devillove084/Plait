@@ -349,7 +349,7 @@ pub fn plan_hosted_pd_with_assignments(
             }
             None
         };
-        if let Some(endpoint) = context.endpoint(
+        if let Some(endpoint) = context.incumbent(
             instance.version,
             instance.role,
             capacity,
@@ -696,6 +696,19 @@ struct EndpointContext<'a> {
 }
 
 impl EndpointContext<'_> {
+    fn incumbent(
+        mut self,
+        version: GroupVersion,
+        role: ServingRole,
+        capacity: SloProfile,
+        ranks: &BTreeMap<NodeId, u64>,
+        pipeline: Option<(&PipelineProfile, NodeId)>,
+    ) -> Option<Endpoint> {
+        // Keep the measured baseline available while evaluating a replacement.
+        self.evidence.policy.tp_rtt_budget = None;
+        self.endpoint(version, role, capacity, ranks, pipeline)
+    }
+
     fn candidate(
         &self,
         version: GroupVersion,
@@ -739,7 +752,10 @@ impl EndpointContext<'_> {
                 profile.kv_weights(&lanes),
             )
         } else {
-            (self.evidence.tp_traffic(ranks).ok()?, ranks.clone())
+            (
+                self.evidence.estimate_tp(ranks).ok()?.traffic,
+                ranks.clone(),
+            )
         };
         match role {
             ServingRole::Prefill => {
@@ -1271,6 +1287,7 @@ mod tests {
         let policy = HostedLinkPolicy {
             bytes_per_rank_pair: 10,
             max_sample_age_ms: 10_000,
+            tp_rtt_budget: None,
         };
         let links = BTreeMap::from([
             ((store, retiring), sample(retiring, 100_000)),
@@ -1400,6 +1417,7 @@ mod tests {
         let policy = HostedLinkPolicy {
             bytes_per_rank_pair: 10,
             max_sample_age_ms: 50,
+            tp_rtt_budget: None,
         };
         let links = BTreeMap::from([
             ((store, slow), sample(slow, 100)),
@@ -1437,6 +1455,7 @@ mod tests {
         let policy = HostedLinkPolicy {
             bytes_per_rank_pair: 100,
             max_sample_age_ms: 25,
+            tp_rtt_budget: None,
         };
         let links = BTreeMap::from([
             ((a, b), sample(b, 1000)),
@@ -1449,30 +1468,48 @@ mod tests {
             now_ms: 1020,
             links: &links,
         };
-        let source = EndpointContext {
+        let context = EndpointContext {
             evidence,
             store_host: Some(store),
             kv_bytes: 200,
             checkpoint: None,
             aggregate_checkpoints: false,
-        }
-        .endpoint(
-            GroupVersion {
-                group: GroupId(a),
-                epoch: 1,
-            },
-            ServingRole::Prefill,
-            SloProfile {
-                rps: 100.0,
-                valid_until_ms: 1100,
-            },
-            &BTreeMap::from([(a, 1), (b, 1)]),
-            None,
-        )
-        .unwrap();
+        };
+        let version = GroupVersion {
+            group: GroupId(a),
+            epoch: 1,
+        };
+        let role = ServingRole::Prefill;
+        let capacity = SloProfile {
+            rps: 100.0,
+            valid_until_ms: 1100,
+        };
+        let ranks = BTreeMap::from([(a, 1), (b, 1)]);
+        let source = context
+            .endpoint(version, role, capacity, &ranks, None)
+            .unwrap();
         assert_eq!(source.traffic.rate_limit(), 5.0);
         let mut shared = source.traffic.clone();
         shared.include(&source.traffic, 1.0);
         assert_eq!(shared.rate_limit(), 2.5);
+
+        let mut constrained = context;
+        constrained.evidence.policy.tp_rtt_budget = Some(crate::serving::HostedTpRttBudget {
+            serial_rounds: 57,
+            max_wait_ns: 100,
+        });
+        assert!(
+            constrained
+                .endpoint(version, role, capacity, &ranks, None)
+                .is_none()
+        );
+        assert_eq!(
+            constrained
+                .incumbent(version, role, capacity, &ranks, None)
+                .unwrap()
+                .traffic
+                .rate_limit(),
+            5.0,
+        );
     }
 }

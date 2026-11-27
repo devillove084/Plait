@@ -19,13 +19,36 @@ pub struct HostedLinkPolicy {
     /// Estimated wire bytes per request for each directed pair of TP workers.
     pub bytes_per_rank_pair: u64,
     pub max_sample_age_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tp_rtt_budget: Option<HostedTpRttBudget>,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostedTpRttBudget {
+    /// Serial peer exchanges within one TP group during the profiled window.
+    pub serial_rounds: u64,
+    pub max_wait_ns: u64,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
 pub enum HostedLinkLimit {
     Local,
-    MissingLink { source: NodeId, target: NodeId },
-    Measured { rps: f64, valid_until_ms: u64 },
+    MissingLink {
+        source: NodeId,
+        target: NodeId,
+    },
+    ExceedsTpRttBudget {
+        peak_rtt_ns: u64,
+        serial_rounds: u64,
+        max_wait_ns: u64,
+    },
+    Measured {
+        rps: f64,
+        valid_until_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        estimated_tp_wait_ns: Option<u64>,
+    },
 }
 
 pub fn limit_hosted_links(
@@ -47,6 +70,12 @@ impl HostedLinkPolicy {
         if self.bytes_per_rank_pair == 0 || self.max_sample_age_ms == 0 {
             return Err("hosted link policy requires positive traffic and sample age");
         }
+        if self
+            .tp_rtt_budget
+            .is_some_and(|budget| budget.serial_rounds == 0 || budget.max_wait_ns == 0)
+        {
+            return Err("hosted TP RTT budget requires positive rounds and wait");
+        }
         Ok(())
     }
 }
@@ -65,13 +94,14 @@ fn limit_hosted_ranks(
         now_ms,
         links,
     })
-    .tp_traffic(ranks)
+    .estimate_tp(ranks)
     {
-        Ok(traffic) => HostedLinkLimit::Measured {
-            rps: traffic.rate_limit(),
-            valid_until_ms: traffic.valid_until_ms,
+        Ok(estimate) => HostedLinkLimit::Measured {
+            rps: estimate.traffic.rate_limit(),
+            valid_until_ms: estimate.traffic.valid_until_ms,
+            estimated_tp_wait_ns: estimate.wait_ns,
         },
-        Err((source, target)) => HostedLinkLimit::MissingLink { source, target },
+        Err(limit) => limit,
     }
 }
 
@@ -88,17 +118,43 @@ struct LinkEvidence<'a> {
     links: &'a BTreeMap<(NodeId, NodeId), HostedLinkSample>,
 }
 
+struct TpEstimate {
+    traffic: Traffic,
+    wait_ns: Option<u64>,
+}
+
 impl LinkEvidence<'_> {
-    fn tp_traffic(&self, ranks: &BTreeMap<NodeId, u64>) -> Result<Traffic, (NodeId, NodeId)> {
-        let mut result = Traffic::new();
+    fn estimate_tp(&self, ranks: &BTreeMap<NodeId, u64>) -> Result<TpEstimate, HostedLinkLimit> {
+        let mut traffic = Traffic::new();
+        let mut peak_rtt_ns = 0;
         for (&source, &senders) in ranks {
-            for (&target, &receivers) in ranks {
+            for (&target, &receivers) in ranks.iter().filter(|&(&target, _)| target != source) {
                 let bytes =
                     self.policy.bytes_per_rank_pair as f64 * senders as f64 * receivers as f64;
-                self.add(&mut result, source, target, bytes)?;
+                let rtt_ns = self
+                    .add(&mut traffic, source, target, bytes)
+                    .map_err(|(source, target)| HostedLinkLimit::MissingLink { source, target })?;
+                if self.policy.tp_rtt_budget.is_some() && rtt_ns == 0 {
+                    return Err(HostedLinkLimit::MissingLink { source, target });
+                }
+                peak_rtt_ns = peak_rtt_ns.max(rtt_ns);
             }
         }
-        Ok(result)
+        let wait_ns = if let Some(budget) = self.policy.tp_rtt_budget {
+            Some(
+                peak_rtt_ns
+                    .checked_mul(budget.serial_rounds)
+                    .filter(|&wait| wait <= budget.max_wait_ns)
+                    .ok_or(HostedLinkLimit::ExceedsTpRttBudget {
+                        peak_rtt_ns,
+                        serial_rounds: budget.serial_rounds,
+                        max_wait_ns: budget.max_wait_ns,
+                    })?,
+            )
+        } else {
+            None
+        };
+        Ok(TpEstimate { traffic, wait_ns })
     }
 
     fn add(
@@ -107,9 +163,9 @@ impl LinkEvidence<'_> {
         source: NodeId,
         target: NodeId,
         bytes: f64,
-    ) -> Result<(), (NodeId, NodeId)> {
+    ) -> Result<u64, (NodeId, NodeId)> {
         if source == target {
-            return Ok(());
+            return Ok(0);
         }
         let sample = self
             .links
@@ -132,7 +188,7 @@ impl LinkEvidence<'_> {
                 .or_default()
                 .add(sample.bytes_per_second, bytes);
         }
-        Ok(())
+        Ok(sample.rtt_ns)
     }
 }
 
@@ -277,12 +333,14 @@ mod tests {
         let policy = HostedLinkPolicy {
             bytes_per_rank_pair: 1_000_000,
             max_sample_age_ms: 50,
+            tp_rtt_budget: None,
         };
         assert_eq!(
             limit_hosted_links(&plan, policy, 1049, &links).unwrap(),
             HostedLinkLimit::Measured {
                 rps: 25.0,
-                valid_until_ms: 1050
+                valid_until_ms: 1050,
+                estimated_tp_wait_ns: None,
             }
         );
         links.get_mut(&(c, a)).unwrap().sampled_at_ms = 999;
@@ -292,6 +350,57 @@ mod tests {
                 source: c,
                 target: a
             }
+        );
+    }
+
+    #[test]
+    fn tp_wait_uses_serial_rounds_and_the_slower_direction() {
+        let [a, b] = ["left", "right"].map(NodeId::derive);
+        let ranks = BTreeMap::from([(a, 2), (b, 4)]);
+        let sample = |target, rtt_ns| HostedLinkSample {
+            target,
+            target_session: target,
+            sampled_at_ms: 10,
+            bytes_per_second: 1_000_000,
+            rtt_ns,
+        };
+        let mut links = BTreeMap::from([((a, b), sample(b, 5)), ((b, a), sample(a, 9))]);
+        let policy = HostedLinkPolicy {
+            bytes_per_rank_pair: 100,
+            max_sample_age_ms: 40,
+            tp_rtt_budget: Some(HostedTpRttBudget {
+                serial_rounds: 3,
+                max_wait_ns: 27,
+            }),
+        };
+        assert_eq!(
+            limit_hosted_ranks(&ranks, policy, 11, &links),
+            HostedLinkLimit::Measured {
+                rps: 1250.0,
+                valid_until_ms: 50,
+                estimated_tp_wait_ns: Some(27),
+            },
+        );
+        links.get_mut(&(b, a)).unwrap().rtt_ns = 10;
+        assert_eq!(
+            limit_hosted_ranks(&ranks, policy, 11, &links),
+            HostedLinkLimit::ExceedsTpRttBudget {
+                peak_rtt_ns: 10,
+                serial_rounds: 3,
+                max_wait_ns: 27,
+            },
+        );
+        links.get_mut(&(b, a)).unwrap().rtt_ns = 0;
+        assert_eq!(
+            limit_hosted_ranks(&ranks, policy, 11, &links),
+            HostedLinkLimit::MissingLink {
+                source: b,
+                target: a
+            },
+        );
+        assert_eq!(
+            limit_hosted_ranks(&BTreeMap::from([(a, 6)]), policy, 11, &links),
+            HostedLinkLimit::Local,
         );
     }
 }

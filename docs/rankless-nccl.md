@@ -1084,14 +1084,26 @@ For each pair of hosts, the planner multiplies the byte estimate by
 the number of sending and receiving rank pairs. It sums traffic through
 each host's send and receive port and uses the slowest measured path
 through each port as its capacity. The smallest resulting rate caps
-the candidate's supplied SLO capacity. RTT is available for diagnosis.
+the candidate's supplied SLO capacity.
+
+For a latency-sensitive layout, add `tp_rtt_budget` inside `link_policy`.
+Supply `serial_rounds`, the number of dependent peer exchanges in one
+profiled window inside a TP group, and `max_wait_ns`, its RTT allowance.
+For example, `{"serial_rounds":57,"max_wait_ns":500000000}` allows up to
+500 ms of RTT-derived wait for 57 serial exchanges. Count the exchanges
+on the critical path after accounting for overlap. The estimate multiplies
+the largest fresh directed RTT by this count. For PP candidates the check
+applies to each stage's TP group. Local TP groups have zero inter-host RTT.
 
 The response includes one `link_limits` entry per candidate. A
 cross-host candidate needs fresh samples in both directions for every
 host pair. Missing or expired evidence leaves that candidate unselected.
-The measured cap describes the TCP traffic budget for the supplied
-workload estimate. Application goodput still comes from the SLO
-profiles.
+A configured wait allowance reports `estimated_tp_wait_ns` for eligible
+cross-host candidates and `ExceedsTpRttBudget` for those over budget.
+Automatic placement discards over-budget layouts during search. Current
+groups supply the measured baseline while their replacements are evaluated.
+The RTT estimate covers serial TP exchanges. Application goodput still
+comes from the SLO profiles, which account for compute and queueing.
 
 ### Generate placements from registered hosts
 

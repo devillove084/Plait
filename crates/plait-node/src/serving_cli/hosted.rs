@@ -150,10 +150,14 @@ pub(super) async fn replan(
                     .map_err(invalid_input)?;
                 match limit {
                     HostedLinkLimit::Local => {}
-                    HostedLinkLimit::MissingLink { .. } => candidate.capacity.valid_until_ms = 0,
+                    HostedLinkLimit::MissingLink { .. }
+                    | HostedLinkLimit::ExceedsTpRttBudget { .. } => {
+                        candidate.capacity.valid_until_ms = 0;
+                    }
                     HostedLinkLimit::Measured {
                         rps,
                         valid_until_ms,
+                        ..
                     } => {
                         candidate.capacity.rps = candidate.capacity.rps.min(rps);
                         candidate.capacity.valid_until_ms =
@@ -318,4 +322,17 @@ async fn replay(
         io::ErrorKind::InvalidInput,
         "operation ID was used for a different serving action",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absent_tp_rtt_budget_preserves_the_link_policy_replay_input() {
+        let old = r#"{"bytes_per_rank_pair":1024,"max_sample_age_ms":5000}"#;
+        let policy: HostedLinkPolicy = serde_json::from_str(old).unwrap();
+        assert!(policy.tp_rtt_budget.is_none());
+        assert_eq!(serde_json::to_string(&policy).unwrap(), old);
+    }
 }

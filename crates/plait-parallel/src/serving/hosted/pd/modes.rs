@@ -350,7 +350,7 @@ fn endpoint(
     } else {
         (pool.capacity(name, tp)?, None)
     };
-    context.endpoint(assignment.version, role, capacity, ranks, pipeline)
+    context.incumbent(assignment.version, role, capacity, ranks, pipeline)
 }
 
 fn route_rate(
@@ -630,6 +630,7 @@ mod tests {
         let policy = HostedLinkPolicy {
             max_sample_age_ms: 40,
             bytes_per_rank_pair: 100,
+            tp_rtt_budget: None,
         };
         let links = BTreeMap::from([((p, a), sample(a, 10_000)), ((a, d), sample(d, 10_000))]);
         let plan = |snap: &HostedServingPlanning,
@@ -746,6 +747,7 @@ mod tests {
                 policy: HostedLinkPolicy {
                     max_sample_age_ms: 100,
                     bytes_per_rank_pair: 100,
+                    tp_rtt_budget: None,
                 },
                 now_ms: forecast.now_ms,
                 links: &links,
@@ -808,6 +810,7 @@ mod tests {
         let policy = HostedLinkPolicy {
             max_sample_age_ms: 40,
             bytes_per_rank_pair: 100,
+            tp_rtt_budget: None,
         };
         let evidence = LinkEvidence {
             policy,
@@ -863,6 +866,7 @@ mod tests {
         let policy = HostedLinkPolicy {
             max_sample_age_ms: 40,
             bytes_per_rank_pair: 100,
+            tp_rtt_budget: None,
         };
         let links = BTreeMap::from([((p, a), sample(a, 10_000)), ((a, d), sample(d, 10_000))]);
         let Some(ServingAction::PrepareHostedServing { plan, .. }) = plan_hosted_serving(
@@ -919,6 +923,7 @@ mod tests {
         let policy = HostedLinkPolicy {
             max_sample_age_ms: 40,
             bytes_per_rank_pair: 100,
+            tp_rtt_budget: None,
         };
         let links = BTreeMap::new();
         assert!(

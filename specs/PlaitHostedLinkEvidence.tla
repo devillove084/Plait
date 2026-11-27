@@ -1,12 +1,17 @@
 ---- MODULE PlaitHostedLinkEvidence ----
 EXTENDS Naturals
 
+CONSTANT EnforceTpRttBudget
+
 \* A planner reads a directory snapshot and one sample in each direction.
 \* Published samples can outlive a receiver or sender session.
 Hosts == {"a", "b"}
 Other(h) == CHOOSE peer \in Hosts : peer # h
 MaxAge == 2
-NoSample == [time |-> 0, source |-> 0, target |-> 0]
+SerialRounds == 2
+TpWaitBudget == 4
+SampleRtts == {1, 2, 3}
+NoSample == [time |-> 0, source |-> 0, target |-> 0, rtt |-> 0]
 NoDecision == [time |-> 0, directory |-> [h \in Hosts |-> 0],
                used |-> [h \in Hosts |-> NoSample]]
 
@@ -28,22 +33,26 @@ Restart(h) ==
     /\ sessions' = [sessions EXCEPT ![h] = @ + 1]
     /\ UNCHANGED <<clock, samples, decision>>
 
-Measure(h) ==
+Measure(h, rtt) ==
     /\ samples' = [samples EXCEPT ![h] =
-         [time |-> clock, source |-> sessions[h], target |-> sessions[Other(h)]]]
+         [time |-> clock, source |-> sessions[h], target |-> sessions[Other(h)], rtt |-> rtt]]
     /\ UNCHANGED <<clock, sessions, decision>>
 
 Valid(h) ==
     /\ samples[h].source = sessions[h] /\ samples[h].target = sessions[Other(h)]
     /\ clock - samples[h].time < MaxAge
 
+WithinRttBudget(observed) ==
+    \A h \in Hosts : observed[h].rtt * SerialRounds <= TpWaitBudget
+
 Select ==
     /\ decision = NoDecision
     /\ \A h \in Hosts : Valid(h)
+    /\ EnforceTpRttBudget => WithinRttBudget(samples)
     /\ decision' = [time |-> clock, directory |-> sessions, used |-> samples]
     /\ UNCHANGED <<clock, sessions, samples>>
 
-Next == Tick \/ Select \/ \E h \in Hosts : Restart(h) \/ Measure(h)
+Next == Tick \/ Select \/ \E h \in Hosts : Restart(h) \/ \E rtt \in SampleRtts : Measure(h, rtt)
 Spec == Init /\ [][Next]_vars
 
 FreshDirections == decision # NoDecision =>
@@ -55,4 +64,6 @@ MatchingSessions == decision # NoDecision =>
     \A h \in Hosts :
        /\ decision.used[h].source = decision.directory[h]
        /\ decision.used[h].target = decision.directory[Other(h)]
+
+BoundedTpWait == decision # NoDecision => WithinRttBudget(decision.used)
 ====

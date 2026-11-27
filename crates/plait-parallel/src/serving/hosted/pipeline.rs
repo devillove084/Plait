@@ -118,7 +118,7 @@ impl PipelineProfile {
             for &host in stage {
                 *ranks.entry(host).or_default() += 1;
             }
-            traffic.include(&evidence.tp_traffic(&ranks).ok()?, 1.0);
+            traffic.include(&evidence.estimate_tp(&ranks).ok()?.traffic, 1.0);
         }
         for (sender, receiver) in stages.clone().zip(stages.clone().skip(1)) {
             for (&from, &to) in sender.iter().zip(receiver) {
@@ -386,6 +386,7 @@ mod tests {
             policy: HostedLinkPolicy {
                 bytes_per_rank_pair: 100,
                 max_sample_age_ms: 10,
+                tp_rtt_budget: None,
             },
             now_ms: 10,
             links: &links,
@@ -423,6 +424,7 @@ mod tests {
         let policy = HostedLinkPolicy {
             bytes_per_rank_pair: 100,
             max_sample_age_ms: 10,
+            tp_rtt_budget: None,
         };
         assert!(
             profile

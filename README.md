@@ -407,7 +407,7 @@ release the result after the matching completion has executed in the control pla
 | [Hosted rollout and failover](specs/PlaitHostLaunch.tla) | Full readiness before activation, ordered standby promotion on incumbent revocation, and exclusion of groups affected by the same host loss. |
 | [Hosted assignment](specs/PlaitHostedAssignment.tla) | An observed assignment requires an ordered claim before launch. The local lock remains held through supervisor loss until the launcher exits. |
 | [KFD device release](specs/PlaitKfdRelease.tla) | A complete report for the captured device checks its queues and VRAM. Activity on another device leaves release enabled. |
-| [Hosted link evidence](specs/PlaitHostedLinkEvidence.tla) | A measured placement requires fresh evidence in both directions with probe sessions matching the planner's directory snapshot. |
+| [Hosted link evidence](specs/PlaitHostedLinkEvidence.tla) | Fresh directional samples match both probe sessions. A configured TP RTT budget rejects candidates whose serial exchanges exceed the wait allowance. |
 | [Hosted pool reservations](specs/PlaitHostedPool.tla) | A placement is checked against current inventory when prepared. Competing placements cannot reserve the same devices or API ports, including while a revoked group awaits retirement. |
 | [Hosted P/D publication](specs/PlaitHostedPd.tla) | Both roles cut over in one publication after their participants report readiness. Candidate failure or a changed directory revision prevents a stale cutover. |
 | [Hosted serving modes](specs/PlaitHostedServingModes.tla) | An aggregate, a split path, or both can be published in one revision after all target groups are ready. Removed groups drain admitted requests before retiring. |

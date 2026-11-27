@@ -532,7 +532,8 @@ fn search_layouts(
                     layout.ranks.insert(host, u64::from(count));
                     layout.link_rps = match limit_hosted_ranks(&layout.ranks, policy, now, links) {
                         HostedLinkLimit::Local => f64::INFINITY,
-                        HostedLinkLimit::MissingLink { .. } => continue,
+                        HostedLinkLimit::MissingLink { .. }
+                        | HostedLinkLimit::ExceedsTpRttBudget { .. } => continue,
                         HostedLinkLimit::Measured { rps, .. } => rps,
                     };
                     if layout.api_host.is_none() && available.ports.is_some() {
@@ -578,6 +579,7 @@ mod tests {
     use plait_core::serving::{GroupVersion, HostResources, HostedInventory, WorkerGrant};
 
     use super::*;
+    use crate::serving::HostedTpRttBudget;
 
     #[test]
     fn pool_combines_asymmetric_hosts_and_skips_stale_devices_and_held_ports() {
@@ -682,6 +684,7 @@ mod tests {
         let policy = HostedLinkPolicy {
             bytes_per_rank_pair: 100,
             max_sample_age_ms: 20,
+            tp_rtt_budget: None,
         };
         let mut links = BTreeMap::new();
         for from in [a, b, c] {
@@ -720,6 +723,25 @@ mod tests {
                 bytes: 15,
                 pinned_bytes: 2
             }
+        );
+        let budget = HostedLinkPolicy {
+            tp_rtt_budget: Some(HostedTpRttBudget {
+                serial_rounds: 57,
+                max_wait_ns: 6_000,
+            }),
+            ..policy
+        };
+        assert_eq!(
+            generate_hosted_candidates(&resources, &planning, &forecast, &pool, budget, &links)
+                .unwrap()
+                .len(),
+            1,
+        );
+        links.get_mut(&(b, a)).unwrap().rtt_ns = 120;
+        assert!(
+            generate_hosted_candidates(&resources, &planning, &forecast, &pool, budget, &links)
+                .unwrap()
+                .is_empty()
         );
         links.remove(&(b, a));
         assert!(

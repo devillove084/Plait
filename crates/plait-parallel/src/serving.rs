@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 mod hosted;
 pub use hosted::{
     HostedLinkLimit, HostedLinkPolicy, HostedModePolicy, HostedPdDecision, HostedPdIncumbents,
-    HostedPdPool, HostedPdSelection, HostedPool, generate_hosted_candidates, limit_hosted_links,
-    plan_hosted_evacuation, plan_hosted_pd, plan_hosted_pd_recovery,
+    HostedPdPool, HostedPdSelection, HostedPool, HostedTpRttBudget, generate_hosted_candidates,
+    limit_hosted_links, plan_hosted_evacuation, plan_hosted_pd, plan_hosted_pd_recovery,
     plan_hosted_pd_with_assignments, plan_hosted_pd_with_releases, plan_hosted_serving,
 };
 
