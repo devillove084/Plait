@@ -434,7 +434,7 @@ release the result after the matching completion has executed in the control pla
 | [KV publication](https://github.com/devillove084/vllm/blob/plait/v0.31-runtime/tools/plait/kv-store/specs/PlaitKvPublication.tla) | All heads must come from one write attempt before a page becomes readable. A consumer reads its requested head range, and a complete page stays immutable. |
 | [Layered KV](https://github.com/devillove084/vllm/blob/plait/v0.31-runtime/tools/plait/kv-store/specs/PlaitLayeredKv.tla) | A page publishes after one write attempt covers every layer and head. A consumer can read it with a different stage partition or a whole-head request. |
 | [Prefill to Decode handoff](https://github.com/devillove084/vllm/blob/plait/v0.31-runtime/tools/plait/serving/specs/PlaitKvHandoff.tla) | The receipt matches the request context. Decode emits output after loading the required pages, including when the shared store can reset between admission and load. |
-| [P/D stream replay](https://github.com/devillove084/vllm/blob/plait/v0.31-runtime/tools/plait/serving/specs/PlaitPdStreamReplay.tla) | A failed Decode version is excluded. Each attempt releases its own handoff, and suffix output follows a checked prefix. |
+| [P/D stream replay](https://github.com/devillove084/vllm/blob/plait/v0.31-runtime/tools/plait/serving/specs/PlaitPdStreamReplay.tla) | A failed Decode version is excluded. Each attempt releases its own handoff, and suffix output follows a checked prefix. The ingress can wait for a route within the original deadline. TLC checked 12,597 states. |
 
 The ordered publication configuration explores 70,968 distinct states.
 Run the suite with TLC 2.19 and `tlc` on your `PATH`.

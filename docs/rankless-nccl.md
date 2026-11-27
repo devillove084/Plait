@@ -1654,6 +1654,12 @@ receives a recovery error. Replay keeps state in the live ingress and uses
 an available Prefill/Decode path. It regenerates the emitted prefix with
 the replacement engine.
 
+When the directory has no ready alternative, [hosted P/D repair](#restore-a-failed-hosted-pd-group)
+can prepare a replacement on spare devices while the ingress waits. The
+original request deadline still governs the start of a replacement attempt.
+The replacement can reuse the surviving Prefill and use a different Decode
+TP width if both groups share a compatible prompt KV contract.
+
 ### Start and publish a managed Prefill and Decode deployment
 
 Install the model profile on each resident execution host. The plan
