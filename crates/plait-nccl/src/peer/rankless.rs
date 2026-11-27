@@ -31,6 +31,12 @@ impl RanklessListener {
         }
     }
 
+    #[cfg(feature = "control")]
+    pub(crate) fn with_staging_ceiling(mut self, bytes: u64) -> Self {
+        self.listener.staging_ceiling = usize::try_from(bytes).unwrap_or(usize::MAX);
+        self
+    }
+
     pub(crate) fn connect(
         self,
         members: Vec<RanklessMember>,

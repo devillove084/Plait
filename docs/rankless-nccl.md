@@ -2161,6 +2161,16 @@ The budget covers staged inputs and expected outputs, including results
 waiting for retrieval. Internal reduction scratch and the blocking path
 use their existing allocations.
 
+A worker joining through the control plane reads a ceiling for its exact
+epoch, device, incarnation, and fence. The ceiling is the group's reserved
+host bytes minus pinned bytes, divided by the number of assigned devices
+on that host and rounded down. The communicator takes the lower of this
+ceiling and its local setting. The share stays fixed for the lifetime of the
+communicator. If the voter lacks this lookup or it times out, the worker
+joins with a zero-byte async staging budget and can use the blocking path.
+Include engine memory and blocking scratch when sizing the host profile.
+The staging limit applies to asynchronous payloads.
+
 Submission reserves bytes before synchronizing the producer stream or
 copying its input. The reservation follows the work through the wire
 exchange and result delivery. Destroying a pending ticket frees its result

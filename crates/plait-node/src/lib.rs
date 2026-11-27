@@ -484,6 +484,9 @@ impl NodeState {
                     GroupLookup::GrantStatus(grant) => {
                         GroupReply::GrantStatus(runtime.peer_grant_status(grant))
                     }
+                    GroupLookup::PeerStagingBytes(grant) => {
+                        GroupReply::PeerStagingBytes(runtime.peer_staging_bytes(grant))
+                    }
                     GroupLookup::Standby(group) => GroupReply::Standby(runtime.peer_standby(group)),
                     GroupLookup::LatestPreparation(group) => {
                         GroupReply::Preparation(runtime.latest_peer_preparation(group))

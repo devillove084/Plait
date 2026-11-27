@@ -24,13 +24,13 @@ pub(crate) struct Dispatcher {
 }
 
 impl Dispatcher {
-    pub(super) fn from_env() -> io::Result<Self> {
+    pub(super) fn from_env(staging_ceiling: usize) -> io::Result<Self> {
         let limit = match std::env::var("PLAIT_NCCL_PEER_ASYNC_STAGING_BYTES") {
             Ok(value) => value.parse().map_err(|_| invalid_limit())?,
             Err(std::env::VarError::NotPresent) => DEFAULT_STAGING_BYTES,
             Err(_) => return Err(invalid_limit()),
         };
-        Ok(Self::new(limit))
+        Ok(Self::new(limit.min(staging_ceiling)))
     }
 
     pub(super) fn new(staging_limit: usize) -> Self {

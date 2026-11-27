@@ -243,6 +243,23 @@ impl ServingState {
         )
     }
 
+    pub(crate) fn peer_staging_bytes(&self, grant: WorkerGrant) -> Option<u64> {
+        let view = self.peer_groups.get(grant.version)?;
+        view.check_grant(grant).ok()?;
+        if !view.phase.accepts_peer_join() || view.released.contains(&grant.device) {
+            return None;
+        }
+        let host = grant.device.node;
+        let memory = view.resources.hosts[&host];
+        // Keep shares fixed for the epoch, even if a worker releases early.
+        let workers = view
+            .grants
+            .keys()
+            .filter(|device| device.node == host)
+            .count() as u64;
+        Some((memory.bytes - memory.pinned_bytes) / workers)
+    }
+
     pub(crate) fn peer_standby(&self, group: GroupId) -> Option<GroupVersion> {
         let epoch = self.peer_groups.history.get(&group)?.standby?;
         Some(GroupVersion { group, epoch })
@@ -855,10 +872,7 @@ impl ServingState {
         let grant = member.grant;
         let view = self.peer_groups.get_mut(grant.version)?;
         view.check_grant(grant)?;
-        if !matches!(
-            view.phase,
-            GroupPhase::Preparing | GroupPhase::Ready | GroupPhase::Active
-        ) {
+        if !view.phase.accepts_peer_join() {
             return Err(GroupError::InvalidPhase(view.phase));
         }
         let endpoint = member.endpoint;
@@ -896,10 +910,7 @@ impl ServingState {
     fn ready_peer_group(&mut self, grant: WorkerGrant, digest: [u8; 32]) -> GroupResult {
         let view = self.peer_groups.get_mut(grant.version)?;
         view.check_grant(grant)?;
-        if !matches!(
-            view.phase,
-            GroupPhase::Preparing | GroupPhase::Ready | GroupPhase::Active
-        ) {
+        if !view.phase.accepts_peer_join() {
             return Err(GroupError::InvalidPhase(view.phase));
         }
         if view
@@ -2056,6 +2067,15 @@ mod tests {
             .grants
             .try_into()
             .unwrap();
+        assert_eq!(state.peer_staging_bytes(first), Some(2));
+        assert_eq!(state.peer_staging_bytes(second), Some(2));
+        assert_eq!(
+            state.peer_staging_bytes(WorkerGrant {
+                fence: first.fence + 1,
+                ..first
+            }),
+            None
+        );
         let member = |grant, port, ticket| GroupMember {
             grant,
             endpoint: PeerEndpoint {
@@ -2107,6 +2127,7 @@ mod tests {
         );
         state.quiesce_peer_group(old, GroupPhase::Draining).unwrap();
         assert_eq!(state.peer_grant_status(first), GrantStatus::Held);
+        assert_eq!(state.peer_staging_bytes(first), None);
         state.release_peer_worker(first).unwrap();
         assert_eq!(state.peer_grant_status(first), GrantStatus::Ended);
         assert_eq!(state.peer_grant_status(second), GrantStatus::Held);
@@ -2123,6 +2144,8 @@ mod tests {
         state.prepare_peer_group(group, 1, &plan(&[a])).unwrap();
         let successor = state.peer_group_view(new).unwrap().grants[0];
         assert!(successor.fence > first.fence);
+        assert_eq!(state.peer_staging_bytes(successor), Some(4));
+        assert_eq!(state.peer_staging_bytes(first), None);
         state.release_peer_worker(first).unwrap();
         assert_eq!(state.workers[&a].grant, Some(successor));
         assert_eq!(state.peer_grant_status(first), GrantStatus::Ended);

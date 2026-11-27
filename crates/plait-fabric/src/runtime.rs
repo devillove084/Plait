@@ -144,6 +144,10 @@ impl Runtime {
         self.serving.peer_grant_status(grant)
     }
 
+    pub fn peer_staging_bytes(&self, grant: WorkerGrant) -> Option<u64> {
+        self.serving.peer_staging_bytes(grant)
+    }
+
     pub fn peer_standby(&self, group: plait_core::group::GroupId) -> Option<GroupVersion> {
         self.serving.peer_standby(group)
     }

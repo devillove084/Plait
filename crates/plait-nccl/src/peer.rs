@@ -33,6 +33,7 @@ pub struct Listener {
     socket: TcpListener,
     endpoint: Endpoint,
     version: Option<GroupVersion>,
+    staging_ceiling: usize,
 }
 
 impl Listener {
@@ -74,6 +75,7 @@ impl Listener {
             socket,
             endpoint,
             version,
+            staging_ceiling: usize::MAX,
         })
     }
 
@@ -120,7 +122,7 @@ impl Listener {
         {
             return Err(io::Error::other("invalid peer group manifest"));
         }
-        let requests = requests::Dispatcher::from_env()?;
+        let requests = requests::Dispatcher::from_env(self.staging_ceiling)?;
         let deadline = Instant::now()
             .checked_add(bootstrap_timeout)
             .ok_or_else(|| io::Error::other("invalid peer bootstrap timeout"))?;

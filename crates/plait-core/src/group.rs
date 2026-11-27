@@ -471,6 +471,7 @@ pub enum GroupLookup {
     },
     Recipe(GroupVersion),
     LatestPreparation(GroupId),
+    PeerStagingBytes(WorkerGrant),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -488,6 +489,7 @@ pub enum GroupReply {
     ComputeRate(Option<ComputeRate>),
     Recipe(Option<GroupRecipe>),
     Preparation(Option<PreparedSetView>),
+    PeerStagingBytes(Option<u64>),
 }
 
 /// A replica's applied view of an exact communicator grant.
@@ -511,6 +513,10 @@ impl GroupView {
 }
 
 impl GroupPhase {
+    pub fn accepts_peer_join(self) -> bool {
+        matches!(self, Self::Preparing | Self::Ready | Self::Active)
+    }
+
     pub fn grant_status(self, has_grant: bool, released: bool) -> GrantStatus {
         if has_grant && !released && !matches!(self, Self::Revoked | Self::Retired) {
             GrantStatus::Held

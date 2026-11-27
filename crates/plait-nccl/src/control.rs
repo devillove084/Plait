@@ -9,8 +9,8 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use plait_core::group::{
-    GrantStatus, GroupAction, GroupFault, GroupLookup, GroupOperation, GroupPhase, GroupReply,
-    GroupVersion, GroupView, WorkerGrant,
+    GrantStatus, GroupAction, GroupFault, GroupLookup, GroupOperation, GroupReply, GroupVersion,
+    GroupView, WorkerGrant,
 };
 use plait_core::{DeviceId, NodeId, OpId};
 use plait_net::control::{Client, discover_voters};
@@ -133,6 +133,7 @@ async fn connect(
         sleep(POLL).await;
     };
 
+    let listener = listener.with_staging_ceiling(control.staging_bytes(grant).await);
     // Other local participants may be using this runtime to finish their joins.
     let group = tokio::task::spawn_blocking(move || {
         listener.connect(
@@ -231,10 +232,7 @@ fn control_runtime() -> io::Result<&'static Runtime> {
 }
 
 fn check_open(view: &GroupView) -> io::Result<()> {
-    if matches!(
-        view.phase,
-        GroupPhase::Preparing | GroupPhase::Ready | GroupPhase::Active
-    ) {
+    if view.phase.accepts_peer_join() {
         Ok(())
     } else {
         Err(io::Error::other(format!(
@@ -246,7 +244,7 @@ fn check_open(view: &GroupView) -> io::Result<()> {
 
 const POLL: Duration = Duration::from_millis(100);
 const WATCH_INTERVAL: Duration = Duration::from_millis(250);
-const WATCH_QUERY_TIMEOUT: Duration = Duration::from_millis(750);
+const METADATA_QUERY_TIMEOUT: Duration = Duration::from_millis(750);
 const WATCH_DISCOVERY_INTERVAL: Duration = Duration::from_secs(10);
 const REPORT_TIMEOUT: Duration = Duration::from_secs(15);
 type PeerCall<'a, T> = Pin<Box<dyn Future<Output = io::Result<T>> + Send + 'a>>;
@@ -289,6 +287,23 @@ impl Rendezvous {
             GroupReply::Version(view) => view,
             _ => None,
         }
+    }
+
+    async fn staging_bytes(&mut self, grant: WorkerGrant) -> u64 {
+        let read = async {
+            for &voter in &self.voters {
+                if let Ok(GroupReply::PeerStagingBytes(Some(bytes))) = self
+                    .client
+                    .query_group(voter, GroupLookup::PeerStagingBytes(grant))
+                    .await
+                {
+                    return bytes;
+                }
+            }
+            0
+        };
+        // An older voter or a slow lookup limits this join to the blocking path.
+        timeout(METADATA_QUERY_TIMEOUT, read).await.unwrap_or(0)
     }
 
     async fn watch(
@@ -344,7 +359,7 @@ impl Rendezvous {
             self.voters.rotate_left(1);
             if !legacy.contains(&voter) {
                 let response = timeout(
-                    WATCH_QUERY_TIMEOUT,
+                    METADATA_QUERY_TIMEOUT,
                     self.client
                         .query_group(voter, GroupLookup::GrantStatus(grant)),
                 )
@@ -358,7 +373,7 @@ impl Rendezvous {
                 }
             }
             let response = timeout(
-                WATCH_QUERY_TIMEOUT,
+                METADATA_QUERY_TIMEOUT,
                 self.client
                     .query_group(voter, GroupLookup::Version(grant.version)),
             )
