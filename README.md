@@ -182,9 +182,9 @@ HGGC workers with the vLLM multiprocess executor. All four workers reported
 their grants ready, and the HTTP response's eight token IDs matched a single-device
 baseline. [Four-vendor serving verification](docs/rankless-nccl.md#verify-four-vendor-tp4-over-http)
 
-Two-host TP2 groups served a dense AWQ model by pairing ROCm W4A8 with
-CUDA W4A4 and, in a separate run, with CANN W4A4. Each pair used a native
-Plait communicator.
+A native TP4 group served dense AWQ with CUDA and CANN at W4A4 and ROCm
+and PPU at W4A8. Three physical control peers agreed on the four device
+grants. Six streamed completions returned the same eight token IDs.
 [Integer activation setup](docs/rankless-nccl.md#run-dense-awq-with-integer-activations)
 
 The deployment ingress resolves the active native epoch. The engine validates

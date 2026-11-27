@@ -756,6 +756,25 @@ engine's environment to size the executor's shared-memory response slots.
 The CANN-led TP2 run used 1 MiB slots and capped the host-side compiler
 pool with `TORCHNPU_PRECOMPILE_THREADS=2`.
 
+#### Verify four-vendor mixed-precision TP4
+
+Use one CUDA, ROCm, CANN, and PPU worker in the same native TP4 group, with
+one model worker per host. Assign W4A4 to CUDA and CANN and W4A8 to ROCm and
+PPU through each host's engine environment. Give vLLM one identical dense
+AWQ checkpoint on all four hosts. The test used Qwen3-0.6B weights converted
+to 128-element AWQ groups, the V2 model runner in eager mode, a 128-token
+block size, and a 256 MiB KV budget per worker. CUDA, ROCm, and PPU used
+`TRITON_ATTN`. CANN used the Ascend plugin's attention backend.
+
+Prepare through three Plait voters on separate hosts. Verify that all
+four workers log the same committed group version and their assigned
+activation precision. Activate once all four grants are ready and
+`/health` returns HTTP 200. Send streaming completion requests with
+`return_token_ids: true` and the active `X-Plait-Group-Version` header.
+The test checked the returned group version and `[DONE]` on every response.
+All six requests returned the same eight token IDs. A second group ran W4A8
+on every worker with the same checkpoint and layout and passed the same checks.
+
 ### Assign different numbers of workers per host
 
 For four TP workers across three hosts, start the same model on each host.
