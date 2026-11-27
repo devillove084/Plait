@@ -1095,6 +1095,34 @@ on the critical path after accounting for overlap. The estimate multiplies
 the largest fresh directed RTT by this count. For PP candidates the check
 applies to each stage's TP group. Local TP groups have zero inter-host RTT.
 
+Calibrate the RTT window and traffic volume with the engine that will run
+the candidate. For serial generation, send the same prompt with output
+limits of one, two, and several tokens. Keep the prompt length, batch
+shape, TP width, dtype, and prefix-cache state fixed. With the host-staged
+blocking peer path, set `PLAIT_NCCL_PHASE_LOG` on each worker and compare
+the ordered collective traces. After warming the engine, isolate one
+request at a time. Use the trace's worker slot, group size, operation, dtype,
+and local input byte count to match the TP calls. The one-token trace
+covers prefill and first-token sampling. The additional calls in the
+two-token trace cover one decode step. Check the longer request for
+repeated decode steps before extrapolating the profile.
+[Phase log format](../crates/plait-nccl/src/profile.rs)
+
+Translate each call to the exchanges used by its wire algorithm. A
+replicated AllReduce or an AllGather has one exchange. The sequential
+scatter-gather path has two. Count concurrent transfers to peers once for
+the RTT window, and add the bytes actually sent to each directed peer for
+the traffic forecast. For a fixed-shape request with a repeating decode
+step, use the first-token bytes plus one decode-step budget for each
+remaining token. Reprofile layouts that use a different collective
+algorithm or change the critical path through overlap.
+
+When first-token and decode latency have separate allowances on the same TP
+group, compare each allowance divided by its serial round count. Configure
+`tp_rtt_budget` with the window that allows the smaller RTT. Both windows
+use the same measured peak RTT. Keep `bytes_per_rank_pair` scoped to the
+whole request so the bandwidth estimate covers all generated tokens.
+
 The response includes one `link_limits` entry per candidate. A
 cross-host candidate needs fresh samples in both directions for every
 host pair. Missing or expired evidence leaves that candidate unselected.
