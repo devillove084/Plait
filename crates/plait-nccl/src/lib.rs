@@ -22,6 +22,7 @@ mod backend;
 #[cfg(feature = "control")]
 mod control;
 mod cross;
+mod host_reduce;
 mod ipc;
 mod kernel;
 mod native;
@@ -854,6 +855,15 @@ pub(crate) fn reduce_slices(op: ReduceOp, dtype: DataType, buffers: &[&[u8]]) ->
             output
         }
         DataType::Float16 => {
+            let pair_sum = match buffers {
+                [left, right] if matches!(op, ReduceOp::Sum) => {
+                    host_reduce::sum_fp16_pair(left, right)
+                }
+                _ => None,
+            };
+            if let Some(sum) = pair_sum {
+                return sum;
+            }
             let mut values = vec![0.0f32; bytes / 2];
             for (index, chunk) in buffers[0].chunks_exact(2).enumerate() {
                 values[index] = f16::from_bits(u16::from_ne_bytes([chunk[0], chunk[1]])).to_f32();
@@ -2866,6 +2876,43 @@ mod tests {
             .flat_map(|value| bf16::from_f32(*value).to_bits().to_ne_bytes())
             .collect();
         assert_eq!(sum, expected);
+    }
+
+    #[test]
+    fn bulk_fp16_pair_sum_matches_scalar_bits() {
+        let words: Vec<_> = (0..=u16::MAX)
+            .filter(|word| word & 0x7c00 != 0x7c00)
+            .collect();
+        let mut left: Vec<_> = words.iter().flat_map(|word| word.to_ne_bytes()).collect();
+        let right: Vec<_> = words
+            .iter()
+            .rev()
+            .cycle()
+            .skip(173)
+            .take(words.len())
+            .flat_map(|word| word.to_ne_bytes())
+            .collect();
+
+        // Remove a word to exercise a partial conversion block.
+        let right = &right[..right.len() - 2];
+        left.truncate(right.len());
+        let compare_with_scalar_chunks = |left: &[u8]| {
+            let expected: Vec<_> = left
+                .chunks(256)
+                .zip(right.chunks(256))
+                .flat_map(|(l, r)| reduce_slices(ReduceOp::Sum, DataType::Float16, &[l, r]))
+                .collect();
+            assert_eq!(
+                reduce_slices(ReduceOp::Sum, DataType::Float16, &[left, right]),
+                expected
+            );
+        };
+        assert!(host_reduce::sum_fp16_pair(&left, right).is_some());
+        compare_with_scalar_chunks(&left);
+
+        left[..2].copy_from_slice(&0x7e03u16.to_ne_bytes());
+        assert!(host_reduce::sum_fp16_pair(&left, right).is_none());
+        compare_with_scalar_chunks(&left);
     }
 
     #[test]
