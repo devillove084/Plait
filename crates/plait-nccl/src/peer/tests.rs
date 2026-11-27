@@ -127,6 +127,52 @@ fn replicated_exchange_drains_two_writers_with_small_send_buffers() {
     });
 }
 
+#[test]
+fn replicated_exchange_progresses_on_other_links_while_one_peer_waits() {
+    fn sockets() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let local = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let remote = listener.accept().unwrap().0;
+        remote
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        (local, remote)
+    }
+
+    let (slow, slow_remote) = sockets();
+    let (fast, fast_remote) = sockets();
+    let (release, wait) = std::sync::mpsc::channel();
+    let op = Collective::AllReduce(DataType::Uint8, ReduceOp::Sum);
+    let header = op.header(0, 1, REPLICATED_EXCHANGE);
+
+    thread::scope(|scope| {
+        scope.spawn(move || {
+            frame::read(&slow_remote, 0, &header, &mut [0]).unwrap();
+            wait.recv_timeout(Duration::from_secs(3)).unwrap();
+            frame::write(&slow_remote, &header, &[7]).unwrap();
+        });
+        scope.spawn(move || {
+            frame::read(&fast_remote, 0, &header, &mut [0]).unwrap();
+            frame::write(&fast_remote, &header, &[8]).unwrap();
+            release.send(()).unwrap();
+        });
+        let mut first = [0];
+        let mut second = [0];
+        frame::exchange_replicated(
+            [
+                (1, &slow, first.as_mut_slice()),
+                (2, &fast, second.as_mut_slice()),
+            ]
+            .into_iter(),
+            &header,
+            &[1],
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        assert_eq!((first, second), ([7], [8]));
+    });
+}
+
 fn groups_with_timeout(world: usize, timeout: Duration) -> Vec<Arc<PeerGroup>> {
     let (listeners, members) = listeners(world);
     thread::scope(|scope| {

@@ -485,16 +485,12 @@ impl PeerGroup {
             let header = collective.header(sequence, bytes, REPLICATED_EXCHANGE);
             let mut inputs = vec![vec![0; bytes]; world];
             inputs[self.slot].copy_from_slice(input);
-            for peer in self.partners() {
-                frame::exchange_duplex(
-                    &self.link(peer).collective,
-                    peer,
-                    &header,
-                    input,
-                    &mut inputs[peer],
-                    self.timeout,
-                )?;
-            }
+            let peers = self.links.iter().zip(&mut inputs).enumerate().filter_map(
+                |(peer, (link, received))| {
+                    Some((peer, &link.as_ref()?.collective, received.as_mut_slice()))
+                },
+            );
+            frame::exchange_replicated(peers, &header, input, self.timeout)?;
             return Ok(collective.reduce(&inputs));
         }
         match collective {

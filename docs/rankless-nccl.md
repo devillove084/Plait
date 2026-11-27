@@ -1263,10 +1263,11 @@ with the same control directory to recover the last durable state.
 ## Execute a collective
 
 For small all-reduces, each worker sends its complete contribution to each
-peer and reduces the received values in slot order. A worker advances the
-send and receive on each link independently under one deadline. The planner
-uses this path up to 1 MiB of input for two workers. For larger groups it caps
-the replicated traffic per worker at 64 KiB.
+peer and polls all peer sockets together under one collective deadline.
+A slow link leaves the other sends and receives free to progress. The worker
+reduces the complete inputs in slot order. The planner uses this path up to
+1 MiB of input for two workers. For larger groups it caps the replicated
+traffic per worker at 64 KiB.
 
 Larger all-reduces divide the tensor into contiguous shards and assign one
 shard to each slot. In each round a worker sends its contribution to a

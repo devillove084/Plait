@@ -29,73 +29,114 @@ pub(super) fn read(
     stream.read_exact(data)
 }
 
-// The collective sequence lock owns this lane. Point-to-point traffic uses
-// a different socket with its own blocking mode.
-pub(super) fn exchange_duplex(
-    stream: &TcpStream,
-    peer: usize,
+// The collective sequence lock owns these lanes. Point-to-point traffic uses
+// separate sockets with their own blocking mode.
+pub(super) fn exchange_replicated<'a>(
+    peers: impl Iterator<Item = (usize, &'a TcpStream, &'a mut [u8])>,
     header: &[u8; 24],
     outgoing: &[u8],
-    incoming: &mut [u8],
     timeout: Duration,
 ) -> io::Result<()> {
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| io::Error::other("invalid peer exchange timeout"))?;
-    stream.set_nonblocking(true)?;
-    let result = transfer(stream, peer, header, outgoing, incoming, deadline);
-    let restored = stream.set_nonblocking(false);
-    result.and(restored)
+    let mut transfers: Vec<_> = peers
+        .map(|(peer, stream, incoming)| Transfer {
+            peer,
+            stream,
+            incoming,
+            sent: 0,
+            remote_header: [0; 24],
+            header_bytes: 0,
+            body_bytes: 0,
+        })
+        .collect();
+    let mut enabled = 0;
+    let mut result = (|| {
+        for transfer in &transfers {
+            transfer.stream.set_nonblocking(true)?;
+            enabled += 1;
+        }
+        transfer_all(&mut transfers, header, outgoing, deadline)
+    })();
+    for transfer in &transfers[..enabled] {
+        result = result.and(transfer.stream.set_nonblocking(false));
+    }
+    result
 }
 
-fn transfer(
-    mut stream: &TcpStream,
+struct Transfer<'a> {
     peer: usize,
-    header: &[u8; 24],
-    outgoing: &[u8],
-    incoming: &mut [u8],
-    deadline: Instant,
-) -> io::Result<()> {
-    let mut slices = [IoSlice::new(header), IoSlice::new(outgoing)];
-    let mut pending_write = slices.as_mut_slice();
-    let mut remote_header = [0; 24];
-    let mut header_bytes = 0;
-    let mut body_bytes = 0;
-    loop {
-        if !pending_write.is_empty() {
-            let written = socket_progress(
-                stream.write_vectored(pending_write),
-                io::ErrorKind::WriteZero,
-            )?;
-            IoSlice::advance_slices(&mut pending_write, written);
+    stream: &'a TcpStream,
+    incoming: &'a mut [u8],
+    sent: usize,
+    remote_header: [u8; 24],
+    header_bytes: usize,
+    body_bytes: usize,
+}
+
+impl Transfer<'_> {
+    fn progress(&mut self, header: &[u8; 24], outgoing: &[u8]) -> io::Result<libc::c_short> {
+        let mut stream = self.stream;
+        let total = header.len() + outgoing.len();
+        if self.sent < total {
+            let remaining = [
+                IoSlice::new(&header[self.sent.min(header.len())..]),
+                IoSlice::new(&outgoing[self.sent.saturating_sub(header.len())..]),
+            ];
+            self.sent +=
+                socket_progress(stream.write_vectored(&remaining), io::ErrorKind::WriteZero)?;
         }
-        if header_bytes < header.len() {
-            header_bytes += socket_progress(
-                stream.read(&mut remote_header[header_bytes..]),
+        if self.header_bytes < header.len() {
+            self.header_bytes += socket_progress(
+                stream.read(&mut self.remote_header[self.header_bytes..]),
                 io::ErrorKind::UnexpectedEof,
             )?;
-            if header_bytes == header.len() {
-                check_header(peer, header, &remote_header)?;
+            if self.header_bytes == header.len() {
+                check_header(self.peer, header, &self.remote_header)?;
             }
         }
-        if header_bytes == header.len() && body_bytes < incoming.len() {
-            body_bytes += socket_progress(
-                stream.read(&mut incoming[body_bytes..]),
+        if self.header_bytes == header.len() && self.body_bytes < self.incoming.len() {
+            self.body_bytes += socket_progress(
+                stream.read(&mut self.incoming[self.body_bytes..]),
                 io::ErrorKind::UnexpectedEof,
             )?;
         }
 
         let mut events = 0;
-        if !pending_write.is_empty() {
+        if self.sent < total {
             events |= libc::POLLOUT;
         }
-        if header_bytes < header.len() || body_bytes < incoming.len() {
+        if self.header_bytes < header.len() || self.body_bytes < self.incoming.len() {
             events |= libc::POLLIN;
         }
-        if events == 0 {
+        Ok(events)
+    }
+}
+
+fn transfer_all(
+    transfers: &mut [Transfer<'_>],
+    header: &[u8; 24],
+    outgoing: &[u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    let mut waiting = Vec::with_capacity(transfers.len());
+    loop {
+        waiting.clear();
+        for transfer in transfers.iter_mut() {
+            let events = transfer.progress(header, outgoing)?;
+            if events != 0 {
+                waiting.push(libc::pollfd {
+                    fd: transfer.stream.as_raw_fd(),
+                    events,
+                    revents: 0,
+                });
+            }
+        }
+        if waiting.is_empty() {
             return Ok(());
         }
-        wait_ready(stream, events, deadline)?;
+        wait_ready(&mut waiting, deadline)?;
     }
 }
 
@@ -115,12 +156,7 @@ fn socket_progress(result: io::Result<usize>, on_closed: io::ErrorKind) -> io::R
     }
 }
 
-fn wait_ready(stream: &TcpStream, events: libc::c_short, deadline: Instant) -> io::Result<()> {
-    let mut request = libc::pollfd {
-        fd: stream.as_raw_fd(),
-        events,
-        revents: 0,
-    };
+fn wait_ready(waiting: &mut [libc::pollfd], deadline: Instant) -> io::Result<()> {
     loop {
         let time = deadline.saturating_duration_since(Instant::now());
         if time.is_zero() {
@@ -130,8 +166,9 @@ fn wait_ready(stream: &TcpStream, events: libc::c_short, deadline: Instant) -> i
             ));
         }
         let millis = time.as_millis().clamp(1, i32::MAX as u128) as i32;
-        // The socket outlives the call and request contains one valid pollfd.
-        let ready = unsafe { libc::poll(&mut request, 1, millis) };
+        // Each socket outlives the poll and waiting contains initialized pollfds.
+        let ready =
+            unsafe { libc::poll(waiting.as_mut_ptr(), waiting.len() as libc::nfds_t, millis) };
         if ready > 0 {
             return Ok(());
         }

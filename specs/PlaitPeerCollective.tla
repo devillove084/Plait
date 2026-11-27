@@ -1,5 +1,5 @@
 ---- MODULE PlaitPeerCollective ----
-\* Each participant's cursor advances with a matched peer or an idle round.
+\* Sharded phases follow paired rounds. Replicated inputs can arrive in any order.
 \* The scopes share participants but use separate connections and failure state.
 \* Tensor chunks contain one integer each to model ownership and materialization.
 EXTENDS Naturals
@@ -63,9 +63,11 @@ Exchange(g, a, b) ==
     /\ Running(g, a) /\ Running(g, b)
     /\ LET left == local[g][a]
            right == local[g][b]
-       IN /\ InRound(left)
-          /\ left.round = right.round /\ left.phase = right.phase
-          /\ b = Partner(a, left.round)
+       IN /\ left.phase = right.phase /\ left.phase # "Done"
+          /\ IF left.phase = "Replicated"
+                THEN b \notin left.seen /\ a \notin right.seen
+                ELSE /\ InRound(left) /\ left.round = right.round
+                     /\ b = Partner(a, left.round)
           /\ local' = [local EXCEPT
                 ![g][a] = Receive(@, b, Payload(g, b, a)),
                 ![g][b] = Receive(@, a, Payload(g, a, b))]
@@ -73,6 +75,7 @@ Exchange(g, a, b) ==
 
 Idle(g, slot) ==
     /\ Running(g, slot) /\ InRound(local[g][slot])
+    /\ local[g][slot].phase # "Replicated"
     /\ Partner(slot, local[g][slot].round) \notin Slots
     /\ local' = [local EXCEPT ![g][slot].round = @ + 1]
     /\ UNCHANGED <<lost, aborted>>
@@ -86,7 +89,9 @@ BeginGather(g, slot) ==
 
 Finish(g, slot) ==
     /\ Running(g, slot)
-    /\ local[g][slot].phase \in {"Gather", "Replicated"} /\ local[g][slot].round = Pivot
+    /\ LET state == local[g][slot]
+       IN \/ state.phase = "Gather" /\ state.round = Pivot
+          \/ state.phase = "Replicated" /\ state.seen = Slots
     /\ local' = [local EXCEPT ![g][slot].phase = "Done"]
     /\ UNCHANGED <<lost, aborted>>
 
@@ -96,9 +101,13 @@ Lose ==
     /\ UNCHANGED <<local, aborted>>
 
 Timeout(g, slot) ==
-    /\ Running(g, slot) /\ InRound(local[g][slot])
-    /\ LET peer == Partner(slot, local[g][slot].round)
-       IN peer \in Slots /\ ~Alive(g, peer)
+    /\ Running(g, slot)
+    /\ LET state == local[g][slot]
+       IN IF state.phase = "Replicated"
+             THEN \E peer \in Slots \ state.seen : ~Alive(g, peer)
+             ELSE /\ InRound(state)
+                  /\ LET peer == Partner(slot, state.round)
+                     IN peer \in Slots /\ ~Alive(g, peer)
     /\ aborted' = aborted \cup {g}
     /\ UNCHANGED <<local, lost>>
 
