@@ -30,6 +30,22 @@ pub struct Workload {
     pub minimum_gain_ns: u64,
 }
 
+impl Workload {
+    pub fn validate(&self, calibrated: bool) -> Result<(), &'static str> {
+        if self.widths.is_empty()
+            || self.widths.contains(&0)
+            || self.device_bytes == 0
+            || self.operations == 0
+            || self.per_worker_host.pinned_bytes > self.per_worker_host.bytes
+            || self.per_host.pinned_bytes > self.per_host.bytes
+            || (self.compute_work == 0 && (self.bytes_per_peer == 0 || calibrated))
+        {
+            return Err("invalid group placement workload");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DirectedLink {
@@ -105,23 +121,12 @@ pub fn select_with_rates(
     now_ms: u64,
     rates: Option<&[ComputeRate]>,
 ) -> Result<Decision, &'static str> {
+    workload.validate(rates.is_some())?;
     let widths: BTreeSet<_> = workload
         .widths
         .iter()
         .map(|&width| width as usize)
         .collect();
-    if widths.is_empty()
-        || widths.contains(&0)
-        || workload.device_bytes == 0
-        || workload.operations == 0
-        || workload.per_worker_host.pinned_bytes > workload.per_worker_host.bytes
-        || workload.per_host.pinned_bytes > workload.per_host.bytes
-        || (workload.compute_work == 0 && workload.bytes_per_peer == 0)
-        || (rates.is_some() && workload.compute_work == 0)
-    {
-        return Err("invalid group placement workload");
-    }
-
     let mut fresh = BTreeMap::new();
     for link in links {
         if link.source == link.target || link.bytes_per_second == 0 || link.rtt_ns == 0 {

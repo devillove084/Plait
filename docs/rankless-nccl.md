@@ -177,6 +177,61 @@ remains available after device release while the same incarnation is
 registered. Collect separate rates when the workload's precision or GEMM
 shape changes. The startup benchmark supports FP16 and BF16 GEMM.
 
+#### Prepare replacements automatically
+
+Save a policy for each group that Plait should evaluate and start a node
+with `--group-replan`. A voter can use the same option on its existing
+`run` command. A nonvoting node discovers voters from its seeds.
+
+```sh
+plait-node run --compute-only --seed "$SEED_IP:$SEED_PORT" \
+  --group-replan group-policy.json
+```
+
+```json
+{
+  "control_ip": "192.0.2.10",
+  "interval_ms": 5000,
+  "stable_samples": 2,
+  "groups": [
+    {
+      "group": [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      "workload": {
+        "widths": [1, 2],
+        "device_bytes": 4294967296,
+        "per_worker_host": {"bytes": 536870912, "pinned_bytes": 67108864},
+        "per_host": {"bytes": 268435456, "pinned_bytes": 0},
+        "compute_work": 1000000000,
+        "bytes_per_peer": 65536,
+        "max_link_age_ms": 30000,
+        "operations": 1000,
+        "switch_ns": 500000000
+      }
+    }
+  ]
+}
+```
+
+Set `control_ip` to a local address the voters can reach. List only the
+widths the engine can run and size the memory and cost estimates for that
+workload. Set the policy's optional `calibration` to the ID of the published
+compute rates. By default, the node polls every five seconds and requires
+two consecutive recommendations for the same candidate and incumbent.
+Each poll evaluates the latest available rates and links, which may include
+measurements used in a previous poll.
+
+A confirmed candidate is submitted with the latest group epoch, resource
+requirements, and measurement versions from the final poll. Several nodes
+can run the same policy. The ordered reservation accepts one successor
+for the observed epoch. Each node keeps the operation ID and payload when
+retrying an ambiguous submission. A group in `Preparing` or `Ready` waits
+for deployment before another successor can be prepared.
+
+The deployment layer reads the reserved grants, starts the model workers,
+and submits `Activate` after the successor is ready to receive work. It can
+revoke a candidate that fails to start and release its grants after teardown.
+The incumbent's communicator can continue serving during preparation.
+
 #### Run resident link probes
 
 Add `--link-probe "$NODE_IP:0"` to `plait-node run` on each participating host.

@@ -214,6 +214,11 @@ devices. A measured reservation also checks the rates of the chosen devices
 and any incumbent devices used in the comparison.
 [Heterogeneous group placement](docs/rankless-nccl.md#plan-across-heterogeneous-resources)
 
+A node with `--group-replan` periodically evaluates caller-supplied
+workload policies and reserves a successor after repeated matching
+recommendations. Deployment starts the successor and decides when to activate it.
+[Automatic group preparation](docs/rankless-nccl.md#prepare-replacements-automatically)
+
 ### vLLM reference integration
 
 Managed replacements reuse complete prompt KV blocks across TP sizes and PP
@@ -333,6 +338,7 @@ release the result after the matching completion has executed in the control pla
 | [Native group placement](specs/PlaitGroupPlacement.tla) | A planned reservation checks the version, incumbent, and resource availability against concurrent changes. |
 | [Native probe sessions](specs/PlaitProbePlacement.tla) | A planned reservation checks both endpoint revisions if a probe restarts after measurement. |
 | [Native compute rates](specs/PlaitComputeRatePlacement.tla) | A measured reservation checks the selected devices and the scored incumbent. A worker can publish a rate while its exact grant is open. |
+| [Resident group replanning](specs/PlaitGroupReplan.tla) | A planner submits after consecutive matching recommendations. Competing planners can reserve only one successor for the observed epoch. |
 | [Hosted rollout and failover](specs/PlaitHostLaunch.tla) | Full readiness before activation, ordered standby promotion on incumbent revocation, and exclusion of groups affected by the same host loss. |
 | [Hosted assignment](specs/PlaitHostedAssignment.tla) | An observed assignment requires an ordered claim before launch. The local lock remains held through supervisor loss until the launcher exits. |
 | [KFD device release](specs/PlaitKfdRelease.tla) | A complete report for the captured device checks its queues and VRAM. Activity on another device leaves release enabled. |
