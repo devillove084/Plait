@@ -1029,6 +1029,101 @@ Replace the previous Plait checkout script paths with the module commands
 above when updating vLLM. Run `tools/plait/serving/check-tla.sh` from the
 fork to check ingress versioning and stream handoff.
 
+### Switch aggregate and P/D using native groups
+
+Reserve separate native group IDs for the aggregate, Prefill and Decode
+engines. Run the native launcher for each group with its own deployment
+file and disjoint API and rendezvous ports. Set `api_role` in each local
+engine configuration to `aggregated`, `prefill` or `decode`. Give Prefill
+and Decode the same [KV store and namespace](#reuse-prompt-kv-across-tp-layouts).
+Set the first engine's connector role to `kv_producer` and the second to
+`kv_consumer`. Use the same model weights, KV dtype and block size.
+Omit the launcher's `--routes` publisher when coordinating a group set.
+
+Publish the engine-owned bindings in one file. Each route identifies exact
+versions and reachable HTTP origins. The example stages an active aggregate
+and the two prepared P/D engines in the same revision.
+
+```json
+{
+  "model": "example",
+  "revision": 1,
+  "aggregated": [
+    {"url": "http://192.0.2.21:8000", "version": "00000000000000000000000000000001@1"}
+  ],
+  "paths": [
+    {
+      "prefill": {
+        "url": "http://192.0.2.22:8010",
+        "version": "00000000000000000000000000000002@1",
+        "kv_host": "192.0.2.20",
+        "kv_port": 7952
+      },
+      "decode": {
+        "url": "http://192.0.2.23:8020",
+        "version": "00000000000000000000000000000003@1"
+      }
+    }
+  ]
+}
+```
+
+```sh
+python -m vllm.entrypoints.serve.plait_serving.disaggregate \
+  --native-routes routes.json --control-seed "$SEED" \
+  --control-listen "$INGRESS_REPLY_ADDR" --port 8192
+```
+
+The ingress accepts a route only when one ordered `ObserveActiveSet`
+includes all of its exact versions. It keeps accepting aggregate requests
+while the P/D engines prepare. Update the file with an atomic rename and a
+higher `revision` when adding or replacing bindings. If a group fails, the
+next observation excludes any route that requires it. Other eligible
+routes can continue to serve.
+
+After checking the target engines' versioned HTTP health and the
+communication groups' `Ready` phase, submit one `SwitchActiveSet` to the
+native group API. Each transition specifies the expected and target active
+epoch. A `null` target drains the current epoch. Equal values guard a
+retained epoch. A stale expectation or unready target rejects the whole set.
+Use the same operation ID and payload to retry an uncertain submission.
+
+```sh
+python - <<'PY' | plait-node group --seed "$SEED" --listen "$CONTROL_REPLY_ADDR"
+import json
+import uuid
+
+changes = [
+    (1, 1, None),  # drain aggregate @1
+    (2, None, 1),  # activate Prefill @1
+    (3, None, 1),  # activate Decode @1
+]
+print(json.dumps({
+    "request": "apply",
+    "operation": {
+        "id": {"origin": list(uuid.uuid4().bytes), "counter": 1},
+        "action": {"SwitchActiveSet": {"transitions": [
+            {"group": list(group.to_bytes(16, "big")), "expected": old, "target": new}
+            for group, old, new in changes
+        ]}},
+    },
+}))
+PY
+```
+
+The old group drains existing HTTP work before its launcher revokes and
+returns its grants. To return to aggregate serving, stage a new aggregate
+epoch and submit the inverse switch once it is ready. The same ingress
+can also serve aggregate and P/D paths together. Both the ingress and the
+voters need the active-set APIs for this mode. The reference integration
+uses shared KV pages owned by the engine.
+
+On one CUDA host, three TP1 engines ran Qwen3-0.6B FP16 through the same
+ingress. The aggregate-to-P/D switch preserved the old 32-token stream
+until drain finished. A new request reused 144 prompt tokens in Decode
+and matched the aggregate's output. After releasing the old grant, the
+test reused that device for a new aggregate epoch and switched back.
+
 ### Hand off prompt KV between independent Prefill and Decode groups
 
 Use the vLLM fork at `9122df3da` or later on `plait/v0.31-runtime`.

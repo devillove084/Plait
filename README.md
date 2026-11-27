@@ -236,6 +236,11 @@ The vLLM fork ships the aggregate and P/D ingress, stream recovery,
 resident launcher, and serving benchmark as Python modules.
 [Serving modules](https://github.com/devillove084/vllm/tree/plait/v0.31-runtime/vllm/entrypoints/serve/plait_serving)
 
+The native P/D ingress keeps model routes in vLLM. A single ordered group
+operation can switch several active epochs together. The ingress matches
+both sides of a route against one ordered observation.
+[Switch aggregate and P/D groups](docs/rankless-nccl.md#switch-aggregate-and-pd-using-native-groups)
+
 Managed replacements reuse complete prompt KV blocks across TP sizes and PP
 layouts with the vLLM fork's `PlaitKvConnector` and its optional
 `vllm-plait-kv-store` binary.
@@ -356,6 +361,7 @@ release the result after the matching completion has executed in the control pla
 | [Native compute rates](specs/PlaitComputeRatePlacement.tla) | A measured reservation checks the selected devices and the scored incumbent. A worker can publish a rate while its exact grant is open. |
 | [Resident group replanning](specs/PlaitGroupReplan.tla) | A planner submits after consecutive matching recommendations. Competing planners can reserve only one successor for the observed epoch. |
 | [Committed group recipes](specs/PlaitGroupRecipe.tla) | Reservation binds the recipe and grants together. A launch uses the recipe recorded for its grant epoch. |
+| [Active group sets](specs/PlaitActiveGroupSet.tla) | An ordered switch checks every expected epoch and applies the complete change. Routing uses one observation and requires every group in a P/D path. Existing work keeps its draining grants. |
 | [Native serving cutover](specs/PlaitNativeServingCutover.tla) | The deployment publishes a ready engine's origin before activation. An admitted stream keeps its version as ingress replicas observe the switch. |
 | [Native serving retirement](specs/PlaitNativeServingRetire.tla) | Planned retirement closes admission, waits for the engine to drain, and releases each host's grants after its process group exits. |
 | [Hosted rollout and failover](specs/PlaitHostLaunch.tla) | Full readiness before activation, ordered standby promotion on incumbent revocation, and exclusion of groups affected by the same host loss. |

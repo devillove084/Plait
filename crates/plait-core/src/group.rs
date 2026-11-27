@@ -243,6 +243,15 @@ pub struct GroupRecipe {
     pub recipe: Option<NodeId>,
 }
 
+/// A compare-and-set for a group's active epoch. A missing target drains the
+/// current epoch. Equal epochs check the group without changing it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupTransition {
+    pub group: GroupId,
+    pub expected: Option<u64>,
+    pub target: Option<u64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GroupAction {
     SetHostMemory {
@@ -335,6 +344,12 @@ pub enum GroupAction {
         probes: Vec<ProbeRegistration>,
         rates: Option<RateEvidence>,
     },
+    SwitchActiveSet {
+        transitions: Vec<GroupTransition>,
+    },
+    ObserveActiveSet {
+        groups: Vec<GroupId>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -343,7 +358,7 @@ pub enum GroupFault {
     Device,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GroupOutcome {
     HostConfigured,
     WorkerRegistered,
@@ -353,6 +368,7 @@ pub enum GroupOutcome {
     },
     Probe(Option<ProbeRegistration>),
     ComputeRate(ComputeRate),
+    ActiveSet(Vec<(GroupId, Option<u64>)>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -371,7 +387,9 @@ pub enum GroupError {
     DeviceCapacityExceeded(DeviceId),
     UnknownVersion(GroupVersion),
     NoActiveGroup(GroupId),
-    StaleEpoch { current: u64 },
+    StaleEpoch {
+        current: u64,
+    },
     CandidateExists(GroupVersion),
     InvalidPhase(GroupPhase),
     GrantMismatch,
@@ -379,9 +397,21 @@ pub enum GroupError {
     ManifestMismatch,
     SequenceExhausted,
     ProfileMismatch(DeviceId),
-    ActiveEpochChanged { current: Option<u64> },
-    StaleProbe { host: NodeId, revision: u64 },
-    StaleComputeRate { device: DeviceId, revision: u64 },
+    ActiveEpochChanged {
+        current: Option<u64>,
+    },
+    StaleProbe {
+        host: NodeId,
+        revision: u64,
+    },
+    StaleComputeRate {
+        device: DeviceId,
+        revision: u64,
+    },
+    GroupSetChanged {
+        group: GroupId,
+        current: Option<u64>,
+    },
 }
 
 pub type GroupResult = Result<GroupOutcome, GroupError>;
@@ -535,6 +565,19 @@ impl GroupOperation {
             }
             GroupAction::Observe { group, .. } => {
                 reads.insert(Key::ServingGroup(*group));
+            }
+            GroupAction::SwitchActiveSet { transitions } => {
+                for change in transitions {
+                    let key = Key::ServingGroup(change.group);
+                    if change.expected == change.target {
+                        reads.insert(key);
+                    } else {
+                        keys.insert(key);
+                    }
+                }
+            }
+            GroupAction::ObserveActiveSet { groups } => {
+                reads.extend(groups.iter().copied().map(Key::ServingGroup));
             }
             GroupAction::ObserveProbe(host) => {
                 reads.insert(Key::LinkProbe(*host));

@@ -6,8 +6,8 @@ use std::num::NonZeroU64;
 use plait_core::group::{
     ActivePlacement, ComputeRate, GrantStatus, GroupAction, GroupError, GroupId, GroupManifest,
     GroupMember, GroupOperation, GroupOutcome, GroupPhase, GroupReceipt, GroupRecipe, GroupResult,
-    GroupVersion, GroupView, PeerEndpoint, PlacementHost, PlacementInventory, PlacementWorker,
-    ResourcePlan, WorkerGrant,
+    GroupTransition, GroupVersion, GroupView, PeerEndpoint, PlacementHost, PlacementInventory,
+    PlacementWorker, ResourcePlan, WorkerGrant,
 };
 use plait_core::link::{ProbeEndpoint, ProbeRegistration};
 use plait_core::serving::{ExecutionDrainTarget, ServingError};
@@ -116,6 +116,10 @@ impl PeerGroups {
             .get_mut(&version.group)
             .and_then(|history| history.versions.get_mut(&version.epoch))
             .ok_or(GroupError::UnknownVersion(version))
+    }
+
+    fn active_epoch(&self, group: GroupId) -> Option<u64> {
+        self.history.get(&group)?.active
     }
 }
 
@@ -247,7 +251,7 @@ impl ServingState {
     pub(crate) fn apply_peer_group(&mut self, operation: &GroupOperation) -> GroupResult {
         if let Some(receipt) = self.peer_group_receipt(operation.id) {
             return if &receipt.operation == operation {
-                receipt.result
+                receipt.result.clone()
             } else {
                 Err(GroupError::OperationIdReused)
             };
@@ -257,7 +261,7 @@ impl ServingState {
             operation.id,
             GroupReceipt {
                 operation: operation.clone(),
-                result,
+                result: result.clone(),
             },
         );
         result
@@ -294,13 +298,26 @@ impl ServingState {
             GroupAction::ReportFailure { grant, .. } => self.report_peer_failure(grant),
             GroupAction::Observe { group, epoch } => {
                 let epoch = epoch
-                    .or_else(|| self.peer_groups.history.get(&group)?.active)
+                    .or_else(|| self.peer_groups.active_epoch(group))
                     .ok_or(GroupError::NoActiveGroup(group))?;
                 let version = GroupVersion { group, epoch };
                 self.peer_groups
                     .get(version)
                     .map(Version::outcome)
                     .ok_or(GroupError::UnknownVersion(version))
+            }
+            GroupAction::SwitchActiveSet { ref transitions } => self.switch_active_set(transitions),
+            GroupAction::ObserveActiveSet { ref groups } => {
+                let group_ids: BTreeSet<_> = groups.iter().copied().collect();
+                if group_ids.is_empty() || group_ids.len() != groups.len() {
+                    return Err(GroupError::InvalidPlan);
+                }
+                Ok(GroupOutcome::ActiveSet(
+                    groups
+                        .iter()
+                        .map(|&group| (group, self.peer_groups.active_epoch(group)))
+                        .collect(),
+                ))
             }
             GroupAction::AdvertiseWorker {
                 ref profile,
@@ -748,6 +765,62 @@ impl ServingState {
         Ok(view.outcome())
     }
 
+    fn switch_active_set(&mut self, transitions: &[GroupTransition]) -> GroupResult {
+        let mut groups = BTreeSet::new();
+        if transitions.is_empty() {
+            return Err(GroupError::InvalidPlan);
+        }
+        for &GroupTransition {
+            group,
+            expected,
+            target,
+        } in transitions
+        {
+            if !groups.insert(group) {
+                return Err(GroupError::InvalidPlan);
+            }
+            let current = self.peer_groups.active_epoch(group);
+            if expected != current {
+                return Err(GroupError::GroupSetChanged { group, current });
+            }
+            if let Some(epoch) = target.filter(|next| Some(*next) != expected) {
+                let version = GroupVersion { group, epoch };
+                self.peer_groups
+                    .history
+                    .get(&group)
+                    .ok_or(GroupError::UnknownVersion(version))?
+                    .check_candidate(version)?;
+            }
+        }
+
+        // Each group was checked above and occurs at most once. Applying a
+        // switch leaves its previous grants with the draining epoch.
+        for &GroupTransition {
+            group,
+            expected,
+            target,
+        } in transitions
+        {
+            match (expected, target) {
+                (old, Some(epoch)) if old != Some(epoch) => {
+                    self.activate_peer_group(GroupVersion { group, epoch })
+                        .expect("prechecked target epoch");
+                }
+                (Some(epoch), None) => {
+                    self.quiesce_peer_group(GroupVersion { group, epoch }, GroupPhase::Draining)
+                        .expect("prechecked active epoch");
+                }
+                _ => {}
+            }
+        }
+        Ok(GroupOutcome::ActiveSet(
+            transitions
+                .iter()
+                .map(|change| (change.group, change.target))
+                .collect(),
+        ))
+    }
+
     fn set_peer_standby(&mut self, active: GroupVersion, standby: Option<u64>) -> GroupResult {
         let history = self
             .peer_groups
@@ -994,6 +1067,111 @@ mod tests {
         let standby = GroupVersion { group, epoch: 2 };
         let grant = state.peer_group_view(active).unwrap().grants[0];
         (state, active, standby, grant)
+    }
+
+    #[test]
+    fn active_set_switch_checks_every_target_and_replays_the_same_observation() {
+        let mut state = ServingState::default();
+        let groups = ["aggregate", "prefill", "decode"].map(|name| GroupId(NodeId::derive(name)));
+        let versions = groups.map(|group| GroupVersion { group, epoch: 1 });
+        let [aggregate, prefill, decode] = versions;
+        for version in versions {
+            let host = version.group.0;
+            let device = DeviceId::new(host, 0);
+            state.set_host_memory(host, HostMemory::default()).unwrap();
+            state.register_worker(device, 1, 16).unwrap();
+            state
+                .prepare_peer_group(
+                    version.group,
+                    0,
+                    &ResourcePlan {
+                        hosts: BTreeMap::from([(host, HostMemory::default())]),
+                        workers: BTreeMap::from([(
+                            device,
+                            WorkerDemand {
+                                incarnation: 1,
+                                device_bytes: 16,
+                            },
+                        )]),
+                    },
+                )
+                .unwrap();
+        }
+        let original = ready_single_worker(&mut state, aggregate);
+        state.activate_peer_group(aggregate).unwrap();
+        ready_single_worker(&mut state, prefill);
+        let [a, p, d] = groups;
+        let transition = GroupAction::SwitchActiveSet {
+            transitions: vec![
+                GroupTransition {
+                    group: a,
+                    expected: Some(1),
+                    target: None,
+                },
+                GroupTransition {
+                    group: p,
+                    expected: None,
+                    target: Some(1),
+                },
+                GroupTransition {
+                    group: d,
+                    expected: None,
+                    target: Some(1),
+                },
+            ],
+        };
+        let read = GroupOperation {
+            id: OpId {
+                origin: a.0,
+                counter: 1,
+            },
+            action: GroupAction::ObserveActiveSet {
+                groups: groups.to_vec(),
+            },
+        };
+        let old_set = Ok(GroupOutcome::ActiveSet(vec![
+            (a, Some(1)),
+            (p, None),
+            (d, None),
+        ]));
+        assert_eq!(state.apply_peer_group(&read), old_set);
+        assert_eq!(
+            state.peer_group_transition(&transition),
+            Err(GroupError::InvalidPhase(GroupPhase::Preparing))
+        );
+        assert_eq!(state.peer_group_transition(&read.action), old_set);
+
+        let decode_grant = ready_single_worker(&mut state, decode);
+        let new_set = Ok(GroupOutcome::ActiveSet(vec![
+            (a, None),
+            (p, Some(1)),
+            (d, Some(1)),
+        ]));
+        assert_eq!(state.peer_group_transition(&transition), new_set);
+        assert_eq!(state.peer_group_transition(&read.action), new_set);
+        assert_eq!(state.apply_peer_group(&read), old_set);
+        assert_eq!(
+            state.peer_group_view(aggregate).unwrap().phase,
+            GroupPhase::Draining
+        );
+        assert_eq!(state.peer_grant_status(original), GrantStatus::Held);
+
+        state.report_peer_failure(decode_grant).unwrap();
+        assert_eq!(
+            state.peer_group_transition(&read.action),
+            Ok(GroupOutcome::ActiveSet(vec![
+                (a, None),
+                (p, Some(1)),
+                (d, None)
+            ]))
+        );
+        assert_eq!(
+            state.peer_group_transition(&transition),
+            Err(GroupError::GroupSetChanged {
+                group: a,
+                current: None
+            })
+        );
     }
 
     #[test]

@@ -55,6 +55,7 @@ tlc -deadlock -config specs/PlaitGroupManifest.cfg specs/PlaitGroupManifest.tla
 tlc -deadlock -config specs/PlaitGroupPlacement.cfg specs/PlaitGroupPlacement.tla
 tlc -deadlock -config specs/PlaitGroupReplan.cfg specs/PlaitGroupReplan.tla
 tlc -deadlock -config specs/PlaitGroupRecipe.cfg specs/PlaitGroupRecipe.tla
+tlc -deadlock -config specs/PlaitActiveGroupSet.cfg specs/PlaitActiveGroupSet.tla
 tlc -deadlock -config specs/PlaitNativeServingCutover.cfg specs/PlaitNativeServingCutover.tla
 tlc -deadlock -config specs/PlaitNativeServingRetire.cfg specs/PlaitNativeServingRetire.tla
 tlc -deadlock -config specs/PlaitProbePlacement.cfg specs/PlaitProbePlacement.tla
