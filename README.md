@@ -345,6 +345,7 @@ release the result after the matching completion has executed in the control pla
 | [Native compute rates](specs/PlaitComputeRatePlacement.tla) | A measured reservation checks the selected devices and the scored incumbent. A worker can publish a rate while its exact grant is open. |
 | [Resident group replanning](specs/PlaitGroupReplan.tla) | A planner submits after consecutive matching recommendations. Competing planners can reserve only one successor for the observed epoch. |
 | [Native serving cutover](specs/PlaitNativeServingCutover.tla) | The deployment publishes a ready engine's origin before activation. An admitted stream keeps its version as ingress replicas observe the switch. |
+| [Native serving retirement](specs/PlaitNativeServingRetire.tla) | Planned retirement closes admission, waits for the engine to drain, and releases each host's grants after its process group exits. |
 | [Hosted rollout and failover](specs/PlaitHostLaunch.tla) | Full readiness before activation, ordered standby promotion on incumbent revocation, and exclusion of groups affected by the same host loss. |
 | [Hosted assignment](specs/PlaitHostedAssignment.tla) | An observed assignment requires an ordered claim before launch. The local lock remains held through supervisor loss until the launcher exits. |
 | [KFD device release](specs/PlaitKfdRelease.tla) | A complete report for the captured device checks its queues and VRAM. Activity on another device leaves release enabled. |

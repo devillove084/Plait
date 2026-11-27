@@ -480,10 +480,26 @@ return HTTP 200 from `/health` with the expected group version. It publishes
 the new origin atomically before sending `Activate`. The ingress opens new
 requests on the new version once it observes activation. Existing streams
 finish on their original engine. If activation's reply is lost, the
-publisher retries with the same operation ID. Deployment keeps the old
-engine running until the operator has confirmed drain and can retire its
-grants. Each launcher reports an unexpected child exit against an exact
-grant in the affected version.
+publisher retries with the same operation ID.
+
+#### Drain and release an old vLLM group
+
+The old API host observes `Draining` and closes admission for that version.
+A stale ingress receives a versioned rejection before model dispatch and
+can retry after it observes the active epoch. The old API lets admitted
+responses finish. When that count reaches zero, it pauses vLLM in wait mode
+and waits for vLLM to synchronize the devices.
+
+After the API acknowledges drain, its launcher submits `Revoke` for the old
+version. Each participating host observes the revocation and stops its local
+engine process group. It returns only its own grants, after the entire process
+group has exited. Plait releases each host's reservation after its last grant
+returns. The group becomes `Retired` once all grants have returned.
+
+Each launcher reports an unexpected child exit against an exact grant in the
+affected version. Automatic retirement tracks the process groups started by
+the running launcher. A launcher crash can leave grants held until the
+deployment operator establishes that the old process group has stopped.
 
 #### Cancel a committed communicator
 
