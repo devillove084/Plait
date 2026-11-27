@@ -232,6 +232,54 @@ and submits `Activate` after the successor is ready to receive work. It can
 revoke a candidate that fails to start and release its grants after teardown.
 The incumbent's communicator can continue serving during preparation.
 
+#### Compare layouts of the same width
+
+Set `workload.recipes` in the resident policy or the `plan` request. Each
+candidate supplies a stable recipe ID and a vector of work per delivered
+operation. The positions follow ascending device identity. The length
+must be one of the allowed widths. Use work units that match the advertised
+or calibrated device rates.
+
+```json
+[
+  {
+    "id": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    "work": [500000000, 500000000],
+    "compute": "parallel",
+    "communication": {"kind": "all_to_all", "rounds": 57, "bytes_per_peer": 2048}
+  },
+  {
+    "id": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+    "work": [400000000, 600000000],
+    "compute": "sequential",
+    "communication": {
+      "kind": "directed",
+      "edges": [
+        {"from": 0, "to": 1, "rounds": 1, "bytes": 2048},
+        {"from": 1, "to": 0, "rounds": 1, "bytes": 16}
+      ]
+    }
+  }
+]
+```
+
+Parallel compute charges the slowest device. Sequential compute adds the
+stage times. Each cross-host exchange charges its stated number of rounds
+using measured bandwidth and RTT. All-to-all rounds use the busiest host
+direction. Directed exchanges follow the supplied device positions and add
+their costs. The planner uses these estimates for latency per operation.
+
+With recipes configured, each candidate uses a listed recipe. The running
+group is scored with its committed recipe. Legacy groups use the policy's
+base work and communication settings. Stability checks compare the recipe
+along with the devices and incumbent. The reservation writes the winning
+recipe ID and grants in the same ordered operation. The group can retain
+the same width while the successor uses a different recipe. Preparation
+requires enough spare devices and host memory to hold both versions.
+Read the committed value with a `recipe` request and an exact `version`.
+Keep recipes for running versions in the policy and upgrade all voters and
+launchers before submitting recipe-backed reservations.
+
 #### Run resident link probes
 
 Add `--link-probe "$NODE_IP:0"` to `plait-node run` on each participating host.
@@ -474,6 +522,22 @@ model layers to the devices in grant order. For a 28-layer model,
 Widths without a configured partition continue to use tensor parallelism.
 The descriptor binds the full version to the selected collective axis.
 The engine verifies the layer partition during startup, before activation.
+
+For plans using `workload.recipes`, map their exact IDs to engine layouts in
+the shared deployment file. Use the same mapping on each launch host.
+
+```json
+{
+  "layout_recipes": {
+    "01010101010101010101010101010101": {"width": 2},
+    "02020202020202020202020202020202": {"width": 2, "pipeline_layers": [11, 17]}
+  }
+}
+```
+
+A committed ID selects one of these layouts before the host builds its
+launch descriptor. An absent mapping or a width mismatch prevents startup.
+An older untagged version uses the deployment's width-based settings.
 
 Run one route publisher alongside the ingress, or add `--routes` to the
 launcher on that host. Both processes use the same route file.

@@ -231,6 +231,19 @@ pub struct GroupOperation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateEvidence {
+    pub calibration: NodeId,
+    pub compared_active: bool,
+    pub rates: Vec<ComputeRate>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupRecipe {
+    pub version: GroupVersion,
+    pub recipe: Option<NodeId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GroupAction {
     SetHostMemory {
         host: NodeId,
@@ -313,6 +326,15 @@ pub enum GroupAction {
         expected_revision: u64,
         operations_per_second: NonZeroU64,
     },
+    PrepareRecipe {
+        group: GroupId,
+        expected_epoch: u64,
+        expected_active: Option<u64>,
+        resources: ResourcePlan,
+        recipe: NodeId,
+        probes: Vec<ProbeRegistration>,
+        rates: Option<RateEvidence>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -386,6 +408,7 @@ pub enum GroupLookup {
         device: DeviceId,
         calibration: NodeId,
     },
+    Recipe(GroupVersion),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -401,6 +424,7 @@ pub enum GroupReply {
         rates: Vec<ComputeRate>,
     },
     ComputeRate(Option<ComputeRate>),
+    Recipe(Option<GroupRecipe>),
 }
 
 /// A replica's applied view of an exact communicator grant.
@@ -463,12 +487,16 @@ impl GroupOperation {
             }
             | GroupAction::PrepareWithRates {
                 group, resources, ..
+            }
+            | GroupAction::PrepareRecipe {
+                group, resources, ..
             } => {
                 keys.insert(Key::ServingGroup(*group));
                 keys.extend(resources.hosts.keys().copied().map(Key::HostMemory));
                 keys.extend(resources.workers.keys().copied().map(Key::Device));
                 if let GroupAction::PrepareMeasured { probes, .. }
-                | GroupAction::PrepareWithRates { probes, .. } = &self.action
+                | GroupAction::PrepareWithRates { probes, .. }
+                | GroupAction::PrepareRecipe { probes, .. } = &self.action
                 {
                     reads.extend(
                         probes
@@ -476,8 +504,13 @@ impl GroupOperation {
                             .map(|probe| Key::LinkProbe(probe.endpoint.host)),
                     );
                 }
-                if let GroupAction::PrepareWithRates { rates, .. } = &self.action {
-                    reads.extend(rates.iter().map(|rate| Key::Device(rate.device)));
+                match &self.action {
+                    GroupAction::PrepareWithRates { rates, .. }
+                    | GroupAction::PrepareRecipe {
+                        rates: Some(RateEvidence { rates, .. }),
+                        ..
+                    } => reads.extend(rates.iter().map(|rate| Key::Device(rate.device))),
+                    _ => {}
                 }
             }
             GroupAction::PublishEndpoint(GroupMember { grant, .. })

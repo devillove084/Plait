@@ -142,6 +142,7 @@ struct Proposal {
     latest: Option<(GroupVersion, GroupPhase)>,
     active: Option<GroupVersion>,
     compared_active: bool,
+    recipe: Option<NodeId>,
     resources: ResourcePlan,
 }
 
@@ -173,7 +174,7 @@ impl Replan {
             let reply = control
                 .query_group(Snapshot::lookup(policy.group, policy.calibration))
                 .await?;
-            let snapshot = Snapshot::from_reply(reply, policy.calibration)?;
+            let mut snapshot = Snapshot::from_reply(reply, policy.calibration)?;
             if matches!(
                 snapshot.inventory.latest,
                 Some((_, GroupPhase::Preparing | GroupPhase::Ready))
@@ -181,7 +182,18 @@ impl Replan {
                 self.seen = None;
                 return Ok(None);
             }
-            let (links, probes) = if policy.workload.bytes_per_peer == 0 {
+            if !policy.workload.recipes.is_empty()
+                && let Some(active) = &snapshot.inventory.active
+            {
+                let GroupReply::Recipe(Some(recipe)) = control
+                    .query_group(GroupLookup::Recipe(active.version))
+                    .await?
+                else {
+                    return Err(io::Error::other("active group recipe is not visible yet"));
+                };
+                snapshot.active_recipe = recipe.recipe;
+            }
+            let (links, probes) = if !policy.workload.needs_links() {
                 (Vec::new(), None)
             } else {
                 let GroupReply::LinkProbes(mut probes) =
@@ -195,6 +207,7 @@ impl Replan {
             let Decision::Prepare {
                 resources,
                 incumbent,
+                recipe,
                 ..
             } = snapshot.select(&policy.workload, &links)?
             else {
@@ -209,6 +222,7 @@ impl Replan {
                     .as_ref()
                     .map(|active| active.version),
                 compared_active: incumbent.is_some(),
+                recipe,
                 resources,
             };
             if !self.confirm(&proposed, samples) {
@@ -216,7 +230,12 @@ impl Replan {
             }
             self.submitted = Some(GroupOperation {
                 id: OpId::new(NodeId::random(), 1),
-                action: snapshot.prepare(proposed.resources, proposed.compared_active, probes),
+                action: snapshot.prepare(
+                    proposed.resources,
+                    proposed.compared_active,
+                    probes,
+                    proposed.recipe,
+                ),
             });
         }
         // The previous request could have committed even if its reply was lost.
@@ -246,6 +265,7 @@ mod tests {
             latest: Some((active, GroupPhase::Active)),
             active: Some(active),
             compared_active: true,
+            recipe: None,
             resources: ResourcePlan {
                 workers: BTreeMap::from([(
                     device,
@@ -270,5 +290,7 @@ mod tests {
         proposed.compared_active = false;
         assert!(!replan.confirm(&proposed, 2));
         assert!(replan.confirm(&proposed, 2));
+        proposed.recipe = Some(NodeId::derive("directed"));
+        assert!(!replan.confirm(&proposed, 2));
     }
 }

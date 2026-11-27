@@ -5,7 +5,8 @@ use std::io;
 
 use plait_core::NodeId;
 use plait_core::group::{
-    ComputeRate, GroupAction, GroupId, GroupLookup, GroupReply, PlacementInventory, ResourcePlan,
+    ComputeRate, GroupAction, GroupId, GroupLookup, GroupReply, PlacementInventory, RateEvidence,
+    ResourcePlan,
 };
 use plait_core::link::ProbeRegistration;
 use plait_parallel::group_placement::{self, Decision, DirectedLink, Workload};
@@ -13,6 +14,7 @@ use plait_parallel::group_placement::{self, Decision, DirectedLink, Workload};
 pub(super) struct Snapshot {
     pub(super) inventory: PlacementInventory,
     pub(super) rates: Option<Vec<ComputeRate>>,
+    pub(super) active_recipe: Option<NodeId>,
     calibration: Option<NodeId>,
 }
 
@@ -34,6 +36,7 @@ impl Snapshot {
         Ok(Self {
             inventory,
             rates,
+            active_recipe: None,
             calibration,
         })
     }
@@ -43,12 +46,13 @@ impl Snapshot {
         workload: &Workload,
         links: &[DirectedLink],
     ) -> io::Result<Decision> {
-        group_placement::select_with_rates(
+        group_placement::select_with_recipes(
             &self.inventory,
             workload,
             links,
             crate::hosted_probe::now_ms()?,
             self.rates.as_deref(),
+            self.active_recipe,
         )
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
     }
@@ -68,6 +72,7 @@ impl Snapshot {
         resources: ResourcePlan,
         compared_active: bool,
         probes: Option<Vec<ProbeRegistration>>,
+        recipe: Option<NodeId>,
     ) -> GroupAction {
         let group = self.inventory.group;
         let expected_epoch = self
@@ -90,12 +95,37 @@ impl Snapshot {
             probes.retain(|probe| used.contains(&probe.endpoint.host));
             probes
         });
-        if let (Some(calibration), Some(mut rates)) = (self.calibration, self.rates) {
+        let evidence = if let (Some(calibration), Some(mut rates)) = (self.calibration, self.rates)
+        {
             let mut used: BTreeSet<_> = resources.workers.keys().copied().collect();
             if compared_active && let Some(active) = incumbent {
                 used.extend(active.workers.iter().map(|&(device, _)| device));
             }
             rates.retain(|rate| used.contains(&rate.device));
+            Some(RateEvidence {
+                calibration,
+                compared_active,
+                rates,
+            })
+        } else {
+            None
+        };
+        if let Some(recipe) = recipe {
+            GroupAction::PrepareRecipe {
+                group,
+                expected_epoch,
+                expected_active,
+                resources,
+                recipe,
+                probes: probes.unwrap_or_default(),
+                rates: evidence,
+            }
+        } else if let Some(RateEvidence {
+            calibration,
+            compared_active,
+            rates,
+        }) = evidence
+        {
             GroupAction::PrepareWithRates {
                 group,
                 expected_epoch,

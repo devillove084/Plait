@@ -470,6 +470,9 @@ impl NodeState {
                     GroupLookup::Version(version) => {
                         GroupReply::Version(runtime.peer_group(version))
                     }
+                    GroupLookup::Recipe(version) => {
+                        GroupReply::Recipe(runtime.peer_group_recipe(version))
+                    }
                     GroupLookup::Receipt(id) => {
                         GroupReply::Receipt(runtime.peer_group_receipt(id).cloned())
                     }

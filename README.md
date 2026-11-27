@@ -219,6 +219,11 @@ workload policies and reserves a successor after repeated matching
 recommendations. Deployment starts the successor and decides when to activate it.
 [Automatic group preparation](docs/rankless-nccl.md#prepare-replacements-automatically)
 
+Callers can supply multiple compute and communication recipes for the same
+group width. The planner scores them against device rates and link samples,
+then commits the selected recipe with the version's device grants.
+[Layout selection](docs/rankless-nccl.md#compare-layouts-of-the-same-width)
+
 The vLLM fork can start engines from those grants. Its route publisher
 checks both communicator and engine readiness, prepares the HTTP origin,
 and then activates the new group. Deployment can assign a complete grant
@@ -345,6 +350,7 @@ release the result after the matching completion has executed in the control pla
 | [Native probe sessions](specs/PlaitProbePlacement.tla) | A planned reservation checks both endpoint revisions if a probe restarts after measurement. |
 | [Native compute rates](specs/PlaitComputeRatePlacement.tla) | A measured reservation checks the selected devices and the scored incumbent. A worker can publish a rate while its exact grant is open. |
 | [Resident group replanning](specs/PlaitGroupReplan.tla) | A planner submits after consecutive matching recommendations. Competing planners can reserve only one successor for the observed epoch. |
+| [Committed group recipes](specs/PlaitGroupRecipe.tla) | Reservation binds the recipe and grants together. A launch uses the recipe recorded for its grant epoch. |
 | [Native serving cutover](specs/PlaitNativeServingCutover.tla) | The deployment publishes a ready engine's origin before activation. An admitted stream keeps its version as ingress replicas observe the switch. |
 | [Native serving retirement](specs/PlaitNativeServingRetire.tla) | Planned retirement closes admission, waits for the engine to drain, and releases each host's grants after its process group exits. |
 | [Hosted rollout and failover](specs/PlaitHostLaunch.tla) | Full readiness before activation, ordered standby promotion on incumbent revocation, and exclusion of groups affected by the same host loss. |

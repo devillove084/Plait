@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
 
 use plait_core::group::{
-    GroupAction, GroupId, GroupLookup, GroupOperation, GroupReceipt, GroupReply, GroupVersion,
-    HostMemory, ResourcePlan, WorkerDemand,
+    GroupAction, GroupId, GroupLookup, GroupOperation, GroupReceipt, GroupRecipe, GroupReply,
+    GroupVersion, HostMemory, ResourcePlan, WorkerDemand,
 };
 use plait_core::link::ProbeRegistration;
 use plait_core::{DeviceId, NodeId, OpId};
@@ -45,10 +45,15 @@ enum Request {
     View {
         version: GroupVersion,
     },
+    Recipe {
+        version: GroupVersion,
+    },
     Observe {
         id: OpId,
         group: GroupId,
         epoch: Option<u64>,
+        #[serde(default)]
+        with_recipe: bool,
     },
 }
 
@@ -131,6 +136,10 @@ async fn handle(client: &mut Client, voters: &[NodeId], request: Request) -> io:
             if let Some(id) = prepare
                 && let Some(receipt) = group_receipt(client, voters, id).await?
             {
+                let recipe = match &receipt.operation.action {
+                    GroupAction::PrepareRecipe { recipe, .. } => Some(*recipe),
+                    _ => None,
+                };
                 let (GroupAction::PreparePlanned {
                     group: selected,
                     resources,
@@ -142,6 +151,11 @@ async fn handle(client: &mut Client, voters: &[NodeId], request: Request) -> io:
                     ..
                 }
                 | GroupAction::PrepareWithRates {
+                    group: selected,
+                    resources,
+                    ..
+                }
+                | GroupAction::PrepareRecipe {
                     group: selected,
                     resources,
                     ..
@@ -158,16 +172,28 @@ async fn handle(client: &mut Client, voters: &[NodeId], request: Request) -> io:
                         "operation id already used for another group",
                     ));
                 }
-                return Ok(json!({ "decision": "prepare", "replayed": true,
+                let mut response = json!({ "decision": "prepare", "replayed": true,
                     "workers": resources.workers.iter().collect::<Vec<_>>(),
                     "hosts": resources.hosts.iter().collect::<Vec<_>>(),
                     "result": receipt.result,
-                }));
+                });
+                if let Some(recipe) = recipe {
+                    response["recipe"] = json!(recipe);
+                }
+                return Ok(response);
             }
-            let snapshot = placement_inventory(client, voters, group, calibration).await?;
+            let mut snapshot = placement_inventory(client, voters, group, calibration).await?;
+            if !workload.recipes.is_empty()
+                && let Some(active) = &snapshot.inventory.active
+            {
+                snapshot.active_recipe = group_recipe(client, voters, active.version)
+                    .await?
+                    .ok_or_else(|| io::Error::other("active group recipe is not visible yet"))?
+                    .recipe;
+            }
             let (links, probes) = match links {
                 Some(links) => (links, None),
-                None if workload.bytes_per_peer == 0 => (Vec::new(), None),
+                None if !workload.needs_links() => (Vec::new(), None),
                 None => {
                     let mut probes = link_probes(client, voters).await?;
                     snapshot.restrict_probes(&mut probes);
@@ -191,14 +217,19 @@ async fn handle(client: &mut Client, voters: &[NodeId], request: Request) -> io:
                     resources,
                     cost,
                     incumbent,
+                    recipe,
                 } => {
                     let mut response = json!({
                         "decision": "prepare", "cost": cost, "incumbent": incumbent,
                         "workers": resources.workers.iter().collect::<Vec<_>>(),
                         "hosts": resources.hosts.iter().collect::<Vec<_>>(),
                     });
+                    if let Some(recipe) = recipe {
+                        response["recipe"] = json!(recipe);
+                    }
                     if let Some(id) = prepare {
-                        let action = snapshot.prepare(resources, incumbent.is_some(), probes);
+                        let action =
+                            snapshot.prepare(resources, incumbent.is_some(), probes, recipe);
                         let operation = GroupOperation { id, action };
                         response["result"] = json!(apply(client, voters, &operation).await?);
                     }
@@ -255,11 +286,29 @@ async fn handle(client: &mut Client, voters: &[NodeId], request: Request) -> io:
                 Err(last)
             };
         }
-        Request::Observe { id, group, epoch } => {
+        Request::Recipe { version } => {
+            return Ok(json!({ "recipe": group_recipe(client, voters, version).await? }));
+        }
+        Request::Observe {
+            id,
+            group,
+            epoch,
+            with_recipe,
+        } => {
             let mut last = io::Error::other("no reachable voter");
             for &peer in voters {
                 match client.observe_group(peer, id, group, epoch).await {
-                    Ok(result) => return Ok(json!({ "result": result })),
+                    Ok(result) => {
+                        if with_recipe && let Ok(ref view) = result {
+                            let recipe = group_recipe(client, voters, view.version)
+                                .await?
+                                .ok_or_else(|| {
+                                    io::Error::other("observed group recipe is not visible yet")
+                                })?;
+                            return Ok(json!({ "result": result, "recipe": recipe }));
+                        }
+                        return Ok(json!({ "result": result }));
+                    }
                     Err(error) => last = error,
                 }
             }
@@ -267,6 +316,26 @@ async fn handle(client: &mut Client, voters: &[NodeId], request: Request) -> io:
         }
     };
     Ok(json!({ "result": apply(client, voters, &operation).await? }))
+}
+
+async fn group_recipe(
+    client: &mut Client,
+    voters: &[NodeId],
+    version: GroupVersion,
+) -> io::Result<Option<GroupRecipe>> {
+    let mut missing = false;
+    let mut last = io::Error::other("no reachable voter");
+    for &peer in voters {
+        match client.query_group(peer, GroupLookup::Recipe(version)).await {
+            Ok(GroupReply::Recipe(Some(recipe))) if recipe.version == version => {
+                return Ok(Some(recipe));
+            }
+            Ok(GroupReply::Recipe(None)) => missing = true,
+            Ok(_) => last = io::Error::other("expected group recipe"),
+            Err(error) => last = error,
+        }
+    }
+    if missing { Ok(None) } else { Err(last) }
 }
 
 async fn link_probes(client: &mut Client, voters: &[NodeId]) -> io::Result<Vec<ProbeRegistration>> {

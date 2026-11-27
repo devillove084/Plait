@@ -28,9 +28,55 @@ pub struct Workload {
     pub switch_ns: u64,
     #[serde(default)]
     pub minimum_gain_ns: u64,
+    #[serde(default)]
+    pub recipes: Vec<Recipe>,
+}
+
+/// Caller-defined comparable work for one operation, in stable device order.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Recipe {
+    pub id: NodeId,
+    pub work: Vec<u64>,
+    pub compute: ComputeOrder,
+    pub communication: Communication,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputeOrder {
+    Parallel,
+    Sequential,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Communication {
+    AllToAll { rounds: u64, bytes_per_peer: u64 },
+    Directed { edges: Vec<Exchange> },
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Exchange {
+    pub from: usize,
+    pub to: usize,
+    pub rounds: u64,
+    pub bytes: u64,
 }
 
 impl Workload {
+    pub fn needs_links(&self) -> bool {
+        self.bytes_per_peer > 0
+            || self
+                .recipes
+                .iter()
+                .any(|recipe| match &recipe.communication {
+                    Communication::AllToAll { rounds, .. } => *rounds != 0,
+                    Communication::Directed { edges } => !edges.is_empty(),
+                })
+    }
+
     pub fn validate(&self, calibrated: bool) -> Result<(), &'static str> {
         if self.widths.is_empty()
             || self.widths.contains(&0)
@@ -41,6 +87,25 @@ impl Workload {
             || (self.compute_work == 0 && (self.bytes_per_peer == 0 || calibrated))
         {
             return Err("invalid group placement workload");
+        }
+        let mut recipes = BTreeSet::new();
+        for recipe in &self.recipes {
+            let width = recipe.work.len();
+            if !recipes.insert(recipe.id)
+                || !self.widths.iter().any(|&item| item as usize == width)
+                || recipe.work.iter().all(|&work| work == 0)
+                || matches!(
+                    recipe.communication,
+                    Communication::AllToAll {
+                        rounds: 0,
+                        bytes_per_peer: 1..
+                    }
+                )
+                || matches!(&recipe.communication, Communication::Directed { edges } if edges.iter().any(|edge|
+                    edge.from >= width || edge.to >= width || edge.from == edge.to || edge.rounds == 0))
+            {
+                return Err("invalid group placement recipe");
+            }
         }
         Ok(())
     }
@@ -82,6 +147,7 @@ pub enum Decision {
         resources: ResourcePlan,
         cost: Cost,
         incumbent: Option<Cost>,
+        recipe: Option<NodeId>,
     },
 }
 
@@ -120,6 +186,19 @@ pub fn select_with_rates(
     links: &[DirectedLink],
     now_ms: u64,
     rates: Option<&[ComputeRate]>,
+) -> Result<Decision, &'static str> {
+    select_with_recipes(inventory, workload, links, now_ms, rates, None)
+}
+
+/// The incumbent uses its committed recipe even when another recipe would be
+/// cheaper on the same devices.
+pub fn select_with_recipes(
+    inventory: &PlacementInventory,
+    workload: &Workload,
+    links: &[DirectedLink],
+    now_ms: u64,
+    rates: Option<&[ComputeRate]>,
+    active_recipe: Option<NodeId>,
 ) -> Result<Decision, &'static str> {
     workload.validate(rates.is_some())?;
     let widths: BTreeSet<_> = workload
@@ -169,7 +248,16 @@ pub fn select_with_rates(
         if workers.iter().any(|worker| worker.compute_rate.is_none()) {
             return Ok(Decision::AwaitComputeRates(version));
         }
-        let Some(cost) = model.cost(&workers) else {
+        let recipe = active_recipe
+            .map(|id| {
+                workload
+                    .recipes
+                    .iter()
+                    .find(|profile| profile.id == id && profile.work.len() == workers.len())
+                    .ok_or("active group recipe is missing from the workload policy")
+            })
+            .transpose()?;
+        let Some(cost) = model.cost(&workers, recipe) else {
             return Ok(Decision::AwaitLinks(version));
         };
         Some((version, cost))
@@ -183,71 +271,30 @@ pub fn select_with_rates(
         }
     }
 
-    let max_width = *widths.last().expect("nonempty widths");
-    let mut states = BTreeMap::from([(
-        0,
-        vec![Candidate {
-            workers: Vec::new(),
-            cost: Cost {
-                compute_ns: 0,
-                network_ns: 0,
-            },
-        }],
-    )]);
-    let mut hosts: Vec<_> = inventory
-        .hosts
-        .iter()
-        .filter(|host| host.eligible)
-        .collect();
-    hosts.sort_unstable_by_key(|host| host.host);
-    for host in hosts {
-        let Some(mut workers) = available.remove(&host.host) else {
-            continue;
-        };
-        workers.sort_unstable_by_key(|worker| (std::cmp::Reverse(worker.compute_rate), worker.id));
-        let fit = (1..=workers.len().min(max_width))
-            .take_while(|&count| {
-                model.host_demand(count).is_some_and(|needed| {
-                    needed.bytes <= host.capacity.bytes.saturating_sub(host.reserved.bytes)
-                        && needed.pinned_bytes
-                            <= host
-                                .capacity
-                                .pinned_bytes
-                                .saturating_sub(host.reserved.pinned_bytes)
-                })
+    let best = if workload.recipes.is_empty() {
+        model
+            .search(inventory, &available, &widths, None)
+            .map(|candidate| (candidate, None))
+    } else {
+        workload
+            .recipes
+            .iter()
+            .filter_map(|recipe| {
+                let width = BTreeSet::from([recipe.work.len()]);
+                model
+                    .search(inventory, &available, &width, Some(recipe))
+                    .map(|candidate| (candidate, Some(recipe.id)))
             })
-            .count();
-        let mut next = states.clone();
-        for (&width, candidates) in &states {
-            for candidate in candidates {
-                for count in 1..=fit.min(max_width - width) {
-                    let mut devices = candidate.workers.clone();
-                    devices.extend_from_slice(&workers[..count]);
-                    if let Some(cost) = model.cost(&devices) {
-                        keep_best(
-                            next.entry(width + count).or_default(),
-                            Candidate {
-                                workers: devices,
-                                cost,
-                            },
-                        );
-                    }
-                }
-            }
-        }
-        states = next;
-    }
-    let best = states
-        .into_iter()
-        .filter(|(width, _)| widths.contains(width))
-        .flat_map(|(_, ranks)| ranks.into_iter().take(1))
-        .min_by(compare);
+            .min_by(|(left, left_recipe), (right, right_recipe)| {
+                compare(left, right).then_with(|| left_recipe.cmp(right_recipe))
+            })
+    };
 
     let incumbent_cost = incumbent.map(|(_, cost)| cost);
     if let Some((version, cost)) = incumbent {
         let operations = u128::from(workload.operations);
         let ready_cost = cost.operation_ns().saturating_mul(operations);
-        let use_new = best.as_ref().is_some_and(|candidate| {
+        let use_new = best.as_ref().is_some_and(|(candidate, _)| {
             let total = candidate
                 .cost
                 .operation_ns()
@@ -261,7 +308,7 @@ pub fn select_with_rates(
             return Ok(Decision::Keep { version, cost });
         }
     }
-    let Some(best) = best else {
+    let Some((best, recipe)) = best else {
         return Ok(Decision::NoPlacement);
     };
     let hosts = count_hosts(&best.workers)
@@ -285,10 +332,80 @@ pub fn select_with_rates(
         resources: ResourcePlan { workers, hosts },
         cost: best.cost,
         incumbent: incumbent_cost,
+        recipe,
     })
 }
 
 impl Model<'_> {
+    fn search(
+        &self,
+        inventory: &PlacementInventory,
+        available: &BTreeMap<NodeId, Vec<Worker>>,
+        widths: &BTreeSet<usize>,
+        recipe: Option<&Recipe>,
+    ) -> Option<Candidate> {
+        let max_width = *widths.last().expect("nonempty widths");
+        let mut states = BTreeMap::from([(
+            0,
+            vec![Candidate {
+                workers: Vec::new(),
+                cost: Cost {
+                    compute_ns: 0,
+                    network_ns: 0,
+                },
+            }],
+        )]);
+        let mut hosts: Vec<_> = inventory
+            .hosts
+            .iter()
+            .filter(|host| host.eligible)
+            .collect();
+        hosts.sort_unstable_by_key(|host| host.host);
+        for host in hosts {
+            let Some(mut workers) = available.get(&host.host).cloned() else {
+                continue;
+            };
+            workers
+                .sort_unstable_by_key(|worker| (std::cmp::Reverse(worker.compute_rate), worker.id));
+            let fit = (1..=workers.len().min(max_width))
+                .take_while(|&count| {
+                    self.host_demand(count).is_some_and(|needed| {
+                        needed.bytes <= host.capacity.bytes.saturating_sub(host.reserved.bytes)
+                            && needed.pinned_bytes
+                                <= host
+                                    .capacity
+                                    .pinned_bytes
+                                    .saturating_sub(host.reserved.pinned_bytes)
+                    })
+                })
+                .count();
+            let mut next = states.clone();
+            for (&width, candidates) in &states {
+                for candidate in candidates {
+                    for count in 1..=fit.min(max_width - width) {
+                        let mut devices = candidate.workers.clone();
+                        devices.extend_from_slice(&workers[..count]);
+                        if let Some(cost) = self.cost(&devices, recipe) {
+                            keep_best(
+                                next.entry(width + count).or_default(),
+                                Candidate {
+                                    workers: devices,
+                                    cost,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            states = next;
+        }
+        states
+            .into_iter()
+            .filter(|(width, _)| widths.contains(width))
+            .flat_map(|(_, ranks)| ranks.into_iter().take(1))
+            .min_by(compare)
+    }
+
     fn eligible(&self, worker: &PlacementWorker) -> Option<Worker> {
         let profile = worker.profile.as_ref()?;
         let compute_rate = match &self.rates {
@@ -366,7 +483,10 @@ impl Model<'_> {
         Some((active.version, workers))
     }
 
-    fn cost(&self, workers: &[Worker]) -> Option<Cost> {
+    fn cost(&self, workers: &[Worker], recipe: Option<&Recipe>) -> Option<Cost> {
+        if let Some(recipe) = recipe {
+            return self.recipe_cost(workers, recipe);
+        }
         let compute_ns = if self.workload.compute_work == 0 {
             0
         } else {
@@ -380,36 +500,90 @@ impl Model<'_> {
                 u128::from(floor_rate) * workers.len() as u128,
             )
         };
-        let mut network_ns = 0;
-        if self.workload.bytes_per_peer > 0 {
-            let counts = count_hosts(workers);
-            for (&src, &left) in &counts {
-                let mut incoming = 0u64;
-                let mut outgoing = 0u64;
-                for (&dst, &right) in counts.iter().filter(|&(&host, _)| host != src) {
-                    let traffic = u128::from(self.workload.bytes_per_peer)
-                        .saturating_mul(left as u128)
-                        .saturating_mul(right as u128);
-                    outgoing = outgoing.saturating_add(self.link_time(src, dst, traffic)?);
-                    incoming = incoming.saturating_add(self.link_time(dst, src, traffic)?);
-                }
-                network_ns = network_ns.max(incoming).max(outgoing);
-            }
-        }
+        let network_ns = if self.workload.bytes_per_peer > 0 {
+            self.all_to_all(workers, self.workload.bytes_per_peer, 1)?
+        } else {
+            0
+        };
         Some(Cost {
             compute_ns,
             network_ns,
         })
     }
 
-    fn link_time(&self, source: NodeId, target: NodeId, bytes: u128) -> Option<u64> {
+    fn recipe_cost(&self, workers: &[Worker], recipe: &Recipe) -> Option<Cost> {
+        let mut ordered = workers.to_vec();
+        ordered.sort_unstable_by_key(|worker| worker.id);
+        let mut compute_ns = 0u64;
+        for (worker, &work) in ordered.iter().zip(&recipe.work) {
+            if work == 0 {
+                continue;
+            }
+            let rate = worker.compute_rate.filter(|&rate| rate != 0)?;
+            let time = ns(u128::from(work) * NANOS, u128::from(rate));
+            compute_ns = match recipe.compute {
+                ComputeOrder::Parallel => compute_ns.max(time),
+                ComputeOrder::Sequential => compute_ns.saturating_add(time),
+            };
+        }
+        let network_ns = match &recipe.communication {
+            Communication::AllToAll {
+                rounds,
+                bytes_per_peer,
+            } => self.all_to_all(workers, *bytes_per_peer, *rounds)?,
+            Communication::Directed { edges } => {
+                let mut total = 0u64;
+                for edge in edges {
+                    if let (Some(from), Some(to)) = (ordered.get(edge.from), ordered.get(edge.to))
+                        && from.id.node != to.id.node
+                    {
+                        total = total.saturating_add(self.link_time(
+                            from.id.node,
+                            to.id.node,
+                            u128::from(edge.bytes),
+                            edge.rounds,
+                        )?);
+                    }
+                }
+                total
+            }
+        };
+        Some(Cost {
+            compute_ns,
+            network_ns,
+        })
+    }
+
+    fn all_to_all(&self, workers: &[Worker], bytes_per_peer: u64, rounds: u64) -> Option<u64> {
+        let mut network_ns = 0;
+        if rounds > 0 {
+            let counts = count_hosts(workers);
+            for (&src, &left) in &counts {
+                let mut incoming = 0u64;
+                let mut outgoing = 0u64;
+                for (&dst, &right) in counts.iter().filter(|&(&host, _)| host != src) {
+                    let traffic = u128::from(bytes_per_peer)
+                        .saturating_mul(left as u128)
+                        .saturating_mul(right as u128);
+                    outgoing = outgoing.saturating_add(self.link_time(src, dst, traffic, rounds)?);
+                    incoming = incoming.saturating_add(self.link_time(dst, src, traffic, rounds)?);
+                }
+                network_ns = network_ns.max(incoming).max(outgoing);
+            }
+        }
+        Some(network_ns)
+    }
+
+    fn link_time(&self, source: NodeId, target: NodeId, bytes: u128, rounds: u64) -> Option<u64> {
         let link = self.links.get(&(source, target))?;
         Some(
             ns(
-                bytes.saturating_mul(NANOS),
+                bytes
+                    .saturating_mul(u128::from(rounds))
+                    .saturating_mul(NANOS),
                 u128::from(link.bytes_per_second),
             )
-            .saturating_add(link.rtt_ns),
+            .saturating_add(link.rtt_ns.saturating_mul(rounds)),
         )
     }
 }
@@ -505,6 +679,7 @@ mod tests {
             operations: 5,
             switch_ns: 0,
             minimum_gain_ns: 0,
+            recipes: Vec::new(),
         }
     }
 
@@ -642,6 +817,7 @@ mod tests {
             resources,
             cost,
             incumbent,
+            ..
         } = select(&inventory, &workload, &slow, 55).unwrap()
         else {
             panic!("cheaper placement")
@@ -649,6 +825,79 @@ mod tests {
         assert_eq!(resources.hosts, BTreeMap::from([(c, memory(9, 5))]));
         assert_eq!(cost.network_ns, 0);
         assert!(incumbent.unwrap().network_ns > 0);
+    }
+
+    #[test]
+    fn link_cost_selects_different_recipes_on_the_same_devices() {
+        let [a, b] = [1, 2].map(host);
+        let inventory = PlacementInventory {
+            group: test_group(),
+            latest: None,
+            active: None,
+            hosts: [a, b]
+                .into_iter()
+                .map(|host| PlacementHost {
+                    host,
+                    capacity: memory(32, 16),
+                    reserved: memory(0, 0),
+                    eligible: true,
+                })
+                .collect(),
+            workers: vec![worker(b, 0, 1_000_000_000), worker(a, 0, 2_000_000_000)],
+        };
+        let parallel = NodeId::derive("all-to-all");
+        let sequential = NodeId::derive("directed");
+        let mut workload = workload();
+        workload.recipes = vec![
+            Recipe {
+                id: parallel,
+                work: vec![100_000_000; 2],
+                compute: ComputeOrder::Parallel,
+                communication: Communication::AllToAll {
+                    rounds: 57,
+                    bytes_per_peer: 1024,
+                },
+            },
+            Recipe {
+                id: sequential,
+                work: vec![150_000_000, 50_000_000],
+                compute: ComputeOrder::Sequential,
+                communication: Communication::Directed {
+                    edges: vec![Exchange {
+                        from: 0,
+                        to: 1,
+                        rounds: 1,
+                        bytes: 1024,
+                    }],
+                },
+            },
+        ];
+        let mut links = links_between(a, b, 1_000_000_000, 51);
+        let Decision::Prepare {
+            resources,
+            recipe: Some(id),
+            ..
+        } = select(&inventory, &workload, &links, 55).unwrap()
+        else {
+            panic!("the measured link fits both recipes");
+        };
+        assert_eq!(id, parallel);
+        for link in &mut links {
+            link.rtt_ns = 41_000_000;
+        }
+        let Decision::Prepare {
+            resources: selected,
+            recipe: Some(id),
+            cost,
+            ..
+        } = select(&inventory, &workload, &links, 55).unwrap()
+        else {
+            panic!("the directed recipe fits the slower link");
+        };
+        assert_eq!(id, sequential);
+        assert_eq!(selected, resources);
+        assert_eq!(cost.compute_ns, 125_000_000);
+        assert_eq!(cost.network_ns, 41_001_024);
     }
 
     #[test]
@@ -714,6 +963,7 @@ mod tests {
             resources,
             incumbent,
             cost,
+            ..
         } = select_with_rates(&inventory, &workload, &[], 0, Some(&rates)).unwrap()
         else {
             panic!("expected a faster candidate");

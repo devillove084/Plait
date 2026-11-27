@@ -133,6 +133,13 @@ impl Runtime {
         self.serving.peer_group_view(version)
     }
 
+    pub fn peer_group_recipe(
+        &self,
+        version: GroupVersion,
+    ) -> Option<plait_core::group::GroupRecipe> {
+        self.serving.peer_group_recipe(version)
+    }
+
     pub fn peer_grant_status(&self, grant: WorkerGrant) -> GrantStatus {
         self.serving.peer_grant_status(grant)
     }

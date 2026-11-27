@@ -5,9 +5,9 @@ use std::num::NonZeroU64;
 
 use plait_core::group::{
     ActivePlacement, ComputeRate, GrantStatus, GroupAction, GroupError, GroupId, GroupManifest,
-    GroupMember, GroupOperation, GroupOutcome, GroupPhase, GroupReceipt, GroupResult, GroupVersion,
-    GroupView, PeerEndpoint, PlacementHost, PlacementInventory, PlacementWorker, ResourcePlan,
-    WorkerGrant,
+    GroupMember, GroupOperation, GroupOutcome, GroupPhase, GroupReceipt, GroupRecipe, GroupResult,
+    GroupVersion, GroupView, PeerEndpoint, PlacementHost, PlacementInventory, PlacementWorker,
+    ResourcePlan, WorkerGrant,
 };
 use plait_core::link::{ProbeEndpoint, ProbeRegistration};
 use plait_core::serving::{ExecutionDrainTarget, ServingError};
@@ -47,6 +47,7 @@ impl History {
 #[derive(Clone)]
 struct Version {
     version: GroupVersion,
+    recipe: Option<NodeId>,
     phase: GroupPhase,
     resources: ResourcePlan,
     grants: BTreeMap<DeviceId, WorkerGrant>,
@@ -215,6 +216,13 @@ impl ServingState {
 
     pub(crate) fn peer_group_view(&self, version: GroupVersion) -> Option<GroupView> {
         self.peer_groups.get(version).map(Version::view)
+    }
+
+    pub(crate) fn peer_group_recipe(&self, version: GroupVersion) -> Option<GroupRecipe> {
+        self.peer_groups.get(version).map(|record| GroupRecipe {
+            version,
+            recipe: record.recipe,
+        })
     }
 
     pub(crate) fn peer_grant_status(&self, grant: WorkerGrant) -> GrantStatus {
@@ -405,6 +413,47 @@ impl ServingState {
                 self.check_compute_rates(calibration, resources, incumbent, rates)?;
                 self.prepare_planned_peer_group(group, expected_epoch, expected_active, resources)
             }
+            GroupAction::PrepareRecipe {
+                group,
+                expected_epoch,
+                expected_active,
+                ref resources,
+                recipe,
+                ref probes,
+                ref rates,
+            } => {
+                self.check_link_probes(probes)?;
+                if let Some(evidence) = rates {
+                    let incumbent = if evidence.compared_active {
+                        Some(GroupVersion {
+                            group,
+                            epoch: expected_active.ok_or(GroupError::InvalidPlan)?,
+                        })
+                    } else {
+                        None
+                    };
+                    self.check_compute_rates(
+                        evidence.calibration,
+                        resources,
+                        incumbent,
+                        &evidence.rates,
+                    )?;
+                }
+                let result = self.prepare_planned_peer_group(
+                    group,
+                    expected_epoch,
+                    expected_active,
+                    resources,
+                )?;
+                let GroupOutcome::Version { version, .. } = result else {
+                    unreachable!("preparation returns its new group version");
+                };
+                self.peer_groups
+                    .get_mut(version)
+                    .expect("new group version")
+                    .recipe = Some(recipe);
+                Ok(result)
+            }
         }
     }
 
@@ -592,6 +641,7 @@ impl ServingState {
         self.install_grants(&grants);
         let record = Version {
             version,
+            recipe: None,
             phase: GroupPhase::Preparing,
             resources: resources.clone(),
             grants,
