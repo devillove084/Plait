@@ -186,6 +186,11 @@ The Qwen3 V2 runner can overlap one prompt-logprob chunk's peer AllGather
 with the next chunk's vocabulary projection. This path is opt-in and keeps
 one chunk of lookahead. [Setup and validation](docs/rankless-nccl.md#overlap-vllm-prompt-scoring-with-peer-allgather)
 
+The vLLM fork also supports sharded prompt scoring. It exchanges candidate
+scores and normalizers, sums token ranks, and gathers full vocabulary logits
+for rows that need the dense scorer.
+[vLLM configuration](https://github.com/devillove084/vllm/blob/plait/v0.31-runtime/docs/serving/parallelism_scaling.md#plait-tensor-and-pipeline-parallelism)
+
 A native TP4 group served dense AWQ with CUDA and CANN at W4A4 and ROCm
 and PPU at W4A8. Three physical control peers agreed on the four device
 grants. Six streamed completions returned the same eight token IDs.
@@ -380,6 +385,7 @@ release the result after the matching completion has executed in the control pla
 | [Peer failover](specs/PlaitPeerFailover.tla) | Exact-grant failure reports, readiness and host-loss eligibility for standby activation, one active version, and grant retention until release. |
 | [Shared-host fault isolation](specs/PlaitSharedHostFault.tla) | A device fault revokes its group version. A separate group on the same host keeps its communicator and grants. The model also checks standby activation, asynchronous cancellation, and per-device release after stop. TLC checked 36,895 states. |
 | [Peer collective requests](specs/PlaitPeerRequests.tla) | Blocking and ticketed operations share the wire order. A dropped ticket keeps its sequence, and a cancelled communicator denies delivery of a buffered result. TLC checked 695,556 states. |
+| [Sharded prompt scoring](https://github.com/devillove084/vllm/blob/plait/v0.31-runtime/tools/plait/serving/specs/PlaitShardedPromptScores.tla) | Exact-integer candidate coverage and rank sums across 2,187 score vectors. TLC checked 1,024 states for agreement on fallback rows and collective order. |
 | [Replicated group manifest](specs/PlaitGroupManifest.tla) | Activation follows complete endpoint and handshake evidence. Retrying an old release preserves any successor grant. |
 | [Native group placement](specs/PlaitGroupPlacement.tla) | A planned reservation checks the version, incumbent, and resource availability against concurrent changes. |
 | [Native probe sessions](specs/PlaitProbePlacement.tla) | A planned reservation checks both endpoint revisions if a probe restarts after measurement. |
