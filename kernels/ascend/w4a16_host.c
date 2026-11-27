@@ -15,10 +15,10 @@ extern uint32_t aclrtlaunch_plait_ascend_w4a16(
 #if defined(PLAIT_ASCEND_INTEGER_CUBE)
 extern uint32_t aclrtlaunch_plait_ascend_quantize_scales(
     uint32_t blocks, aclrtStream stream, void *input, void *scales,
-    uint32_t rows, uint32_t k, uint32_t group_size, uint32_t bits);
+    uint32_t rows, uint32_t k, uint32_t group_size, uint32_t bits, uint32_t report_invalid);
 extern uint32_t aclrtlaunch_plait_ascend_quantize_pack(
     uint32_t blocks, aclrtStream stream, void *input, void *scales, void *codes, void *invalid,
-    uint32_t rows, uint32_t k, uint32_t group_size, uint32_t bits);
+    uint32_t rows, uint32_t k, uint32_t group_size, uint32_t bits, uint32_t report_invalid);
 extern uint32_t aclrtlaunch_plait_ascend_pack_w4(
     uint32_t blocks, aclrtStream stream, void *activation, void *weight, void *zero,
     void *packed_a, void *packed_b, uint32_t m, uint32_t n, uint32_t k, uint32_t group_size,
@@ -433,6 +433,62 @@ const plait_w4a16_humming_api_v2_table *plait_w4a16_humming_api_v2(void) {
 }
 #endif
 
+static aclError enqueue_quantization(
+    aclrtStream stream, uint32_t vector_cores, uint32_t rows, uint32_t columns, uint32_t group_size,
+    uint32_t bits, const void *input, void *codes, void *scales, void *invalid) {
+    const uint64_t scale_bytes = (uint64_t)rows * plait_ceil_div(columns, group_size) * sizeof(float);
+    const uint32_t stride = bits == 4 ? plait_ceil_div(columns, 2) : columns;
+    const uint64_t code_bytes = (uint64_t)rows * stride;
+    aclError status = aclrtlaunch_plait_ascend_quantize_scales(
+        block_count(vector_cores, 2 + (scale_bytes - 1) / PLAIT_ASCEND_DCACHE_LINE_BYTES),
+        stream, (void *)input, scales, rows, columns, group_size, bits, invalid != NULL);
+    if (status == ACL_SUCCESS) {
+        status = aclrtlaunch_plait_ascend_quantize_pack(
+            block_count(vector_cores, 2 + (code_bytes - 1) / PLAIT_ASCEND_DCACHE_LINE_BYTES),
+            stream, (void *)input, scales, codes, invalid ? invalid : scales,
+            rows, columns, group_size, bits, invalid != NULL);
+    }
+    return status;
+}
+
+static size_t cube_workspace(cube_plan plan) {
+    return plan.a_bytes + plan.b_bytes + plan.bytes + PLAIT_ASCEND_WORKSPACE_ALIGNMENT - 1;
+}
+
+static aclError enqueue_integer_projection(
+    aclrtStream stream, uint32_t vector_cores, uint32_t cube_cores, const plait_w4a16_shape *s,
+    uint32_t bits, const void *a, const void *as, const void *w, const void *ws, const void *zero,
+    const void *bias, void *out, void *workspace, const cube_plan *plan) {
+    aclError status = ACL_SUCCESS;
+    void *scratch = out;
+    if (plan) {
+        uint8_t *packed_a = (uint8_t *)align_workspace((uintptr_t)workspace);
+        uint8_t *packed_b = packed_a + plan->a_bytes;
+        scratch = packed_b + plan->b_bytes;
+        const uint32_t blocks = block_count(vector_cores,
+            1 + (plan->a_bytes + plan->b_bytes) / PLAIT_ASCEND_WORKSPACE_ALIGNMENT);
+        status = aclrtlaunch_plait_ascend_pack_w4(
+            blocks, stream, (void *)a, (void *)w, (void *)zero, packed_a, packed_b,
+            s->m, s->n, s->k, s->group_size, plan->m, plan->n, plan->k, bits);
+        if (status == ACL_SUCCESS) {
+            const uint64_t tiles = (uint64_t)plan->groups * (plan->m / PLAIT_ASCEND_TILE_M) *
+                                   (plan->n / PLAIT_ASCEND_TILE_N);
+            status = aclrtlaunch_plait_ascend_w4_cube(
+                block_count(cube_cores, tiles), stream,
+                packed_a, packed_b, scratch, plan->m, plan->n, plan->k, plan->groups);
+        }
+    }
+    if (status == ACL_SUCCESS) {
+        const uint64_t output_bytes = (uint64_t)s->m * s->n * (s->output_bits / 8);
+        status = aclrtlaunch_plait_ascend_finish_w4(
+            block_count(vector_cores, 2 + (output_bytes - 1) / PLAIT_ASCEND_WORKSPACE_ALIGNMENT), stream,
+            (void *)a, (void *)as, (void *)w, (void *)ws, (void *)zero,
+            (void *)(bias ? bias : ws), scratch, out,
+            s->m, s->n, s->k, s->group_size, bits, s->output_bits, bias != NULL, plan != NULL);
+    }
+    return status;
+}
+
 int plait_w4_quantize_f16_v1(
     void *handle, uint32_t rows, uint32_t columns, uint32_t group_size, uint32_t bits,
     const void *input, void *codes, void *scales, void *invalid, void **result) {
@@ -443,18 +499,8 @@ int plait_w4_quantize_f16_v1(
     ascend_completion *completion = NULL;
     aclError status = completion_new(session, &completion);
     if (status != ACL_SUCCESS) return status;
-
-    const uint64_t scale_bytes = (uint64_t)rows * plait_ceil_div(columns, group_size) * sizeof(float);
-    const uint32_t stride = bits == 4 ? plait_ceil_div(columns, 2) : columns;
-    const uint64_t code_bytes = (uint64_t)rows * stride;
-    status = aclrtlaunch_plait_ascend_quantize_scales(
-        block_count(session->vector_cores, 2 + (scale_bytes - 1) / PLAIT_ASCEND_DCACHE_LINE_BYTES),
-        session->stream, (void *)input, scales, rows, columns, group_size, bits);
-    if (status == ACL_SUCCESS) {
-        status = aclrtlaunch_plait_ascend_quantize_pack(
-            block_count(session->vector_cores, 2 + (code_bytes - 1) / PLAIT_ASCEND_DCACHE_LINE_BYTES),
-            session->stream, (void *)input, scales, codes, invalid, rows, columns, group_size, bits);
-    }
+    status = enqueue_quantization(session->stream, session->vector_cores, rows, columns, group_size,
+                                  bits, input, codes, scales, invalid);
     return complete_submission(session, completion, status, result);
 }
 
@@ -467,42 +513,66 @@ int plait_w4_quantized_launch_v1(
     ascend_completion *completion = NULL;
     aclError status = completion_new(session, &completion);
     if (status != ACL_SUCCESS) return status;
-
-    void *scratch = out;
     cube_plan plan;
     const bool use_cube = make_cube_plan(s, &plan);
     if (use_cube) {
-        status = aclrtMalloc(&completion->workspace, plan.a_bytes + plan.b_bytes + plan.bytes +
-                             (PLAIT_ASCEND_WORKSPACE_ALIGNMENT - 1),
-                             ACL_MEM_MALLOC_NORMAL_ONLY);
-        if (status == ACL_SUCCESS) {
-            uint8_t *packed_a = (uint8_t *)align_workspace((uintptr_t)completion->workspace);
-            uint8_t *packed_b = packed_a + plan.a_bytes;
-            scratch = packed_b + plan.b_bytes;
-            const uint32_t blocks = block_count(session->vector_cores,
-                1 + (plan.a_bytes + plan.b_bytes) / PLAIT_ASCEND_WORKSPACE_ALIGNMENT);
-            status = aclrtlaunch_plait_ascend_pack_w4(
-                blocks, session->stream, (void *)a, (void *)w, (void *)zero, packed_a, packed_b,
-                s->m, s->n, s->k, s->group_size, plan.m, plan.n, plan.k, bits);
-            if (status == ACL_SUCCESS) {
-                const uint64_t tiles = (uint64_t)plan.groups * (plan.m / PLAIT_ASCEND_TILE_M) *
-                                       (plan.n / PLAIT_ASCEND_TILE_N);
-                status = aclrtlaunch_plait_ascend_w4_cube(
-                    block_count(session->cube_cores, tiles), session->stream,
-                    packed_a, packed_b, scratch, plan.m, plan.n, plan.k, plan.groups);
-            }
-        }
+        status = aclrtMalloc(&completion->workspace, cube_workspace(plan), ACL_MEM_MALLOC_NORMAL_ONLY);
     }
     if (status == ACL_SUCCESS) {
-        const uint64_t output_bytes = (uint64_t)s->m * s->n * (s->output_bits / 8);
-        status = aclrtlaunch_plait_ascend_finish_w4(
-            block_count(session->vector_cores, 2 + (output_bytes - 1) / PLAIT_ASCEND_WORKSPACE_ALIGNMENT),
-            session->stream,
-            (void *)a, (void *)as, (void *)w, (void *)ws, (void *)zero,
-            (void *)(bias ? bias : ws), scratch, out,
-            s->m, s->n, s->k, s->group_size, bits, s->output_bits, bias != NULL, use_cube);
+        status = enqueue_integer_projection(session->stream, session->vector_cores, session->cube_cores,
+            s, bits, a, as, w, ws, zero, bias, out, completion->workspace, use_cube ? &plan : NULL);
     }
     return complete_submission(session, completion, status, result);
+}
+
+static size_t activation_scale_offset(const plait_w4a16_shape *s, uint32_t bits) {
+    const size_t bytes = (size_t)s->m * (bits == 4 ? plait_ceil_div(s->k, 2) : s->k);
+    return (bytes + sizeof(float) - 1) & ~(sizeof(float) - 1);
+}
+
+static size_t stream_workspace(const plait_w4a16_shape *s, uint32_t bits, size_t *cube_offset,
+                               cube_plan *plan, bool *use_cube) {
+    if (!plait_w4_quantized_valid_shape(s, bits) || (uint64_t)s->m * s->k > UINT32_MAX) return SIZE_MAX;
+    const size_t scale_offset = activation_scale_offset(s, bits);
+    const uint64_t scale_bytes = (uint64_t)s->m * plait_ceil_div(s->k, s->group_size) * sizeof(float);
+    if (scale_bytes > SIZE_MAX - scale_offset) return SIZE_MAX;
+    *cube_offset = scale_offset + (size_t)scale_bytes;
+    *use_cube = make_cube_plan(s, plan);
+    const size_t cube_bytes = *use_cube ? cube_workspace(*plan) : 0;
+    return cube_bytes > SIZE_MAX - *cube_offset ? SIZE_MAX : *cube_offset + cube_bytes;
+}
+
+size_t plait_w4_stream_workspace_v1(const plait_w4a16_shape *s, uint32_t bits) {
+    size_t cube_offset;
+    cube_plan plan;
+    bool use_cube;
+    return stream_workspace(s, bits, &cube_offset, &plan, &use_cube);
+}
+
+int plait_w4_stream_launch_v1(
+    const plait_w4a16_shape *s, uint32_t bits, const uint16_t *input,
+    const uint8_t *w, const uint16_t *ws, const uint8_t *zero, const uint16_t *bias,
+    void *out, void *workspace, size_t workspace_bytes, void *stream) {
+    size_t cube_offset;
+    cube_plan plan;
+    bool use_cube;
+    const size_t required = stream_workspace(s, bits, &cube_offset, &plan, &use_cube);
+    if (required == SIZE_MAX || required > workspace_bytes || !workspace ||
+        (uintptr_t)workspace % sizeof(float) || !input || !w || !ws || !zero || !out) {
+        return ACL_ERROR_INVALID_PARAM;
+    }
+    int32_t ordinal;
+    aclError status = aclrtGetDevice(&ordinal);
+    if (status != ACL_SUCCESS) return status;
+    const uint32_t vector_cores = device_cores(ordinal, ACL_DEV_ATTR_VECTOR_CORE_NUM);
+    const uint32_t cube_cores = use_cube ? device_cores(ordinal, ACL_DEV_ATTR_CUBE_CORE_NUM) : 0;
+    uint8_t *codes = workspace;
+    float *scales = (float *)(codes + activation_scale_offset(s, bits));
+    status = enqueue_quantization(stream, vector_cores, s->m, s->k, s->group_size,
+                                  bits, input, codes, scales, NULL);
+    if (status != ACL_SUCCESS) return status;
+    return enqueue_integer_projection(stream, vector_cores, cube_cores, s, bits, codes, scales,
+                                      w, ws, zero, bias, out, codes + cube_offset, use_cube ? &plan : NULL);
 }
 #endif
 

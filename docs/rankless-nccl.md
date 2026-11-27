@@ -719,26 +719,42 @@ library built for its device architecture and runtime. Set
 `--quantization awq --dtype half --enforce-eager`. In a managed deployment,
 both variables can go in that host's engine `env`.
 
-Use the CUDA (`PLAIT_W4_CUDA_INTEGER_MMA`), HIP (`PLAIT_W4_HIP_INTEGER_DOT`),
-or PPU (`PLAIT_W4_PPU_INTEGER_MMA`) build of `kernels/w4a16_cuda.cu`, and
-check that it exports `plait_w4_stream_workspace_v1` and
-`plait_w4_stream_launch_v1`. Build against the device runtime used by that
-worker's PyTorch installation. Check the worker startup logs for
+Build `kernels/w4a16_cuda.cu` with `PLAIT_W4_CUDA_INTEGER_MMA`,
+`PLAIT_W4_HIP_INTEGER_DOT`, or `PLAIT_W4_PPU_INTEGER_MMA` for the matching
+CUDA, HIP, or PPU runtime. For Ascend 950-series targets, load the CANN SDK
+environment and build `kernels/ascend` with CMake, setting `SOC_VERSION` to
+the installed architecture. Use the resulting `libplait-w4a16-ascend.so`
+with the Ascend vLLM platform plugin and `torch_npu`.
+
+Check that the library exports `plait_w4_stream_workspace_v1` and
+`plait_w4_stream_launch_v1`. Match the device runtime used by the worker's
+PyTorch installation. Check the worker startup logs for
 `Plait dense AWQ uses W4A4` or `Plait dense AWQ uses W4A8`.
 
 The loader repacks each local AWQ weight shard once. The forward pass
 quantizes FP16 input and queues integer GEMM on the current PyTorch stream.
-The two kernels share device scratch supplied by PyTorch. Each worker
+The kernels share device scratch supplied by PyTorch. On CANN, the Cube
+path uses INT8 matrix inputs for both activation widths. The A4 path packs
+INT4 codes after quantization and unpacks them when preparing the Cube
+inputs. Shapes outside the Cube workspace or group-length limits use the
+scalar integer projection on the vector cores. Each worker
 produces FP16 output in the engine's original tensor layout, so all workers
 in a TP group use the same collective tensor shape and dtype.
 
-Device checks on CUDA, ROCm, and PPU covered both precisions, a non-default
-stream, odd group tails, and a short workspace. Single-device vLLM runs
-completed Qwen3-0.6B generation on ROCm with W4A8 and on PPU with W4A4.
-A managed TP2 run used W4A4 on CUDA and W4A8 on ROCm. The two device grants
-were active, and two greedy HTTP completions returned the same eight token
-IDs. The experiments used vendor-specific vLLM wheels with the fork's updated
-Python modules and weights converted to the AWQ format for functional testing.
+Device checks on CUDA, ROCm, CANN, and PPU covered both precisions, a
+non-default stream, odd group tails, and a short workspace. Single-device
+vLLM runs completed Qwen3-0.6B generation on ROCm with W4A8, on PPU with
+W4A4, and on CANN with each activation width in a separate run.
+Two managed TP2 runs paired ROCm W4A8 with either CUDA W4A4 or CANN W4A4.
+Both device grants were active in each run, and repeated greedy HTTP
+completions returned matching sets of eight token IDs. The experiments used
+vendor-specific vLLM wheels with the fork's updated Python modules and weights
+converted to the AWQ format for functional testing.
+
+On a host with a small `/dev/shm`, set `VLLM_MQ_MAX_CHUNK_BYTES_MB` in the
+engine's environment to size the executor's shared-memory response slots.
+The CANN-led TP2 run used 1 MiB slots and capped the host-side compiler
+pool with `TORCHNPU_PRECOMPILE_THREADS=2`.
 
 ### Assign different numbers of workers per host
 

@@ -155,7 +155,14 @@ extern "C" __global__ __aicore__ void plait_ascend_finish_w4(
             const auto ar = a + row * a_stride;
             const auto wr = w + col * w_stride;
             float sum = 0;
+            bool invalid = false;
             for (uint32_t group = 0; group < groups; ++group) {
+                const float a_scale = as[row * groups + group];
+                const uint32_t scale_bits = __builtin_bit_cast(uint32_t, a_scale);
+                if ((scale_bits & 0x7fffffffu) > 0x7f800000u) {
+                    invalid = true;
+                    break;
+                }
                 const uint64_t parameter = col * groups + group;
                 int32_t dot;
                 if (use_cube) {
@@ -166,12 +173,17 @@ extern "C" __global__ __aicore__ void plait_ascend_finish_w4(
                     dot = bits == 4 ? scalar_dot<4>(ar, wr, begin, count, z[parameter])
                                     : scalar_dot<8>(ar, wr, begin, count, z[parameter]);
                 }
-                const float scale = as[row * groups + group] * float(ws[parameter]);
+                const float scale = a_scale * float(ws[parameter]);
                 sum += float(dot) * scale;
             }
             if (has_bias) sum += float(b[col]);
-            if (output_bits == 32) reinterpret_cast<__gm__ float *>(output)[index] = sum;
-            else reinterpret_cast<__gm__ half *>(output)[index] = half(sum);
+            if (output_bits == 32) {
+                reinterpret_cast<__gm__ float *>(output)[index] =
+                    invalid ? __builtin_bit_cast(float, 0x7fc00000u) : sum;
+            } else {
+                reinterpret_cast<__gm__ uint16_t *>(output)[index] =
+                    invalid ? 0x7e00u : __builtin_bit_cast(uint16_t, half(sum));
+            }
         }
     }
     flush(output);

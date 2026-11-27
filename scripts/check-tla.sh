@@ -43,6 +43,7 @@ tlc -deadlock -config specs/PlaitKernelPrimitivesCheck.cfg specs/PlaitKernelPrim
 tlc -deadlock -config specs/PlaitW4A4Check.cfg specs/PlaitW4A4Check.tla
 tlc -deadlock -config specs/PlaitW4OperatorsCheck.cfg specs/PlaitW4OperatorsCheck.tla
 tlc -deadlock -config specs/PlaitW4CallerStream.cfg specs/PlaitW4CallerStream.tla
+tlc -deadlock -config specs/PlaitW4CallerStreamCANN.cfg specs/PlaitW4CallerStreamCANN.tla
 tlc -deadlock -config specs/PlaitOrderedPublication.cfg specs/PlaitOrderedPublication.tla
 tlc -deadlock -config specs/PlaitPeerCollective.cfg specs/PlaitPeerCollective.tla
 tlc -deadlock -config specs/PlaitPeerCollectiveOdd.cfg specs/PlaitPeerCollective.tla

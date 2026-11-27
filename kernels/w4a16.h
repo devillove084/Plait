@@ -84,7 +84,7 @@ int plait_w4_quantize_f16_v1(
     uint32_t activation_bits, const void *input, void *codes, void *scales,
     void *invalid, void **completion);
 
-/* Optional FP16 input projection on a caller-owned CUDA, HIP, or PPU stream.
+/* Optional FP16 input projection on a caller-owned CUDA, HIP, CANN, or PPU stream.
  * Weight, scale, zero, bias, and output follow plait_w4a16_launch. The library
  * quantizes A to signed INT4 or INT8 before the corresponding integer GEMM.
  * The workspace query returns SIZE_MAX for an unsupported shape or bit width.
