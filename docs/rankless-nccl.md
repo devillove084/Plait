@@ -1618,11 +1618,17 @@ engine that accepted it.
 #### Automate the handoff from the native mode policy
 
 Prewarm the temporary aggregate group on independent devices and include
-it in the native directory's `discover.aggregated` list. Add its exact
-version and capacity to `modes` as a single-group mode. Set `bridge` on
-the target's `provision` entry to that version, for example
+it in the native directory's `discover.aggregated` list. Set `bridge` on
+the target's `provision` entry to the temporary group's exact version, for example
 `"bridge": "00000000000000000000000000000004@1"`. Each bridge version
 identifies one target provision.
+
+Supply the bridge's capacity as a single-group entry in `modes` or enable
+`calibration` and omit that entry. With calibration, the controller
+measures the exact ready bridge through a private ingress after the release
+preview succeeds. The benchmark uses the configured workload, offered
+rates, and latency thresholds. The incumbent keeps serving and the public
+arrival counters track the public requests.
 
 The policy first tries to prepare the target using free resources. If
 the stable target has no placement, it previews placement after the
@@ -1635,9 +1641,10 @@ as the old grants return. It can resume from the same active-set
 observation after restarting. The target takes over once all its routes
 are ready and an exact-version capacity profile covers the rate the
 bridge can serve at the observed demand. Configure that profile in
-`modes` or enable candidate calibration. If availability changes or the
-profile expires during preparation, the current bridge can continue
-serving while the controller waits.
+`modes` or let calibration measure the ready target through the private
+ingress. With `--mode-state`, the controller retains both measurements
+with their route bindings, manifests, and expiry. The current bridge can
+continue serving if availability changes or a needed profile expires.
 
 #### Select a ready native layout from live demand
 
