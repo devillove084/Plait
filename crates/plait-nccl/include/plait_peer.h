@@ -86,10 +86,11 @@ typedef struct {
     size_t count;       /* NCCL count: input count for gather, output count for scatter */
 } PlaitPeerCollective;
 
-/* Reserve host staging for the input and expected output, then stage input
-   from the producer stream and enqueue network work. Successful submission
-   owns the staged bytes and returns a request. BUSY leaves the sequence
-   unallocated. Retry or issue the same collective through its blocking entry
+/* Reserve a pending queue slot and host staging for the input and output,
+   then stage input from the producer stream and enqueue network work.
+   Successful submission owns the staged bytes and returns a request.
+   Capacity rejection returns BUSY without touching the device or reserving
+   a sequence. Retry or issue the same collective through its blocking entry
    point before issuing later calls. Peers submit matching operations in order. */
 int32_t plaitPeerCollectiveSubmit(const struct ncclComm *comm,
                                  const PlaitPeerCollective *operation, const void *send,

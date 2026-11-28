@@ -12,6 +12,7 @@ use crate::{
     ncclAllGather, ncclAllReduce, ncclBroadcast, ncclRecv, ncclReduce, ncclReduceScatter, ncclSend,
 };
 use std::ffi::c_void;
+use std::sync::atomic::AtomicUsize;
 
 use plait_core::{NodeId, group::GroupId};
 
@@ -950,7 +951,9 @@ fn asynchronous_staging_budget_covers_buffered_and_abandoned_results() {
     let Transport::Peers(group) = &left.transport else {
         unreachable!()
     };
-    assert_eq!(try_submit_i32(2, 1, &[1], left), Err(PLAIT_PEER_BUSY));
+    for _ in 0..=requests::QUEUE_DEPTH {
+        assert_eq!(try_submit_i32(2, 1, &[1], left), Err(PLAIT_PEER_BUSY));
+    }
     assert_eq!(group.order.lock().unwrap().submitted, 0);
 
     let mut buffered = submit_i32(1, 1, &[1], left);
@@ -1098,15 +1101,35 @@ fn asynchronous_collectives_stage_inputs_and_share_blocking_order() {
 
 #[test]
 fn cancellation_drains_pending_requests_without_writing_output() {
+    struct TracedDevice(Arc<AtomicUsize>);
+
+    impl DeviceRuntime for TracedDevice {
+        fn copy_host_to_device(&self, target: u64, source: &[u8]) -> Result<(), BackendError> {
+            HostDevice.copy_host_to_device(target, source)
+        }
+
+        fn copy_device_to_host(&self, source: u64, target: &mut [u8]) -> Result<(), BackendError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            HostDevice.copy_device_to_host(source, target)
+        }
+
+        fn synchronize_stream(&self, stream: u64) -> Result<(), BackendError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            HostDevice.synchronize_stream(stream)
+        }
+    }
+
     let version = GroupVersion {
         group: GroupId(NodeId::derive("native asynchronous cancellation")),
         epoch: 1,
     };
     let devices = [1, 2].map(|index| DeviceId::new(NodeId::from_bytes([index; 16]), 0));
-    let peers = rankless_comms(version, &devices, None);
-    let [waiting, idle] = peers.as_slice() else {
+    let mut peers = rankless_comms(version, &devices, None);
+    let [waiting, idle] = peers.as_mut_slice() else {
         unreachable!()
     };
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    waiting.0.runtime = Box::new(TracedDevice(Arc::clone(&device_calls)));
     let mut first = submit_i32(1, 1, &[1], waiting);
     let mut queued = submit_i32(1, 1, &[2], waiting);
     let Transport::Peers(remote) = &idle.transport else {
@@ -1121,8 +1144,8 @@ fn cancellation_drains_pending_requests_without_writing_output() {
     };
     let op = Collective::AllReduce(DataType::Int32, ReduceOp::Sum);
     let submit = || {
-        let staging = group.requests.reserve_staging(8).unwrap();
-        requests::Dispatcher::submit(group, op, vec![0; 4], staging)
+        let admission = group.requests.admit(8).ok_or(io::ErrorKind::WouldBlock)?;
+        requests::Dispatcher::submit(group, op, vec![0; 4], admission)
     };
     let remaining = (0..requests::QUEUE_DEPTH - 1)
         .map(|_| submit().unwrap())
@@ -1132,6 +1155,9 @@ fn cancellation_drains_pending_requests_without_writing_output() {
         panic!("the pending collective queue exceeded capacity");
     };
     assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(device_calls.load(Ordering::Relaxed), 4);
+    assert_eq!(try_submit_i32(1, 1, &[3], waiting), Err(PLAIT_PEER_BUSY));
+    assert_eq!(device_calls.load(Ordering::Relaxed), 4);
     assert_eq!(group.order.lock().unwrap().submitted, submitted);
     assert!(waiting.cancel_peers());
     let mut output = [-1];

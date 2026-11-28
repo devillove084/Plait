@@ -2349,8 +2349,9 @@ collective order, including calls through the blocking ABI.
    the group and wake pending requests. Wait for device calls already in
    progress before releasing their buffers and streams.
 
-The network queue holds up to eight waiting jobs per communicator. Each
-communicator also has a 1 GiB asynchronous host staging budget. Set
+Each communicator allows eight requests across input staging and the pending
+network queue. The dispatcher returns a queue slot when it takes the job.
+Each communicator also has a 1 GiB asynchronous host staging budget. Set
 `PLAIT_NCCL_PEER_ASYNC_STAGING_BYTES` to a decimal byte count before
 connecting a worker. Workers on the same group can set different limits.
 The budget covers staged inputs and expected outputs, including results
@@ -2367,11 +2368,12 @@ joins with a zero-byte async staging budget and can use the blocking path.
 Include engine memory and blocking scratch when sizing the host profile.
 The staging limit applies to asynchronous payloads.
 
-Submission reserves bytes before synchronizing the producer stream or
-copying its input. The reservation follows the work through the wire
-exchange and result delivery. Destroying a pending ticket frees its result
-after the worker finishes the accepted operation. A full queue or byte
-budget returns `PLAIT_PEER_BUSY` without allocating a sequence. Retry the
+Submission reserves a queue slot and staging bytes before synchronizing the
+producer stream or copying its input. The byte reservation follows the work
+through the wire exchange and result delivery. Destroying a pending ticket
+frees its result after the worker finishes the accepted operation. A full
+queue or byte budget returns `PLAIT_PEER_BUSY` before device work and leaves
+the sequence unallocated. Retry the
 same operation once there is capacity, or call its blocking entry point
 before submitting a later operation. Python `try_all_gather` and
 `try_all_reduce` return `None` in this case. A peer with available capacity

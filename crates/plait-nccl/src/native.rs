@@ -92,10 +92,7 @@ impl PlaitPeerRequest {
         let staging_bytes = input_bytes
             .checked_add(output_bytes)
             .ok_or(NCCL_INVALID_ARGUMENT)?;
-        let staging = group
-            .requests
-            .reserve_staging(staging_bytes)
-            .ok_or(PLAIT_PEER_BUSY)?;
+        let admission = group.requests.admit(staging_bytes).ok_or(PLAIT_PEER_BUSY)?;
         let input = stage_peer_input(
             comm,
             group,
@@ -105,7 +102,7 @@ impl PlaitPeerRequest {
             stream as *mut c_void,
             &mut Phases::new(false),
         )?;
-        let completion = Dispatcher::submit(group, op, input, staging).map_err(|error| {
+        let completion = Dispatcher::submit(group, op, input, admission).map_err(|error| {
             if error.kind() == io::ErrorKind::WouldBlock {
                 PLAIT_PEER_BUSY
             } else {

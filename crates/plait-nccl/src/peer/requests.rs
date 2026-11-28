@@ -14,11 +14,12 @@ struct Job {
     operation: Collective,
     input: Vec<u8>,
     result: SyncSender<io::Result<StagedOutput>>,
-    staging: StagingReservation,
+    admission: Admission,
 }
 
 pub(crate) struct Dispatcher {
     sender: Mutex<Option<SyncSender<Job>>>,
+    pending: Arc<AtomicUsize>,
     staged_bytes: Arc<AtomicUsize>,
     staging_limit: usize,
 }
@@ -36,29 +37,23 @@ impl Dispatcher {
     pub(super) fn new(staging_limit: usize) -> Self {
         Self {
             sender: Mutex::new(None),
+            pending: Arc::new(AtomicUsize::new(0)),
             staged_bytes: Arc::new(AtomicUsize::new(0)),
             staging_limit,
         }
     }
 
-    pub(crate) fn reserve_staging(&self, bytes: usize) -> Option<StagingReservation> {
-        self.staged_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                used.checked_add(bytes)
-                    .filter(|&next| next <= self.staging_limit)
-            })
-            .ok()?;
-        Some(StagingReservation {
-            used: Arc::clone(&self.staged_bytes),
-            bytes,
-        })
+    pub(crate) fn admit(&self, bytes: usize) -> Option<Admission> {
+        let slot = Reservation::try_new(&self.pending, 1, QUEUE_DEPTH)?;
+        let staging = Reservation::try_new(&self.staged_bytes, bytes, self.staging_limit)?;
+        Some(Admission { slot, staging })
     }
 
     pub(crate) fn submit(
         group: &Arc<PeerGroup>,
         operation: Collective,
         input: Vec<u8>,
-        staging: StagingReservation,
+        admission: Admission,
     ) -> io::Result<Completion> {
         group.live()?;
         let mut sender = group.requests.sender.lock().unwrap();
@@ -69,6 +64,8 @@ impl Dispatcher {
                 .name("plait-peer-collectives".into())
                 .spawn(move || {
                     while let Ok(job) = rx.recv() {
+                        let Admission { slot, staging } = job.admission;
+                        drop(slot);
                         let outcome = match weak.upgrade() {
                             Some(group) => group.execute_reserved(
                                 job.sequence,
@@ -82,7 +79,7 @@ impl Dispatcher {
                         drop(job.input);
                         let result = outcome.map(|bytes| StagedOutput {
                             bytes,
-                            _staging: job.staging,
+                            _staging: staging,
                         });
                         let _ = job.result.send(result);
                     }
@@ -98,7 +95,7 @@ impl Dispatcher {
                     operation,
                     input,
                     result,
-                    staging,
+                    admission,
                 })
                 .map_err(|error| match error {
                     TrySendError::Full(_) => {
@@ -114,14 +111,32 @@ impl Dispatcher {
     }
 }
 
-pub(crate) struct StagingReservation {
-    used: Arc<AtomicUsize>,
-    bytes: usize,
+pub(crate) struct Admission {
+    slot: Reservation,
+    staging: Reservation,
 }
 
-impl Drop for StagingReservation {
+struct Reservation {
+    used: Arc<AtomicUsize>,
+    count: usize,
+}
+
+impl Reservation {
+    fn try_new(used: &Arc<AtomicUsize>, count: usize, limit: usize) -> Option<Self> {
+        used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            used.checked_add(count).filter(|&next| next <= limit)
+        })
+        .ok()?;
+        Some(Self {
+            used: Arc::clone(used),
+            count,
+        })
+    }
+}
+
+impl Drop for Reservation {
     fn drop(&mut self) {
-        self.used.fetch_sub(self.bytes, Ordering::Relaxed);
+        self.used.fetch_sub(self.count, Ordering::Relaxed);
     }
 }
 
@@ -140,7 +155,7 @@ pub(crate) struct Completion {
 pub(crate) struct StagedOutput {
     pub(crate) bytes: Vec<u8>,
     // Held by the channel, then by whoever copies or drops these bytes.
-    _staging: StagingReservation,
+    _staging: Reservation,
 }
 
 impl Completion {
