@@ -645,6 +645,15 @@ native group APIs and call `plaitPeerSetReplicatedEgressBytes` between
 `plaitPeerListen` and `plaitPeerConnect`. Zero egress permits only empty
 replicated exchanges when the group has at least two members.
 
+For a mixed TP × PP layout, the launcher writes one `model_group` descriptor.
+The ordered device list assigns consecutive TP slots to each pipeline stage.
+Each worker publishes one endpoint under its grant and connects to the workers
+in its TP row and PP column. The handshake checks the committed manifest, slot
+order, and TP size. The axes have separate collective queues and share the
+grant's staging limit. A worker reports ready after both axes connect. Ending
+its grant closes both communicators. Rust clients can use
+`join_committed_model_group` to obtain the two communicators.
+
 #### Verify four-vendor TP4 over HTTP
 
 The integration test installed vLLM `0.31.0+plait.acea9b5ad` and the Plait
@@ -822,17 +831,25 @@ the shared deployment file. Use the same mapping on each launch host.
       "width": 2,
       "pipeline_layers": [18, 10],
       "kv_cache_memory_bytes_by_stage": [344981504, 191889408]
+    },
+    "05050505050505050505050505050505": {
+      "width": 4,
+      "tensor_parallel": 2,
+      "pipeline_layers": [14, 14]
     }
   }
 }
 ```
 
 A committed ID selects one of these layouts before the host builds its
-launch descriptor. The launcher derives the same binding ID for an explicit
-TP cap and copies that cap to `tp_groups`. A missing binding or a width
-mismatch prevents startup. An older untagged version uses the deployment's
-width-based settings. Add new entries while the launcher is running to
-offer more recipes. Existing entries retain their widths and options.
+launch descriptor. A recipe with `tensor_parallel` and `pipeline_layers` must
+reserve one worker per TP slot in each stage. The four-worker recipe above
+starts TP2 × PP2. When the recipe omits `tensor_parallel`, a layer partition
+uses TP1 and a recipe with no partition uses pure TP. An explicit AllReduce
+cap applies to the TP communicator. A missing binding or a width mismatch
+prevents startup. An untagged version uses the deployment's width-based
+settings. Add new entries while the launcher is running to offer more recipes.
+Existing entries retain their widths and options.
 
 Set `kv_cache_memory_bytes_by_stage` for a PP recipe to supply one positive
 byte count per stage. The launcher passes the vector as

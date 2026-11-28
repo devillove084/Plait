@@ -37,7 +37,7 @@ use backend::{
     BackendError, CudaRuntime, DeviceRuntime, HostCopyRuntime, HuaweiRuntime, PpuRuntime,
 };
 #[cfg(feature = "control")]
-pub use control::{JoinGroup, join_committed_group};
+pub use control::{JoinGroup, join_committed_group, join_committed_model_group};
 use peer::{Collective, PeerGroup};
 pub use peer::{
     Endpoint as PeerEndpoint, Listener as PeerListener, RanklessListener, RanklessMember,
@@ -2871,6 +2871,10 @@ fn _plait_nccl(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyPeerListener>()?;
     module.add_function(wrap_pyfunction!(
         python_control::join_versioned_group,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        python_control::join_versioned_model_group,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(take_last_error, module)?)?;

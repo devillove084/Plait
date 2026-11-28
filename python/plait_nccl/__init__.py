@@ -282,6 +282,30 @@ class NCCLLibrary:
         self._comms.add(comm)
         return comm
 
+    def join_versioned_model_group(
+        self,
+        host: str,
+        seeds: list[str],
+        version: str,
+        devices: list[tuple[str, int]],
+        slot: int,
+        tensor_parallel: int,
+        *,
+        replicated_egress_bytes: int | None = None,
+    ) -> tuple[CommHandle, CommHandle]:
+        """Join the local TP and PP communicators using one committed device grant."""
+        if self.device is None:
+            raise ValueError("a versioned group requires the local accelerator index")
+        address = f"[{host}]:0" if ":" in host else f"{host}:0"
+        timeout_ms = int(os.environ.get("PLAIT_NCCL_TIMEOUT_MS", "120000"))
+        tp, pp = _plait_nccl.join_versioned_model_group(
+            address, seeds, version, devices, slot, self.device, timeout_ms,
+            tensor_parallel, replicated_egress_bytes,
+        )
+        tensor, pipeline = CommHandle(tp), CommHandle(pp)
+        self._comms.update((tensor, pipeline))
+        return tensor, pipeline
+
     def ncclAllReduce(self, sendbuff, recvbuff, count: int, datatype: int, op: int, comm: CommHandle, stream) -> None:
         send = _ptr(sendbuff)
         recv = _ptr(recvbuff)

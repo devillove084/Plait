@@ -7,7 +7,7 @@ use plait_core::{DeviceId, NodeId};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-use crate::control::join_committed_group_with_egress;
+use crate::control::{join_committed_group_with_egress, join_committed_model_group};
 use crate::{CommHandle, JoinGroup, Transport, backend_from_env};
 
 fn control_addresses(address: &str, seeds: Vec<String>) -> PyResult<(SocketAddr, Vec<SocketAddr>)> {
@@ -93,24 +93,9 @@ pub(super) fn join_versioned_group(
     timeout_ms: u32,
     replicated_egress_bytes: Option<u64>,
 ) -> PyResult<CommHandle> {
-    let (listen, seeds) = control_addresses(address, seeds)?;
-    let layout = devices
-        .into_iter()
-        .map(|(host, ordinal)| NodeId::from_hex(&host).map(|node| DeviceId::new(node, ordinal)))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| PyValueError::new_err(error.to_string()))?;
-    let member = *layout
-        .get(slot)
-        .ok_or_else(|| PyValueError::new_err("slot is outside the group layout"))?;
-    let version = parse_version(version)?;
+    let request = join_request(address, seeds, version, devices, slot)?;
+    let version = request.version;
     let backend = backend_from_env().map_err(PyValueError::new_err)?;
-    let request = JoinGroup {
-        version,
-        member,
-        layout,
-        listen,
-        seeds,
-    };
     let timeout = Duration::from_millis(u64::from(timeout_ms));
     py.allow_threads(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -129,4 +114,73 @@ pub(super) fn join_versioned_group(
             })
     })
     .map_err(|error| PyRuntimeError::new_err(format!("Plait group join for {version:?}: {error}")))
+}
+
+#[pyfunction]
+#[pyo3(signature = (address, seeds, version, devices, slot, device, timeout_ms, tensor_parallel, replicated_egress_bytes=None))]
+pub(super) fn join_versioned_model_group(
+    py: Python<'_>,
+    address: &str,
+    seeds: Vec<String>,
+    version: &str,
+    devices: Vec<(String, u32)>,
+    slot: usize,
+    device: usize,
+    timeout_ms: u32,
+    tensor_parallel: usize,
+    replicated_egress_bytes: Option<u64>,
+) -> PyResult<(CommHandle, CommHandle)> {
+    let request = join_request(address, seeds, version, devices, slot)?;
+    let version = request.version;
+    let backend = backend_from_env().map_err(PyValueError::new_err)?;
+    let timeout = Duration::from_millis(u64::from(timeout_ms));
+    py.allow_threads(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let (tensor, pipeline) = runtime.block_on(join_committed_model_group(
+            request,
+            backend,
+            device,
+            timeout,
+            tensor_parallel,
+            replicated_egress_bytes,
+        ))?;
+        Ok::<_, std::io::Error>((
+            CommHandle {
+                ptr: tensor.into_raw(),
+            },
+            CommHandle {
+                ptr: pipeline.into_raw(),
+            },
+        ))
+    })
+    .map_err(|error| {
+        PyRuntimeError::new_err(format!("Plait model group join for {version:?}: {error}"))
+    })
+}
+
+fn join_request(
+    address: &str,
+    seeds: Vec<String>,
+    version: &str,
+    devices: Vec<(String, u32)>,
+    slot: usize,
+) -> PyResult<JoinGroup> {
+    let (listen, seeds) = control_addresses(address, seeds)?;
+    let layout = devices
+        .into_iter()
+        .map(|(host, ordinal)| NodeId::from_hex(&host).map(|node| DeviceId::new(node, ordinal)))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    let member = *layout
+        .get(slot)
+        .ok_or_else(|| PyValueError::new_err("slot is outside the group layout"))?;
+    Ok(JoinGroup {
+        version: parse_version(version)?,
+        member,
+        layout,
+        listen,
+        seeds,
+    })
 }

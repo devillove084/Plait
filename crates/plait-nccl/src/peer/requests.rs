@@ -87,6 +87,16 @@ impl Dispatcher {
         }
     }
 
+    #[cfg(feature = "control")]
+    pub(super) fn share_staging(&self) -> Self {
+        Self {
+            sender: Mutex::new(None),
+            pending: Arc::new(AtomicUsize::new(0)),
+            staged_bytes: self.staged_bytes.clone(),
+            staging_limit: self.staging_limit,
+        }
+    }
+
     pub(crate) fn admit(&self, bytes: usize) -> Option<Admission> {
         let slot = Reservation::try_new(&self.pending, 1, QUEUE_DEPTH)?;
         let staging = Reservation::try_new(&self.staged_bytes, bytes, self.staging_limit)?;

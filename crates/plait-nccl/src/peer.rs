@@ -109,8 +109,53 @@ impl Listener {
         timeout: Duration,
         bootstrap_timeout: Duration,
     ) -> io::Result<Arc<PeerGroup>> {
-        if timeout.is_zero()
-            || bootstrap_timeout.is_zero()
+        let manifest = binding.as_ref().map_or_else(
+            || {
+                peer_digest(self.version, members.iter().copied())
+                    .finalize()
+                    .into()
+            },
+            |binding| binding.handshake_digest,
+        );
+        let manifest = self.wire_digest(manifest);
+        let expected = vec![true; members.len()];
+        let requests = requests::Dispatcher::from_env(self.staging_ceiling)?;
+        let links = self.connect_links(
+            &members,
+            &expected,
+            Bootstrap::new(slot, manifest, timeout, bootstrap_timeout)?,
+        )?;
+        Ok(PeerGroup::new(
+            slot,
+            links,
+            manifest,
+            timeout,
+            self.replicated_egress_bytes,
+            requests,
+            binding,
+        ))
+    }
+
+    fn wire_digest(&self, manifest: [u8; 32]) -> [u8; 32] {
+        if let Some(bytes) = self.replicated_egress_bytes {
+            let mut digest = Sha256::new();
+            digest.update(b"plait-peer-all-reduce-egress-v1");
+            digest.update(manifest);
+            digest.update(bytes.to_le_bytes());
+            digest.finalize().into()
+        } else {
+            manifest
+        }
+    }
+
+    fn connect_links(
+        &self,
+        members: &[Endpoint],
+        expected: &[bool],
+        bootstrap: Bootstrap,
+    ) -> io::Result<Vec<Option<Link>>> {
+        let slot = bootstrap.slot;
+        if members.len() != expected.len()
             || members.len() > i32::MAX as usize
             || members.get(slot) != Some(&self.endpoint)
             || members
@@ -131,41 +176,21 @@ impl Listener {
         {
             return Err(io::Error::other("invalid peer group manifest"));
         }
-        let requests = requests::Dispatcher::from_env(self.staging_ceiling)?;
-        let deadline = Instant::now()
-            .checked_add(bootstrap_timeout)
-            .ok_or_else(|| io::Error::other("invalid peer bootstrap timeout"))?;
-        let mut manifest = binding.as_ref().map_or_else(
-            || {
-                peer_digest(self.version, members.iter().copied())
-                    .finalize()
-                    .into()
-            },
-            |binding| binding.handshake_digest,
-        );
-        if let Some(bytes) = self.replicated_egress_bytes {
-            let mut digest = Sha256::new();
-            digest.update(b"plait-peer-all-reduce-egress-v1");
-            digest.update(manifest);
-            digest.update(bytes.to_le_bytes());
-            manifest = digest.finalize().into();
-        }
-        let bootstrap = Bootstrap {
-            slot,
-            timeout,
-            deadline,
-            manifest,
-        };
         let mut connections = (0..members.len()).map(|_| [None, None]).collect::<Vec<_>>();
         let (incoming, local_and_outgoing) = connections.split_at_mut(slot);
         thread::scope(|scope| {
-            let inbound = scope.spawn(|| bootstrap.accept_lower(&self.socket, incoming));
-            let dialed = bootstrap.dial_higher(&members[slot + 1..], &mut local_and_outgoing[1..]);
+            let inbound =
+                scope.spawn(|| bootstrap.accept_lower(&self.socket, &expected[..slot], incoming));
+            let dialed = bootstrap.dial_higher(
+                &members[slot + 1..],
+                &expected[slot + 1..],
+                &mut local_and_outgoing[1..],
+            );
             let accepted = inbound.join().expect("peer bootstrap listener panicked");
             dialed.and(accepted)
         })?;
         let mut links = Vec::with_capacity(members.len());
-        for [collective, direct] in connections {
+        for (index, [collective, direct]) in connections.into_iter().enumerate() {
             let link = match (collective, direct) {
                 (Some(collective), Some(direct)) => {
                     collective.set_nonblocking(true)?;
@@ -176,25 +201,12 @@ impl Listener {
                         direct,
                     })
                 }
-                (None, None) => None,
+                (None, None) if index == slot || !expected[index] => None,
                 _ => return Err(io::Error::other("peer group is missing a wire lane")),
             };
             links.push(link);
         }
-        Ok(Arc::new(PeerGroup {
-            slot,
-            links,
-            profile_group: u128::from_le_bytes(manifest[..16].try_into().unwrap()),
-            timeout,
-            replicated_egress_bytes: self.replicated_egress_bytes,
-            order: Mutex::new(CollectiveOrder::default()),
-            turn: Condvar::new(),
-            requests,
-            failed: AtomicBool::new(false),
-            binding,
-            #[cfg(feature = "control")]
-            grant_watch: std::sync::OnceLock::new(),
-        }))
+        Ok(links)
     }
 }
 
@@ -216,8 +228,33 @@ struct Bootstrap {
 }
 
 impl Bootstrap {
-    fn accept_lower(&self, listener: &TcpListener, incoming: &mut [WireLanes]) -> io::Result<()> {
-        for _ in 0..self.slot * 2 {
+    fn new(
+        slot: usize,
+        manifest: [u8; 32],
+        timeout: Duration,
+        bootstrap_timeout: Duration,
+    ) -> io::Result<Self> {
+        if timeout.is_zero() || bootstrap_timeout.is_zero() {
+            return Err(io::Error::other("peer bootstrap timeout must be positive"));
+        }
+        let deadline = Instant::now()
+            .checked_add(bootstrap_timeout)
+            .ok_or_else(|| io::Error::other("invalid peer bootstrap timeout"))?;
+        Ok(Self {
+            slot,
+            timeout,
+            deadline,
+            manifest,
+        })
+    }
+
+    fn accept_lower(
+        &self,
+        listener: &TcpListener,
+        expected: &[bool],
+        incoming: &mut [WireLanes],
+    ) -> io::Result<()> {
+        for _ in 0..expected.iter().filter(|&&member| member).count() * 2 {
             let mut stream = accept(listener, self.deadline)?;
             configure(&stream, remaining(self.deadline)?)?;
             let mut hello = [0; 45];
@@ -225,6 +262,7 @@ impl Bootstrap {
             let source = u32::from_le_bytes(hello[4..8].try_into().unwrap()) as usize;
             let lane = hello[44];
             if source >= self.slot
+                || !expected[source]
                 || lane > DIRECT_LANE
                 || incoming[source][lane as usize].is_some()
                 || hello != greeting(&self.manifest, source, self.slot, lane)
@@ -238,8 +276,18 @@ impl Bootstrap {
         Ok(())
     }
 
-    fn dial_higher(&self, members: &[Endpoint], outgoing: &mut [WireLanes]) -> io::Result<()> {
-        for (offset, (member, pair)) in members.iter().zip(outgoing).enumerate() {
+    fn dial_higher(
+        &self,
+        members: &[Endpoint],
+        expected: &[bool],
+        outgoing: &mut [WireLanes],
+    ) -> io::Result<()> {
+        for (offset, ((member, pair), &expected)) in
+            members.iter().zip(outgoing).zip(expected).enumerate()
+        {
+            if !expected {
+                continue;
+            }
             let target = self.slot + 1 + offset;
             for lane in [COLLECTIVE_LANE, DIRECT_LANE] {
                 let mut stream =
@@ -387,7 +435,7 @@ pub(crate) struct PeerGroup {
     failed: AtomicBool,
     binding: Option<GrantBinding>,
     #[cfg(feature = "control")]
-    grant_watch: std::sync::OnceLock<crate::control::GrantReporter>,
+    grant_watch: std::sync::OnceLock<Arc<crate::control::GrantReporter>>,
 }
 
 #[derive(Default)]
@@ -397,6 +445,31 @@ struct CollectiveOrder {
 }
 
 impl PeerGroup {
+    fn new(
+        slot: usize,
+        links: Vec<Option<Link>>,
+        manifest: [u8; 32],
+        timeout: Duration,
+        replicated_egress_bytes: Option<u64>,
+        requests: requests::Dispatcher,
+        binding: Option<GrantBinding>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            slot,
+            links,
+            profile_group: u128::from_le_bytes(manifest[..16].try_into().unwrap()),
+            timeout,
+            replicated_egress_bytes,
+            order: Mutex::new(CollectiveOrder::default()),
+            turn: Condvar::new(),
+            requests,
+            failed: AtomicBool::new(false),
+            binding,
+            #[cfg(feature = "control")]
+            grant_watch: std::sync::OnceLock::new(),
+        })
+    }
+
     pub(crate) fn live(&self) -> io::Result<()> {
         if self.is_failed() {
             return Err(io::Error::other("peer communicator has failed"));
@@ -474,7 +547,7 @@ impl PeerGroup {
     }
 
     #[cfg(feature = "control")]
-    pub(crate) fn watch_grant(&self, reporter: crate::control::GrantReporter) {
+    pub(crate) fn watch_grant(&self, reporter: Arc<crate::control::GrantReporter>) {
         assert!(
             self.grant_watch.set(reporter).is_ok(),
             "one watcher per communicator"

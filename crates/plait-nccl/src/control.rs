@@ -47,6 +47,58 @@ pub(crate) async fn join_committed_group_with_egress(
     timeout: Duration,
     replicated_egress_bytes: Option<u64>,
 ) -> io::Result<RanklessComm> {
+    join(
+        request,
+        backend,
+        device,
+        timeout,
+        replicated_egress_bytes,
+        None,
+    )
+    .await
+    .map(|(group, _)| group)
+}
+
+/// Join both communication axes of a rectangular vLLM-style model layout.
+/// The device order lists the tensor slots of each pipeline stage in order.
+pub async fn join_committed_model_group(
+    request: JoinGroup,
+    backend: BackendKind,
+    device: usize,
+    timeout: Duration,
+    tensor_parallel: usize,
+    replicated_egress_bytes: Option<u64>,
+) -> io::Result<(RanklessComm, RanklessComm)> {
+    let width = request.layout.len();
+    if tensor_parallel <= 1 || tensor_parallel >= width || width % tensor_parallel != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "mixed layout requires nontrivial TP and PP sizes",
+        ));
+    }
+    let (tensor, pipeline) = join(
+        request,
+        backend,
+        device,
+        timeout,
+        replicated_egress_bytes,
+        Some(tensor_parallel),
+    )
+    .await?;
+    Ok((
+        tensor,
+        pipeline.expect("mixed group has a pipeline communicator"),
+    ))
+}
+
+async fn join(
+    request: JoinGroup,
+    backend: BackendKind,
+    device: usize,
+    timeout: Duration,
+    replicated_egress_bytes: Option<u64>,
+    tensor_parallel: Option<usize>,
+) -> io::Result<(RanklessComm, Option<RanklessComm>)> {
     let layout: BTreeSet<_> = request.layout.iter().copied().collect();
     if layout.len() != request.layout.len()
         || !layout.contains(&request.member)
@@ -76,7 +128,7 @@ pub(crate) async fn join_committed_group_with_egress(
             device,
             deadline,
             timeout,
-            replicated_egress_bytes,
+            (replicated_egress_bytes, tensor_parallel),
         ),
     )
     .await
@@ -90,8 +142,9 @@ async fn connect(
     device: usize,
     deadline: Instant,
     timeout: Duration,
-    replicated_egress_bytes: Option<u64>,
-) -> io::Result<RanklessComm> {
+    transport_options: (Option<u64>, Option<usize>),
+) -> io::Result<(RanklessComm, Option<RanklessComm>)> {
+    let (replicated_egress_bytes, tensor_parallel) = transport_options;
     let failure_scope = match std::env::var("PLAIT_DEVICE_FAILURE_SCOPE") {
         Err(std::env::VarError::NotPresent) => DeviceFailureScope::default(),
         Ok(value) if value == "host" => DeviceFailureScope::Host,
@@ -145,6 +198,9 @@ async fn connect(
         .find(|grant| grant.device == member)
         .ok_or_else(|| io::Error::other("this device has no grant for this group"))?;
     let runtime = create_runtime(backend, device).map_err(io::Error::other)?;
+    let pipeline_runtime = tensor_parallel
+        .map(|_| create_runtime(backend, device).map_err(io::Error::other))
+        .transpose()?;
     let mut listener = RanklessListener::bind(listen, *session.as_bytes(), grant)?;
     if let Some(bytes) = replicated_egress_bytes {
         listener.set_replicated_egress_bytes(bytes);
@@ -168,13 +224,16 @@ async fn connect(
 
     let listener = listener.with_staging_ceiling(control.staging_bytes(grant).await);
     // Other local participants may be using this runtime to finish their joins.
-    let group = tokio::task::spawn_blocking(move || {
-        listener.connect(
-            manifest.members,
-            Some(&order),
-            timeout,
-            deadline.saturating_duration_since(Instant::now()),
-        )
+    let (group, pipeline) = tokio::task::spawn_blocking(move || {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if let Some(tp) = tensor_parallel {
+            let (group, pipeline) =
+                listener.connect_axes(manifest.members, &order, tp, timeout, remaining)?;
+            Ok((group, Some(pipeline)))
+        } else {
+            let group = listener.connect(manifest.members, Some(&order), timeout, remaining)?;
+            Ok::<_, io::Error>((group, None))
+        }
     })
     .await
     .map_err(io::Error::other)??;
@@ -191,7 +250,7 @@ async fn connect(
         })
         .await?;
     let (notify, closes) = mpsc::channel(1);
-    group.watch_grant(GrantReporter {
+    let reporter = Arc::new(GrantReporter {
         notify,
         listen,
         seeds,
@@ -201,8 +260,15 @@ async fn connect(
         },
         attempted: OnceLock::new(),
     });
-    executor.spawn(control.watch(Arc::downgrade(&group), grant, OpId::new(session, 4), closes));
-    Ok(Comm::rankless_from_peers(group, device, runtime))
+    group.watch_grant(reporter.clone());
+    let mut watched = vec![Arc::downgrade(&group)];
+    let pipeline = pipeline.zip(pipeline_runtime).map(|(pipeline, runtime)| {
+        pipeline.watch_grant(reporter);
+        watched.push(Arc::downgrade(&pipeline));
+        Comm::rankless_from_peers(pipeline, device, runtime)
+    });
+    executor.spawn(control.watch(watched, grant, OpId::new(session, 4), closes));
+    Ok((Comm::rankless_from_peers(group, device, runtime), pipeline))
 }
 
 #[cfg(feature = "python")]
@@ -395,7 +461,7 @@ impl Rendezvous {
 
     async fn watch(
         mut self,
-        group: Weak<PeerGroup>,
+        groups: Vec<Weak<PeerGroup>>,
         grant: WorkerGrant,
         id: OpId,
         mut closes: mpsc::Receiver<Option<GroupFault>>,
@@ -403,8 +469,11 @@ impl Rendezvous {
         let fault = tokio::select! {
             biased;
             closed = closes.recv() => closed.flatten(),
-            () = self.wait_for_revocation(&group, grant) => None,
+            () = self.wait_for_revocation(grant) => None,
         };
+        for group in groups.iter().filter_map(Weak::upgrade) {
+            group.cancel();
+        }
         if let Some(fault) = fault {
             let operation = GroupOperation {
                 id,
@@ -415,7 +484,7 @@ impl Rendezvous {
         }
     }
 
-    async fn wait_for_revocation(&mut self, group: &Weak<PeerGroup>, grant: WorkerGrant) {
+    async fn wait_for_revocation(&mut self, grant: WorkerGrant) {
         let mut ticks = interval(WATCH_INTERVAL);
         ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut refresh_at = Instant::now() + WATCH_DISCOVERY_INTERVAL;
@@ -424,9 +493,6 @@ impl Rendezvous {
             ticks.tick().await;
             let status = self.poll_grant(grant, &mut legacy).await;
             if status == GrantStatus::Ended {
-                if let Some(group) = group.upgrade() {
-                    group.cancel();
-                }
                 return;
             }
             if status == GrantStatus::Unknown || Instant::now() >= refresh_at {
