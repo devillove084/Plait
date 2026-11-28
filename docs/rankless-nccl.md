@@ -110,6 +110,27 @@ remain safe to retry. Use `ReportFailure` when an error identifies a failed
 communicator without confirming a worker outage. Upgrade every voter
 before submitting the new action.
 
+For a committed peer communicator, a confirmed local ECC failure during
+stream synchronization or a device copy submits this action with the
+communicator's own grant. The reporting call stops new local operations and
+waits up to 15 seconds for the ordered receipt. The report has its own
+operation ID, so an earlier transport failure can still be followed by a
+local hardware diagnosis while the grant is held.
+
+CUDA uses `CUDA_ERROR_ECC_UNCORRECTABLE` and verifies the current context and
+any explicit stream. Native HIP and HGGC use their uncorrectable ECC status
+(214) and check the device of an explicit stream before reporting. CANN uses
+`ACL_ERROR_RT_HBM_MULTI_BIT_ECC_ERROR` (507054). Generic execution errors,
+uncertain stream ownership, and a CANN suspect peer-memory error continue to
+revoke the communicator without withdrawing the device. Third-party PPU
+adapters have no hardware-error contract and retain the generic path.
+[CUDA Driver results][cuda-driver-results] · [HIP error codes][hip-error-codes] ·
+[CANN runtime error codes][cann-runtime-errors]
+
+[cuda-driver-results]: https://docs.nvidia.com/cuda/cuda-driver-api/cuda_driver_api/group__CUDA__TYPES.html
+[hip-error-codes]: https://rocm.docs.amd.com/projects/HIP/en/latest/reference/error_codes.html
+[cann-runtime-errors]: https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/910/API/runtimeapi/aclcppdevg_03_1345.html
+
 ### Plan across heterogeneous resources
 
 Use `AdvertiseWorker` with a `DeviceProfile`, incarnation, and allocatable

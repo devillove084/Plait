@@ -387,7 +387,7 @@ pub(crate) struct PeerGroup {
     failed: AtomicBool,
     binding: Option<GrantBinding>,
     #[cfg(feature = "control")]
-    grant_watch: std::sync::OnceLock<tokio::sync::mpsc::Sender<Option<GroupFault>>>,
+    grant_watch: std::sync::OnceLock<crate::control::GrantReporter>,
 }
 
 #[derive(Default)]
@@ -436,30 +436,49 @@ impl PeerGroup {
         self.close(Some(fault));
     }
 
-    fn close(&self, _fault: Option<GroupFault>) {
-        let first = {
-            let _order = self.order.lock().unwrap();
-            let first = !self.failed.swap(true, Ordering::AcqRel);
-            self.turn.notify_all();
-            first
-        };
-        if first {
-            for link in self.links.iter().flatten() {
-                let _ = link.collective.shutdown(Shutdown::Both);
-                let _ = link.direct.shutdown(Shutdown::Both);
+    pub(crate) fn fail_unavailable_worker(&self) {
+        #[cfg(feature = "control")]
+        if let Some(reporter) = self.grant_watch.get() {
+            let first = self.mark_failed();
+            reporter.withdraw();
+            if first {
+                self.disconnect(Some(GroupFault::Device));
             }
-            #[cfg(feature = "control")]
-            if let Some(watch) = self.grant_watch.get() {
-                let _ = watch.try_send(_fault);
-            }
+            return;
+        }
+        self.fail(GroupFault::Device);
+    }
+
+    fn close(&self, fault: Option<GroupFault>) {
+        if self.mark_failed() {
+            self.disconnect(fault);
+        }
+    }
+
+    fn mark_failed(&self) -> bool {
+        let _order = self.order.lock().unwrap();
+        let first = !self.failed.swap(true, Ordering::AcqRel);
+        self.turn.notify_all();
+        first
+    }
+
+    fn disconnect(&self, _fault: Option<GroupFault>) {
+        for link in self.links.iter().flatten() {
+            let _ = link.collective.shutdown(Shutdown::Both);
+            let _ = link.direct.shutdown(Shutdown::Both);
+        }
+        #[cfg(feature = "control")]
+        if let Some(watch) = self.grant_watch.get() {
+            watch.closed(_fault);
         }
     }
 
     #[cfg(feature = "control")]
-    pub(crate) fn watch_grant(&self, watch: tokio::sync::mpsc::Sender<Option<GroupFault>>) {
-        self.grant_watch
-            .set(watch)
-            .expect("one watcher per communicator");
+    pub(crate) fn watch_grant(&self, reporter: crate::control::GrantReporter) {
+        assert!(
+            self.grant_watch.set(reporter).is_ok(),
+            "one watcher per communicator"
+        );
     }
 
     pub(crate) fn manifest_digest(&self) -> Option<[u8; 32]> {

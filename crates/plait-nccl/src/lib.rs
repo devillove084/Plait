@@ -33,7 +33,9 @@ mod profile;
 mod python_control;
 mod shm;
 
-use backend::{CudaRuntime, DeviceRuntime, HostCopyRuntime, HuaweiRuntime, PpuRuntime};
+use backend::{
+    BackendError, CudaRuntime, DeviceRuntime, HostCopyRuntime, HuaweiRuntime, PpuRuntime,
+};
 #[cfg(feature = "control")]
 pub use control::{JoinGroup, join_committed_group};
 use peer::{Collective, PeerGroup};
@@ -293,25 +295,27 @@ fn create_runtime(backend: BackendKind, device: usize) -> Result<Box<dyn DeviceR
     match backend {
         BackendKind::Cuda => CudaRuntime::new(device)
             .map(|runtime| Box::new(runtime) as Box<dyn DeviceRuntime>)
-            .map_err(|error| error.0),
+            .map_err(|error| error.to_string()),
         BackendKind::Rocm => HostCopyRuntime::hip(device)
             .map(|runtime| Box::new(runtime) as Box<dyn DeviceRuntime>)
-            .map_err(|error| error.0),
+            .map_err(|error| error.to_string()),
         BackendKind::Huawei => HuaweiRuntime::new(device)
             .map(|runtime| Box::new(runtime) as Box<dyn DeviceRuntime>)
-            .map_err(|error| error.0),
+            .map_err(|error| error.to_string()),
         BackendKind::Ppu => {
             if std::env::var_os("PLAIT_PPU_LIB").is_some() {
                 return PpuRuntime::new(device)
                     .map(|runtime| Box::new(runtime) as Box<dyn DeviceRuntime>)
-                    .map_err(|error| error.0);
+                    .map_err(|error| error.to_string());
             }
             match HostCopyRuntime::hggc(device) {
                 Ok(runtime) => Ok(Box::new(runtime)),
-                Err(error) if std::env::var_os("PLAIT_PPU_HGGCRT_LIB").is_some() => Err(error.0),
+                Err(error) if std::env::var_os("PLAIT_PPU_HGGCRT_LIB").is_some() => {
+                    Err(error.to_string())
+                }
                 Err(native) => PpuRuntime::new(device)
                     .map(|runtime| Box::new(runtime) as Box<dyn DeviceRuntime>)
-                    .map_err(|adapter| format!("{}; {}", native.0, adapter.0)),
+                    .map_err(|adapter| format!("{native}; {adapter}")),
             }
         }
     }
@@ -519,6 +523,17 @@ impl Comm {
             Transport::Peers(_) => unreachable!("requires a star communicator"),
         }
     }
+
+    fn device_error(&self, error: BackendError, status: NcclResult) -> NcclResult {
+        if let Transport::Peers(group) = &self.transport {
+            match &error {
+                BackendError::WorkerUnavailable(_) => group.fail_unavailable_worker(),
+                BackendError::Operation(_) => group.fail(GroupFault::Device),
+            }
+        }
+        set_error(error.to_string());
+        status
+    }
 }
 
 thread_local! {
@@ -642,12 +657,7 @@ fn synchronize_stream(comm: &Comm, stream: *mut std::ffi::c_void) -> Result<(), 
     }
     comm.runtime
         .synchronize_stream(stream as u64)
-        .map_err(|error| {
-            if let Transport::Peers(group) = &comm.transport {
-                group.fail(GroupFault::Device);
-            }
-            set_error(error.0)
-        })
+        .map_err(|error| comm.device_error(error, NCCL_INVALID_USAGE))
 }
 
 fn execute_peer_collective(
@@ -675,14 +685,13 @@ fn execute_peer_collective(
     if let Err(error) = group.live() {
         return set_error(error.to_string());
     }
-    if !output.is_empty()
-        && phases
+    if !output.is_empty() {
+        if let Err(error) = phases
             .upload
-            .measure(|| host_to_device(comm.runtime.as_ref(), recv as u64, &output))
-            .is_err()
-    {
-        group.fail(GroupFault::Device);
-        return NCCL_UNHANDLED_CUDA_ERROR;
+            .measure(|| comm.runtime.copy_host_to_device(recv as u64, &output))
+        {
+            return comm.device_error(error, NCCL_UNHANDLED_CUDA_ERROR);
+        }
     }
     if let Some(log) = log {
         phases.record(log, comm.rank, comm.world, op, bytes);
@@ -712,10 +721,9 @@ fn stage_peer_input(
         }
         if let Err(error) = phases
             .download
-            .measure(|| device_to_host(comm.runtime.as_ref(), send as u64, &mut input))
+            .measure(|| comm.runtime.copy_device_to_host(send as u64, &mut input))
         {
-            group.fail(GroupFault::Device);
-            return Err(error);
+            return Err(comm.device_error(error, NCCL_UNHANDLED_CUDA_ERROR));
         }
     }
     Ok(input)
@@ -2227,11 +2235,8 @@ pub extern "C" fn ncclSend(
         return NCCL_INVALID_ARGUMENT;
     };
     let mut host = vec![0u8; bytes];
-    if device_to_host(comm.runtime.as_ref(), sendbuff as u64, &mut host).is_err() {
-        if let Transport::Peers(group) = &comm.transport {
-            group.fail(GroupFault::Device);
-        }
-        return NCCL_UNHANDLED_CUDA_ERROR;
+    if let Err(error) = comm.runtime.copy_device_to_host(sendbuff as u64, &mut host) {
+        return comm.device_error(error, NCCL_UNHANDLED_CUDA_ERROR);
     }
     let result = match &comm.transport {
         Transport::Star { p2p, .. } => p2p
@@ -2288,11 +2293,8 @@ pub extern "C" fn ncclRecv(
         Ok(buffer) => buffer,
         Err(error) => return set_error(format!("p2p recv: {error}")),
     };
-    if host_to_device(comm.runtime.as_ref(), recvbuff as u64, &result).is_err() {
-        if let Transport::Peers(group) = &comm.transport {
-            group.fail(GroupFault::Device);
-        }
-        return NCCL_UNHANDLED_CUDA_ERROR;
+    if let Err(error) = comm.runtime.copy_host_to_device(recvbuff as u64, &result) {
+        return comm.device_error(error, NCCL_UNHANDLED_CUDA_ERROR);
     }
     NCCL_SUCCESS
 }

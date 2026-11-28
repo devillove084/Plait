@@ -101,7 +101,7 @@ async fn connect(
     } = request;
     let executor = control_runtime()?;
     let mut control = executor
-        .spawn(Rendezvous::new(listen, seeds))
+        .spawn(Rendezvous::new(listen, seeds.clone()))
         .await
         .map_err(io::Error::other)??;
     let session = NodeId::random();
@@ -180,7 +180,16 @@ async fn connect(
         })
         .await?;
     let (notify, closes) = mpsc::channel(1);
-    group.watch_grant(notify);
+    group.watch_grant(GrantReporter {
+        notify,
+        listen,
+        seeds,
+        operation: GroupOperation {
+            id: OpId::new(session, 5),
+            action: GroupAction::ReportWorkerUnavailable { grant },
+        },
+        attempted: OnceLock::new(),
+    });
     executor.spawn(control.watch(Arc::downgrade(&group), grant, OpId::new(session, 4), closes));
     Ok(Comm::rankless_from_peers(group, device, runtime))
 }
@@ -270,6 +279,51 @@ const METADATA_QUERY_TIMEOUT: Duration = Duration::from_millis(750);
 const WATCH_DISCOVERY_INTERVAL: Duration = Duration::from_secs(10);
 const REPORT_TIMEOUT: Duration = Duration::from_secs(15);
 type PeerCall<'a, T> = Pin<Box<dyn Future<Output = io::Result<T>> + Send + 'a>>;
+
+pub(crate) struct GrantReporter {
+    notify: mpsc::Sender<Option<GroupFault>>,
+    listen: SocketAddr,
+    seeds: Vec<SocketAddr>,
+    operation: GroupOperation,
+    attempted: OnceLock<()>,
+}
+
+impl GrantReporter {
+    pub(crate) fn closed(&self, fault: Option<GroupFault>) {
+        let _ = self.notify.try_send(fault);
+    }
+
+    pub(crate) fn withdraw(&self) {
+        // A confirmed local error can arrive after the normal group watcher
+        // has already observed revocation or reported a network failure.
+        self.attempted.get_or_init(|| {
+            if let Err(error) = self.report() {
+                eprintln!("Plait unavailable worker report: {error}");
+            }
+        });
+    }
+
+    fn report(&self) -> io::Result<()> {
+        let executor = control_runtime()?;
+        let listen = self.listen;
+        let seeds = self.seeds.clone();
+        let operation = self.operation.clone();
+        let (deliver, receipt) = std::sync::mpsc::sync_channel(1);
+        executor.spawn(async move {
+            let result = timeout(REPORT_TIMEOUT, async {
+                let mut control = Rendezvous::new(listen, seeds).await?;
+                control.apply(&operation).await
+            })
+            .await;
+            let _ = deliver.send(result);
+        });
+        // Wait for the receipt before returning an error that may exit the worker.
+        receipt
+            .recv_timeout(REPORT_TIMEOUT)
+            .map_err(io::Error::other)?
+            .map_err(io::Error::other)?
+    }
+}
 
 struct Rendezvous {
     client: Client,

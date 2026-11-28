@@ -13,9 +13,10 @@ use plait_core::{DeviceId, NodeId};
 use crate::peer::requests::{Completion, Dispatcher};
 use crate::profile::Phases;
 use crate::{
-    BackendKind, Collective, Comm, DataType, NCCL_INVALID_ARGUMENT, NCCL_SUCCESS, NCCL_UNSUPPORTED,
-    NcclResult, PeerEndpoint, PeerGroup, RanklessListener, RanklessMember, ReduceOp, Transport,
-    host_to_device, set_error, stage_peer_input, synchronize_stream,
+    BackendKind, Collective, Comm, DataType, NCCL_INVALID_ARGUMENT, NCCL_SUCCESS,
+    NCCL_UNHANDLED_CUDA_ERROR, NCCL_UNSUPPORTED, NcclResult, PeerEndpoint, PeerGroup,
+    RanklessListener, RanklessMember, ReduceOp, Transport, set_error, stage_peer_input,
+    synchronize_stream,
 };
 
 const ADDRESS_BYTES: usize = 80;
@@ -161,9 +162,9 @@ impl PlaitPeerRequest {
         }
         synchronize_stream(comm, stream as *mut c_void)?;
         group.live().map_err(|error| set_error(error.to_string()))?;
-        host_to_device(comm.runtime.as_ref(), recv, &output.bytes).inspect_err(|_| {
-            group.fail(GroupFault::Device);
-        })
+        comm.runtime
+            .copy_host_to_device(recv, &output.bytes)
+            .map_err(|error| comm.device_error(error, NCCL_UNHANDLED_CUDA_ERROR))
     }
 }
 

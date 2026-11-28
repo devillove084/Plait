@@ -17,11 +17,16 @@ thread_local! {
 use cudarc::driver::{CudaContext, sys};
 
 #[derive(Debug)]
-pub struct BackendError(pub String);
+pub enum BackendError {
+    Operation(String),
+    WorkerUnavailable(String),
+}
 
 impl std::fmt::Display for BackendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        match self {
+            Self::Operation(message) | Self::WorkerUnavailable(message) => f.write_str(message),
+        }
     }
 }
 
@@ -39,7 +44,9 @@ pub trait DeviceRuntime: Send + Sync {
     }
 
     fn map_host(&self, _pointer: usize, _bytes: usize) -> Result<u64, BackendError> {
-        Err(BackendError("host mapping requires CUDA".to_owned()))
+        Err(BackendError::Operation(
+            "host mapping requires CUDA".to_owned(),
+        ))
     }
 
     fn cuda_context(&self) -> Option<Arc<CudaContext>> {
@@ -64,7 +71,7 @@ pub struct CudaRuntime {
 impl CudaRuntime {
     pub fn new(device: usize) -> Result<Self, BackendError> {
         let context = CudaContext::new(device)
-            .map_err(|error| BackendError(format!("CUDA context {device}: {error}")))?;
+            .map_err(|error| BackendError::Operation(format!("CUDA context {device}: {error}")))?;
         Ok(Self { context, device })
     }
 }
@@ -76,9 +83,38 @@ impl CudaRuntime {
         }
         self.context
             .bind_to_thread()
-            .map_err(|error| BackendError(format!("bind CUDA context: {error}")))?;
+            .map_err(|error| BackendError::Operation(format!("bind CUDA context: {error}")))?;
         BOUND_CUDA_DEVICE.with(|slot| slot.set(Some(self.device)));
         Ok(())
+    }
+
+    fn execution_status(
+        &self,
+        operation: &str,
+        status: sys::CUresult,
+        stream: sys::CUstream,
+    ) -> Result<(), BackendError> {
+        if status == sys::CUresult::CUDA_SUCCESS {
+            return Ok(());
+        }
+        let message = format!("{operation}: {status:?}");
+        if status == sys::CUresult::CUDA_ERROR_ECC_UNCORRECTABLE {
+            let mut current = std::ptr::null_mut();
+            let context_status = unsafe { sys::cuCtxGetCurrent(&mut current) };
+            if context_status == sys::CUresult::CUDA_SUCCESS
+                && current == self.context.cu_ctx()
+                && (stream.is_null() || self.stream_on_context(stream))
+            {
+                return Err(BackendError::WorkerUnavailable(message));
+            }
+        }
+        Err(BackendError::Operation(message))
+    }
+
+    fn stream_on_context(&self, stream: sys::CUstream) -> bool {
+        let mut context = std::ptr::null_mut();
+        let status = unsafe { sys::cuStreamGetCtx(stream, &mut context) };
+        status == sys::CUresult::CUDA_SUCCESS && context == self.context.cu_ctx()
     }
 }
 
@@ -86,21 +122,13 @@ impl DeviceRuntime for CudaRuntime {
     fn synchronize_stream(&self, stream: u64) -> Result<(), BackendError> {
         self.bind()?;
         let status = unsafe { sys::cuStreamSynchronize(stream as sys::CUstream) };
-        if status == sys::CUresult::CUDA_SUCCESS {
-            Ok(())
-        } else {
-            Err(BackendError(format!("cuStreamSynchronize: {status:?}")))
-        }
+        self.execution_status("cuStreamSynchronize", status, stream as sys::CUstream)
     }
 
     fn copy_host_to_device(&self, target: u64, source: &[u8]) -> Result<(), BackendError> {
         self.bind()?;
         let status = unsafe { sys::cuMemcpyHtoD_v2(target, source.as_ptr().cast(), source.len()) };
-        if status == sys::CUresult::CUDA_SUCCESS {
-            Ok(())
-        } else {
-            Err(BackendError(format!("cuMemcpyHtoD: {status:?}")))
-        }
+        self.execution_status("cuMemcpyHtoD", status, std::ptr::null_mut())
     }
 
     fn copy_host_to_device_async(
@@ -118,11 +146,7 @@ impl DeviceRuntime for CudaRuntime {
                 stream as sys::CUstream,
             )
         };
-        if status == sys::CUresult::CUDA_SUCCESS {
-            Ok(())
-        } else {
-            Err(BackendError(format!("cuMemcpyHtoDAsync: {status:?}")))
-        }
+        self.execution_status("cuMemcpyHtoDAsync", status, stream as sys::CUstream)
     }
 
     fn cuda_context(&self) -> Option<Arc<CudaContext>> {
@@ -137,7 +161,7 @@ impl DeviceRuntime for CudaRuntime {
         if status == sys::CUresult::CUDA_SUCCESS {
             Ok(device)
         } else {
-            Err(BackendError(format!(
+            Err(BackendError::Operation(format!(
                 "cuMemHostGetDevicePointer: {status:?}"
             )))
         }
@@ -155,7 +179,9 @@ impl DeviceRuntime for CudaRuntime {
         if status == sys::CUresult::CUDA_SUCCESS {
             Ok(())
         } else {
-            Err(BackendError(format!("cuMemHostRegister: {status:?}")))
+            Err(BackendError::Operation(format!(
+                "cuMemHostRegister: {status:?}"
+            )))
         }
     }
 
@@ -163,11 +189,7 @@ impl DeviceRuntime for CudaRuntime {
         self.bind()?;
         let status =
             unsafe { sys::cuMemcpyDtoH_v2(target.as_mut_ptr().cast(), source, target.len()) };
-        if status == sys::CUresult::CUDA_SUCCESS {
-            Ok(())
-        } else {
-            Err(BackendError(format!("cuMemcpyDtoH: {status:?}")))
-        }
+        self.execution_status("cuMemcpyDtoH", status, std::ptr::null_mut())
     }
 }
 
@@ -189,43 +211,58 @@ pub struct HuaweiRuntime {
     device: i32,
 }
 
+fn acl_execution_status(operation: &str, status: i32) -> Result<(), BackendError> {
+    const ACL_ERROR_RT_HBM_MULTI_BIT_ECC_ERROR: i32 = 507054;
+    match status {
+        0 => Ok(()),
+        ACL_ERROR_RT_HBM_MULTI_BIT_ECC_ERROR => Err(BackendError::WorkerUnavailable(format!(
+            "{operation}: {status}"
+        ))),
+        _ => Err(BackendError::Operation(format!("{operation}: {status}"))),
+    }
+}
+
 impl HuaweiRuntime {
     pub fn new(device: usize) -> Result<Self, BackendError> {
         let library_path =
             std::env::var("PLAIT_HUAWEI_ACL_LIB").unwrap_or_else(|_| "libascendcl.so".to_owned());
         let library = unsafe { libloading::Library::new(&library_path) }
-            .map_err(|error| BackendError(format!("load {library_path}: {error}")))?;
+            .map_err(|error| BackendError::Operation(format!("load {library_path}: {error}")))?;
         let init = unsafe {
             *library
                 .get::<unsafe extern "C" fn(*const std::ffi::c_char) -> i32>(b"aclInit\0")
-                .map_err(|error| BackendError(format!("aclInit: {error}")))?
+                .map_err(|error| BackendError::Operation(format!("aclInit: {error}")))?
         };
         let set_device = unsafe {
             *library
                 .get::<unsafe extern "C" fn(i32) -> i32>(b"aclrtSetDevice\0")
-                .map_err(|error| BackendError(format!("aclrtSetDevice: {error}")))?
+                .map_err(|error| BackendError::Operation(format!("aclrtSetDevice: {error}")))?
         };
         let memcpy = unsafe {
             *library
                 .get::<unsafe extern "C" fn(*mut c_void, usize, *const c_void, usize, u32) -> i32>(
                     b"aclrtMemcpy\0",
                 )
-                .map_err(|error| BackendError(format!("aclrtMemcpy: {error}")))?
+                .map_err(|error| BackendError::Operation(format!("aclrtMemcpy: {error}")))?
         };
         let synchronize_device = unsafe {
             *library
                 .get::<unsafe extern "C" fn() -> i32>(b"aclrtSynchronizeDevice\0")
-                .map_err(|error| BackendError(format!("aclrtSynchronizeDevice: {error}")))?
+                .map_err(|error| {
+                    BackendError::Operation(format!("aclrtSynchronizeDevice: {error}"))
+                })?
         };
         let synchronize_stream = unsafe {
             *library
                 .get::<unsafe extern "C" fn(*mut c_void) -> i32>(b"aclrtSynchronizeStream\0")
-                .map_err(|error| BackendError(format!("aclrtSynchronizeStream: {error}")))?
+                .map_err(|error| {
+                    BackendError::Operation(format!("aclrtSynchronizeStream: {error}"))
+                })?
         };
         const ACL_ERROR_REPEAT_INITIALIZE: i32 = 100002;
         let status = unsafe { init(std::ptr::null()) };
         if status != 0 && status != ACL_ERROR_REPEAT_INITIALIZE {
-            return Err(BackendError(format!("aclInit: {status}")));
+            return Err(BackendError::Operation(format!("aclInit: {status}")));
         }
         let runtime = Self {
             api: Arc::new(AclApi {
@@ -235,8 +272,9 @@ impl HuaweiRuntime {
                 synchronize_device,
                 synchronize_stream,
             }),
-            device: i32::try_from(device)
-                .map_err(|_| BackendError(format!("invalid ACL device index {device}")))?,
+            device: i32::try_from(device).map_err(|_| {
+                BackendError::Operation(format!("invalid ACL device index {device}"))
+            })?,
         };
         runtime.bind()?;
         Ok(runtime)
@@ -247,7 +285,7 @@ impl HuaweiRuntime {
         if status == 0 {
             Ok(())
         } else {
-            Err(BackendError(format!(
+            Err(BackendError::Operation(format!(
                 "aclrtSetDevice({}): {status}",
                 self.device
             )))
@@ -265,11 +303,7 @@ impl DeviceRuntime for HuaweiRuntime {
                 (self.api.synchronize_stream)(stream as *mut c_void)
             }
         };
-        if status == 0 {
-            Ok(())
-        } else {
-            Err(BackendError(format!("ACL synchronization: {status}")))
-        }
+        acl_execution_status("ACL synchronization", status)
     }
 
     fn copy_host_to_device(&self, target: u64, source: &[u8]) -> Result<(), BackendError> {
@@ -284,11 +318,7 @@ impl DeviceRuntime for HuaweiRuntime {
                 1,
             )
         };
-        if status == 0 {
-            Ok(())
-        } else {
-            Err(BackendError(format!("aclrtMemcpy H2D: {status}")))
-        }
+        acl_execution_status("aclrtMemcpy H2D", status)
     }
 
     fn copy_device_to_host(&self, source: u64, target: &mut [u8]) -> Result<(), BackendError> {
@@ -303,11 +333,7 @@ impl DeviceRuntime for HuaweiRuntime {
                 2,
             )
         };
-        if status == 0 {
-            Ok(())
-        } else {
-            Err(BackendError(format!("aclrtMemcpy D2H: {status}")))
-        }
+        acl_execution_status("aclrtMemcpy D2H", status)
     }
 }
 
@@ -335,33 +361,39 @@ impl PpuRuntime {
         let library_path =
             std::env::var("PLAIT_PPU_LIB").unwrap_or_else(|_| "libplait_ppu.so".to_owned());
         let library = unsafe { libloading::Library::new(&library_path) }
-            .map_err(|error| BackendError(format!("load {library_path}: {error}")))?;
+            .map_err(|error| BackendError::Operation(format!("load {library_path}: {error}")))?;
         let set_device = unsafe {
             *library
                 .get::<unsafe extern "C" fn(i32) -> i32>(b"plait_ppu_set_device\0")
-                .map_err(|error| BackendError(format!("plait_ppu_set_device: {error}")))?
+                .map_err(|error| {
+                    BackendError::Operation(format!("plait_ppu_set_device: {error}"))
+                })?
         };
         let h2d = unsafe {
             *library
                 .get::<unsafe extern "C" fn(u64, *const c_void, usize) -> i32>(
                     b"plait_ppu_memcpy_h2d\0",
                 )
-                .map_err(|error| BackendError(format!("plait_ppu_memcpy_h2d: {error}")))?
+                .map_err(|error| {
+                    BackendError::Operation(format!("plait_ppu_memcpy_h2d: {error}"))
+                })?
         };
         let d2h = unsafe {
             *library
                 .get::<unsafe extern "C" fn(u64, *mut c_void, usize) -> i32>(
                     b"plait_ppu_memcpy_d2h\0",
                 )
-                .map_err(|error| BackendError(format!("plait_ppu_memcpy_d2h: {error}")))?
+                .map_err(|error| {
+                    BackendError::Operation(format!("plait_ppu_memcpy_d2h: {error}"))
+                })?
         };
         let sync = unsafe {
             *library
                 .get::<unsafe extern "C" fn() -> i32>(b"plait_ppu_sync\0")
-                .map_err(|error| BackendError(format!("plait_ppu_sync: {error}")))?
+                .map_err(|error| BackendError::Operation(format!("plait_ppu_sync: {error}")))?
         };
         if unsafe { set_device(device as i32) } != 0 {
-            return Err(BackendError(format!(
+            return Err(BackendError::Operation(format!(
                 "plait_ppu_set_device({device}) failed"
             )));
         }
@@ -382,7 +414,9 @@ impl DeviceRuntime for PpuRuntime {
         if status == 0 {
             Ok(())
         } else {
-            Err(BackendError(format!("plait_ppu_memcpy_h2d: {status}")))
+            Err(BackendError::Operation(format!(
+                "plait_ppu_memcpy_h2d: {status}"
+            )))
         }
     }
 
@@ -392,7 +426,9 @@ impl DeviceRuntime for PpuRuntime {
             let _ = unsafe { (self.api.sync)() };
             Ok(())
         } else {
-            Err(BackendError(format!("plait_ppu_memcpy_d2h: {status}")))
+            Err(BackendError::Operation(format!(
+                "plait_ppu_memcpy_d2h: {status}"
+            )))
         }
     }
 }
