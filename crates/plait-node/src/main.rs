@@ -204,12 +204,11 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         group_replan = Some(config);
                     }
                     "--watch-pci" => {
+                        if !cfg!(target_os = "linux") {
+                            return Err("PCI watch requires Linux".into());
+                        }
                         let path = args.next().ok_or("--watch-pci needs a path")?;
-                        let mut config: pci_watch::Config = serde_json::from_reader(
-                            std::fs::File::open(path)?,
-                        )?;
-                        config.validate()?;
-                        pci_watch_config = Some(config);
+                        pci_watch_config = Some(pci_watch::Inventory::load(PathBuf::from(path))?);
                     }
                     "--compute-only" => compute_only = true,
                     "--link-probe" => {

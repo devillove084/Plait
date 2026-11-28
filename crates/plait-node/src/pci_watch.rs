@@ -5,7 +5,7 @@ use std::ffi::{OsStr, OsString};
 use std::future::pending;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use plait_core::group::{GroupAction, GroupLookup, GroupOperation, GroupReply};
@@ -22,12 +22,12 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Config {
+struct Config {
     control_ip: IpAddr,
     devices: Vec<Device>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Device {
     ordinal: u32,
@@ -36,32 +36,97 @@ struct Device {
 }
 
 impl Config {
-    pub(super) fn validate(&mut self) -> io::Result<()> {
+    fn parse(bytes: &[u8]) -> io::Result<Self> {
+        let mut config: Self = serde_json::from_slice(bytes)?;
         let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
-        if !cfg!(target_os = "linux") {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "PCI watch requires Linux",
-            ));
-        }
-        if self.control_ip.is_unspecified()
-            || self.control_ip.is_multicast()
-            || matches!(self.control_ip, IpAddr::V4(ip) if ip.is_broadcast())
+        if config.control_ip.is_unspecified()
+            || config.control_ip.is_multicast()
+            || matches!(config.control_ip, IpAddr::V4(ip) if ip.is_broadcast())
         {
             return Err(invalid("PCI watch requires a concrete control IP"));
         }
         let mut ordinals = BTreeSet::new();
-        for device in &mut self.devices {
+        for device in &mut config.devices {
             if !ordinals.insert(device.ordinal) {
                 return Err(invalid("PCI watch requires distinct device ordinals"));
             }
             device.bdf =
                 canonical_bdf(&device.bdf).ok_or_else(|| invalid("invalid PCI address"))?;
         }
-        if self.devices.is_empty() {
-            return Err(invalid("PCI watch requires at least one device"));
+        Ok(config)
+    }
+}
+
+pub(super) struct Inventory {
+    path: PathBuf,
+    control_ip: IpAddr,
+    contents: Vec<u8>,
+    // Keep the last accepted binding even when the ordinal leaves the watch list.
+    registrations: BTreeMap<u32, Device>,
+    observations: BTreeMap<u32, Observation>,
+}
+
+impl Inventory {
+    pub(super) fn load(path: PathBuf) -> io::Result<Self> {
+        let contents = std::fs::read(&path)?;
+        let config = Config::parse(&contents)?;
+        let registrations: BTreeMap<_, _> = config
+            .devices
+            .into_iter()
+            .map(|device| (device.ordinal, device))
+            .collect();
+        let observations = registrations
+            .keys()
+            .map(|&ordinal| (ordinal, Observation::default()))
+            .collect();
+        Ok(Self {
+            path,
+            control_ip: config.control_ip,
+            contents,
+            registrations,
+            observations,
+        })
+    }
+
+    async fn refresh(&mut self) -> io::Result<bool> {
+        let contents = tokio::fs::read(&self.path).await?;
+        if contents == self.contents {
+            return Ok(false);
         }
-        Ok(())
+        let config = Config::parse(&contents)?;
+        if config.control_ip != self.control_ip {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "PCI watch control IP requires a restart to change",
+            ));
+        }
+        for device in &config.devices {
+            if let Some(previous) = self.registrations.get(&device.ordinal)
+                && (device.incarnation < previous.incarnation
+                    || (device.incarnation == previous.incarnation && device != previous))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "PCI watch ordinal {} requires a newer incarnation",
+                        device.ordinal
+                    ),
+                ));
+            }
+        }
+        let mut previous = std::mem::take(&mut self.observations);
+        for device in config.devices {
+            let ordinal = device.ordinal;
+            let observation = if self.registrations.get(&ordinal) == Some(&device) {
+                previous.remove(&ordinal).unwrap_or_default()
+            } else {
+                self.registrations.insert(ordinal, device);
+                Observation::default()
+            };
+            self.observations.insert(ordinal, observation);
+        }
+        self.contents = contents;
+        Ok(true)
     }
 }
 
@@ -148,12 +213,12 @@ impl Observation {
 
 pub(super) async fn run(
     host: NodeId,
-    config: Option<Config>,
+    inventory: Option<Inventory>,
     mut peers: BTreeMap<NodeId, String>,
     seeds: Vec<SocketAddr>,
     local_voter: bool,
 ) -> io::Result<()> {
-    let Some(config) = config else {
+    let Some(inventory) = inventory else {
         return pending().await;
     };
     if local_voter
@@ -161,13 +226,13 @@ pub(super) async fn run(
         && let Ok(socket) = address.parse::<SocketAddr>()
         && socket.ip().is_unspecified()
     {
-        *address = SocketAddr::new(config.control_ip, socket.port()).to_string();
+        *address = SocketAddr::new(inventory.control_ip, socket.port()).to_string();
     }
     let peers = peers
         .into_iter()
         .map(|(id, address)| format!("{id}@{address}"))
         .collect();
-    let listen = SocketAddr::new(config.control_ip, 0).to_string();
+    let listen = SocketAddr::new(inventory.control_ip, 0).to_string();
     let endpoints = ControlPeers::new(peers, seeds, listen);
     let mut last_connect_error = None;
     let control = loop {
@@ -183,7 +248,7 @@ pub(super) async fn run(
             }
         }
     };
-    watch(host, config.devices, control, Path::new(PCI_DEVICES)).await
+    watch(host, inventory, control, Path::new(PCI_DEVICES)).await
 }
 
 fn snapshot(root: &Path) -> io::Result<BTreeSet<OsString>> {
@@ -195,19 +260,34 @@ fn snapshot(root: &Path) -> io::Result<BTreeSet<OsString>> {
 
 async fn watch(
     host: NodeId,
-    devices: Vec<Device>,
+    mut inventory: Inventory,
     mut control: GroupControl,
     root: &Path,
 ) -> io::Result<()> {
     let mut ticks = interval(PERIOD);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut observations = devices
-        .into_iter()
-        .map(|device| (device, Observation::default()))
-        .collect::<Vec<_>>();
+    let mut last_config_error = None;
     let mut last_snapshot_error = None;
     loop {
         ticks.tick().await;
+        match inventory.refresh().await {
+            Ok(reloaded) => {
+                last_config_error = None;
+                if reloaded {
+                    println!(
+                        "plait-node PCI watch reloaded {} enrollments",
+                        inventory.observations.len()
+                    );
+                }
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if last_config_error.as_ref() != Some(&message) {
+                    eprintln!("plait-node PCI watch could not reload enrollments: {message}");
+                    last_config_error = Some(message);
+                }
+            }
+        }
         let current = match snapshot(root) {
             Ok(current) => {
                 last_snapshot_error = None;
@@ -221,15 +301,16 @@ async fn watch(
                     );
                     last_snapshot_error = Some(message);
                 }
-                for (_, observation) in &mut observations {
+                for observation in inventory.observations.values_mut() {
                     observation.absent = 0;
                 }
                 continue;
             }
         };
-        for (device, observation) in &mut observations {
+        for (&ordinal, observation) in &mut inventory.observations {
+            let device = &inventory.registrations[&ordinal];
             if observation.sample(current.contains(OsStr::new(&device.bdf))) {
-                let id = DeviceId::new(host, device.ordinal);
+                let id = DeviceId::new(host, ordinal);
                 let _ = timeout(
                     RPC_TIMEOUT,
                     observation.reconcile(&mut control, id, device.incarnation),
@@ -247,7 +328,43 @@ mod tests {
         GroupId, GroupMember, GroupOutcome, GroupPhase, GroupVersion, HostMemory, PeerEndpoint,
         ResourcePlan, WorkerDemand,
     };
-    use plait_node::{NodeConfig, RunningNode};
+    use plait_core::serving::{ExecutionDrainTarget, ServingLookup, ServingView};
+    use plait_core::{AcceleratorKind, DeviceProfile};
+    use plait_node::{Client, NodeConfig, RunningNode};
+    use serde_json::json;
+    use std::fs;
+
+    struct TestRoot(PathBuf);
+
+    impl TestRoot {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("plait-pci-{}", NodeId::random()));
+            fs::create_dir(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn replace_config(path: &Path, registrations: &[(u32, u64, &str)]) {
+        let devices = registrations
+            .iter()
+            .map(|(ordinal, incarnation, bdf)| {
+                json!({"ordinal": ordinal, "incarnation": incarnation, "bdf": bdf})
+            })
+            .collect::<Vec<_>>();
+        let draft = path.with_extension("next");
+        fs::write(
+            &draft,
+            json!({"control_ip":"127.0.0.1", "devices":devices}).to_string(),
+        )
+        .unwrap();
+        fs::rename(draft, path).unwrap();
+    }
 
     #[test]
     fn addresses_are_canonical_and_cannot_name_another_path() {
@@ -266,35 +383,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watcher_retires_only_the_missing_functions_with_current_incarnations() {
-        use std::fs;
-        use std::path::PathBuf;
+    async fn reload_preserves_only_unchanged_active_observations() {
+        let temp = TestRoot::new();
+        let path = temp.0.join("pci.json");
+        let first = "0000:01:00.0";
+        let second = "0000:01:01.0";
+        replace_config(&path, &[(0, 1, first), (1, 2, second)]);
+        let mut inventory = Inventory::load(path.clone()).unwrap();
 
-        struct TestRoot(PathBuf);
-        impl Drop for TestRoot {
-            fn drop(&mut self) {
-                let _ = fs::remove_dir_all(&self.0);
-            }
-        }
-        let temp = TestRoot(std::env::temp_dir().join(format!("plait-pci-{}", NodeId::random())));
-        fs::create_dir(&temp.0).unwrap();
+        let id = OpId::new(NodeId::random(), 1);
+        let observation = inventory.observations.get_mut(&0).unwrap();
+        observation.sample(false);
+        observation.submitted = Some(GroupOperation {
+            id,
+            action: GroupAction::ReportIdleWorkerUnavailable {
+                device: DeviceId::new(id.origin, 0),
+                incarnation: 1,
+            },
+        });
+        inventory.observations.get_mut(&1).unwrap().sample(false);
+
+        // One invalid binding rejects a simultaneous valid change.
+        replace_config(&path, &[(0, 2, first), (1, 2, first)]);
+        assert!(inventory.refresh().await.is_err());
+        assert_eq!(inventory.registrations[&0].incarnation, 1);
+        assert_eq!(inventory.observations[&1].absent, 1);
+        fs::write(&path, "{").unwrap();
+        assert!(inventory.refresh().await.is_err());
+
+        replace_config(&path, &[(1, 3, second), (0, 1, "00000000:01:00.0")]);
+        assert!(inventory.refresh().await.unwrap());
+        assert!(!inventory.refresh().await.unwrap());
+        assert_eq!(inventory.observations[&0].absent, 1);
+        assert_eq!(
+            inventory.observations[&0].submitted.as_ref().unwrap().id,
+            id
+        );
+        assert!(!inventory.observations.get_mut(&1).unwrap().sample(false));
+        assert!(inventory.observations.get_mut(&1).unwrap().sample(false));
+
+        replace_config(&path, &[]);
+        assert!(inventory.refresh().await.unwrap());
+        assert!(inventory.observations.is_empty());
+        replace_config(&path, &[(1, 2, second)]);
+        assert!(inventory.refresh().await.is_err());
+        replace_config(&path, &[(1, 3, second)]);
+        assert!(inventory.refresh().await.unwrap());
+        assert_eq!(inventory.observations[&1].absent, 0);
+    }
+
+    #[tokio::test]
+    async fn watcher_withdraws_a_readmitted_worker_after_live_reload() {
+        let temp = TestRoot::new();
         let root = temp.0.join("devices");
         fs::create_dir(&root).unwrap();
         let host = NodeId::random();
-        let watched = (0..4)
-            .map(|ordinal| Device {
-                ordinal,
-                incarnation: 1,
-                bdf: format!("0000:01:{ordinal:02x}.0"),
-            })
-            .collect::<Vec<_>>();
-        let names = watched
-            .iter()
-            .map(|device| device.bdf.clone())
-            .collect::<Vec<_>>();
+        let names = [
+            "0000:01:00.0",
+            "0000:01:01.0",
+            "0000:01:02.0",
+            "0000:01:03.0",
+        ];
+        let mut enrollments = [0, 1, 2, 3].map(|i| (i as u32, 1, names[i]));
         for address in &names {
             fs::create_dir(root.join(address)).unwrap();
         }
+        let path = temp.0.join("pci.json");
+        replace_config(&path, &enrollments);
+        let inventory = Inventory::load(path.clone()).unwrap();
         let mut config = NodeConfig::bootstrap(host, "127.0.0.1:0", BTreeMap::new());
         config.advertise_devices = false;
         let node = RunningNode::start(config).await.unwrap();
@@ -328,12 +484,12 @@ mod tests {
             )
             .await;
         }
-        let incumbent = active(&mut control, devices[0], 0).await;
-        let neighbor = active(&mut control, devices[1], 1).await;
+        let incumbent = active(&mut control, devices[0], 1, 0).await;
+        let neighbor = active(&mut control, devices[1], 1, 1).await;
         let monitor_root = root.clone();
         let monitor = tokio::spawn(async move {
             let control = GroupControl::connect(endpoints).await.unwrap();
-            watch(host, watched, control, &monitor_root).await
+            watch(host, inventory, control, &monitor_root).await
         });
         let hidden = temp.0.join("hidden");
         fs::rename(&root, &hidden).unwrap();
@@ -387,6 +543,72 @@ mod tests {
                 has_native_grant: true,
             })),
         );
+
+        let mut client = Client::new_on("127.0.0.1:0").await.unwrap();
+        client.add_peer(host, node.addr());
+        let target = ExecutionDrainTarget::Device(devices[0]);
+        let ServingView::ExecutionDrain(old_drain) = client
+            .query_serving(host, ServingLookup::ExecutionDrain(target))
+            .await
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        apply(&mut control, GroupAction::Release(failed_view.grants[0])).await;
+        let replacement = "0000:01:04.0";
+        fs::create_dir(root.join(replacement)).unwrap();
+        apply(
+            &mut control,
+            GroupAction::ReadmitWorker {
+                profile: DeviceProfile {
+                    id: devices[0],
+                    name: "test".into(),
+                    arch: AcceleratorKind::Nvidia,
+                    memory_bytes: 32,
+                    flops: 1,
+                    compute_units: 1,
+                    supports_fp16: true,
+                    supports_bf16: true,
+                    supports_fp64: false,
+                    rdma_capable: false,
+                    numa_node: None,
+                },
+                expected_incarnation: 1,
+                incarnation: 2,
+                device_bytes: 16,
+                drain: old_drain.drain.unwrap(),
+            },
+        )
+        .await;
+        enrollments[0] = (0, 2, replacement);
+        replace_config(&path, &enrollments);
+        let recovered = active(&mut control, devices[0], 2, 2).await;
+        let fresh_grant = view(&mut control, recovered).await.grants[0];
+        assert!(fresh_grant.fence > failed_view.grants[0].fence);
+        sleep(PERIOD * 3).await;
+        assert_eq!(
+            view(&mut control, recovered).await.phase,
+            GroupPhase::Active
+        );
+
+        fs::remove_dir(root.join(replacement)).unwrap();
+        timeout(Duration::from_secs(6), async {
+            while view(&mut control, recovered).await.phase != GroupPhase::Revoked {
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(view(&mut control, neighbor).await.phase, GroupPhase::Active);
+        let ServingView::ExecutionDrain(new_drain) = client
+            .query_serving(host, ServingLookup::ExecutionDrain(target))
+            .await
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(new_drain.drain.is_some());
+        assert_ne!(new_drain.drain, old_drain.drain);
         monitor.abort();
         let _ = monitor.await;
     }
@@ -416,7 +638,12 @@ mod tests {
         view
     }
 
-    async fn active(control: &mut GroupControl, device: DeviceId, slot: u16) -> GroupVersion {
+    async fn active(
+        control: &mut GroupControl,
+        device: DeviceId,
+        incarnation: u64,
+        slot: u16,
+    ) -> GroupVersion {
         let GroupOutcome::Version { version, .. } = apply(
             control,
             GroupAction::Prepare {
@@ -426,7 +653,7 @@ mod tests {
                     workers: BTreeMap::from([(
                         device,
                         WorkerDemand {
-                            incarnation: 1,
+                            incarnation,
                             device_bytes: 8,
                         },
                     )]),

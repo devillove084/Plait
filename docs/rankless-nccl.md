@@ -175,8 +175,20 @@ before recording the drain. If a reservation raced the observation, the
 node reads the current grant and reevaluates the report. Both paths retain
 the drain until an explicit recovery operation. Release of any held grant
 still requires the execution supervisor's local teardown evidence.
-After readmission, restart the local watch with the enrolled incarnation
-updated to match the new registration.
+
+After `ReadmitWorker` succeeds, atomically replace the JSON file with an
+entry for the new incarnation. The resident reads the file again before
+each scan. It validates the entire file and keeps the previous inventory
+if a read or validation fails. Keep `control_ip` fixed while the node
+runs. A PCI address change for a known ordinal requires a higher
+incarnation, even if the ordinal was removed from the watch list.
+
+New bindings start their own sequence of absence observations. Unchanged
+bindings keep their observations and any pending fault report. Remove
+entries to stop monitoring those workers, or use `"devices": []` to leave
+the watch running with no enrollments. These file edits only control
+monitoring. Device eligibility changes through the ordered control plane.
+
 Upgrade the voters before enabling the PCI watch.
 
 ### Plan across heterogeneous resources
