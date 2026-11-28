@@ -398,9 +398,11 @@ release the result after the matching completion has executed in the control pla
 | [Hosted budget selection](specs/PlaitHostedBudgetSelection.tla) | A candidate requires fresh directed samples and support from every host. The incumbent is quoted with its committed profile as the link conditions change. TLC checked 2,484 distinct states. |
 | [Rankless peer join](specs/PlaitRanklessPeerJoin.tla) | Socket handshakes bind the group version and grant view. Cancellation closes the participant's links. |
 | [Logical slot layout](specs/PlaitRanklessLayout.tla) | A participant reports ready after connecting to all members with a common slot layout. |
+| [Mixed TP × PP peer axes](specs/PlaitMixedPeerAxes.tla) | Both axes connect before readiness and share one staging allowance. After an exact grant ends, workers that observe the end and run cancellation close both axes. TLC checked 1,925 states for TP2 × PP2 and 48,073 for TP2 × PP3. |
 | [Peer revocation](specs/PlaitPeerRevocation.tla) | Observing that an exact grant has ended closes that communicator and wakes a pending call. A draining group can keep its links. |
 | [Peer failover](specs/PlaitPeerFailover.tla) | Exact-grant failure reports, readiness and host-loss eligibility for standby activation, one active version, and grant retention until release. |
-| [Shared-host fault isolation](specs/PlaitSharedHostFault.tla) | A device fault revokes its group version. A separate group on the same host keeps its communicator and grants. The model also checks standby activation, asynchronous cancellation, and per-device release after stop. TLC checked 36,895 states. |
+| [Host quarantine](specs/PlaitHostQuarantine.tla) | A confirmed fault revokes every affected group and excludes a same-host standby. Grants remain held until worker exit and release. The drain survives release and excludes new placements on the host. TLC checked 8,268 states. |
+| [Device-scoped shared-host faults](specs/PlaitSharedHostFault.tla) | A device fault revokes its group version. A separate group on the same host keeps its communicator and grants. The model also checks standby activation, asynchronous cancellation, and per-device release after stop. TLC checked 36,895 states. |
 | [Unavailable worker](specs/PlaitWorkerUnavailable.tla) | An exact report withdraws one device and revokes the group. Release preserves the device drain, healthy devices can join a successor, and a stale report cannot drain a device held by the successor. TLC checked 113 states. |
 | [PCI device watch](specs/PlaitPciWatch.tla) | Two successful absence observations qualify the idle report. A race with allocation or a newer incarnation rejects the report. TLC checked 27 states. |
 | [PCI watch reload](specs/PlaitPciReload.tla) | A new binding requires fresh absence observations. The watch retains binding history through removal, and a delayed report applies only to its registered incarnation. TLC checked 76 states. |
@@ -484,6 +486,11 @@ correction for any finite group, packed-read bounds under the load guards, and
 the matching-event and copy requirements for device publication.
 [Proof module](specs/PlaitContractsProof.tla)
 
+TLAPS also discharged all 36 obligations for the mixed layout's slot
+geometry. For any positive rectangular layout, a slot's TP and PP
+coordinates are in bounds. Distinct workers cannot share both coordinates.
+[Mixed layout proof](specs/PlaitMixedPeerAxesProof.tla)
+
 Run the proofs with `tlapm` on your `PATH`. The run uses the 1.6.0 pre-release
 at commit `e4d66f4`. [TLAPS release](https://github.com/tlaplus/tlapm/releases/tag/1.6.0-pre)
 
@@ -492,6 +499,7 @@ at commit `e4d66f4`. [TLAPS release](https://github.com/tlaplus/tlapm/releases/t
   cache=$(mktemp -d)
   trap 'rm -rf "$cache"' EXIT
   tlapm --strict --threads 2 --cache-dir "$cache" specs/PlaitContractsProof.tla
+  tlapm --strict --threads 2 --cache-dir "$cache" specs/PlaitMixedPeerAxesProof.tla
 )
 ```
 
