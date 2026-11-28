@@ -5,19 +5,25 @@ use std::net::SocketAddr;
 
 use plait_core::serving::{
     ActiveGroup, ExecutionHostLiveness, GroupId, GroupPhase, GroupPlan, GroupResources,
-    GroupVersion, GroupView, HostMemory, HostResources, PdRoute, ResidentOwner, ResolvedPdRoute,
-    RouteDirectory, RouteSetId, ServingAction, ServingEndpoint, ServingError, ServingOperation,
-    ServingOutcome, ServingReceipt, ServingResources, ServingResult, ServingRole,
-    W4_MAX_ADMISSION_MS, W4DrainStatus, W4GroupLayout, W4ShardLayout, WorkerDispatch, WorkerGrant,
-    WorkerResources,
+    GroupVersion, GroupView, HostMemory, HostResources, HostedInventory, HostedPdIntent,
+    HostedPdKv, HostedPdLaunch, HostedPdTransition, HostedPdTransitionStatus, HostedProbeEndpoint,
+    HostedRecipe, PdRoute, ResidentOwner, ResolvedPdRoute, RouteDirectory, RouteSetId,
+    ServingAction, ServingEndpoint, ServingError, ServingOperation, ServingOutcome, ServingReceipt,
+    ServingResources, ServingResult, ServingRole, W4_MAX_ADMISSION_MS, W4DrainStatus,
+    W4GroupLayout, W4ShardLayout, WorkerDispatch, WorkerGrant, WorkerResources,
 };
 use plait_core::{DeviceId, NodeId, OpId};
 
 mod decoder;
 mod host;
 mod host_launch;
+mod hosted_pd;
+mod hosted_pd_transition;
+mod hosted_serving;
+mod maintenance;
+mod peer_group;
 use decoder::{DecoderState, RecoveryPolicy};
-use host_launch::HostLaunch;
+use host_launch::{HostLaunch, HostedSwitch};
 
 #[derive(Clone)]
 struct HostState {
@@ -50,6 +56,8 @@ struct RouteSet {
     model: String,
     revision: u64,
     paths: Vec<PdRoute>,
+    hosted_kv: Option<HostedPdKv>,
+    aggregated: Vec<GroupVersion>,
 }
 
 #[derive(Clone, Copy)]
@@ -67,6 +75,7 @@ struct W4Switch {
 #[derive(Clone, Default)]
 pub(crate) struct ServingState {
     groups: BTreeMap<GroupId, GroupHistory>,
+    peer_groups: peer_group::PeerGroups,
     hosts: BTreeMap<NodeId, HostState>,
     workers: BTreeMap<DeviceId, WorkerState>,
     receipts: BTreeMap<OpId, ServingReceipt>,
@@ -76,7 +85,19 @@ pub(crate) struct ServingState {
     w4_work: BTreeMap<GroupVersion, BTreeMap<OpId, u64>>,
     resident: BTreeMap<GroupVersion, BTreeMap<DeviceId, ResidentOwner>>,
     host_launches: BTreeMap<GroupVersion, HostLaunch>,
+    hosted_switches: BTreeMap<GroupVersion, HostedSwitch>,
+    hosted_recipes: BTreeMap<GroupVersion, HostedRecipe>,
+    hosted_pool_versions: BTreeSet<GroupVersion>,
+    hosted_pd_launches: BTreeMap<GroupVersion, HostedPdLaunch>,
+    hosted_pd_intents: BTreeMap<RouteSetId, HostedPdIntent>,
+    hosted_serving_intents: BTreeMap<RouteSetId, plait_core::serving::HostedServingIntent>,
+    hosted_pd_transitions: BTreeMap<RouteSetId, HostedPdTransition>,
+    hosted_pd_transition_status: BTreeMap<RouteSetId, HostedPdTransitionStatus>,
+    hosted_inventories: BTreeMap<NodeId, HostedInventory>,
+    hosted_release_profiles: BTreeMap<NodeId, BTreeSet<String>>,
+    hosted_probes: BTreeMap<NodeId, HostedProbeEndpoint>,
     execution_hosts: BTreeMap<NodeId, ExecutionHostLiveness>,
+    execution_drains: BTreeMap<plait_core::serving::ExecutionDrainTarget, OpId>,
     decoder: DecoderState,
 }
 
@@ -149,12 +170,16 @@ impl ServingState {
                 .map(|(&host, state)| HostResources {
                     host,
                     capacity: state.capacity,
-                    reserved: state.reserved,
+                    reserved: add_memory(state.reserved, self.deferred_pd_host_memory(host))
+                        .expect("deferred memory is within capacity"),
                 })
                 .collect(),
             workers: self
                 .workers
                 .iter()
+                .filter(|(device, worker)| {
+                    worker.grant.is_some() || self.execution_drain_for(**device).is_none()
+                })
                 .map(|(&device, worker)| WorkerResources {
                     device,
                     incarnation: worker.incarnation,
@@ -214,11 +239,185 @@ impl ServingState {
                 incarnation,
                 device_bytes,
             } => self.register_worker(*device, *incarnation, *device_bytes),
+            ServingAction::BeginExecutionDrain { target } => {
+                self.begin_execution_drain(*target, operation.id)
+            }
+            ServingAction::ConfirmExecutionDrain { target, drain } => {
+                self.confirm_execution_drain(*target, *drain)
+            }
+            ServingAction::ResumeExecutionTarget { target, drain } => {
+                self.resume_execution_target(*target, *drain)
+            }
             ServingAction::Prepare {
                 group,
                 expected_epoch,
                 plan,
             } => self.prepare(*group, *expected_epoch, plan),
+            ServingAction::RegisterHostedProbe(endpoint) => self.register_hosted_probe(*endpoint),
+            ServingAction::AdvertiseHostedInventory {
+                inventory,
+                supervisor_lock,
+            } => self.advertise_hosted_inventory(inventory, operation.id, *supervisor_lock),
+            ServingAction::AdvertiseHostedInventoryWithRelease {
+                inventory,
+                supervisor_lock,
+                release_profiles,
+            } => {
+                if !release_profiles.is_subset(&inventory.profiles) {
+                    return Err(ServingError::InvalidPlan);
+                }
+                let result =
+                    self.advertise_hosted_inventory(inventory, operation.id, *supervisor_lock)?;
+                self.hosted_release_profiles
+                    .insert(inventory.host, release_profiles.clone());
+                Ok(result)
+            }
+            ServingAction::PrepareHostedPd {
+                model,
+                expected_revision,
+                kv,
+                placements,
+                paths,
+            }
+            | ServingAction::PreparePlannedHostedPd {
+                model,
+                expected_revision,
+                kv,
+                placements,
+                paths,
+                ..
+            } => self.prepare_hosted_pd(
+                operation.id,
+                model,
+                *expected_revision,
+                kv,
+                placements,
+                paths,
+            ),
+            ServingAction::ResolveHostedPd { intent, cancel } => {
+                if self
+                    .hosted_pd_transitions
+                    .contains_key(&RouteSetId::for_model(&intent.model))
+                {
+                    return Err(ServingError::InvalidDirectory);
+                }
+                self.resolve_hosted_pd(intent, *cancel)
+            }
+            ServingAction::PrepareHostedServing {
+                model,
+                expected_revision,
+                plan,
+            } => self.prepare_hosted_serving(operation.id, model, *expected_revision, plan),
+            ServingAction::PrepareHostedEvacuation {
+                model,
+                expected_revision,
+                plan,
+                drains,
+            } => {
+                if drains.is_empty()
+                    || drains
+                        .iter()
+                        .any(|(target, drain)| self.execution_drains.get(target) != Some(drain))
+                {
+                    return Err(ServingError::StaleExecutionDrain);
+                }
+                self.prepare_hosted_serving(operation.id, model, *expected_revision, plan)
+            }
+            ServingAction::ResolveHostedServing { intent, cancel } => {
+                self.resolve_hosted_serving(intent, *cancel)
+            }
+            ServingAction::PrepareHostedPdTransition {
+                model,
+                expected_revision,
+                kv,
+                bridge,
+                release,
+                target,
+            } => self.prepare_hosted_pd_transition(
+                operation.id,
+                model,
+                *expected_revision,
+                kv,
+                bridge,
+                release,
+                target,
+            ),
+            ServingAction::PreparePlannedHostedPdTransition {
+                model,
+                expected_revision,
+                kv,
+                bridge,
+                release,
+                target,
+                ..
+            } => {
+                let mut versions = BTreeSet::new();
+                for retiring in release {
+                    if self.hosted_pd_release(retiring.version).as_ref() != Some(retiring)
+                        || !versions.insert(retiring.version)
+                    {
+                        return Err(ServingError::InvalidPlan);
+                    }
+                }
+                self.prepare_hosted_pd_transition(
+                    operation.id,
+                    model,
+                    *expected_revision,
+                    kv,
+                    bridge,
+                    &versions,
+                    target,
+                )
+            }
+            ServingAction::ResolveHostedPdTransition { transition, intent } => {
+                self.resolve_hosted_pd_transition(transition, intent)
+            }
+            ServingAction::AdvanceHostedPdTransition(transition) => {
+                self.advance_hosted_pd_transition(transition)
+            }
+            ServingAction::PrepareHostedSwitch {
+                group,
+                expected_epoch,
+                expected_active,
+                plan,
+                activation,
+                ..
+            } => self.prepare_hosted_switch(
+                *group,
+                *expected_epoch,
+                *expected_active,
+                plan,
+                *activation,
+            ),
+            ServingAction::PrepareHostedDeployment {
+                group,
+                expected_epoch,
+                expected_active,
+                plan,
+                activation,
+                recipe,
+                ..
+            }
+            | ServingAction::PrepareHostedPoolDeployment {
+                group,
+                expected_epoch,
+                expected_active,
+                plan,
+                activation,
+                recipe,
+                ..
+            } => self.prepare_hosted_deployment(
+                *group,
+                *expected_epoch,
+                *expected_active,
+                plan,
+                *activation,
+                recipe,
+                matches!(
+                    &operation.action,
+                    ServingAction::PrepareHostedPoolDeployment { .. }
+                ),
+            ),
             ServingAction::PrepareW4Switch {
                 group,
                 expected_epoch,
@@ -650,7 +849,17 @@ impl ServingState {
                 addr,
                 shard,
             } => self.worker_ready_at(*grant, *launch_digest, *addr, Some(*shard)),
-            ServingAction::Activate(version) => self.activate(*version),
+            ServingAction::Activate(version) => {
+                if self.hosted_pd_launches.contains_key(version)
+                    || self
+                        .hosted_serving_intents
+                        .values()
+                        .any(|intent| intent.prepared.contains(version))
+                {
+                    return Err(ServingError::InvalidDirectory);
+                }
+                self.activate(*version)
+            }
             ServingAction::Drain(version) => self.quiesce(*version, GroupPhase::Draining),
             ServingAction::Revoke(version) => self.quiesce(*version, GroupPhase::Revoked),
             ServingAction::WorkerStopped(grant) => self.worker_stopped(*grant),
@@ -758,7 +967,9 @@ impl ServingState {
             .hosts
             .get(&host)
             .map_or(HostMemory::default(), |old| old.reserved);
-        if !fits(reserved, capacity) {
+        if add_memory(reserved, self.deferred_pd_host_memory(host))
+            .is_none_or(|total| !fits(total, capacity))
+        {
             return Err(ServingError::HostCapacityExceeded(host));
         }
         self.hosts.insert(host, HostState { capacity, reserved });
@@ -787,6 +998,7 @@ impl ServingState {
             }
             fence = old.fence;
         }
+        self.peer_groups.clear_compute_rates(device);
         self.workers.insert(
             device,
             WorkerState {
@@ -815,6 +1027,17 @@ impl ServingState {
         reservations: &mut Reservations,
     ) -> Result<GroupView, ServingError> {
         plan.validate()?;
+        if self.peer_groups.has_group(group) {
+            return Err(ServingError::InvalidPlan);
+        }
+        if let Some((transition, _)) = self
+            .deferred_pd_placements()
+            .find(|(_, placement)| placement.group == group)
+        {
+            return Err(ServingError::HostedPdInProgress {
+                staged: transition.staged,
+            });
+        }
         let latest = self
             .groups
             .get(&group)
@@ -835,9 +1058,33 @@ impl ServingState {
                 .ok_or(ServingError::SequenceExhausted)?,
         };
 
+        let grants = self.reserve_resources(version, &plan.workers, &plan.hosts, reservations)?;
+
+        Ok(GroupView {
+            version,
+            phase: GroupPhase::Preparing,
+            plan: plan.clone(),
+            grants,
+            ready: BTreeSet::new(),
+            stopped: BTreeSet::new(),
+            launch_owner: None,
+            endpoint: None,
+        })
+    }
+
+    fn reserve_resources(
+        &self,
+        version: GroupVersion,
+        workers: &BTreeMap<DeviceId, plait_core::group::WorkerDemand>,
+        hosts: &BTreeMap<NodeId, HostMemory>,
+        reservations: &mut Reservations,
+    ) -> Result<BTreeMap<DeviceId, WorkerGrant>, ServingError> {
         // Build the complete set of grants and new counters before mutating any reservation.
         let mut grants = BTreeMap::new();
-        for (&device, demand) in &plan.workers {
+        for (&device, demand) in workers {
+            if let Some(target) = self.execution_drain_for(device) {
+                return Err(ServingError::ExecutionTargetDraining(target));
+            }
             let worker = self
                 .workers
                 .get(&device)
@@ -845,7 +1092,12 @@ impl ServingState {
             if worker.incarnation != demand.incarnation {
                 return Err(ServingError::StaleIncarnation(device));
             }
-            if worker.grant.is_some() || !reservations.devices.insert(device) {
+            if worker.grant.is_some()
+                || self
+                    .deferred_pd_placements()
+                    .any(|(_, placement)| placement.plan.workers.contains_key(&device))
+                || !reservations.devices.insert(device)
+            {
                 return Err(ServingError::WorkerBusy(device));
             }
             if demand.device_bytes > worker.device_bytes {
@@ -865,7 +1117,7 @@ impl ServingState {
                 },
             );
         }
-        for (&host, demand) in &plan.hosts {
+        for (&host, demand) in hosts {
             self.require_execution_host(host)?;
             let state = self
                 .hosts
@@ -876,22 +1128,30 @@ impl ServingState {
                 .get(&host)
                 .copied()
                 .unwrap_or(state.reserved);
+            let held = self.deferred_pd_host_memory(host);
             let reserved = add_memory(prior, *demand)
-                .filter(|total| fits(*total, state.capacity))
+                .filter(|total| {
+                    add_memory(*total, held).is_some_and(|budget| fits(budget, state.capacity))
+                })
                 .ok_or(ServingError::HostCapacityExceeded(host))?;
             reservations.hosts.insert(host, reserved);
         }
 
-        Ok(GroupView {
-            version,
-            phase: GroupPhase::Preparing,
-            plan: plan.clone(),
-            grants,
-            ready: BTreeSet::new(),
-            stopped: BTreeSet::new(),
-            launch_owner: None,
-            endpoint: None,
-        })
+        Ok(grants)
+    }
+
+    fn install_host_reservations(&mut self, hosts: BTreeMap<NodeId, HostMemory>) {
+        for (host, reserved) in hosts {
+            self.hosts.get_mut(&host).expect("validated host").reserved = reserved;
+        }
+    }
+
+    fn install_grants(&mut self, grants: &BTreeMap<DeviceId, WorkerGrant>) {
+        for (&device, &grant) in grants {
+            let worker = self.workers.get_mut(&device).expect("validated worker");
+            worker.fence = grant.fence;
+            worker.grant = Some(grant);
+        }
     }
 
     fn install_groups(
@@ -899,16 +1159,10 @@ impl ServingState {
         views: impl IntoIterator<Item = GroupView>,
         reservations: Reservations,
     ) {
-        for (host, reserved) in reservations.hosts {
-            self.hosts.get_mut(&host).expect("validated host").reserved = reserved;
-        }
+        self.install_host_reservations(reservations.hosts);
         for view in views {
             let version = view.version;
-            for (&device, &grant) in &view.grants {
-                let worker = self.workers.get_mut(&device).expect("validated worker");
-                worker.fence = grant.fence;
-                worker.grant = Some(grant);
-            }
+            self.install_grants(&view.grants);
             self.groups
                 .entry(version.group)
                 .or_default()
@@ -1095,6 +1349,18 @@ impl ServingState {
     ) -> ServingResult {
         let id = RouteSetId::for_model(model);
         let previous = self.routes.get(&id);
+        if self.hosted_serving_intents.contains_key(&id)
+            || previous.is_some_and(|directory| {
+                directory.hosted_kv.is_some() || !directory.aggregated.is_empty()
+            })
+            || activate.is_some_and(|version| self.hosted_pd_launches.contains_key(&version))
+            || paths
+                .iter()
+                .flat_map(|path| [path.prefill, path.decode])
+                .any(|version| self.hosted_pd_launches.contains_key(&version))
+        {
+            return Err(ServingError::InvalidDirectory);
+        }
         if model.is_empty() || previous.is_some_and(|directory| directory.model != model) {
             return Err(ServingError::InvalidDirectory);
         }
@@ -1129,6 +1395,8 @@ impl ServingState {
                 model: model.to_owned(),
                 revision,
                 paths: paths.to_vec(),
+                hosted_kv: None,
+                aggregated: Vec::new(),
             },
         );
         Ok(ServingOutcome::RoutesPublished { revision })
@@ -1140,13 +1408,22 @@ impl ServingState {
         path: PdRoute,
         activate: Option<GroupVersion>,
     ) -> Option<ResolvedPdRoute> {
+        self.resolve_route_with(model, path, |group| routable(group, activate))
+    }
+
+    fn resolve_route_with(
+        &self,
+        model: &str,
+        path: PdRoute,
+        eligible: impl Fn(&GroupView) -> bool,
+    ) -> Option<ResolvedPdRoute> {
         let prefill = self.group(path.prefill)?;
         let decode = self.group(path.decode)?;
         if prefill.plan.role != ServingRole::Prefill
             || decode.plan.role != ServingRole::Decode
             || prefill.plan.model != decode.plan.model
-            || !routable(prefill, activate)
-            || !routable(decode, activate)
+            || !eligible(prefill)
+            || !eligible(decode)
         {
             return None;
         }
@@ -1181,7 +1458,8 @@ impl ServingState {
         }
         view.phase = phase;
         let history = self.groups.get_mut(&version.group).expect("known group");
-        if history.active == Some(version.epoch) {
+        let was_active = history.active == Some(version.epoch);
+        if was_active {
             history.active = None;
         }
         let phase = if phase == GroupPhase::Draining {
@@ -1191,6 +1469,9 @@ impl ServingState {
         } else {
             if let Some(work) = self.w4_work.get_mut(&version) {
                 work.clear();
+            }
+            if was_active {
+                self.hosted_incumbent_revoked(version);
             }
             phase
         };
@@ -1502,6 +1783,10 @@ impl ServingState {
         self.w4_work.remove(&version);
         self.resident.remove(&version);
         self.host_launches.remove(&version);
+        self.hosted_switches.remove(&version);
+        self.hosted_recipes.remove(&version);
+        self.hosted_pool_versions.remove(&version);
+        self.hosted_pd_launches.remove(&version);
         self.decoder.endpoints.remove(&version);
         self.decoder.managed.remove(&version);
         Ok(group_outcome(version, GroupPhase::Retired))

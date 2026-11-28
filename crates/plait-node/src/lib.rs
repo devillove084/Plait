@@ -6,27 +6,25 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::Notify;
+use tokio::sync::{Notify, oneshot};
 use tokio::task::JoinHandle;
 
 use plait_consensus::{Options, Replica};
+use plait_core::group::{GroupLookup, GroupReply};
 use plait_core::serving::{ServingAction, ServingLookup, ServingOperation, ServingView};
 use plait_core::{
-    AcceleratorKind, ClusterConfig, Command, ComputeRequirement, ComputeTask, DeviceId, FuseKind,
-    NodeId, OpId, OpSpec, ShardId, TensorId, TensorKey,
+    AcceleratorKind, ClusterConfig, Command, ComputeRequirement, ComputeTask, DeviceId,
+    DeviceProfile, FuseKind, NodeId, OpId, OpSpec, ShardId, TensorId, TensorKey,
 };
 use plait_fabric::Runtime;
 use plait_net::{TcpTransport, Wire};
 use serde::{Deserialize, Serialize};
 
-mod client;
-mod discovery;
 mod execution_host;
 mod observation;
 mod storage;
-pub use client::{Client, QueryResult};
-pub use discovery::discover_voters;
 use observation::PendingObservation;
+pub use plait_net::control::{Client, QueryResult, discover_voters};
 pub use storage::StorageMode;
 use storage::{Image, Journal};
 
@@ -171,15 +169,19 @@ impl RunningNode {
             options: config.options,
             joined: config.join.is_none(),
             join: config.join,
-            advertise_devices: config.advertise_devices,
+            device_discovery: if config.advertise_devices {
+                DeviceDiscovery::Pending
+            } else {
+                DeviceDiscovery::Finished
+            },
             staged_proposed: BTreeSet::new(),
             commit_proposed: BTreeSet::new(),
-            devices_registered: false,
             last_join_poll: 0,
             last_ready: 0,
             started: Instant::now(),
             observations: BTreeMap::new(),
             execution_hosts: execution_host::HostWatch::default(),
+            next_hosted_pd_scan: 0,
         };
         let handle = tokio::spawn(state.run(task_stop));
         Self {
@@ -224,16 +226,22 @@ struct NodeState {
     journal: Option<Journal>,
     options: Options,
     join: Option<JoinTarget>,
-    advertise_devices: bool,
+    device_discovery: DeviceDiscovery,
     joined: bool,
     staged_proposed: BTreeSet<NodeId>,
     commit_proposed: BTreeSet<NodeId>,
-    devices_registered: bool,
     last_join_poll: u64,
     last_ready: u64,
     started: Instant,
     observations: BTreeMap<(NodeId, u64), PendingObservation>,
     execution_hosts: execution_host::HostWatch,
+    next_hosted_pd_scan: u64,
+}
+
+enum DeviceDiscovery {
+    Pending,
+    Running(oneshot::Receiver<Vec<DeviceProfile>>),
+    Finished,
 }
 
 impl NodeState {
@@ -275,6 +283,43 @@ impl NodeState {
                             .expirations(self.replica.machine(), now)
                         {
                             self.propose(Command::Serving(Box::new(operation)), now);
+                        }
+                        if now >= self.next_hosted_pd_scan {
+                            self.next_hosted_pd_scan = now + 1000;
+                            for intent in self.replica.machine().serving_hosted_work() {
+                                self.propose(
+                                    Command::Serving(Box::new(ServingOperation {
+                                        id: OpId::new(NodeId::random(), 1),
+                                        action: ServingAction::ResolveHostedServing {
+                                            intent,
+                                            cancel: false,
+                                        },
+                                    })),
+                                    now,
+                                );
+                            }
+                            for intent in self.replica.machine().serving_hosted_pd_work() {
+                                self.propose(
+                                    Command::Serving(Box::new(ServingOperation {
+                                        id: OpId::new(NodeId::random(), 1),
+                                        action: ServingAction::ResolveHostedPd {
+                                            intent,
+                                            cancel: false,
+                                        },
+                                    })),
+                                    now,
+                                );
+                            }
+                            for action in self.replica.machine().serving_hosted_pd_transition_work()
+                            {
+                                self.propose(
+                                    Command::Serving(Box::new(ServingOperation {
+                                        id: OpId::new(NodeId::random(), 1),
+                                        action,
+                                    })),
+                                    now,
+                                );
+                            }
                         }
                     }
                     self.maybe_register_devices(now);
@@ -376,14 +421,7 @@ impl NodeState {
                 let result = if !can_propose {
                     Err("this node is not a voter".to_owned())
                 } else {
-                    match self.replica.machine().validate(&command) {
-                        Err(error) => Err(error),
-                        Ok(()) => self
-                            .replica
-                            .propose(command, now)
-                            .map(|_| String::new())
-                            .map_err(|error| error.to_string()),
-                    }
+                    self.submit(command, now)
                 };
                 let (ok, message) = match result {
                     Ok(message) => (true, message),
@@ -421,6 +459,61 @@ impl NodeState {
             }
             Wire::Ping => {
                 let _ = self.transport.send(from, Wire::Pong).await;
+            }
+            Wire::GroupQuery {
+                request,
+                lookup,
+                reply_to,
+            } => {
+                self.transport.set_peer(from, reply_to);
+                let runtime = self.replica.machine();
+                let view = match lookup {
+                    GroupLookup::Version(version) => {
+                        GroupReply::Version(runtime.peer_group(version))
+                    }
+                    GroupLookup::Recipe(version) => {
+                        GroupReply::Recipe(runtime.peer_group_recipe(version))
+                    }
+                    GroupLookup::Receipt(id) => {
+                        GroupReply::Receipt(runtime.peer_group_receipt(id).cloned())
+                    }
+                    GroupLookup::Placement(group) => {
+                        GroupReply::Placement(runtime.placement_inventory(group))
+                    }
+                    GroupLookup::Worker(device) => GroupReply::Worker(runtime.worker_state(device)),
+                    GroupLookup::LinkProbes => GroupReply::LinkProbes(runtime.link_probes()),
+                    GroupLookup::GrantStatus(grant) => {
+                        GroupReply::GrantStatus(runtime.peer_grant_status(grant))
+                    }
+                    GroupLookup::PeerStagingBytes(grant) => {
+                        GroupReply::PeerStagingBytes(runtime.peer_staging_bytes(grant))
+                    }
+                    GroupLookup::Standby(group) => GroupReply::Standby(runtime.peer_standby(group)),
+                    GroupLookup::LatestPreparation(group) => {
+                        GroupReply::Preparation(runtime.latest_peer_preparation(group))
+                    }
+                    GroupLookup::PlacementWithRates { group, calibration } => {
+                        GroupReply::PlacementWithRates {
+                            inventory: runtime.placement_inventory(group),
+                            rates: runtime.compute_rates(calibration),
+                        }
+                    }
+                    GroupLookup::ComputeRate {
+                        device,
+                        calibration,
+                    } => GroupReply::ComputeRate(runtime.compute_rate(device, calibration)),
+                };
+                let _ = self
+                    .transport
+                    .send(
+                        from,
+                        Wire::GroupQueryReply {
+                            request,
+                            lookup,
+                            view: Box::new(view),
+                        },
+                    )
+                    .await;
             }
             Wire::ServingQuery {
                 request,
@@ -469,6 +562,54 @@ impl NodeState {
                     }
                     ServingLookup::ExecutionHostLiveness(host) => {
                         ServingView::ExecutionHostLiveness(runtime.serving_execution_host(host))
+                    }
+                    ServingLookup::HostedAssignments(host) => {
+                        ServingView::HostedAssignments(runtime.serving_hosted_assignments(host))
+                    }
+                    ServingLookup::HostedManagedAssignments(host) => {
+                        ServingView::HostedManagedAssignments(
+                            runtime.serving_hosted_managed_assignments(host),
+                        )
+                    }
+                    ServingLookup::HostedPdPending(key) => {
+                        ServingView::HostedPdPending(runtime.serving_hosted_pd_pending(key))
+                    }
+                    ServingLookup::HostedRoutes(key) => {
+                        ServingView::HostedRoutes(runtime.serving_hosted_routes(key))
+                    }
+                    ServingLookup::HostedServingPending(key) => {
+                        ServingView::HostedServingPending(runtime.serving_hosted_pending(key))
+                    }
+                    ServingLookup::HostedServingPlanning(key) => {
+                        ServingView::HostedServingPlanning(runtime.serving_mode_planning(key))
+                    }
+                    ServingLookup::HostedEvacuationPlanning(key) => {
+                        ServingView::HostedEvacuationPlanning(
+                            runtime.serving_hosted_evacuation(key),
+                        )
+                    }
+                    ServingLookup::ExecutionDrain(target) => {
+                        ServingView::ExecutionDrain(runtime.serving_execution_drain(target))
+                    }
+                    ServingLookup::HostedPdPlanning(key) => {
+                        ServingView::HostedPdPlanning(runtime.serving_hosted_pd_planning(key))
+                    }
+                    ServingLookup::HostedPdReconfiguration(key) => {
+                        ServingView::HostedPdReconfiguration(
+                            runtime.serving_hosted_pd_reconfiguration(key),
+                        )
+                    }
+                    ServingLookup::HostedPdRecovery(key) => {
+                        ServingView::HostedPdRecovery(runtime.serving_hosted_pd_recovery(key))
+                    }
+                    ServingLookup::HostedPdTransition(key) => ServingView::HostedPdTransition(
+                        runtime.serving_hosted_pd_transition_status(key),
+                    ),
+                    ServingLookup::HostedProbeEndpoints => {
+                        ServingView::HostedProbeEndpoints(runtime.serving_hosted_probe_endpoints())
+                    }
+                    ServingLookup::HostedPlanning => {
+                        ServingView::HostedPlanning(runtime.serving_hosted_planning())
                     }
                     ServingLookup::DecoderClaims(version) => {
                         ServingView::DecoderClaims(runtime.serving_decoder_claims(version))
@@ -527,7 +668,8 @@ impl NodeState {
             | Wire::Ack { .. }
             | Wire::QueryReply { .. }
             | Wire::ServingQueryReply { .. }
-            | Wire::ServingGroupObserved { .. } => {}
+            | Wire::ServingGroupObserved { .. }
+            | Wire::GroupQueryReply { .. } => {}
         }
         Ok(())
     }
@@ -547,18 +689,43 @@ impl NodeState {
     }
 
     fn maybe_register_devices(&mut self, now: u64) {
-        if !self.advertise_devices
-            || self.devices_registered
-            || !self.replica.config().is_voter(self.id)
-            || (self.join.is_some() && !self.joined)
-        {
+        if !self.joined || !self.replica.config().is_voter(self.id) {
             return;
         }
-        let profiles = plait_device::discover(self.id);
-        for profile in &profiles {
-            self.propose(Command::RegisterDevice(profile.clone()), now);
+        let profiles = match &mut self.device_discovery {
+            DeviceDiscovery::Pending => {
+                let id = self.id;
+                let (send, result) = oneshot::channel();
+                // Vendor utilities and driver calls can block indefinitely.
+                // A dedicated thread keeps the replica and Tokio shutdown independent.
+                self.device_discovery = match std::thread::Builder::new()
+                    .name("plait-device-discovery".into())
+                    .spawn(move || {
+                        let _ = send.send(plait_device::discover(id));
+                    }) {
+                    Ok(_) => DeviceDiscovery::Running(result),
+                    Err(error) => {
+                        eprintln!("{id}: cannot start device discovery: {error}");
+                        DeviceDiscovery::Finished
+                    }
+                };
+                return;
+            }
+            DeviceDiscovery::Running(result) => match result.try_recv() {
+                Ok(profiles) => profiles,
+                Err(oneshot::error::TryRecvError::Empty) => return,
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    eprintln!("{}: device discovery exited without results", self.id);
+                    self.device_discovery = DeviceDiscovery::Finished;
+                    return;
+                }
+            },
+            DeviceDiscovery::Finished => return,
+        };
+        self.device_discovery = DeviceDiscovery::Finished;
+        for profile in profiles {
+            self.propose(Command::RegisterDevice(profile), now);
         }
-        self.devices_registered = true;
     }
 
     async fn drive_join(&mut self, now: u64) {
@@ -621,6 +788,26 @@ impl NodeState {
         }
     }
 
+    fn submit(&mut self, command: Command, now: u64) -> Result<String, String> {
+        let runtime = self.replica.machine();
+        if let Command::Serving(operation) = &command
+            && retired_decoder_action(&operation.action)
+        {
+            // Gate client proposals here so committed history and in-flight
+            // consensus instances retain their deterministic apply behavior.
+            return match runtime.serving_receipt(operation.id) {
+                Some(receipt) if receipt.operation == **operation => Ok(String::new()),
+                Some(_) => Err("serving operation id already used for another action".into()),
+                None => Err("the native decoder is retired; submit inference to the engine".into()),
+            };
+        }
+        runtime.validate(&command)?;
+        self.replica
+            .propose(command, now)
+            .map(|_| String::new())
+            .map_err(|error| error.to_string())
+    }
+
     fn propose(&mut self, command: Command, now: u64) {
         if let Err(error) = self.replica.propose(command, now) {
             eprintln!("{}: proposal failed: {error}", self.id);
@@ -638,6 +825,39 @@ impl NodeState {
             }
         }
     }
+}
+
+// Expiration and cancellation remain available to close work from old journals.
+fn retired_decoder_action(action: &ServingAction) -> bool {
+    matches!(
+        action,
+        ServingAction::DecoderReady { .. }
+            | ServingAction::DecoderReadyManaged { .. }
+            | ServingAction::PublishDecoderRoutes { .. }
+            | ServingAction::PublishDecoderStandbys { .. }
+            | ServingAction::FailoverDecoder { .. }
+            | ServingAction::StageDecoderSwitch { .. }
+            | ServingAction::CommitDecoderSwitch { .. }
+            | ServingAction::PrepareDecoderSwitch { .. }
+            | ServingAction::PrepareDecoderSwitchFromPool { .. }
+            | ServingAction::PrepareWeightedDecoderSwitch { .. }
+            | ServingAction::ConfigureDecoderWeights { .. }
+            | ServingAction::AdmitDecoder { .. }
+            | ServingAction::AdmitDecoderRouted { .. }
+            | ServingAction::AdmitDecoderWithRecovery { .. }
+            | ServingAction::AdmitDecoderWithRetry { .. }
+            | ServingAction::AdmitDecoderReplay { .. }
+            | ServingAction::AdmitResumableDecoder { .. }
+            | ServingAction::SubmitDecoder { .. }
+            | ServingAction::SubmitDecoderRouted { .. }
+            | ServingAction::AppendDecoderOutput { .. }
+            | ServingAction::TakeoverDecoder { .. }
+            | ServingAction::TakeoverDecoderWithRetry { .. }
+            | ServingAction::RecoverDecoderWork { .. }
+            | ServingAction::RestartDecoderWork { .. }
+            | ServingAction::RebindDecoderEntry { .. }
+            | ServingAction::AdvanceDecoder { .. }
+    )
 }
 
 /// Start three TCP nodes, propose a fused sum through different nodes, and

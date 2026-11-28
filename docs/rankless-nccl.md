@@ -1,78 +1,2825 @@
-# Rankless NCCL compatibility
+# Plait TP transport and NCCL compatibility
 
-The NCCL C ABI takes `(nranks, uniqueId, rank)` at init. Plait keeps that ABI
-for existing applications, but the runtime itself does not need a rank table:
-the unique id is the only group metadata.
+The vLLM fork uses Plait's peer transport for tensor parallel groups when
+`VLLM_USE_PLAIT=1`. Each worker publishes its own endpoint and contributes
+to collectives with its local accelerator. CUDA, ROCm, Huawei CANN, and PPU
+HGGC workers share the same wire format.
 
-## Three layers
+The vLLM fork provides request admission, KV transfer, and stream recovery.
+Its KV page store runs as a separate process. The Plait node journal stores
+group state and operation receipts. [vLLM KV page store][vllm-kv-store]
 
-1. **Wire group** — `Group(world, port)` writes `PLNC`, the TCP port, and the
-   world size into one 128-byte `ncclUniqueId`. The root listens; workers join
-   the same id and receive their rank at rendezvous. No separate metadata
-   service, JSON file, or rank list is read.
-2. **Rankless API** — `Group.join_root(device)` / `Group.join(device)` return a
-   `CommHandle` without caller-supplied rank or world. Arrival order assigns
-   ranks, so callers only need the id and their device.
-3. **NCCL ABI** — `ncclGetUniqueId` / `ncclCommInitRank` are thin adapters over
-   the same wire group. `rank` is accepted because NCCL applications pass it;
-   it is not needed by the collective algorithms.
+Drain and retire any original Rust decoder groups before upgrading. The
+`tensor decoder-w4`, `tensor generate-pd`, `tensor replay-pd`, and
+`tensor resume-pd` commands have been removed. Existing journals still replay
+their decoder records and return committed receipts. The legacy expiration
+and cancellation operations and the usual device-release checks remain
+available for cleanup after an upgrade.
 
-```python
-import plait_nccl
-root = plait_nccl.Group(world=2, port=35000)
-id = root.unique_id                       # send through the existing store
-comm = root.join_root(device=0)           # rank 0
-# worker:
-comm = plait_nccl.Group.from_id(id).join(device=1)  # rank assigned at join
+[vllm-kv-store]: https://github.com/devillove084/vllm/tree/plait/v0.31-runtime/tools/plait/kv-store
+
+## Start a peer group
+
+### Join by device identity
+
+Use the native [C ABI](../crates/plait-nccl/include/plait_peer.h) or Rust
+`RanklessListener` for a caller that already owns a committed group version
+and the corresponding worker grants. The caller supplies these grants and
+distributes peer endpoint records through its control plane.
+
+1. On every participant, call `plaitPeerListen` with the group ID and epoch,
+   stable device ID, incarnation, fence, and a fresh per-listener ticket.
+   The returned member record carries the selected endpoint and grant.
+2. Give every participant the full member list. Call `plaitPeerConnect`
+   with the list in any order and the local backend and device ordinal.
+   Plait sorts by device ID and checks the group version, complete grant list,
+   endpoints, and tickets in each handshake. Rust callers use
+   `Comm::connect_rankless`.
+3. Use the usual NCCL operations on the returned handle. Resolve a stable
+   device ID to its current slot with `plaitPeerDeviceSlot` when an operation
+   accepts a peer or root slot.
+
+`plaitPeerCancel` closes the communicator's sockets and prevents new calls.
+`plaitPeerFailed` reports failure recorded locally by cancellation or an
+operation. Wait for active calls before destroying the handle or releasing its
+buffers. Build a new communicator from the next group's grants and tickets
+when the control plane changes membership. Independent communicators continue
+using their own sockets and sequence state.
+
+### Publish a manifest through the control plane
+
+The native group API uses the same device fences and host memory ledger as
+hosted execution. Its placement specifies a group ID, the expected epoch,
+worker incarnations, and per-device and per-host resource demand. Any voter
+can accept a proposal. To send newline-delimited requests, start a client with
+`plait-node group --listen 192.0.2.10:0 --seed 192.0.2.11:7950`.
+Rust callers can use `plait_core::group` and `plait_node::Client`.
+
+On startup, a voting node probes local devices on a separate thread and
+submits their profiles through consensus as soon as the probe returns.
+The voter can process group requests while its vendor tools and drivers
+initialize. Each startup launches at most one scan. Hosts that register
+execution workers separately can use `--no-advertise-devices`.
+
+1. Register capacity with `SetHostMemory` and `RegisterWorker`. Use the
+   `prepare` request to reserve a version. Its `workers` and `hosts` fields
+   are lists of `(identity, demand)` pairs. The version's view contains the
+   granted fences and incarnations.
+2. Each participant opens a listener and submits `PublishEndpoint` with its
+   local grant and endpoint record. A published endpoint is immutable for the
+   lifetime of the version. The version exposes a manifest after every grant
+   has an endpoint. Clients can poll `view` and use `observe` to order a fresh
+   read against group mutations.
+3. Each participant joins using the observed manifest, then submits `Ready`
+   with its grant and `plaitPeerManifestDigest` from the connected handle.
+   The control plane accepts `Activate` after every member confirms the same
+   manifest. Use `observe` without an explicit epoch to resolve the group
+   for new work, and check that the returned phase is still `Active`.
+4. `Drain` and `Revoke` remove the version from new admissions. After a worker
+   finishes or cancels its calls and closes access to its device and buffers,
+   submit `Release` with its exact grant. An available device becomes eligible
+   for a new fence immediately. The host's reservation remains until its last
+   grant in that version is released. Later retries for a released grant
+   preserve any successor reservation.
+
+The `apply` request takes an `operation` containing an `id` and a serialized
+`GroupAction`. Keep the operation ID when retrying an ambiguous result.
+Voters with `run --state-dir` preserve applied group metadata through restart.
+Callers use current metadata and device completion to decide when existing
+handles can be reclaimed.
+
+### Quarantine a compute host
+
+Confirmed local hardware loss defaults to host scope. A `QuarantineHost`
+operation accepts the exact held grant or the current incarnation of an idle
+worker. The voter records a host drain and revokes all affected execution
+groups in the same operation. Standbys on the quarantined host are revoked
+with the other groups. A ready native standby on a healthy host can take over.
+Existing grants stay charged until their owners confirm teardown.
+
+The host drain excludes all of the host's devices from new placements,
+including devices advertised after the fault. Compute admission and voter
+membership are independent. After inspecting the host, query
+`execution_drain` with `{"Host": <node id>}` through `plait-node serving`,
+then confirm the drain and resume it using its current drain ID.
+Upgrade voters before starting reporters that submit `QuarantineHost`.
+
+### Withdraw an unavailable worker
+
+The device-scoped path remains available for device recovery experiments.
+Set `PLAIT_DEVICE_FAILURE_SCOPE=device` for the committed peer communicator
+and `"failure_scope": "device"` in the PCI watch configuration.
+
+For a confirmed worker outage, send an `apply` request to `plait-node group`
+with the `ReportWorkerUnavailable` action and the exact held grant.
+One ordered operation revokes the group, activates any armed standby, and
+records a drain for that device.
+The report can follow a group-wide failure report while the grant remains
+held. A delayed report for a released grant returns `GrantMismatch`.
+
+Each old worker returns its grant after local work and device access have
+ended. The drained device stays out of placement after its grant returns.
+Other devices on the same host can serve their current groups or receive
+new grants. The resident planner can prepare a smaller configured recipe
+as soon as its devices and host resources become available.
+
+After verifying the device with its local runtime, look up the device drain
+with `execution_drain` through `plait-node serving`. To return a native
+worker under a fresh incarnation, send `ReadmitWorker` through
+`plait-node group`. Supply the current drain ID as `drain`, the last
+registered generation as `expected_incarnation`, a higher `incarnation`,
+and the recovered worker's `profile` and `device_bytes`, as in
+`AdvertiseWorker`. Upgrade the voters before sending the action.
+
+The voter checks the exact drain and old generation, as well as outstanding
+grants and deferred placements, in the same operation that registers the
+new incarnation and clears the device drain. It clears the recovered
+device's old calibration and keeps its fence counter. The next reservation
+allocates a higher fence. Any covering host drain continues to apply.
+Refresh the placement snapshot and publish new calibration for measured
+layouts. An ambiguous submission can be retried with the original operation
+ID. An explicit rejection needs a new ID after checking the current state.
+
+For an administrative pause at the current incarnation, confirm the drain
+and use `resume_execution_target`. Use `ReportFailure` for a communicator
+failure without a confirmed worker outage.
+
+For a committed peer communicator, a confirmed local ECC failure during
+stream synchronization or a device copy submits a hardware loss report
+with the communicator's own grant. The reporting call stops new local operations and
+waits up to 15 seconds for the ordered receipt. The report has its own
+operation ID, so an earlier transport failure can still be followed by a
+local hardware diagnosis while the grant is held.
+
+CUDA uses `CUDA_ERROR_ECC_UNCORRECTABLE` and verifies the current context and
+any explicit stream. Native HIP and HGGC use their uncorrectable ECC status
+(214) and check the device of an explicit stream before reporting. CANN uses
+`ACL_ERROR_RT_HBM_MULTI_BIT_ECC_ERROR` (507054). Generic execution errors,
+uncertain stream ownership, and a CANN suspect peer-memory error continue to
+revoke the communicator without withdrawing the device. Third-party PPU
+adapters have no hardware-error contract and retain the generic path.
+[CUDA Driver results][cuda-driver-results] · [HIP error codes][hip-error-codes] ·
+[CANN runtime error codes][cann-runtime-errors]
+
+[cuda-driver-results]: https://docs.nvidia.com/cuda/cuda-driver-api/cuda_driver_api/group__CUDA__TYPES.html
+[hip-error-codes]: https://rocm.docs.amd.com/projects/HIP/en/latest/reference/error_codes.html
+[cann-runtime-errors]: https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/910/API/runtimeapi/aclcppdevg_03_1345.html
+
+### Detect a missing execution host
+
+Start `plait-node run` with `--native-execution native.json` on each host
+running native vLLM workers. Use the registered host ID. The same option
+works on a voter. A compute-only node can discover voters from a seed.
+
+```sh
+plait-node run --compute-only --id "$HOST_ID" --seed "$VOTER_ADDR" \
+  --native-execution native.json
 ```
 
-## vLLM
-
-`plait_nccl.patch_vllm()` replaces `NCCLLibrary` and disables the NVIDIA-only
-custom all-reduce/symmetric-memory fast paths so tensor collectives reach the
-Plait communicator. `patch_vllm_control()` maps the remaining
-`torch.distributed` control groups to Gloo; vLLM still needs that group for its
-store and object broadcast, but no tensor data crosses NCCL.
-
-```python
-import plait_nccl
-plait_nccl.patch_vllm()
-plait_nccl.patch_vllm_control()
+```json
+{
+  "control_ip": "192.0.2.10",
+  "host_memory": {"bytes": 68719476736, "pinned_bytes": 1073741824},
+  "lock_dir": "/var/lib/plait/native"
+}
 ```
 
-## Device backends
+Set the memory values to the host budgets available to Plait. Keep the lock
+directory on persistent local storage and retain its `host-supervisor.lock`
+file across restarts. Register devices through the normal group inventory
+path. Start the node before placing groups on that host.
 
-| backend | selection | implementation |
-|---|---|---|
-| CUDA | default | `cudarc` context + `cuMemcpyHtoD/DtoH` |
-| Huawei | `PLAIT_NCCL_BACKEND=huawei` | dynamically loads `libascendcl.so` and resolves `aclInit`, `aclrtSetDevice`, `aclrtMemcpy`, `aclrtSynchronizeDevice` |
-| PPU | `PLAIT_NCCL_BACKEND=ppu` | dynamically loads `libplait_ppu.so` with the adapter ABI below |
+The node publishes a heartbeat every two seconds. After a voter observes
+the same heartbeat for ten seconds, it proposes expiry with that heartbeat
+ID and the current set of affected versions. The commit requires both to
+match. With a live quorum, expiry marks the host offline, revokes its live
+native groups and promotes any armed standby that has reached Ready on
+unaffected hosts. Expiry preserves existing grants and blocks new
+reservations, including for idle devices.
 
-The vendor runtimes are loaded with `libloading`, so the same wheel builds and
-runs on an NVIDIA-only machine. If the vendor library is absent the init fails
-with the library path rather than falling back to CUDA.
+A restart with the same local supervisor lock can renew liveness. Released
+devices then become eligible if they also satisfy the inventory and drain
+checks. A confirmed ECC or PCI fault keeps its quarantine until explicit
+recovery. `--watch-pci` can run in the same node.
 
-PPU adapter ABI (`libplait_ppu.so`):
+### Watch for PCI device removal
 
-```c
-int  plait_ppu_set_device(int device);
-int  plait_ppu_memcpy_h2d(uint64_t dst, const void *src, size_t bytes);
-int  plait_ppu_memcpy_d2h(uint64_t src, void *dst, size_t bytes);
-int  plait_ppu_sync(void);
+On Linux, add `--watch-pci pci.json` to a resident `plait-node run` command.
+Use the host's registered node ID. The file maps each local worker ordinal
+and incarnation to its PCI address from the host inventory. The address
+identifies the physical PCI function independently of any worker visibility
+mask or model slot.
+
+```json
+{
+  "control_ip": "192.0.2.10",
+  "devices": [
+    {"ordinal": 0, "incarnation": 1, "bdf": "0000:01:00.0"}
+  ]
+}
 ```
 
-## Current limits
+A compute-only node can use this option with `--seed`. The resident checks
+the kernel PCI directory every 500 ms. Two consecutive successful reads
+that omit an enrolled function confirm its absence. A read error resets
+that observation. The reporter runs in the node process and can act even
+when the model worker no longer executes any calls.
 
-- The all-reduce path is two-level when `PLAIT_NCCL_HOSTS` is set and
-  `PLAIT_NCCL_SHM=1`: one shared-memory mailbox per host group, one cross-host
-  exchange between group leaders, then a second shared-memory publish. Example:
-  `PLAIT_NCCL_HOSTS=0-3,4-11`.
-- The two-level path covers all-reduce, all-gather, broadcast from rank 0, and
-  reduce-scatter. It uses `PLAIT_NCCL_SHM_BYTES` (64 MiB default with a host
-  layout) per rank; larger messages, `Avg`, and non-zero-root broadcasts fall
-  back to the TCP star. GPU peer memory is not wired into this ABI yet.
-- `patch_vllm_control()` is for control groups only. A full vLLM engine on a
-  vendor platform also needs that platform's `torch` device backend; Plait
-  supplies the collective side, not the tensor runtime.
-- `ncclCommWindowRegister` returns a handle-shaped value but does not create
-  symmetric memory; symmetric-memory dispatch is disabled by `patch_vllm()`.
+The node submits the exact held grant for an assigned worker and the
+observed incarnation for an idle worker. The voter verifies that the
+worker still matches the report before recording the host drain. If a
+reservation raced the observation, the node reads the current grant and
+reevaluates the report. Device scope retains the original per-device
+withdrawal behavior. Both scopes keep the drain until explicit recovery.
+
+In device scope, after `ReadmitWorker` succeeds, atomically replace the JSON file with an
+entry for the new incarnation. The resident reads the file again before
+each scan. It validates the entire file and keeps the previous inventory
+if a read or validation fails. Keep `control_ip` and `failure_scope` fixed while the node
+runs. A PCI address change for a known ordinal requires a higher
+incarnation, even if the ordinal was removed from the watch list.
+
+New bindings start their own sequence of absence observations. Unchanged
+bindings keep their observations and any pending fault report. Remove
+entries to stop monitoring those workers, or use `"devices": []` to leave
+the watch running with no enrollments. These file edits only control
+monitoring. Device eligibility changes through the ordered control plane.
+
+Upgrade the voters before enabling the PCI watch.
+
+### Plan across heterogeneous resources
+
+Use `AdvertiseWorker` with a `DeviceProfile`, incarnation, and allocatable
+device bytes. The incarnation binds the profile to the registered device.
+The `placement` request reads the group's versions, available device grants,
+and host capacity and reservations from a replica.
+
+Send a `plan` request with the group ID and a `workload` object. When the
+workload sends bytes between workers, the planner reads the latest samples
+from the hosts' probes. An explicit `links` array supplies the samples for
+that request. Use `links: []` to evaluate with no link measurements.
+
+| Field | Meaning |
+| --- | --- |
+| `widths` | Legal group sizes supplied by the caller. |
+| `requirement` | Optional device capabilities, including the operation data type. The default data type is FP32. |
+| `device_bytes` | Allocatable device memory required by each worker. |
+| `per_worker_host`, `per_host` | Host memory charged per worker and once per participating host. Each has `bytes` and `pinned_bytes`. |
+| `compute_work`, `bytes_per_peer` | Estimated work per operation and bytes sent per directed worker pair. A zero term excludes that cost. |
+| `max_link_age_ms` | Freshness limit for the link samples. Each sample has `source`, `target`, `bytes_per_second`, `rtt_ns`, and Unix `sampled_at_ms`. |
+| `operations`, `switch_ns`, `minimum_gain_ns` | Forecast horizon in operations, one-time replacement cost, and optional gain threshold. |
+
+The planner filters unavailable devices and accounts for both versions' host
+reservations during preparation. Its estimate uses the slowest compute rate
+for equal work per device. The network estimate accounts for all worker pairs
+sharing each directed host link, then takes the highest host ingress or egress
+cost. A cross-host communication candidate needs fresh measurements in both
+directions. The search retains up to 24 partial layouts per width. The network
+estimate covers cross-host TCP.
+
+The reply reports `prepare` with a placement and cost, `keep` with the active
+version, `pending` with the version in preparation, `await_links` when the
+incumbent cannot be compared, or `no_placement` when the search finds no
+candidate. When both layouts are feasible, the estimated gain over the horizon
+must exceed the replacement cost and threshold. Set the request's optional
+`prepare` field to an operation ID to reserve the selected placement through
+consensus. The transaction rechecks the latest and active epochs and the live
+resource ledger. With automatic sampling, it also compares the probe registrations
+used to score the chosen layout and the incumbent, when compared. A changed
+registration returns `StaleProbe`. Read fresh samples and submit a new operation
+ID to retry that plan. Retrying a submitted operation ID reads its applied receipt.
+The new group follows the normal endpoint, readiness, and activation steps.
+
+#### Prepare several groups together
+
+Use `plan_set` when the deployment needs multiple candidates for one
+transition, such as a Prefill and a Decode group. Each `groups` entry
+contains its own `group`, `workload`, and optional `calibration`. Give each
+role the widths, capability requirements, and resource budgets it can use.
+Set a member's optional `hosts` to the list of host IDs that can launch
+that group. Each member has its own host list and shares the resource ledger.
+`guards` can pin the active epoch of any group that the transition assumes
+will remain live. Use `null` to require that a group has no active epoch.
+
+```json
+{
+  "request": "plan_set",
+  "groups": [
+    {
+      "group": [2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+      "workload": {
+        "widths": [1,2], "device_bytes": 6442450944,
+        "per_worker_host": {"bytes": 536870912, "pinned_bytes": 67108864},
+        "per_host": {"bytes": 268435456, "pinned_bytes": 0},
+        "compute_work": 2000000000, "bytes_per_peer": 1048576,
+        "max_link_age_ms": 10000, "operations": 100, "switch_ns": 0
+      }
+    },
+    {
+      "group": [3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+      "workload": {
+        "widths": [1], "device_bytes": 4294967296,
+        "per_worker_host": {"bytes": 268435456, "pinned_bytes": 67108864},
+        "per_host": {"bytes": 268435456, "pinned_bytes": 0},
+        "compute_work": 500000000, "bytes_per_peer": 0,
+        "max_link_age_ms": 10000, "operations": 500, "switch_ns": 0
+      }
+    }
+  ],
+  "guards": [[[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0], 7]],
+  "prepare": {"origin": [4,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0], "counter": 1}
+}
+```
+
+Send the example as one line to `plait-node group`. Omit `prepare` to
+preview the placements and costs. The planner considers scarce eligible
+devices first, then places the rest against the remaining devices and
+host budgets. Its bounded search keeps up to 24 partial group sets at
+each step, scoring their per-operation estimates over each workload's
+`operations` horizon. A `no_placement` result means the search found no
+feasible set in that snapshot. `pending` identifies candidate versions
+already in preparation or ready. The deployment decides which roles and
+groups to request. Its capacity policy accounts for the cost of moving KV
+between engines and when the layout change pays off.
+
+With `prepare`, a successful `PreparedSet` receipt lists all newly reserved
+versions in the request's group order. The voter checks every specified
+active epoch, candidate epoch, device incarnation, memory budget, and
+applicable probe or rate revision. A rejected transaction leaves every
+version and grant as it was. Retry an ambiguous reply with the same
+operation ID and group set to retrieve the receipt. Replan with a new ID
+after an explicit rejection. Start or let the resident launchers discover
+the prepared groups, wait for all endpoints to become ready, then request
+the separate active-set switch.
+
+To preview placements after the current owners return their grants, omit
+`prepare` and pass `after_releasing` as a list of exact group versions.
+Every listed version must still be active. The preview removes only
+those versions' device grants and charged host memory from the planning
+snapshot. Drained devices, reservations for other groups, and per-host
+capacity limits still apply. A feasible preview returns `after_release`
+with the proposed plans. `release_set_changed` indicates that a required
+active version or its recorded grants could not be verified.
+
+The preview grants no resources. After release, use an ordinary
+`plan_set` with `prepare` to plan against live resources and request
+reservation. Supplying both `after_releasing` and `prepare` is rejected.
+
+#### Replan with measured compute rates
+
+Use a stable `calibration` ID for each workload you want to compare. Use the
+same definition of an operation across participating backends, including the
+operator, shapes, and precision requirements. Measure each device in those
+units and send `PublishComputeRate` through `plait-node group`.
+
+```json
+{"request":"apply","operation":{"id":{"origin":[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"counter":1},"action":{"PublishComputeRate":{"calibration":[2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"device":{"node":[3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"ordinal":0},"incarnation":1,"expected_revision":0,"operations_per_second":2000000000}}}}
+```
+
+Use the registered device identity and incarnation. The first publication
+expects revision zero. Subsequent updates expect the revision returned in
+the `ComputeRate` receipt. Sending the same value at the current revision
+preserves that revision. Publish `null` to invalidate an unusable reading.
+Registration of a new device incarnation clears that device's readings.
+Updating the rate leaves existing device grants and communicator membership
+intact.
+
+Pass the same `calibration` to `placement` to see the inventory and rate
+revisions from one replica snapshot. Pass it to `plan` with nonzero
+`compute_work` to use those rates in the comparison. Candidates need valid
+rates on every device. An otherwise eligible incumbent with a missing rate
+causes `await_compute_rates`. A plan without `calibration` uses the advertised
+compute scores.
+
+When `prepare` is set, the reservation checks the exact rates for the chosen
+devices and for the incumbent if it was scored. If a rate changes before
+reservation, the command returns `StaleComputeRate` with the current
+revision and holds no new resources. Read fresh rates and use a new operation
+ID to rescore. Updates to other calibrations or to devices outside the
+comparison leave the reservation eligible. Journal recovery restores applied
+rate revisions along with the group metadata.
+
+The caller supplies and invalidates measurements. Publish stable estimates
+at the control-plane rate required by the planner. Upgrade the voting nodes
+before enabling the measured-compute requests.
+
+##### Collect rates during vLLM TP startup
+
+With the matching vLLM fork and Plait wheel, add a `compute_calibration`
+object to a TP group in the `VLLM_PLAIT_TP_GROUP_CONFIG` descriptor.
+
+```json
+{
+  "compute_calibration": {"m": 64, "n": 1024, "k": 1024, "dtype": "float16"}
+}
+```
+
+Each worker runs a local `torch.mm` on its assigned device after the
+communicator warm-up. The timed batches include operator launch and device
+synchronization. They use preallocated tensors and run without peer
+communication. The rate counts two operations per scalar multiply-add and
+uses the median of seven samples. The fork derives the calibration ID from
+the benchmark version, data type, and shape. It logs the ID, applied
+revision, and rate for use in a `plan` request.
+
+The worker reads the revision before measuring and publishes against its
+exact grant. A concurrent update, closed group, or invalid fence prevents
+publication. The engine logs a skipped measurement and continues startup
+when the control request or benchmark fails. The latest applied reading
+remains available after device release while the same incarnation is
+registered. Collect separate rates when the workload's precision or GEMM
+shape changes. The startup benchmark supports FP16 and BF16 GEMM.
+
+#### Prepare replacements automatically
+
+Save a policy for each group that Plait should evaluate and start a node
+with `--group-replan`. A voter can use the same option on its existing
+`run` command. A nonvoting node discovers voters from its seeds.
+
+```sh
+plait-node run --compute-only --seed "$SEED_IP:$SEED_PORT" \
+  --group-replan group-policy.json
+```
+
+```json
+{
+  "control_ip": "192.0.2.10",
+  "interval_ms": 5000,
+  "stable_samples": 2,
+  "groups": [
+    {
+      "group": [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      "workload": {
+        "widths": [1, 2],
+        "device_bytes": 4294967296,
+        "per_worker_host": {"bytes": 536870912, "pinned_bytes": 67108864},
+        "per_host": {"bytes": 268435456, "pinned_bytes": 0},
+        "compute_work": 1000000000,
+        "bytes_per_peer": 65536,
+        "max_link_age_ms": 30000,
+        "operations": 1000,
+        "switch_ns": 500000000
+      }
+    }
+  ]
+}
+```
+
+Set `control_ip` to a local address the voters can reach. List only the
+widths the engine can run and size the memory and cost estimates for that
+workload. Set the policy's optional `calibration` to the ID of the published
+compute rates. By default, the node polls every five seconds and requires
+two matching recommendations for the same candidate and incumbent. When
+their comparison uses network measurements, each confirmation needs a newer
+sample for every priced direction. A partial update waits for the remaining
+directions. A change in the probe registration starts the count over. The
+resident probes sample every ten seconds. Size `max_link_age_ms` to cover
+the sampling period and delays across the relevant hosts. Comparisons with
+no network measurements count matching polls.
+
+A confirmed candidate is submitted with the latest group epoch, resource
+requirements, and measurement versions from the final poll. Several nodes
+can run the same policy. The ordered reservation accepts one successor
+for the observed epoch. Each node keeps the operation ID and payload when
+retrying an ambiguous submission. A group in `Preparing` or `Ready` waits
+for deployment before another successor can be prepared.
+
+The deployment layer reads the reserved grants, starts the model workers,
+and submits `Activate` after the successor is ready to receive work. It can
+revoke a candidate that fails to start and release its grants after teardown.
+The incumbent's communicator can continue serving during preparation.
+
+#### Compare layouts of the same width
+
+Set `workload.recipes` in the resident policy or the `plan` request. Each
+candidate supplies a stable recipe ID and a vector of work per delivered
+operation. The positions follow ascending device identity. The length
+must be one of the allowed widths. Use work units that match the advertised
+or calibrated device rates.
+
+For uneven partitions, set `device_bytes_by_slot` in the recipe. Provide one
+positive byte count for each entry in `work`, in the same device order. When
+the field is omitted, each slot uses `workload.device_bytes`. The planner
+checks both advertised memory and allocatable bytes, then records the selected
+slot's requirement in each `WorkerDemand`. An incumbent is comparable when
+its committed reservations cover its recipe's demands in that same order.
+
+```json
+[
+  {
+    "id": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    "work": [500000000, 500000000],
+    "compute": "parallel",
+    "communication": {
+      "kind": "peer_all_reduce",
+      "calls": [{"count": 57, "bytes": 2048, "element_bytes": 2}]
+    }
+  },
+  {
+    "id": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+    "work": [400000000, 600000000],
+    "device_bytes_by_slot": [3221225472, 5368709120],
+    "compute": "sequential",
+    "communication": {
+      "kind": "directed",
+      "edges": [
+        {"from": 0, "to": 1, "rounds": 1, "bytes": 2048},
+        {"from": 1, "to": 0, "rounds": 1, "bytes": 16}
+      ]
+    }
+  }
+]
+```
+
+Parallel compute charges the slowest device. Sequential compute adds
+the device times. For each host and contiguous slot range, the planner selects
+eligible devices in device-ID order using the work assigned to those slots.
+For example, with device rates `[1, 100, 90]` and parallel work `[1, 100]`,
+slots on the first two devices finish in one time unit. The two fastest
+devices would put the larger share on the device with rate 90. The
+cross-host search still checks memory headroom and compares link costs.
+
+In `peer_all_reduce`, `bytes` is the entire input on one
+worker, `element_bytes` is its element width, and `count` is the number
+of sequential calls with that shape per scored operation. Add a bucket
+for each payload size, such as separate prefill and decode calls.
+
+For native TP, `peer_all_reduce` accepts `replicated_egress_bytes`. Offer
+multiple recipes with distinct base IDs to compare budgets against current
+link samples. Use the same workload buckets and device work when comparing
+only the exchange choice. Include staging memory in each worker's host
+reservation. The planner prices the advertised cap with the runtime's
+algorithm selector. An explicit cap binds the base recipe ID, width, and
+cap into the committed recipe ID. Omitting the cap preserves the original ID
+and uses the default runtime threshold.
+
+The planner uses the host-staged peer runtime's exchange choice and shard
+rule. A replicated call prices one exchange of the full input. A larger
+call prices scatter and gather separately, using the actual shard sizes
+and reversing the traffic for gather. In each exchange, it charges the
+largest fresh cross-host RTT once because peer sockets advance concurrently.
+It adds the highest ingress or egress serialization cost across hosts.
+That cost sums the bytes on each directed host link divided by its measured
+rate. The planner charges each call in the bucket and requires both link
+directions between participating hosts. Same-host transfers contribute
+zero cross-host cost.
+
+For a mixed TP × PP layout, use `compute: "pipeline"` and communication
+kind `tensor_pipeline`. The four entries in `work` follow vLLM's slot order
+for this TP2 × PP2 example.
+
+```json
+{
+  "id": [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
+  "work": [400000000, 400000000, 600000000, 600000000],
+  "compute": "pipeline",
+  "communication": {
+    "kind": "tensor_pipeline",
+    "tensor_parallel": 2,
+    "all_reduce_by_stage": [
+      [{"count": 28, "bytes": 131072, "element_bytes": 2}],
+      [{"count": 28, "bytes": 131072, "element_bytes": 2}]
+    ],
+    "transfers": [
+      {"from_stage": 0, "to_stage": 1, "bytes_per_lane": 65536, "rounds": 1},
+      {"from_stage": 1, "to_stage": 0, "bytes_per_lane": 16, "rounds": 1}
+    ]
+  }
+}
+```
+
+The planner adds the slowest worker time from each stage. Each stage's
+AllReduce uses the TP width to choose the exchange algorithm and shard sizes.
+Each transfer phase pairs equal TP slots in the declared source and
+destination stages. It totals the traffic on each directed host link,
+charges the highest ingress or egress serialization cost and the slowest
+link RTT, then multiplies by the number of rounds. Use a reverse transfer
+entry when the workload sends sampling results upstream. An explicit
+`replicated_egress_bytes` cap applies to every TP row.
+
+Configure the same base recipe ID, total width, TP degree, layer partition,
+and optional cap in the vLLM launch definition. New mixed bindings encode
+both TP and PP degrees and the optional cap, so TP2 × PP3 and TP3 × PP2
+resolve to different launch definitions. Existing mixed recipe IDs still
+resolve under their original definitions. Upgrade the vLLM launcher before
+the planner to keep existing and newly committed layouts launchable.
+
+The planner sums the stage and transfer costs for one operation. The
+engine's sustained pipeline capacity depends on its batching and overlap.
+
+Directed exchanges follow the supplied device positions and add their
+round costs. The generic `all_to_all` recipe charges the supplied worker-pair
+bytes and per-link rounds. All recipe costs are latency estimates for one
+operation. Kernel work and device staging need their own calibration.
+
+With recipes configured, each candidate uses a listed recipe. The running
+group is scored with its committed recipe. Legacy groups use the policy's
+base work and communication settings. Stability checks compare the recipe
+along with the devices and incumbent. The reservation writes the winning
+recipe ID and grants in the same ordered operation. The group can retain
+the same width while the successor uses a different recipe. Preparation
+requires enough spare devices and host memory to hold both versions.
+Read the committed value with a `recipe` request and an exact `version`.
+Keep recipes for running versions in the policy and upgrade all voters and
+launchers before submitting recipe-backed reservations.
+
+#### Run resident link probes
+
+Add `--link-probe "$NODE_IP:0"` to `plait-node run` on each participating host.
+Use the same stable `--id` as the host's worker profiles. The IP must be reachable
+by the other probe hosts and by the planner. `:0` lets the OS select a port.
+Upgrade the voters to a version that supports probe registration before
+enabling this option. A nonvoting host can run a probe without an engine
+configuration.
+
+```sh
+plait-node run --compute-only --id "$HOST_ID" \
+  --seed "$SEED_IP:$SEED_PORT" --link-probe "$NODE_IP:0"
+```
+
+Each process publishes its bound endpoint with a new session ID. It discovers
+targets through the replicated directory. A probe sends 1 MiB per target on a
+ten-second interval and records throughput and RTT in the sending direction.
+Durable voters recover the directory from their journals. Samples remain in
+memory and are rebuilt after restart. A `links` request to `plait-node group` returns
+the directory and the available samples. Sample timestamps use the probe
+host's wall clock. Keep host clocks synchronized for `max_link_age_ms` checks.
+
+The planner checks the source session when it requests samples and compares
+the reported target session against the directory. When a probe is replaced,
+samples for its old session are excluded. The ordered reservation checks the
+registration revisions again in case they change after the planner reads them.
+
+### Bootstrap from vLLM
+
+Start the vLLM workers with the same TP layout and the vendor's PyTorch
+runtime on each worker. The default peer bootstrap exchanges endpoints
+over Gloo, which also carries the engine's CPU control operations. Set
+`VLLM_HOST_IP` to the address the other workers can reach when automatic
+address selection chooses the wrong interface. The Rust layer binds a TCP
+port assigned by the OS.
+`PLAIT_NCCL_TIMEOUT_MS` sets the TCP bootstrap and socket I/O timeouts and
+defaults to 120 seconds.
+
+Each worker binds before the Gloo all-gather. The ordered list of endpoints
+and per-launch tickets forms the group manifest. Direct connections verify
+its digest, the slots at both ends, and the wire lane. A restarted worker
+has a new ticket. Slot numbers keep the vLLM tensor layout and determine the
+pairing order. Every participant uses the same startup protocol.
+
+The managed launcher sets `PLAIT_TP_GROUP_VERSION` from its committed launch
+claim. Plait includes the group ID and epoch in the manifest digest. Peers
+with different group versions fail the handshake. A managed replacement
+and its predecessor can hold separate communicators at the same time.
+
+### Join a committed TP group from vLLM
+
+Reserve a native execution group first. Use a Plait Python package built with
+the control-plane join and set `VLLM_USE_PLAIT=1` and
+`VLLM_PLAIT_TP_GROUP_CONFIG` to the launch descriptor's path on every host.
+Each host sets its own `host_id` and uses the same `seeds` and `tp_groups`.
+
+```json
+{
+  "host_id": "00000000000000000000000000000002",
+  "seeds": ["192.0.2.11:7950", "192.0.2.12:7950", "192.0.2.13:7950"],
+  "tp_groups": [{
+    "version": "00000000000000000000000000000003@1",
+    "ranks": [0, 1],
+    "devices": [
+      ["00000000000000000000000000000002", 3],
+      ["00000000000000000000000000000001", 1]
+    ]
+  }]
+}
+```
+
+The corresponding elements in `ranks` and `devices` give each model shard
+its stable device ID. The launcher sets the device mask so the local worker
+runs on that device. The device ordinal in the descriptor identifies the
+physical grant. The ordinal passed to the device runtime follows the process's
+visibility mask. A deployment with multiple TP subgroups provides one entry per
+TP subgroup.
+
+Set `replicated_egress_bytes` on a specific group descriptor to use a measured
+AllReduce budget. The value counts one worker's payload across all its peers in
+one replicated AllReduce. All descriptors for the same group version must agree.
+The handshake checks the value along with the manifest and slot order. A change
+requires a new communicator. Omit the field to use the default policy and join
+peers that predate this option. For managed launches, define the candidate caps
+in the [placement recipes](#compare-layouts-of-the-same-width) and map them in
+the launchers' `layout_recipes`. The committed recipe binds the selected cap to
+the group version. Each launcher copies it into its worker descriptor.
+
+Each worker independently resolves its grant, publishes its endpoint, and reads
+the complete manifest through a voter. The peer handshake binds the manifest and
+the descriptor's device order, so AllGather output and ReduceScatter shards
+follow the engine's slots. Workers report `Ready` for the communicator after
+connecting. The deployment controller can activate the version once transport
+and engine readiness are both confirmed. Use a new epoch when a worker must
+publish a new listener. The engine retains its CPU process groups and PP startup.
+
+Rust clients can use `join_committed_group` with the `plait-nccl/control`
+feature for the same sequence. C clients can publish and join through the
+native group APIs and call `plaitPeerSetReplicatedEgressBytes` between
+`plaitPeerListen` and `plaitPeerConnect`. Zero egress permits only empty
+replicated exchanges when the group has at least two members.
+
+For a mixed TP × PP layout, the launcher writes one `model_group` descriptor.
+The ordered device list assigns consecutive TP slots to each pipeline stage.
+Each worker publishes one endpoint under its grant and connects to the workers
+in its TP row and PP column. The handshake checks the committed manifest, slot
+order, and TP size. The axes have separate collective queues and share the
+grant's staging limit. A worker reports ready after both axes connect. Ending
+its grant closes both communicators. Rust clients can use
+`join_committed_model_group` to obtain the two communicators.
+
+#### Verify four-vendor TP4 over HTTP
+
+The integration test installed vLLM `0.31.0+plait.acea9b5ad` and the Plait
+Python wheel in six Linux environments. Each vLLM wheel was built from the
+same source revision. CUDA and ROCm builds reused the native extensions for
+their installed PyTorch and runtime versions. CANN and HGGC used their vendor
+plugins. The test checked the installed vLLM source files for the native TP
+join and loaded the same Plait wheel on every host. The Plait wheel used the
+dev build profile for this functional test.
+[vLLM revision](https://github.com/devillove084/vllm/commit/acea9b5adb9919192b1b9ef1207c2f4868c64fcb)
+[Plait build source](https://github.com/devillove084/Plait/commit/9bb383cf6c99ec314eab57d976593df85fd0cd06)
+
+For Qwen3-0.6B in FP16, use one device each on CUDA, ROCm, CANN, and HGGC.
+Start four hosts with `--distributed-executor-backend mp`, `--nnodes 4`,
+`--tensor-parallel-size 4`, and `--plait-tp-layout 1 1 1 1`. Use
+`VLLM_USE_V2_MODEL_RUNNER=1`, `--enforce-eager`, `--block-size 128`, and
+`--disable-custom-all-reduce`. Give each host its own node rank. Run the API on
+node rank 0 and append `--headless` on the other hosts. The small-model test set
+`--max-model-len 96`, `--no-enable-prefix-caching`, and
+`--kv-cache-memory-bytes 268435456` on each worker. It selected `TRITON_ATTN`
+on CUDA, ROCm, and HGGC and used the Ascend plugin's attention backend on CANN.
+
+On a PPU host using the vendor Triton runtime, make the SDK's `ppu-smi`
+available to the vLLM worker before launch. Select the native compiler with
+`TRITON_DEFAULT_BACKEND=ppu`. The vLLM worker still uses the vendor
+PyTorch CUDA-compatible device interface. The Triton compiler targets
+`ppu` for its attention kernels.
+
+```sh
+export PATH="$PPU_SDK/ppu-smi/bin:$PPU_SDK/bin:$PATH"
+export TRITON_DEFAULT_BACKEND=ppu
+```
+
+Confirm one ready grant per worker and an HTTP 200 from `/health` on the
+API host. Apply `Activate` to the native group version, then send the same
+greedy completion request to the TP4 endpoint and a single-device baseline.
+The test received HTTP 200 from both `/v1/completions` endpoints and compared
+all eight returned token IDs.
+
+#### Verify a planned change in TP width
+
+The installed build also ran a TP2 successor on separate CUDA and ROCm
+devices. Prepare it under the same group ID with a new epoch and a TP2 launch
+descriptor. The TP4 incumbent continued to answer requests while TP2 loaded
+the model. Both engines had their own HTTP endpoint.
+
+Once TP2 was ready, the test opened a stream on TP4 and submitted `Activate`
+after receiving its first token. The control plane marked TP4 `Draining` and
+TP2 `Active`. The new endpoint returned HTTP 200 with eight token IDs matching
+the single-device baseline. The old stream delivered all 48 tokens and the
+final `[DONE]` frame. The deployment layer uses the active group to route new
+requests and keeps an admitted stream on its original engine.
+
+#### Route native groups through one HTTP endpoint
+
+Install the vLLM fork on the API and ingress hosts. For a manual launch,
+pass `--middleware vllm.entrypoints.serve.plait_version.NativeGroupHeaders`
+to `vllm serve`. The middleware reads the version from
+`VLLM_PLAIT_TP_GROUP_CONFIG`. The descriptor binds one native TP or PP
+group to the HTTP instance. A request carrying a different version receives
+HTTP 409 before model dispatch. Responses carry the instance's group version.
+
+Give each epoch its own HTTP origin and write the map to a JSON file.
+
+```json
+{
+  "1": "http://192.0.2.21:8000",
+  "2": "http://192.0.2.22:8000"
+}
+```
+
+```sh
+python -m vllm.entrypoints.serve.plait_serving.aggregate \
+  --model "$MODEL_ALIAS" --group-id "$GROUP_ID" \
+  --native-routes "$ROUTES" --control-seed "$SEED" --control-listen "$LOCAL_LISTEN"
+```
+
+The ingress polls ordered `Observe` reads and opens each new request against
+the latest observed `Active` epoch. Replace the route file atomically when
+adding an endpoint. An observed active epoch without a usable origin pauses
+new admissions until its binding is available. The ingress refreshes every
+500 ms and expires its last route after eight seconds without a fresh read.
+Retain the old engine until ingress observers have cut over and its admitted
+requests have drained. Each admitted stream retains its upstream connection
+and version across a route change.
+
+The ingress can [recover a greedy stream](#recover-a-greedy-completion-stream)
+after a transport failure when the client opts into `replay-prefix`. Plait
+supplies the next active group version. The vLLM ingress owns the HTTP
+origin map and the emitted prefix.
+
+The installed vLLM test used one client URL for a four-vendor TP4 and its
+CUDA and ROCm TP2 successor. With the new binding withheld, `/health`
+returned HTTP 503 after the ingress observed the switch. Publishing the
+binding let the same URL serve new requests from TP2. Its eight token IDs
+matched TP4, and the original TP4 stream returned all 24 tokens and `[DONE]`.
+
+#### Launch and activate groups from the vLLM fork
+
+Run `vllm.entrypoints.serve.plait_deploy` on each eligible vLLM host. Give
+each instance the same deployment file and a local engine configuration.
+Use the group ID from the Plait replanning policy, expressed in hexadecimal.
+
+```json
+{
+  "group_id": "00000000000000000000000000000003",
+  "seeds": ["192.0.2.11:7950", "192.0.2.12:7950", "192.0.2.13:7950"],
+  "model_alias": "example-model",
+  "hosts": {
+    "00000000000000000000000000000001": "192.0.2.21",
+    "00000000000000000000000000000002": "192.0.2.22"
+  },
+  "api_port_base": 8000,
+  "rendezvous_port_base": 8100,
+  "epoch_ports": 16,
+  "max_num_batched_tokens": 2048,
+  "max_num_seqs": 128
+}
+```
+
+```json
+{
+  "argv": ["vllm"],
+  "model": "/models/example-model",
+  "device_env": "CUDA_VISIBLE_DEVICES",
+  "args": ["--dtype", "float16", "--enforce-eager", "--disable-custom-all-reduce"],
+  "env": {"PLAIT_NCCL_BACKEND": "cuda"}
+}
+```
+
+```sh
+python -m vllm.entrypoints.serve.plait_deploy deployment.json \
+  --control-listen "$LOCAL_IP:0" --host-id "$HOST_ID" \
+  --engine local-engine.json --state-dir "$ENGINE_STATE"
+```
+
+The launcher reads a `Preparing` version through ordered `Observe`. Each
+participant launches only the devices granted to its host. The first granted
+host in ID order starts the API and the vLLM CPU rendezvous. Its peers start
+headless engines. The device order in the descriptor follows host ID and
+local device ordinal, so every worker agrees on vLLM's logical TP slots.
+For multi-host groups, the launcher selects the Gloo interface from the
+local deployment address when `GLOO_SOCKET_IFNAME` is unset.
+The shared batch limits give all workers the same profiling tensor shapes.
+Set matching model and shape-affecting options on the participating engines.
+The two port ranges must be disjoint and reachable. Epochs cycle through
+the configured slots. Keep enough slots for all overlapping engines.
+An optional `compute_calibration` object in the deployment file enables the
+same GEMM startup measurement on each new engine.
+
+To place the model in pipeline stages, set `pipeline_layers` in the shared
+deployment file. Each key is a group width and its value assigns consecutive
+model layers to the devices in grant order. For a 28-layer model,
+`"pipeline_layers": {"2": [11, 17]}` launches width two as PP2 × TP1.
+Widths without a configured partition continue to use tensor parallelism.
+The descriptor binds the full version to the selected collective axis.
+The engine verifies the layer partition during startup, before activation.
+
+The peer communicator supports odd group sizes. To use three devices for
+the same 28-layer model, configure `"pipeline_layers": {"3": [9, 9, 10]}`
+for PP3 × TP1. A three-way TP deployment also requires the model's
+attention and weight shards to support a width of three. For example,
+Qwen3-0.6B has 16 attention heads and vLLM rejects TP3 for that model.
+
+For plans using `workload.recipes`, map their base IDs to engine layouts in
+the shared deployment file. Use the same mapping on each launch host.
+
+```json
+{
+  "layout_recipes": {
+    "01010101010101010101010101010101": {"width": 2},
+    "02020202020202020202020202020202": {"width": 2, "pipeline_layers": [11, 17]},
+    "03030303030303030303030303030303": {"width": 2, "replicated_egress_bytes": 262144},
+    "04040404040404040404040404040404": {
+      "width": 2,
+      "pipeline_layers": [18, 10],
+      "kv_cache_memory_bytes_by_stage": [344981504, 191889408]
+    },
+    "05050505050505050505050505050505": {
+      "width": 4,
+      "tensor_parallel": 2,
+      "pipeline_layers": [14, 14]
+    }
+  }
+}
+```
+
+A committed ID selects one of these layouts before the host builds its
+launch descriptor. A recipe with `tensor_parallel` and `pipeline_layers` must
+reserve one worker per TP slot in each stage. The four-worker recipe above
+starts TP2 × PP2. When the recipe omits `tensor_parallel`, a layer partition
+uses TP1 and a recipe with no partition uses pure TP. An explicit AllReduce
+cap applies to the TP communicator. A missing binding or a width mismatch
+prevents startup. An untagged version uses the deployment's width-based
+settings. Add new entries while the launcher is running to offer more recipes.
+Existing entries retain their widths and options.
+
+Set `kv_cache_memory_bytes_by_stage` for a PP recipe to supply one positive
+byte count per stage. The launcher passes the vector as
+`--kv-cache-memory-bytes-by-stage`. Multi-host workers agree on the full
+vector during startup. Each TP worker uses the budget for its pipeline stage.
+When the vector is present, it takes precedence over the scalar cache budget.
+The engine plans its KV blocks from these per-worker limits. Include model
+weights, working memory and KV in the separate Plait device reservation.
+
+Run one route publisher alongside the ingress, or add `--routes` to the
+launcher on that host. Both processes use the same route file.
+
+```sh
+python -m vllm.entrypoints.serve.plait_deploy deployment.json \
+  --control-listen "$LOCAL_IP:0" --routes "$ROUTES"
+```
+
+The route publisher waits for Plait to report `Ready` and for the engine to
+return HTTP 200 from `/health` with the expected group version. It publishes
+the new origin atomically before sending `Activate`. The ingress opens new
+requests on the new version once it observes activation. Existing streams
+finish on their original engine. If activation's reply is lost, the
+publisher retries with the same operation ID.
+
+#### Drain and release an old vLLM group
+
+The old API host observes `Draining` and closes admission for that version.
+A stale ingress receives a versioned rejection before model dispatch and
+can retry after it observes the active epoch. The old API lets admitted
+responses finish. When that count reaches zero, it pauses vLLM in wait mode
+and waits for vLLM to synchronize the devices.
+
+After the API acknowledges drain, its launcher submits `Revoke` for the old
+version. On Linux the launcher confirms the revocation against its local
+ownership record and writes a stop request for that engine instance. The
+engine's local parent sends `SIGTERM` to the engine session. After a
+ten-second grace period, it force-stops any remaining children and reaps
+adopted descendants, including children that changed process groups. It
+persists the exact local grants and release operation IDs only after the
+kernel reports that all children have exited. Plait releases each host's
+reservation after its last grant returns. The group becomes `Retired` once
+all grants have returned.
+
+The launcher checks that the version is still preparing after acquiring its
+local launch lock. An unexpected child exit is reported against an exact
+grant. If the OS rejects the executable on the first local launch attempt,
+the launcher writes a failure journal in its state directory before sending
+the report. On Linux the engine's parent process inherits the launch lock and
+keeps it even if the launcher exits. It writes the ownership record before
+starting the engine. Restart the launcher with the same state directory to
+continue observing that engine. A restarted launcher matches the version
+and exact grants before writing a stop request. Once the local parent has
+recorded exit, the launcher takes the launch lock and replays release
+operations with their original IDs, then removes the records after every
+receipt.
+
+For automatic recovery after losing the local parent, set `cgroup_root` in
+the Linux engine configuration to an absolute delegated cgroup v2 directory.
+Each engine gets a new subtree and joins it before starting vLLM. The engine
+and external managers keep its processes in that subtree. To recover an
+orphan, the launcher acquires the launch lock and matches the saved boot ID,
+cgroup identity, and exact grants. After ordered revocation it terminates
+that subtree through `cgroup.kill`. It writes the exit journal once
+`cgroup.events` reports `populated 0`, then reuses the original release IDs.
+An unverifiable subtree leaves its grants held until another exit proof
+is available. [Linux cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html)
+
+#### Measure peer collective phases
+
+Set `PLAIT_NCCL_PHASE_LOG` to a local file before starting the worker.
+Plait appends one tab-separated row per successful host-staged peer
+collective. Each duration uses nanoseconds.
+
+```text
+pid  slot  world  operation  dtype  input_bytes  sync_ns  download_ns  collective_ns  wire_ns  fold_ns  upload_ns
+```
+
+`operation` and `dtype` use the numeric peer descriptor values. For FP16
+AllReduce they are 1 and 6. `collective_ns` includes `wire_ns` and
+`fold_ns`, plus local coordination and buffer work. The socket exchange
+can include time waiting for other workers to reach the same operation.
+Stream synchronization can include device work issued before the collective.
+
+#### Cancel a committed communicator
+
+Communicators created through the control-plane join keep their control
+client for the lifetime of the handle. The client checks the local grant
+every 250 ms, rotating through the configured voters. The compact lookup
+checks the group epoch, device incarnation, and fence. With an older voter
+the client uses the existing group version view.
+
+Apply `Revoke` to stop a version's communication. When a communicator
+observes the applied revocation or the release of its own grant, it shuts
+down its collective and point-to-point sockets. Pending socket operations
+return errors, and subsequent calls fail locally. Python callers can read
+`CommHandle.peer_failed`. Other group versions retain their connections.
+A missing reply or an unknown grant view prompts another query.
+
+If vLLM raises during a model or sampler step, its worker closes the
+affected Plait TP communicator and preserves the exception in the worker
+log. Peers blocked in that group wake with a transport error. The worker
+rejects subsequent model RPCs on the closed handle before execution. With
+the matching Plait wheel, the watcher reports the execution failure under
+the worker's exact grant. An eligible standby can then take over through the
+same ordered revocation path.
+
+Use `Drain` to stop admitting work at the deployment layer while admitted
+requests finish. `Draining` preserves communication. `Release` still
+requires the device owner to finish teardown, including any device work
+already in progress. The observer closes sockets and leaves release to the
+owner.
+
+#### Arm a standby for communication group failover
+
+Prepare a successor under the same group ID using available devices. Once its
+communicators are `Ready` and the engine is healthy, send `SetStandby` through
+the `apply` request. The action takes the incumbent `GroupVersion` in `active`
+and the successor epoch in `standby`. The voters check that `active` is still
+current and that the successor is the latest ready version. The `standby`
+request takes the group ID and reads the armed version from a replica. Set
+`standby` to `null` in `SetStandby` to disarm it.
+
+A native control-plane communicator reports terminal transport or device
+errors with `ReportFailure`. The background client retries the same exact-grant
+operation for up to 15 seconds while its process is alive. On an applied report
+for the incumbent, or an ordered host expiry, the control plane revokes the
+affected version and promotes an eligible standby in the same operation. Host
+expiry excludes a standby affected by that host. Explicit `Drain` and `Revoke`
+disarm the incumbent. A failure in a standby or an older draining version stops
+only that version.
+
+An idle model can fail over when the node's execution heartbeat expires or
+a surviving participant observes the failure. After promotion, a fresh
+`observe` resolves the new active version.
+The deployment layer uses that result for new admissions and the engine owns
+in-flight requests and KV. The revoked group keeps its device fences until its
+owners confirm teardown and submit `Release`.
+
+In a native-group test, CUDA, ROCm, CANN, and PPU ran the active TP4
+version. A CUDA TP1 standby was ready before fault injection. A separate
+CUDA–PPU TP2 group used different devices on two of the same hosts. The
+test killed one TP4 CUDA worker after the client received six tokens.
+The standby activated and rebuilt the context from the emitted prefix
+through the vLLM fork's `resume-prefix` path. The original SSE connection
+kept its completion ID and delivered ten more tokens and one `[DONE]`.
+The first token received after injection arrived in 2.815 seconds.
+
+The independent group delivered 48 tokens before injection and 48
+afterward under its original epoch and grants. All four old TP4 grants
+were released after teardown. A subsequent reservation on the killed
+worker's device received a higher fence. This trial measured a worker
+exit with a warm standby and an admitted stream in each group.
+
+### Run dense AWQ with integer activations
+
+Set `VLLM_PLAIT_W4_LIBRARY` in each vLLM worker's environment to the Plait W4
+library built for its device architecture and runtime. Set
+`VLLM_PLAIT_W4_ACTIVATION_BITS` to `4` or `8`, then start the fork with
+`--quantization awq --dtype half --enforce-eager`. In a managed deployment,
+both variables can go in that host's engine `env`.
+
+Build `kernels/w4a16_cuda.cu` with `PLAIT_W4_CUDA_INTEGER_MMA`,
+`PLAIT_W4_HIP_INTEGER_DOT`, or `PLAIT_W4_PPU_INTEGER_MMA` for the matching
+CUDA, HIP, or PPU runtime. For Ascend 950-series targets, load the CANN SDK
+environment and build `kernels/ascend` with CMake, setting `SOC_VERSION` to
+the installed architecture. Use the resulting `libplait-w4a16-ascend.so`
+with the Ascend vLLM platform plugin and `torch_npu`.
+
+Check that the library exports `plait_w4_stream_workspace_v1` and
+`plait_w4_stream_launch_v1`. Match the device runtime used by the worker's
+PyTorch installation. Check the worker startup logs for
+`Plait dense AWQ uses W4A4` or `Plait dense AWQ uses W4A8`.
+
+The loader repacks each local AWQ weight shard once. The forward pass
+quantizes FP16 input and queues integer GEMM on the current PyTorch stream.
+The kernels share device scratch supplied by PyTorch. On CANN, the Cube
+path uses INT8 matrix inputs for both activation widths. The A4 path packs
+INT4 codes after quantization and unpacks them when preparing the Cube
+inputs. Shapes outside the Cube workspace or group-length limits use the
+scalar integer projection on the vector cores. Each worker
+produces FP16 output in the engine's original tensor layout, so all workers
+in a TP group use the same collective tensor shape and dtype.
+
+Device checks on CUDA, ROCm, CANN, and PPU covered both precisions, a
+non-default stream, odd group tails, and a short workspace. Single-device
+vLLM runs completed Qwen3-0.6B generation on ROCm with W4A8, on PPU with
+W4A4, and on CANN with each activation width in a separate run.
+Two managed TP2 runs paired ROCm W4A8 with either CUDA W4A4 or CANN W4A4.
+Both device grants were active in each run, and repeated greedy HTTP
+completions returned matching sets of eight token IDs. The experiments used
+vendor-specific vLLM wheels with the fork's updated Python modules and weights
+converted to the AWQ format for functional testing.
+
+On a host with a small `/dev/shm`, set `VLLM_MQ_MAX_CHUNK_BYTES_MB` in the
+engine's environment to size the executor's shared-memory response slots.
+The CANN-led TP2 run used 1 MiB slots and capped the host-side compiler
+pool with `TORCHNPU_PRECOMPILE_THREADS=2`.
+
+#### Verify four-vendor mixed-precision TP4
+
+Use one CUDA, ROCm, CANN, and PPU worker in the same native TP4 group, with
+one model worker per host. Assign W4A4 to CUDA and CANN and W4A8 to ROCm and
+PPU through each host's engine environment. Give vLLM one identical dense
+AWQ checkpoint on all four hosts. The test used Qwen3-0.6B weights converted
+to 128-element AWQ groups, the V2 model runner in eager mode, a 128-token
+block size, and a 256 MiB KV budget per worker. CUDA, ROCm, and PPU used
+`TRITON_ATTN`. CANN used the Ascend plugin's attention backend.
+
+Prepare through three Plait voters on separate hosts. Verify that all
+four workers log the same committed group version and their assigned
+activation precision. Activate once all four grants are ready and
+`/health` returns HTTP 200. Send streaming completion requests with
+`return_token_ids: true` and the active `X-Plait-Group-Version` header.
+The test checked the returned group version and `[DONE]` on every response.
+All six requests returned the same eight token IDs. A second group ran W4A8
+on every worker with the same checkpoint and layout and passed the same checks.
+
+### Assign different numbers of workers per host
+
+For four TP workers across three hosts, start the same model on each host.
+Use the control host's address and port for `MASTER_ADDR` and `MASTER_PORT`.
+
+```sh
+VLLM_USE_PLAIT=1 vllm serve "$MODEL" --enforce-eager \
+  --distributed-executor-backend mp --nnodes 3 \
+  --master-addr "$MASTER_ADDR" --master-port "$MASTER_PORT" --node-rank "$NODE_RANK" \
+  --tensor-parallel-size 4 --plait-tp-layout 2 1 1
+```
+
+Set `NODE_RANK` to `0`, `1`, or `2` and append `--headless` on
+hosts 1 and 2. Host 0 gets slots 0 and 1, host 1 gets slot 2, and host 2
+gets slot 3. The host's visible device order determines the local workers'
+device assignments. Each host registers its layout on the existing
+vLLM rendezvous endpoint before creating workers. Conflicting layouts
+fail startup. Workers that can share memory with the control worker
+use shared-memory response queues. Other workers use socket queues.
+
+The counts describe workers per host and sum to `TP × PP`. Each pipeline
+stage owns a consecutive set of TP workers in global worker order. The
+model's tensor-partitioning rules determine the shards within a stage.
+Use DP, PCP and DCP sizes of one with EP disabled. The layout is fixed for
+the lifetime of that vLLM process group.
+
+### Split model layers across hosts
+
+For two stages using two devices each, start the same model with
+`--tensor-parallel-size 2 --pipeline-parallel-size 2 --plait-tp-layout 2 2`
+and the `mp` executor. The first host runs the first stage. Set
+`VLLM_PP_LAYER_PARTITION` on both hosts to override the layer split. For a
+28-layer model, `10,18` assigns ten layers to the first stage and eighteen
+to the next. Each host must use the same worker counts, sizes and layer
+partition. Set its device backend and mask locally.
+
+Pipeline stages send device tensors through Plait's point-to-point links.
+The receiver allocates them on its own device and reconstructs any TP
+slices within its stage. Gloo carries tensor descriptors and CPU data.
+The peer transport stages sends through host memory before the source
+tensor can be reused. The receiving stage waits for its activation copy
+before forwarding. This path requires eager execution.
+
+### Start a committed group on several hosts
+
+Run `python -m vllm.entrypoints.serve.plait_serving.launcher` with
+`--host-launch-spec` to derive the placement from a committed `GroupPlan`.
+Give each host the same JSON document. The keys under `hosts` are the
+plan's host IDs.
+
+```json
+{
+  "api_host": "00000000000000000000000000000001",
+  "master_addr": "192.0.2.10",
+  "master_port": 29500,
+  "hosts": {
+    "00000000000000000000000000000001": {
+      "address": "192.0.2.10",
+      "argv": ["/opt/runtime/bin/vllm"],
+      "model_path": "/models/engine",
+      "device_env": "CUDA_VISIBLE_DEVICES",
+      "env": {"PLAIT_NCCL_BACKEND": "cuda"}
+    },
+    "00000000000000000000000000000002": {
+      "address": "192.0.2.20",
+      "argv": ["/opt/runtime/bin/vllm"],
+      "model_path": "/models/engine",
+      "device_env": "ASCEND_RT_VISIBLE_DEVICES",
+      "env": {"PLAIT_NCCL_BACKEND": "huawei"}
+    }
+  }
+}
+```
+
+The engine recipe can include host-specific `args` and `env`. Each
+host address must be reachable by the control replicas and TP peers.
+The script supplies the device mask, tensor parallel placement, and
+peer group version from the launch claim.
+
+1. Use `--print-launch-digest` with the common model, TP size, engine
+   options, `--backend-port`, `--port-base`, `--advertise-http`, and
+   `--host-launch-spec`. Put the digest in the plan's `launch_digest`.
+2. Start the launcher on each planned host with those same options,
+   the committed `--group-id` and `--group-epoch`, its own `--host-id`,
+   and the control peer addresses. Use a vLLM fork with the hosted
+   readiness hook. The API host serves HTTP. The other hosts run headless.
+3. Activate the new version after all planned devices report `Ready`.
+   The previous version begins draining. Inference responses identify
+   the serving version in `X-Plait-Group-Version`.
+
+Use a local `--verify-release` executable on each host to authorize
+grant reuse after that host has closed its workers and transports.
+Retirement requires every host's stop confirmation.
+
+### Commit an automatic rollout or standby
+
+Send one JSON line per operation to `plait-node serving`. Provide the same
+control peers and reachable reply address used by the launchers.
+
+```sh
+plait-node serving --listen "$CONTROL_REPLY_ADDR" --peer "$VOTER_ID@$VOTER_ADDR" < requests.jsonl
+```
+
+`prepare_hosted` takes `id`, `group`, `expected_epoch`, `expected_active`,
+`plan`, and `activation`. Use the latest known epoch as `expected_epoch`.
+For an initial group, use epoch zero and a null `expected_active`. Group
+and operation origin IDs are 16-byte arrays. A plan supplies the model,
+role `Aggregated`, TP and PP sizes, launch digest, and
+device and host reservations. Represent the device and host maps as
+arrays of key/value pairs. Reserve one device per worker, for a total of
+`TP × PP`. When PP is greater than one, each host must run the Plait fork
+with pipeline support. Launch each planned host as described above.
+
+`replan_hosted` takes `id`, `forecast`, `candidates`, and `activation`.
+Each candidate supplies `group`, `expected_epoch`, `plan`, `capacity`,
+`ready_after_ms`, and `transition_loss_requests`. A capacity contains
+`rps` and `valid_until_ms`, the Unix millisecond deadline for that
+measurement. The planner checks device capacity, host memory, and current
+grants, then scores the feasible candidates against the forecast's
+demand, horizon, and minimum gain. Supply capacity measurements for the
+candidate's topology. The control plane rechecks reservations and the
+current epoch when it applies the selected plan. Retry with the same
+operation ID and inputs to retrieve the original decision receipt.
+
+| Activation | When the committed plan starts admitting requests |
+| --- | --- |
+| `OnReady` (default) | Activation waits for all worker grants to be ready and the HTTP endpoint to be published. The final report moves an active incumbent to `Draining` in the same operation. |
+| `OnRevocation` | A ready standby is promoted when the named active epoch is revoked. If revocation arrives first, the last readiness report completes the switch. |
+
+An explicit drain leaves a standby in `Ready`. A failed host's other
+device grants are included in the same host-expiry transition. The model
+and HTTP alias used by a replacement must match the incumbent. A prepared
+standby keeps its grants while waiting, so account for those reservations
+alongside the active group.
+
+### Start groups from resident execution nodes
+
+Use a version of `plait-node` with hosted recipes on the voters and
+execution hosts. Install the launcher and each model profile on its host. The
+profile supplies local executable paths, device visibility, weights and
+backend settings. For example, one host can use this configuration.
+
+```json
+{
+  "listen": "192.0.2.10:0",
+  "host_memory": {"bytes": 68719476736, "pinned_bytes": 0},
+  "lock_dir": "/var/lib/plait/execution",
+  "devices": [{"ordinal": 0, "incarnation": 1, "device_bytes": 25769803776}],
+  "launcher": ["/opt/engine/bin/python", "-m", "vllm.entrypoints.serve.plait_serving.launcher"],
+  "profiles": {
+    "model-fp16": {
+      "argv": ["/opt/engine/bin/vllm"],
+      "model_path": "/models/model",
+      "device_env": "CUDA_VISIBLE_DEVICES",
+      "args": ["--dtype", "float16"],
+      "env": {"PLAIT_NCCL_BACKEND": "cuda"}
+    }
+  }
+}
+```
+
+```sh
+plait-node run --compute-only --id "$HOST_ID" --seed "$VOTER_ADDR" \
+  --hosted-execution /etc/plait/hosted.json
+```
+
+The node discovers control voters from seed IP addresses and registers
+its devices and host memory. Repeat `--seed` for additional address
+hints. Keep the host ID and lock directory stable across restarts.
+
+Include a `recipe` in `prepare_hosted` or on a `replan_hosted` candidate.
+The plan and recipe are committed together. Use 32 zero bytes for the
+plan's `launch_digest` in this request. The CLI derives the digest from
+the recipe. Set these fields on the recipe.
+
+| Field | Meaning |
+| --- | --- |
+| `profile` | Installed profile name on each participating host. |
+| `hosts`, `api_host` | Array of `{"host": node_id, "address": ip}` entries and the host ID serving HTTP. The hosts must match the plan. |
+| `master_port`, `http_port`, `backend_port` | Distinct rendezvous, advertised HTTP, and private engine ports. |
+| `api_model` | Model alias reported by the HTTP server and used by the ingress. |
+| `max_model_len`, `gpu_memory_bps`, `prefix_caching` | Common engine settings. A value of 8000 sets GPU memory utilization to 80 percent. |
+
+Each planned host claims its assignment before starting its launcher.
+The launcher checks the grants and maps them to the local device mask.
+The committed activation policy determines when the ingress switches.
+If the supervisor exits, the launcher closes its worker process group.
+A restarted supervisor uses the same local lock and revokes a claim
+left without a live launcher. Use a profile's optional `verify_release`
+executable to attest device release before its grants can be reused.
+
+For managed groups with dedicated accelerator devices and Plait TCP, a
+profile can use the built-in driver process check instead of an external
+verifier. Set `release_driver` and the matching `PLAIT_NCCL_BACKEND` in
+the engine profile.
+
+```json
+{
+  "release_driver": { "driver": "ppu", "program": "/path/to/ppu-smi" },
+  "env": { "PLAIT_NCCL_BACKEND": "ppu" }
+}
+```
+
+| `driver` | `PLAIT_NCCL_BACKEND` | Local tool |
+| --- | --- | --- |
+| `nvidia` | `cuda` | `nvidia-smi` |
+| `amd` | `rocm` | `amd-smi` |
+| `amd_kfd` | `rocm` | `amd-smi` with Linux KFD sysfs |
+| `ppu` | `ppu` | `ppu-smi` |
+| `ascend` | `huawei` | `npu-smi` |
+
+Use an absolute executable path and load its vendor libraries in the
+resident environment. The driver tool and the engine's visibility mask
+must use the same physical device numbering. The Ascend query addresses
+device IDs whose chip index is zero. The launcher uses the built-in check
+after the worker process group exits and the admission proxy drains.
+It disables the Plait shared-memory and CUDA IPC paths for these groups.
+Every local grant must return a clear process report. Busy devices,
+unsupported reports, and timeouts leave the grants protected. Use
+`verify_release` for profiles that rely on another release procedure,
+such as device resets or transport-specific cleanup.
+
+Use `amd_kfd` for a ROCm whole-device profile on a host where AMD SMI
+returns the same process list for multiple cards. Use `CUDA_VISIBLE_DEVICES`
+or `HIP_VISIBLE_DEVICES` as the profile's `device_env`. The launcher
+captures the HIP-to-KFD mapping before starting vLLM. After drain, it
+checks that the mapping still matches AMD SMI and kernel topology. KFD
+queue IDs and per-device VRAM counters must be clear on the granted
+devices. Work on another device can keep running. The verifier requires
+a complete KFD process view and reconciles the PIDs reported by AMD SMI.
+Partitioned identities, changed mappings and missing process data keep
+the grants protected. The `amd` mode remains available on older hosts.
+
+### Replan with measured host links
+
+Set `probe_listen` in each hosted execution configuration to an address
+reachable from the execution hosts and the planner. Use the same IP as
+`listen`. Port zero lets the node choose a port. Each node registers
+its probe endpoint with the control replicas, then samples its outgoing
+links in sequence. A probe sends 1 MiB over TCP and waits for the peer's
+acknowledgment. It also records the round-trip time of the opening
+request. Samples are kept in the source node's memory.
+
+Send `{"request":"hosted_links"}` to the serving CLI to read the current
+endpoints and directed samples. A sample carries `bytes_per_second`,
+`rtt_ns`, and `sampled_at_ms`. When a node restarts, its probe session
+changes. The planner only uses samples that match the directory's
+source and destination sessions.
+
+To apply these measurements, add a `link_policy` to `replan_hosted`.
+Set `max_sample_age_ms` and supply the estimated request traffic for a
+directed pair of TP workers as `bytes_per_rank_pair`.
+For each pair of hosts, the planner multiplies the byte estimate by
+the number of sending and receiving rank pairs. It sums traffic through
+each host's send and receive port and uses the slowest measured path
+through each port as its capacity. The smallest resulting rate caps
+the candidate's supplied SLO capacity.
+
+For a latency-sensitive layout, add `tp_rtt_budget` inside `link_policy`.
+Supply `serial_rounds`, the number of dependent peer exchanges in one
+profiled window inside a TP group, and `max_wait_ns`, its RTT allowance.
+For example, `{"serial_rounds":57,"max_wait_ns":500000000}` allows up to
+500 ms of RTT-derived wait for 57 serial exchanges. Count the exchanges
+on the critical path after accounting for overlap. The estimate multiplies
+the largest fresh directed RTT by this count. For PP candidates the check
+applies to each stage's TP group. Local TP groups have zero inter-host RTT.
+
+For a pool with several TP widths, put each calibration in `tp_profiles`
+under its decimal TP width. Each entry supplies the bytes and its optional
+RTT budget. The search uses the target width even before it has assigned
+all the workers. Pipeline placement uses the stage's TP width.
+
+```json
+{
+  "max_sample_age_ms": 5000,
+  "tp_profiles": {
+    "2": {
+      "bytes_per_rank_pair": 32768,
+      "tp_rtt_budget": {"serial_rounds": 16, "max_wait_ns": 100000000}
+    },
+    "4": {
+      "bytes_per_rank_pair": 16384,
+      "tp_rtt_budget": {"serial_rounds": 32, "max_wait_ns": 100000000}
+    }
+  }
+}
+```
+
+The top-level byte estimate and optional RTT budget serve as the complete
+fallback for widths absent from `tp_profiles`. An explicit width uses its
+own entry as a unit. With per-width profiles alone, a cross-host candidate
+with an unlisted width returns `MissingTpProfile` when supplied explicitly
+and is skipped during automatic placement. Local TP groups need no
+inter-host calibration. P/D planning budgets incumbent traffic with its
+applicable profile and applies RTT admission to proposed replacements.
+When using per-width profiles alone for a P/D transition, include the TP
+widths that currently serve cross-host traffic as well as the target widths.
+
+Calibrate the RTT window and traffic volume with the engine that will run
+the candidate. For serial generation, send the same prompt with output
+limits of one, two, and several tokens. Keep the prompt length, batch
+shape, TP width, dtype, and prefix-cache state fixed. With the host-staged
+blocking peer path, set `PLAIT_NCCL_PHASE_LOG` on each worker and compare
+the ordered collective traces. After warming the engine, isolate one
+request at a time. Use the trace's worker slot, group size, operation, dtype,
+and local input byte count to match the TP calls. The one-token trace
+covers prefill and first-token sampling. The additional calls in the
+two-token trace cover one decode step. Check the longer request for
+repeated decode steps before extrapolating the profile.
+[Phase log format](../crates/plait-nccl/src/profile.rs)
+
+Translate each call to the exchanges used by its wire algorithm. A
+replicated AllReduce or an AllGather has one exchange. The sequential
+scatter-gather path has two. Count concurrent transfers to peers once for
+the RTT window, and add the bytes actually sent to each directed peer for
+the traffic forecast. For a fixed-shape request with a repeating decode
+step, use the first-token bytes plus one decode-step budget for each
+remaining token. Reprofile layouts that use a different collective
+algorithm or change the critical path through overlap.
+
+When first-token and decode latency have separate allowances on the same TP
+group, compare each allowance divided by its serial round count. Configure
+`tp_rtt_budget` with the window that allows the smaller RTT. Both windows
+use the same measured peak RTT. Keep `bytes_per_rank_pair` scoped to the
+whole request so the bandwidth estimate covers all generated tokens.
+
+The response includes one `link_limits` entry per candidate. A
+cross-host candidate needs fresh samples in both directions for every
+host pair. Missing or expired evidence leaves that candidate unselected.
+A configured wait allowance reports `estimated_tp_wait_ns` for eligible
+cross-host candidates and `ExceedsTpRttBudget` for those over budget.
+Automatic placement discards over-budget layouts during search. Current
+groups supply the measured baseline while their replacements are evaluated.
+The RTT estimate covers serial TP exchanges. Application goodput still
+comes from the SLO profiles, which account for compute and queueing.
+
+### Generate placements from registered hosts
+
+For automatic placement, send a `pool` in place of `candidates` on
+`replan_hosted` and supply `link_policy`. Use
+`{"request":"hosted_planning"}` to inspect the host inventory and committed
+port reservations. Resident nodes advertise their reachable addresses,
+installed profile names, and registered device incarnations. Each host
+should install compatible weights and engine settings under the same
+profile name. Local executable paths and backend settings may differ.
+If a device registration changes, only that device loses eligibility
+until the host advertises its current incarnation.
+
+The example shows the `pool` field. Supply `id`, `forecast`, and
+`link_policy` alongside it. In a running deployment, replace the example
+capacity and Unix millisecond deadline with measurements for the intended
+model and workload. List one entry for each supported TP size.
+
+```json
+{
+  "group": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+  "profile": "model-fp16",
+  "api_model": "model",
+  "max_model_len": 4096,
+  "gpu_memory_bps": 8000,
+  "prefix_caching": true,
+  "ports": {"first": 25000, "count": 48},
+  "sizes": [
+    {
+      "tensor_parallel": 2,
+      "device_bytes": 8589934592,
+      "host_base": {"bytes": 2147483648, "pinned_bytes": 0},
+      "host_per_worker": {"bytes": 536870912, "pinned_bytes": 0},
+      "capacity": {"rps": 4.0, "valid_until_ms": 0},
+      "ready_after_ms": 15000,
+      "transition_loss_requests": 0
+    }
+  ]
+}
+```
+
+For each size, the planner combines free devices on at least two hosts.
+It charges the base host memory once per host and the per-worker memory
+for each assigned rank, including pinned memory. It retains a bounded
+set of layouts ranked by the measured link ceiling, then applies the
+forecast to score the retained candidates. Each size currently uses one
+supplied SLO profile across its layouts. Run `replan_hosted` again with
+a new operation ID after capacity or demand changes.
+
+Keep the port range dedicated to hosted launches. Consecutive triplets
+provide the rendezvous, public HTTP, and backend HTTP ports on the API
+host. The control plane checks for overlapping recipe ports and verifies
+the host inventory, device grants, and group versions when it applies
+the plan. A draining or revoked group retains its ports until retirement.
+`placements` reports generated layouts in the same order as the selection
+scores. An empty list means there was no feasible layout in this search
+using the current inventory and link samples.
+
+### Keep one HTTP endpoint across group versions
+
+Point clients at the aggregate ingress. Use the same API model alias
+for every version of the group. The ingress follows the active version
+through the control replicas.
+
+```sh
+python -m vllm.entrypoints.serve.plait_serving.aggregate \
+  --model "$SERVED_MODEL" --group-id "$GROUP_ID" \
+  --control-peer "$VOTER_ID@$VOTER_ADDR" --control-listen "$INGRESS_REPLY_ADDR" \
+  --host "$INGRESS_BIND_IP" --port 8192
+```
+
+Repeat `--control-peer` for each voter. The control reply address must be
+reachable by the voters. Use the current `plait-node` binary for the
+ordered group observation. The ingress serves `/v1/completions`,
+`/v1/chat/completions`, `/v1/models`, and `/health`.
+
+The ingress waits 500 ms between observations and expires its last
+route after eight seconds without a fresh observation. The response header
+identifies the group that first admitted the request. A request admitted by the old group
+keeps its upstream connection while the old group drains. The ingress can
+retry a connection that failed before sending request bytes or an explicit
+Plait admission rejection. Once forwarding starts, a disconnect without
+an admission rejection ends that attempt.
+
+### Recover a greedy completion stream
+
+Set `X-Plait-Stream-Recovery: replay-prefix` on `POST /v1/completions`
+with `stream: true` and `temperature: 0`. Send one prompt and request one
+completion. This mode supports text and token-array prompts and final usage.
+Use plain greedy completions without echo, log probabilities, beam search,
+continuous usage statistics, or an external KV transfer descriptor.
+
+After an admitted stream breaks, the ingress waits for a newer active
+epoch within the request timeout and submits the original completion
+there. It checks the prompt token IDs and compares both the token IDs
+and text already emitted, even when stream chunks have different boundaries.
+It sends only the suffix after both comparisons pass. The client keeps
+the same HTTP connection and completion ID. The ingress sends a single
+successful `[DONE]` together with the final completion frames. A
+prefix mismatch yields a `plait_recovery_error` event.
+
+Recovery retains the visible prefix in the running ingress process and
+rebuilds KV by recomputation on the replacement. The same connection
+must remain open throughout recovery.
+
+For a native group whose replacement can rank tokens differently, select
+`X-Plait-Stream-Recovery: resume-prefix` on the same greedy streaming
+endpoint. Run the vLLM V2 model runner with speculative decoding disabled.
+The ingress supplies the already-visible token IDs as output history.
+The replacement rebuilds its context from the original prompt and that
+history, then computes the next token. The mode uses the engine's local
+prefill path. The ingress requires the replacement to acknowledge the
+history length and match the prompt, visible token IDs, and visible text
+before forwarding its suffix. The client receives one completion ID and
+the original output-token budget applies across attempts.
+
+An engine-loss test used two native TP1 epochs running Qwen3-0.6B FP16 on
+separate CUDA devices. After the first token event, the test killed the old
+engine and reported the failure against its grant. Plait promoted the ready
+standby. The vLLM ingress kept the same completion ID and returned all 96
+token IDs in order, matching a direct request to the replacement.
+
+The vLLM fork ships the ingress and launcher in its Python package.
+Replace the previous Plait checkout script paths with the module commands
+above when updating vLLM. Run `tools/plait/serving/check-tla.sh` from the
+fork to check ingress versioning and stream handoff.
+
+### Switch aggregate and P/D using native groups
+
+Reserve separate native group IDs for the aggregate, Prefill and Decode
+engines. Run the native launcher for each group with its own deployment
+file and disjoint API and rendezvous ports. Set `api_role` in each local
+engine configuration to `aggregated`, `prefill` or `decode`. Give Prefill
+and Decode the same [KV store and namespace](#reuse-prompt-kv-across-tp-layouts).
+Set the first engine's connector role to `kv_producer` and the second to
+`kv_consumer`. Use the same model weights, KV dtype and block size.
+Omit the launcher's `--routes` publisher when coordinating a group set.
+Use [`plan_set`](#prepare-several-groups-together) to prepare both candidates
+in one reservation transaction.
+
+Publish the engine-owned bindings in one file. Each route identifies exact
+versions and reachable HTTP origins. The example stages an active aggregate
+and the two prepared P/D engines in the same revision.
+
+```json
+{
+  "model": "example",
+  "revision": 1,
+  "aggregated": [
+    {"url": "http://192.0.2.21:8000", "version": "00000000000000000000000000000001@1"}
+  ],
+  "paths": [
+    {
+      "prefill": {
+        "url": "http://192.0.2.22:8010",
+        "version": "00000000000000000000000000000002@1",
+        "kv_host": "192.0.2.20",
+        "kv_port": 7952
+      },
+      "decode": {
+        "url": "http://192.0.2.23:8020",
+        "version": "00000000000000000000000000000003@1"
+      }
+    }
+  ]
+}
+```
+
+```sh
+python -m vllm.entrypoints.serve.plait_serving.disaggregate \
+  --native-routes routes.json --control-seed "$SEED" \
+  --control-listen "$INGRESS_REPLY_ADDR" --port 8192
+```
+
+The ingress accepts a route only when one ordered `ObserveActiveSet`
+includes all of its exact versions. It keeps accepting aggregate requests
+while the P/D engines prepare. Update the file with an atomic rename and a
+higher `revision` when adding or replacing bindings. If a group fails, the
+next observation excludes any route that requires it. Other eligible
+routes can continue to serve.
+
+After checking the target engines' versioned HTTP health and the
+communication groups' `Ready` phase, submit one `SwitchActiveSet` to the
+native group API. Each transition specifies the expected and target active
+epoch. A `null` target drains the current epoch. Equal values guard a
+retained epoch. A stale expectation or unready target rejects the whole set.
+Use the same operation ID and payload to retry an uncertain submission.
+
+```sh
+python - <<'PY' | plait-node group --seed "$SEED" --listen "$CONTROL_REPLY_ADDR"
+import json
+import uuid
+
+changes = [
+    (1, 1, None),  # drain aggregate @1
+    (2, None, 1),  # activate Prefill @1
+    (3, None, 1),  # activate Decode @1
+]
+print(json.dumps({
+    "request": "apply",
+    "operation": {
+        "id": {"origin": list(uuid.uuid4().bytes), "counter": 1},
+        "action": {"SwitchActiveSet": {"transitions": [
+            {"group": list(group.to_bytes(16, "big")), "expected": old, "target": new}
+            for group, old, new in changes
+        ]}},
+    },
+}))
+PY
+```
+
+The old group drains existing HTTP work before its launcher revokes and
+returns its grants. To return to aggregate serving, stage a new aggregate
+epoch and submit the inverse switch once it is ready. The same ingress
+can also serve aggregate and P/D paths together. Both the ingress and the
+voters need the active-set APIs for this mode. The reference integration
+uses shared KV pages owned by the engine.
+
+On one CUDA host, three TP1 engines ran Qwen3-0.6B FP16 through the same
+ingress. The aggregate-to-P/D switch preserved the old 32-token stream
+until drain finished. A new request reused 144 prompt tokens in Decode
+and matched the aggregate's output. After releasing the old grant, the
+test reused that device for a new aggregate epoch and switched back.
+
+#### Keep serving while reusing devices for a larger group
+
+Use a separate aggregate group as a temporary route when the target
+layout needs devices held by the incumbent. Prepare the temporary engine
+on disjoint devices and verify its versioned HTTP health. Publish the
+incumbent and temporary routes in one native directory. The first
+`SwitchActiveSet` activates the temporary group and drains the incumbent
+in one ordered operation.
+
+The incumbent finishes accepted requests. Its launchers return each
+grant after local execution has stopped. After those grants return,
+prepare the larger layout under the incumbent's group ID with a new
+epoch. The temporary engine serves requests during model loading and
+communication setup. Once the target's route is published and its
+versioned health check passes, a second `SwitchActiveSet` activates the
+larger group and drains the temporary engine.
+
+The native vLLM ingress can see a stale route while the old admission
+gate shuts. When every current route declines a request before
+generation admission, the ingress can try a newly observed route once.
+It waits through at most two 500 ms directory poll intervals within the
+request deadline. A failure with unknown delivery is terminal. The
+second attempt relies on the existing active-set watcher.
+
+Size the temporary engine for the demand that must be served during
+preparation. It holds separate resources and may have lower capacity
+than the incumbent. Without those resources, reusing occupied devices
+still requires a gap between the old and new engines. This procedure
+uses explicit deployment decisions and leaves request state with the
+engine that accepted it.
+
+#### Automate the handoff from the native mode policy
+
+Prewarm the temporary aggregate group on independent devices and include
+it in the native directory's `discover.aggregated` list. Set `bridge` on
+the target's `provision` entry to the temporary group's exact version, for example
+`"bridge": "00000000000000000000000000000004@1"`. Each bridge version
+identifies one target provision.
+
+Supply the bridge's capacity as a single-group entry in `modes` or enable
+`calibration` and omit that entry. With calibration, the controller
+measures the exact ready bridge through a private ingress after the release
+preview succeeds. The benchmark uses the configured workload, offered
+rates, and latency thresholds. The incumbent keeps serving and the public
+arrival counters track the public requests.
+
+The policy first tries to prepare the target using free resources. If
+the stable target has no placement, it previews placement after the
+exact incumbent active set releases. It switches to the bridge only
+after that preview finds the target's device count and the bridge is
+healthy with a current capacity profile that covers observed arrivals.
+
+While the bridge is active, the controller retries ordinary reservation
+as the old grants return. It can resume from the same active-set
+observation after restarting. The target takes over after `stable_windows`
+consecutive windows with the same ready target and capacity profile. Each
+window requires the target to cover the smaller of observed arrivals and
+the bridge's capacity. A miss, a different candidate profile, or an ingress
+restart starts a new count. Configure the target profile in `modes` or let
+calibration measure the ready target through the private ingress. With
+`--mode-state`, the controller retains both measurements with their route
+bindings, manifests, and expiry. The bridge can continue serving while
+availability changes or a needed profile expires.
+
+#### Select a ready native layout from live demand
+
+Run the native ingress with `--mode-policy policy.json`. Enable this flag
+on the ingress that measures the demand for the model. The policy reads
+arrival counters in the ingress process. Readiness probes and control
+submissions use a separate control client from the route refresher.
+
+Calibrate each full layout against the workload and its latency SLO with
+`python -m vllm.entrypoints.serve.plait_serving.benchmark`. Record the
+benchmark's `slo_profile` against the exact worker epochs it measured.
+The profile expires at its `valid_until_ms` Unix timestamp. A split
+profile contains both group versions. A mixed profile lists every
+version used by its aggregate and split paths and uses a measurement of
+that combined deployment. Keep the active layout in the policy until
+another layout has activated. Use `route_revision` to bind the capacity
+measurements to the ingress's route file.
+
+```json
+{
+  "route_revision": 1,
+  "window_seconds": 2,
+  "stable_windows": 3,
+  "horizon_seconds": 60,
+  "cooldown_seconds": 10,
+  "device_cost_requests_per_second": 0.1,
+  "switch_loss_requests": 3,
+  "minimum_gain_requests": 2,
+  "modes": [
+    {
+      "versions": ["00000000000000000000000000000001@1"],
+      "devices": 1,
+      "slo_profile": {"rps": 4.0, "valid_until_ms": 1893456000000}
+    },
+    {
+      "versions": [
+        "00000000000000000000000000000002@1",
+        "00000000000000000000000000000003@1"
+      ],
+      "devices": 2,
+      "slo_profile": {"rps": 11.0, "valid_until_ms": 1893456000000}
+    }
+  ]
+}
+```
+
+Replace the example capacities and deadlines with benchmark output. The device
+rate converts the benefit of freeing one device-second to requests. The
+switch loss charges preparation overlap and drain in the same units. In
+each completed window, the ingress caps predicted service by the lesser of
+arrivals per second and measured SLO capacity. It keeps candidates that can
+serve at least the incumbent rate. The score compares projected requests
+and device-seconds over the horizon, then subtracts the switch loss.
+
+After `stable_windows` agree on one ready target, the controller rechecks
+the route revision, active set, and profile lifetime. It validates each
+target's device count and versioned HTTP health. One `SwitchActiveSet`
+compares the active epochs of all groups referenced by the directory. It
+can reject a changed group or target readiness after the check. A lost
+reply is retried with its original operation ID.
+
+For manually prepared successors, include their bindings in the route file.
+Use atomic renames for updates. A revision mismatch or an expired profile
+leaves the current groups active. When a switch succeeds, the policy waits
+through the cooldown before considering another switch.
+
+Three hosts verified automatic switching between CUDA aggregate and ROCm
+Prefill with PPU Decode. The trial used preset capacities of 0.8 and 4.0
+requests/s to exercise the policy with real HTTP arrivals. At 4.55
+requests/s, the ingress switched to P/D. Decode reused 128 prompt tokens
+from the shared store, and all eight output tokens matched the CUDA
+baseline. When the arrivals stopped and a new aggregate epoch was ready,
+the same ingress switched back and served a matching completion.
+
+#### Prepare a native layout on demand
+
+Run one resident launcher per group on each eligible deployment host. Omit
+`--routes` from those launchers so the mode policy can activate the complete
+set. Give each group its own port ranges. Define the stable route roles in
+`--native-routes` using `discover`. Each deployment path is relative to
+the route file and points to the same launch configuration used on the
+workers. The example starts with an aggregate layout.
+
+```json
+{
+  "model": "example",
+  "revision": 1,
+  "paths": [],
+  "discover": {
+    "deployments": {
+      "00000000000000000000000000000001": "aggregate.json",
+      "00000000000000000000000000000002": "prefill.json",
+      "00000000000000000000000000000003": "decode.json"
+    },
+    "aggregated": ["00000000000000000000000000000001"],
+    "paths": [{
+      "prefill": "00000000000000000000000000000002",
+      "decode": "00000000000000000000000000000003",
+      "kv_host": "192.0.2.20",
+      "kv_port": 7952
+    }]
+  }
+}
+```
+
+Add a `provision` array to the mode policy. Each array entry describes a
+prospective layout with its estimated device count and SLO capacity. Its
+`groups` entries use the relative `deployment` path, the same `workload`
+object as `plan_set`, and an optional hexadecimal `calibration` ID.
+For example, add one entry with `devices: 2`, Prefill and Decode workload
+objects of width one, and a current `slo_profile` estimate for the pair.
+Keep the incumbent's exact capacity profile in `modes`.
+
+When consecutive windows favor a projected layout and no ready mode
+qualifies, the policy issues one `plan_set` with the observed active
+epochs as guards. Plait limits each group to its deployment's host list
+and reserves all groups or returns a rejection. A resident launcher
+starts the committed candidate when it sees its grant. The ingress
+derives each HTTP origin from the committed group and its deployment's
+port range. A P/D candidate appears after both groups reach `Ready`.
+The incumbent stays live throughout preparation.
+
+Upgrade the voters and the ingress's `plait-node` binary together for
+on-demand provisioning. During reconciliation the ingress reads each
+candidate's latest preparation receipt through the `preparation` request.
+After a member is revoked or retired before activation, one ordered
+`AbortFailedSet` revokes the remaining candidates in that preparation.
+Plait checks the exact member epochs and rejects the abort if any member
+has ever activated. Grants and host reservations remain charged until the
+owners confirm release. A later preparation can then reuse eligible
+devices with new fences. If a grant has no release confirmation, it stays
+held even after the candidate is revoked.
+
+Measure the candidate through a separate private ingress with `--routes`
+for the candidate endpoints and `--kv-transport plait`. Add its measured
+SLO profile to `modes` with the exact discovered versions and the actual
+granted device count. The regular policy then checks observed demand,
+profile lifetime, and versioned health before submitting the switch.
+One route revision covers successive epochs discovered from the same
+deployment definitions. Update the route revision when changing the
+declared roles or paths.
+
+To bring a new host into a deployment, register its devices and budgets
+with Plait, then add its address to the group's deployment file on the
+ingress and launchers. Start its launcher with the same group configuration.
+Running launchers reload host additions when preparing a version.
+Withdraw a host through Plait before reclaiming its grants.
+
+Three durable voters, synthetic device profiles, and versioned HTTP fixtures
+verified the path from HTTP arrivals to joint reservation and atomic switch.
+The incumbent remained active while only one target was ready, and the
+planner excluded a faster device outside the declared hosts.
+
+##### Run candidate calibration automatically
+
+Add `calibration` to the mode policy. Use a local tokenizer for the same
+checkpoint as the deployment.
+Leave the initial layout's measured capacity in `modes`.
+
+```json
+{
+  "model": "/models/example-model",
+  "input_tokens": 144,
+  "output_tokens": 32,
+  "rates": [2.0, 4.0, 6.0],
+  "seeds": [7, 19],
+  "ttft_ms": 500,
+  "tpot_ms": 60,
+  "prompts": 32,
+  "warmups": 2,
+  "attainment": 0.95,
+  "valid_for": 1800,
+  "timeout_seconds": 300,
+  "retry_seconds": 30
+}
+```
+
+Each trial uses the configured request and token counts. The benchmark
+returns the last contiguous offered rate whose repeated trials satisfy
+the SLO, capped by their lowest measured goodput. Online calibration runs
+the rates in ascending order and finishes all seeds at the first rate that
+misses the target. Higher rates cannot extend the passing range. The
+standalone benchmark scans the full grid by default. The policy starts one
+benchmark at a time against a loopback ingress that forwards exclusively
+to the complete ready candidate. Active groups keep serving on the
+production ingress. Benchmark arrivals stay outside its demand counters.
+The benchmark uses the configured candidate hosts and the existing KV
+store, so account for any shared resource load when choosing rates.
+
+Online calibration imports the installed vLLM serving benchmark once per
+candidate. It runs the same benchmark sequentially with fresh arguments
+for each rate and seed. The calibration deadline covers all trials and
+warmup. Set `calibration.vllm` to an executable path such as
+`/opt/vllm/bin/vllm` to launch that CLI for each trial. The standalone
+benchmark keeps CLI execution as its default and accepts `--in-process`
+to use the installed benchmark.
+
+By default, `warmups` sets the number of requests submitted before each
+timed trial. For a private candidate that benefits from mixed prefill and
+decode warmup, set `warmup_decode_widths` to a list of stream counts.
+In this mode, `warmups` specifies serial requests before the first wave.
+Each wave starts the configured number of streams, waits for a returned
+token ID from each, and inserts one more request. The measuring process
+waits for the complete wave before moving on. For example, `warmups: 3`
+with `warmup_decode_widths: [2, 2, 3, 4]` sends 18 requests once before
+the timed rate sweep. vLLM determines the actual batch composition.
+
+Wave requests use the timed benchmark's prompt generator and the deployed
+model's sampling defaults, with a separate seed. They stay on the pinned
+private ingress. A failed warmup stream cancels its wave and the calibration.
+Only timed trials contribute to the persisted capacity.
+
+Set `timeout_seconds` to cover the full calibration run. When
+a deployment may start with empty kernel caches, measure that case with
+the candidate off the public route and include its warmup in the rollout
+time budget.
+
+For a custom warmup, use the sampling parameters of the timed workload.
+Changing temperature, top-k, or top-p can select different sampler kernels
+on the final pipeline stage. Check the candidate's timed SLO after warmup to
+catch first-use stalls from the remaining workload variants.
+
+On completion, the policy checks the candidate's bindings, grant count,
+readiness, SLO expiry, and the observed active set again. It discards results
+when these checks fail. A measured candidate must win the same stable
+window comparison as a manually profiled candidate. Its profile remains
+available as the incumbent baseline after cutover until it expires or the
+route revision or calibration settings other than the warmup settings change.
+Updating `warmups` or `warmup_decode_widths` cancels any in-progress calibration
+and preserves completed capacity evidence for the same version. The next
+measurement uses the new warmup configuration.
+
+Pass `--mode-state /var/lib/vllm/plait-capacity.json` with `--mode-policy`
+to preserve those measurements across ingress process restarts. The file
+stores the profile and fingerprints of the calibration settings excluding
+the warmup settings, the route bindings, and the communicator manifests.
+The manifests bind the measurements to the device grants and endpoint tickets.
+A restored profile
+must still be current and describe healthy, matching group versions.
+With a state path configured, a new profile is saved before it can trigger
+a switch. An empty `modes` list lets a resumed ingress use the restored
+baseline. Supply a fresh incumbent profile in `modes` if the stored one
+expires. To upgrade a profile from the earlier fingerprint format, let the
+upgraded ingress restore it with the original calibration settings before
+changing `warmups`.
+
+A functional deployment verified this sequence with a CUDA aggregate,
+ROCm Prefill, and PPU Decode serving the same FP16 checkpoint. HTTP demand
+started the two candidates, and the private benchmark supplied the measured
+profile used for cutover. Requests continued on the incumbent until the
+switch, and generation matched across the two layouts.
+
+### Hand off prompt KV between independent Prefill and Decode groups
+
+Use the vLLM fork at `9122df3da` or later on `plait/v0.31-runtime`.
+Start the vLLM fork's [KV page store](#reuse-prompt-kv-across-tp-layouts)
+at an address reachable from both groups. Use the same store, model
+namespace, weights, KV dtype, and logical page size on both sides.
+Give each engine launcher the role `prefill` or `decode` and these fetch
+and publish settings.
+
+```sh
+--plait-kv-namespace "$MODEL_NAMESPACE" --kv-host "$KV_HOST" --kv-port "$KV_PORT"
+```
+
+Use `--proxy-host` to bind the group proxy on an address reachable by
+the router, and `--advertise-http` to publish its HTTP endpoint. The
+Prefill endpoint's `prefill_kv` is the shared store address.
+After the groups report Ready, activate and publish the versioned P/D
+path. Start the router against the published directory.
+
+```sh
+python -m vllm.entrypoints.serve.plait_serving.disaggregate \
+  --model "$MODEL_ALIAS" --kv-transport plait \
+  --control-peer "$VOTER_ID@$VOTER_ADDR" --control-listen "$ROUTER_REPLY_ADDR"
+```
+
+The router gives Prefill a ticket. Prefill returns the ticket, store
+address, prompt digest, and number of published prompt tokens. The
+digest binds the model namespace, page layout, token IDs and cache salt.
+The router compares the ticket and the store advertised by the selected
+Prefill group. Decode checks the digest and requires the complete pages
+claimed in the receipt. It computes the remaining prompt tokens before
+generating. A lost page fails the request under the managed Decode
+configuration. Ordinary untagged requests retain the external cache
+lookup and recomputation behavior.
+
+This path uses the bounded, in-memory Plait KV store and supports the
+eager, dense FP16 and BF16 attention layouts described below.
+
+### Recover a P/D completion after Decode disconnects
+
+With the P/D ingress running `--kv-transport plait`, send
+`X-Plait-Stream-Recovery: replay-prefix` on `POST /v1/completions`. Use
+`stream: true`, `temperature: 0`, and one token-addressable text completion.
+
+If the admitted Decode disconnects, the ingress keeps the HTTP stream open
+and excludes that Decode version. It uses an already live alternative or
+waits for the route directory to publish one. The replacement attempt
+obtains a fresh Prefill handoff, reads the prompt pages through the Plait
+store, and generates from the start of the completion. The ingress checks
+the token IDs and text already emitted before forwarding the suffix. It
+keeps the original completion ID and emits one terminal marker on success.
+
+The ingress releases each completed handoff lease after its Decode attempt.
+When matching fails or the request deadline expires, an in-progress stream
+receives a recovery error. Replay keeps state in the live ingress and uses
+an available Prefill/Decode path. It regenerates the emitted prefix with
+the replacement engine.
+
+When the directory has no ready alternative, [hosted P/D repair](#restore-a-failed-hosted-pd-group)
+can prepare a replacement on spare devices while the ingress waits. The
+original request deadline still governs the start of a replacement attempt.
+The replacement can reuse the surviving Prefill and use a different Decode
+TP width if both groups share a compatible prompt KV contract.
+
+### Start and publish a managed Prefill and Decode deployment
+
+Install the model profile on each resident execution host. The plan
+supplies the KV connector and block size for both roles. Keep those
+options out of the profile's `args`. Set the model namespace to an
+identifier shared by profiles with compatible weights and KV data.
+
+Send `prepare_hosted_pd` to the serving CLI. The request supplies these
+fields.
+
+| Field | Value |
+| --- | --- |
+| `id` | Operation identity. Retry an ambiguous response with the same ID and inputs. |
+| `model` | API alias used by the router and all endpoint recipes. |
+| `expected_revision` | Current route directory revision. Use zero for the initial publication. |
+| `kv` | Shared `store` as an IPv4 address and port, `namespace`, and `block_size`. |
+| `placements` | New groups with `group`, `expected_epoch`, `expected_active`, `plan`, and `recipe`. Use role `Prefill` or `Decode`. Reserve `TP × PP` devices for each group. The CLI computes the launch digest. A group may use one host or multiple hosts. |
+| `paths` | Complete desired path list. Each entry names its `prefill` and `decode` group versions. Include any existing versions the deployment is keeping. |
+
+The voters reserve all new groups in one operation. Each resident host
+starts the groups assigned to its device grants. A voter proposes
+publication after every new group is Ready. The publication operation
+checks the staged revision, current host inventories, group readiness
+and endpoints. It activates the new groups and publishes the complete
+path list together. It drains versions removed from all paths. A
+retained Prefill can serve an additional Decode without a restart.
+To shrink capacity, submit a smaller path list with an empty
+`placements` list.
+
+Use `{"request":"hosted_pd_pending","model":"model"}` to inspect a staged
+intent. The intent survives a voter restart. A failed candidate or
+changed placement inventory cancels its proposal without publishing
+the new paths. For an explicit cancellation, send `ResolveHostedPd`
+with the returned `intent` and `cancel: true` through `execute`, using
+a fresh operation ID. Claims remain reserved until the existing stop
+and retirement protocol confirms release. This API takes explicit
+placements.
+
+### Plan Prefill and Decode placements together
+
+Send `replan_hosted_pd` with `id`, the API alias `model`,
+`expected_revision`, `forecast`, `link_policy`, and `pool`. Use the
+checkpoint identity as `forecast.model` and supply a current capacity
+entry for every group on an existing path. Leave the forecast's
+`paths` and `link_bytes_per_second` empty. The planner derives them from
+the registered layouts and current link samples.
+
+The pool supplies the following fields.
+
+| Field | Value |
+| --- | --- |
+| `kv` | Store address, namespace and block size used by the managed P/D deployment. The store address must match one registered host. |
+| `kv_bytes_per_request` | Estimated bytes written by Prefill and read by Decode for the request class being planned. |
+| `store_bytes_per_second`, `store_valid_until_ms` | Calibrated aggregate read and write budget and its Unix millisecond deadline. |
+| `slots` | Each entry has a `role` of `Prefill` or `Decode` and a `pool` with the hosted pool fields described above. Give each slot a stable group ID and supported TP sizes. A P/D slot can use TP1 or local TP. The planner chooses which slots to populate. |
+| `allow_scale_down` | With `true`, a layout can remove groups when it serves the forecast demand at the baseline rate with fewer devices. It must use already-active groups. |
+
+Placement checks account for live grants, host and pinned memory,
+ports and installed profiles. The search can retain an active group or
+prepare its replacement alongside it. It keeps a bounded set of layouts
+for each Prefill and Decode replica count.
+
+The estimate follows the ingress's round-robin path allocation. The
+planner charges Prefill-to-store writes, store-to-Decode reads, and
+cross-host TP traffic to their directed ports. Workers contribute to
+KV traffic in proportion to their share of the TP group. Paths sharing
+a port consume the same budget. Capacity and startup estimates are
+supplied per role and TP size. Re-run the command with refreshed inputs
+to make another planning decision.
+
+When the roles have different communication patterns at the same TP
+width, set `link_policy.pd_tp_profiles`. Each role maps decimal TP widths
+to a byte estimate for one request and an optional RTT window for that
+role. For example, the prefill RTT window can cover the prompt pass and
+the decode RTT window can cover one generation step.
+
+```json
+{
+  "max_sample_age_ms": 5000,
+  "pd_tp_profiles": {
+    "prefill": {
+      "2": {
+        "bytes_per_rank_pair": 4194304,
+        "tp_rtt_budget": {"serial_rounds": 64, "max_wait_ns": 500000000}
+      }
+    },
+    "decode": {
+      "2": {
+        "bytes_per_rank_pair": 1048576,
+        "tp_rtt_budget": {"serial_rounds": 32, "max_wait_ns": 100000000}
+      }
+    }
+  }
+}
+```
+
+The planner looks for the candidate's role and target TP width first, then
+the shared `tp_profiles` entry for that width, then the top-level default.
+The first match supplies the entire byte and RTT profile. Cross-host
+placements need a matching entry or a default. Pipeline stages use their
+own TP width under the enclosing role. The incumbent's port accounting
+also uses the role profile, and the RTT admission check applies during
+replacement search. With a strict policy, include the profiles needed to
+account for both the incumbent and the proposed layouts.
+
+The response's `selection` reports the baseline and any preferred
+layout. A selected layout is submitted through managed P/D staging.
+The voters recheck route and resource versions when applying it. Retry
+an ambiguous submission using the same operation ID and request.
+
+To change the Decode TP width on spare devices, keep the existing Decode
+group ID in the pool and supply the target TP width and installed
+profile. Include current capacity for both active roles in the forecast.
+Keep the model and prompt KV contract compatible with the retained Prefill.
+When the replacement becomes ready, the directory can publish the new
+Decode epoch with the existing Prefill epoch.
+
+The ingress binds an admitted stream to that Decode epoch. The old Decode
+closes admission when it observes `Draining`. Its API launcher waits for
+admitted work to finish or for `--drain-timeout` to expire, then stops its
+workers. Followers wait for the API host's stop report. Retirement releases
+the old grants after all workers report stopped. Set the drain grace to
+cover the admitted requests the deployment needs to preserve.
+
+### Drive P/D planning from ingress load
+
+A voter and a hosted resident can share a host as separate `plait-node`
+processes. Each process defaults to one Tokio worker per available CPU, up to
+eight workers. Set `TOKIO_WORKER_THREADS` to tune a process independently.
+
+Start each managed P/D ingress with `--load-listen IP:PORT` on a private
+address reachable from the execution node running the policy. Each
+listener reports process-local arrival, completion, failure, and
+in-flight counters for its model alias. Requests that pass the
+ingress checks count towards arrivals while the route directory is
+empty or unavailable. This permits initial placement under offered
+load.
+
+Add a `pd_scaling` list to the resident execution configuration. Each
+policy includes the following fields.
+
+| Field | Value |
+| --- | --- |
+| `model`, `checkpoint` | API alias and the serving plan's model identity. |
+| `ingress` | Private load listener addresses for demand-based scaling. Omit for a repair-only policy. |
+| `repair_on_failure` | When enabled, restore failed roles in a committed hosted P/D directory even when no ingress is running. Defaults to `false`. |
+| `window_ms` | Interval between observations. |
+| `stable_windows` | Consecutive complete windows that must select the same plan. |
+| `cooldown_ms` | Delay after a deployment revision changes or a local attempt submits. |
+| `horizon_ms`, `minimum_gain_requests` | Forecast window and improvement threshold. |
+| `pool`, `link_policy` | The same calibrated pool and link evidence settings used by `replan_hosted_pd`. Enable `pool.allow_scale_down` to permit removing idle groups. |
+
+The node adds arrival rates from all ingress processes. It includes the
+current in-flight count over the forecast horizon. Missing or duplicate
+counters, a process restart, or an excessive gap clears recent
+decisions. A pending deployment blocks another automatic submission.
+Any resident can propose a change. Route revision and reservation
+checks arbitrate concurrent submissions.
+
+Existing group capacities come from the configured slot that matches
+the active role, launch profile, and TP size. Keep those measurements
+and the shared store budget current. The loop supplies observed demand
+to the planner and follows the normal staged rollout. Model capacity
+and startup time remain calibration inputs.
+
+### Restore a failed hosted P/D group
+
+Set `repair_on_failure` on a `pd_scaling` policy. Upgrade the voting
+nodes before enabling the policy. Each `window_ms` tick first checks for
+revoked or retired groups referenced by the committed directory. The
+policy can omit `ingress` when only recovery is needed. A failed slot
+uses the matching group ID and role in `pool.slots`. Each host advertises
+the profile names it can launch, with local settings for its own engine
+and devices. A replacement may use a different TP size from the failed
+group if the checkpoint and KV contract match.
+
+A repair preserves the paths and healthy group versions in the committed
+directory. The node stages a replacement for every failed endpoint in
+one operation. Healthy paths stay available during preparation. If no
+complete layout fits current device grants, host memory, ports and
+directed link evidence, the policy retries on a later tick. The normal
+readiness and revision checks still govern publication. Failed groups
+hold their old device grants until the regular release procedure finishes.
+To remove a slot permanently, publish a hosted directory without it.
+
+### Change a role on an occupied device
+
+Submit `prepare_hosted_pd_transition` when one rollout needs to move traffic
+away from a group and reuse its devices for another role or TP layout. Send
+`id`, `model`, `expected_revision`, and the same `kv` contract used by
+`prepare_hosted_pd`. Send both `bridge` and `target`, each containing a full
+`paths` list and the `placements` it needs at that step. `release` lists the
+old group versions excluded by the bridge. For a group ID reused after
+retirement, set the target placement's `expected_epoch` to the last epoch and
+its `expected_active` to `null`. Upgrade the voting nodes before submitting
+the new operation.
+
+For example, keep the current Prefill, prepare a replacement Decode on the
+new host, and make that pair the bridge. The target can keep the bridge path
+and add a path from a new Prefill on the old Decode's devices. Plait checks
+both layouts before launching the replacement. It protects the target's
+device IDs and launch ports, and holds the host memory shortfall above the
+retiring groups' reservations. As those groups retire, their memory credit
+moves into the target hold. The target receives a new grant only after
+all the listed release records have committed. Reusing a group ID or port
+offers the target under a new epoch. The group proxy rejects an admission
+for the old epoch.
+
+Configure `verify_release` on the retiring groups' resident launch profiles.
+The verifier must attest that the devices and transport are safe to reuse.
+Without a release record, an exited process can leave the rollout serving
+through the bridge and waiting for release.
+
+Query `hosted_pd_transition` with the model alias for the most recent
+transition's operation ID, route revision, phase and any staging error.
+`PreparingBridge` leaves the old directory live. `WaitingForRelease` and
+`PreparingTarget` serve the bridge directory. `Published` exposes the target
+directory. `Cancelled` leaves the last published directory in effect and
+clears the deferred holds. A voter restarted from its WAL can continue the
+same intent. Automatic P/D policies wait for an active transition to finish.
+
+The two layouts are supplied by the caller. Assess the bridge's capacity
+for the expected traffic during drain and target warm-up. Hosted vLLM
+completes existing requests on the old process; the target serves newly
+admitted work after cutover.
+
+### Let the planner choose a two-stage transition
+
+Add `"reconfigure": { "drain_ms": 12000 }` to the hosted P/D pool to
+enable two-stage planning. `drain_ms` is an estimate from bridge publication
+to release of its displaced groups. The control plane still waits for the
+actual release records. The `ready_after_ms` in each size profile estimates
+group startup. Slot IDs may have one Prefill and one Decode profile. A
+published layout selects at most one role and version for each ID.
+
+Each resident advertises the engine profiles that have a configured,
+executable `verify_release`. Planning can reclaim a group's resources only
+when every participating host advertises that profile. Submission checks
+the current directory revision and release capability again before staging.
+
+The planner estimates the bridge on currently available devices. It then
+checks target layouts against a projected ledger that includes the bridge's
+reservations and credits only the displaced groups' memory, devices and
+ports. Bridge capacity must cover the incumbent rate during the estimated
+drain and target startup. The score counts requests completed over the
+remaining window in both layouts and subtracts both transition costs.
+Two-stage changes compete with ordinary changes in the same scoring pass.
+
+`replan_hosted_pd` reports the bridge paths, new placements, release
+versions and estimated target readiness when it selects a transition.
+`pd_scaling` submits the same plan after the full intent remains stable
+across the configured observation windows. Keep the incumbent and target
+profiles calibrated for this model and load.
+
+### Reuse prompt KV across TP layouts
+
+Build the optional page store from the vLLM fork's `plait/v0.31-runtime`
+branch with Rust 1.95 or later. Start it on the engine network. It keeps
+completed pages in memory, independent of either vLLM process group.
+
+```sh
+cargo build --release --locked --manifest-path tools/plait/kv-store/Cargo.toml
+tools/plait/kv-store/target/release/vllm-plait-kv-store \
+  --listen 192.0.2.10:7952 --capacity-bytes 268435456
+```
+
+Use `vllm-plait-kv-store` in place of the former `plait-node kv-store`
+entry point. The new binary takes the same flags and budget files, and
+the connector uses the same address and wire protocol. Deploy it before
+retiring the old entry point. A store restart empties its in-memory pages.
+
+Run `tools/plait/kv-store/check-tla.sh` from the vLLM fork to check page
+publication and checkpoint budgets. Use `tlc` on PATH or set
+`TLA2TOOLS_JAR` to the absolute path of the TLC jar.
+
+Pass the same model namespace, KV dtype, and logical block size to both
+engines. Choose a namespace that identifies the same model weights,
+position encoding, and compatible attention arithmetic. Use
+`--enforce-eager` and `--disable-hybrid-kv-cache-manager` with the connector.
+The two engines can use different TP sizes if each evenly partitions the
+model's KV heads. This path supports dense full-attention FP16 and BF16 KV.
+
+```sh
+--kv-transfer-config '{
+  "kv_connector": "PlaitKvConnector",
+  "kv_role": "kv_producer",
+  "kv_connector_extra_config": {
+    "address": "192.0.2.10:7952",
+    "namespace": "model-revision-fp16"
+  }
+}'
+```
+
+Set `kv_role` to `kv_consumer` on the destination, or `kv_both` for an engine
+that reads and writes. Each producer writes its global head range for a
+completed block. The store publishes a block after one write attempt has
+covered all its heads. The destination looks up contiguous full prefix
+blocks, then loads its own head range into the local attention layout before
+the forward pass. The first unmatched token and subsequent tokens run through
+the usual engine path.
+
+A managed TP4 group on CUDA, ROCm, and PPU HGGC populated two 128-token
+blocks. After activation, its TP2 replacement on CUDA and Ascend CANN
+reported 256 external prefix hits. The replacement's output token IDs and
+text matched its cold run, which reported zero external hits. The transfer
+uses host staging over TCP. The cache starts empty after a store restart.
+
+#### Align different Prefill and Decode pipelines
+
+Use a build of the fork's `vllm-plait-kv-store` that accepts `PLAITKV3`
+before starting a multi-stage Prefill or Decode group. Use the matching
+vLLM fork on the group's hosts. Choose TP, PP and `VLLM_PP_LAYER_PARTITION`
+for each role independently. Within one group, the hosts agree on the layer split
+before loading the model. The two roles use the same weights, KV dtype,
+block size and store namespace.
+
+The engine gives each stage the same global attention layer order. A
+worker sends one range request per page for its local layers and heads.
+The store publishes the page when one write attempt covers every layer
+and head. Until then the page is a miss, including at the sender's
+handoff check. The receiver requests its own ranges before executing
+the first unmatched token. Single-stage engines continue to use
+`PLAITKV2` whole-head requests against the same page keys and bytes.
+
+### Resume a stream from its last emitted token
+
+Use `X-Plait-Stream-Recovery: resume-kv` on the same completion endpoint.
+Set `PlaitKvConnector` to produce on the source and consume on
+the replacement. Use the V2 runner on the replacement. Set `kv_both` on
+an engine that should publish additional pages after it takes over.
+The request must carry a plain text or token-array prompt. Structured
+outputs, prompt log probabilities, repetition detection, and thinking
+budgets require their own continuation state.
+
+After a disconnect, the ingress sends the original request and the token
+IDs already delivered. The replacement restores those IDs as generation
+history, initializes its incremental detokenizer from them, and looks up
+KV using the combined prompt and generated prefix. It loads complete pages
+into its own TP layout and computes any uncovered suffix of the known
+sequence before sampling the next token. The scheduler can reuse a full
+page that ends after the prompt. Prompt usage counts only prompt positions,
+while the external cache metric counts all matched positions.
+
+The replacement acknowledges the restored length in its first choice.
+The ingress verifies that count, the prompt IDs, and the previously sent
+token IDs and text before forwarding the suffix. The client keeps the
+original completion ID, usage budget, and one terminal event. The ingress
+and its client connection must survive the replacement.
+
+On the unified ingress with `--kv-transport plait`, the same header also opts
+in to planned handoff. When the active directory stops
+routing to the current generator and a replacement path accepts work, the
+ingress cuts after a complete emitted SSE frame. It closes the source attempt
+before starting the replacement. A changed Prefill with the same available
+Decode version leaves the generation attempt in place.
+
+Set `stream_checkpoints: true` on the resident Decode engine profile to
+publish pages for these requests. A destination advertises token resume when
+its launch uses a V2 Plait KV consumer. A split destination obtains a fresh
+Prefill receipt and checks every promised prompt page. Complete pages that
+include generated tokens can extend the hit, and the engine computes any
+uncovered known tokens before continuing. A greedy request can use prefix
+replay on a destination without token resume. The request stays on the original
+ingress connection in either case.
+
+#### Resume a completion with an explicit seed
+
+Set `seeded_stream_resume: true` on both resident Decode profiles and use
+the unified ingress. Use a positive `temperature` and an explicit signed
+64-bit `seed` other than `-1`. The supported engine uses the standard
+V2 FP32 sampler without speculative decoding, watermarking, or custom logits
+processors. Every host in a group must use the same profile setting. The
+launcher verifies the engine's sampler capability before declaring it ready.
+
+The engine derives sampling randomness from the request seed and absolute
+token position. The destination keeps the seed, sampling parameters, and
+committed token history. Its first choice confirms the seed and checkpoint
+length. The ingress verifies both before publishing the next token. During
+a planned change, the source keeps generating until an accepting destination
+advertises the seeded sampler capability. Different backends and layouts can
+compute different logits, so matching the seed and history gives the same
+random stream with the destination's logits.
+
+In the four-backend fault test, the source emitted six tokens before one
+of its TP4 workers was killed. The TP2 replacement reported 256 external
+hits for a 254-token prompt. The client received all 16 output tokens on
+the original SSE connection. Token IDs, text, and usage matched a cold
+run on the replacement.
+
+#### Share checkpoints between aggregate and split routes
+
+Use one `kv` contract in `prepare_hosted_serving` and set
+`aggregate_stream_checkpoints: true` on each new aggregate placement that
+should participate. For automatic placement, set the same flag under
+`pd_scaling.serving_modes`. The committed binding fixes the store, namespace,
+and block size for the group's lifetime. Use the same model checkpoint and
+KV dtype in the installed engine profiles. Set `stream_checkpoints: true`
+on Decode profiles to export generated pages from split routes.
+
+An aggregate consumes and publishes shared pages for requests using
+`X-Plait-Stream-Recovery: resume-kv`. Its ordinary requests keep their
+local KV path. Enable `seeded_stream_resume` across the generating profiles
+to carry a positive-temperature request with an explicit seed. During a
+switch into split serving, the ingress still obtains the target Prefill's
+KV receipt. During a switch into aggregation, the engine looks up the
+original prompt and committed output history directly. Both can import
+complete pages from the old layout and compute the remaining known tokens.
+#### Budget checkpoint traffic during a rollout
+
+Add `checkpoint_traffic` to `pd_scaling.pool`. Set
+`write_bytes_per_stream` and `read_bytes_per_stream` from measurements of
+checkpoint traffic. For split serving, exclude the usual prompt handoff
+bytes already in `kv_bytes_per_request`. Include prompt pages in the
+aggregate generator's checkpoint measurements when it stores or reads them.
+Use the upper budget across the layouts in the pool.
+
+`minimum_fraction_bps` sets the floor for the fraction of requests that
+use `resume-kv`, in basis points. The load listener reports the opted-in
+arrivals and their in-flight count. An older listener without these counters
+is budgeted as if all its arrivals and in-flight requests opted in.
+The planner combines those estimates with the normal TP, PP, and split
+handoff traffic on each directional port and at the store.
+
+`handoff_window_ms` is the calibrated interval over which the in-flight
+requests are expected to migrate. When a generating group is replaced, the
+planner reserves old-generation writes, target imports, and any new split
+prefill handoff during that interval. It reserves enough for concentration
+on one target because resumed requests can converge on the first available
+group. A candidate must sustain the incumbent's modeled service rate after
+those reserves.
+
+#### Limit optional checkpoint transfers
+
+Run the upgraded KV store with `--checkpoint-bytes-per-second` and
+`--checkpoint-burst-bytes`. Set `checkpoint_admission: true` on the
+participating Decode and aggregate engine profiles. The launcher checks
+the actual engine capability. Multi-host groups agree on the setting
+before starting workers.
+
+The store combines optional checkpoint reads and writes into one byte
+budget. Use a burst at least as large as a full logical page if the
+store should admit optional imports. A writer requests credit before it
+copies or sends the payload. A reader reserves the full page for 30
+seconds. All TP and PP shards draw from that reservation, and in-flight
+transfers occupy credit until their socket operation finishes. Required
+P/D prompt handoffs use their existing path. When an optional prefix
+reservation is declined, the target computes the uncovered known tokens.
+
+Run `vllm-plait-kv-store --stats HOST:PORT` for completed payload bytes,
+refusals, expired read reservations, and bytes currently held. Use the
+change in the byte counters over a sampling window to measure the store's
+optional transfer rate.
+
+#### Limit checkpoint traffic by peer and direction
+
+Pass `--checkpoint-peer-limits PATH` to the store with a JSON map of
+worker source IPs. Each entry has a `read` budget for traffic from the store
+to that peer and a `write` budget for traffic from that peer to the store.
+Use `bytes_per_second` and `burst_bytes` in each direction.
+
+```json
+{
+  "192.0.2.10": {
+    "read": {"bytes_per_second": 16777216, "burst_bytes": 8388608},
+    "write": {"bytes_per_second": 4194304, "burst_bytes": 2097152}
+  }
+}
+```
+
+Set `checkpoint_peer_budget: true` together with `checkpoint_admission`
+on participating Decode and aggregate profiles. Workers use their
+configured host IP for the KV connection. The scheduler gathers their
+actual page sizes and reserves the complete import atomically across the
+store and all peer read budgets. A shard can consume only the reservation
+for its observed TCP source IP. For writes, the store checks the sender's
+write budget and the shared store budget before accepting payload.
+
+With a peer map, optional traffic from an unlisted address and optional
+reads without a complete peer manifest are declined. The target computes
+the uncovered prefix when the read reservation cannot be admitted.
+Required P/D prompt I/O uses the original protocol. The store's
+`--stats` response reports per-peer successful bytes, refusals, and
+pending bytes in each direction.
+
+#### Share a peer budget across KV stores
+
+Set `--checkpoint-peer-budget-plan PATH` on each store when several stores
+use the same worker's network connection. The plan's `peers` list declares
+total budgets. Each member of `stores` names a concrete listening
+`endpoint` and its own `peers` list. Each peer entry has an `address`
+and a `limit` with the same read and write fields as the per-store map.
+For example, a shared 8 MiB/s read budget with a 2 MiB burst can allocate
+5 and 3 MiB/s with a 1 MiB burst to each of two stores. Add the read rates,
+read bursts, write rates, and write bursts separately. All four totals must
+fit the declared peer budgets.
+
+```json
+{
+  "peers": [
+    {"address": "192.0.2.10", "limit": {
+      "read": {"bytes_per_second": 8388608, "burst_bytes": 2097152},
+      "write": {"bytes_per_second": 6291456, "burst_bytes": 2097152}
+    }}
+  ],
+  "stores": [
+    {"endpoint": "192.0.2.11:7952", "peers": [
+      {"address": "192.0.2.10", "limit": {
+        "read": {"bytes_per_second": 5242880, "burst_bytes": 1048576},
+        "write": {"bytes_per_second": 2097152, "burst_bytes": 1048576}
+      }}
+    ]},
+    {"endpoint": "192.0.2.12:7952", "peers": [
+      {"address": "192.0.2.10", "limit": {
+        "read": {"bytes_per_second": 3145728, "burst_bytes": 1048576},
+        "write": {"bytes_per_second": 4194304, "burst_bytes": 1048576}
+      }}
+    ]}
+  ]
+}
+```
+
+A store installs only the share for its `--listen` endpoint. An empty
+`peers` list on a member gives that store no optional peer capacity. A
+direction with both fields set to zero can be disabled independently.
+Store buckets start empty on each restart and refill at their assigned
+rate, so restarting a member never supplies another initial burst.
+
+With all stores listening, run
+`vllm-plait-kv-store --audit-checkpoint-peer-budget-plan PATH`. It
+verifies the installed plan ID and actual read and write shares at every
+endpoint. A successful audit prints the common ID and member list.
+With static configuration, retire the old allocation before starting stores
+with a different plan.
+
+#### Replace peer shares online
+
+Start each store with `--checkpoint-peer-budget-plan OLD.json` and
+`--checkpoint-budget-control DIR` to enable online changes. Use a durable,
+private directory per endpoint. The first launch installs generation 0.
+Later launches recover the installed plan and any pending change from the
+same directory. The local Unix socket accepts changes from the store owner.
+Activation reads peer status from the plan's TCP endpoints on the trusted
+store network. Keep the same endpoints throughout a change.
+
+Run the following on each store host, with `0` replaced by the currently
+installed generation.
+
+```shell
+vllm-plait-kv-store --prepare-checkpoint-peer-budget-plan DIR 0 OLD.json NEW.json
+vllm-plait-kv-store --activate-checkpoint-peer-budget-plan DIR 0 OLD.json NEW.json
+```
+
+1. Prepare all members. Each store closes new optional reservations and
+   persists the target. Already granted reads and writes can finish. The
+   normal P/D prompt handoff and the stored KV stay available.
+2. Use `vllm-plait-kv-store --stats ENDPOINT` to see the target in
+   `peer_budget_epoch.target_plan_id` and outstanding work in `pending_bytes`.
+   Each activation checks every old member. A member must report zero pending
+   bytes for the same target or show that it already activated that successor.
+   Retry if a peer is unavailable or still draining.
+3. Audit `NEW.json` after activation. The result includes the common
+   `generation`. The new buckets start empty and refill at the new rates.
+   Use the generation to interpret per-peer counters, which reset when
+   a new plan is installed. Store-level counters continue across changes.
+
+A prepare can revise a draining target. If any member has already activated,
+prepare the remaining members for that same successor. A retry for the
+installed successor returns its epoch. A write failure closes optional
+admission and withdraws the local proof. Repair the disk issue and restart
+with the same control directory to recover the last durable state.
+
+## Execute a collective
+
+For small all-reduces, each worker sends its complete contribution to each
+peer and polls all peer sockets together under one collective deadline.
+A slow link leaves the other sends and receives free to progress. The worker
+reduces the complete inputs in slot order. The planner uses this path up to
+1 MiB of input for two workers. For larger groups it caps the replicated
+traffic per worker at 64 KiB.
+
+The collective sockets enter nonblocking mode at group setup. In a two-worker
+replicated all-reduce, each worker exchanges one frame with its peer. It uses
+its existing staged input and allocates space for the remote contribution.
+
+On x86-64 hosts with F16C, FP16 sums of at least 512 bytes per input slice
+convert eight values at a time. The host accumulates in FP32 in slot order,
+rounds to FP16 once and processes a partial vector element by element. In the
+sharded path, the cutoff applies to the local shard. Other hosts use the
+portable blocked or scalar implementation. If any input contains an infinity
+or NaN, the caller discards the provisional output and runs the scalar
+reduction. The two-worker FP16 scatter/gather pipeline can write a complete
+block directly into its gather buffer.
+
+Sharded all-reduces assign one contiguous shard to each slot. Each worker
+sends contributions to the slots that own those shards and receives every
+contribution to its own shard. The two-phase path folds the complete shard
+in slot order before exchanging the results. Each exchange has its own
+deadline. Reduce-scatter returns after the fold. All-gather writes each
+incoming shard to its output range. Broadcast and reduce use the source or
+destination specified by that call.
+
+Sharded FP16 and BF16 sums use a pipeline in two-worker groups and when a
+larger group's smallest shard is at least 256 KiB. A worker folds each
+64 KiB block as soon as all peers have delivered that range. On each socket
+it sends the reduced prefix after the outgoing scatter frame and reads the
+peer's reduced prefix after the incoming scatter frame. Each frame retains
+its length and sequence header. A peer that consumes the complete scatter
+before starting gather can take part in the same group. The scatter deadline
+applies until all local scatter directions finish, then gather gets its own
+deadline. A worker publishes its tensor after the full exchange succeeds.
+
+Frame writes can send the header and available payload in one vectored call.
+Before consuming a payload, each receiver checks the collective sequence, operation, dtype,
+size, and stage. The point-to-point lane is separate.
+A send stages the payload and enqueues it for that peer, so opposing sends
+can be posted before either receive. The caller's stream is synchronized
+before device input is read. The blocking NCCL-compatible calls return after
+the host exchange and output copy.
+
+A failed TCP lane closes the affected communicator's sockets. Independent
+communicators retain their own sockets, sequence counters, and send queues.
+Each group holds two sockets per peer. This transport uses a fixed group
+for its lifetime. Changing membership also requires a new vLLM tensor
+layout and activation of a new application group.
+
+### Submit peer collectives and collect their results
+
+The native peer C API exposes requests for AllReduce, AllGather,
+ReduceScatter, Broadcast, and Reduce. It uses the communicator's existing
+collective order, including calls through the blocking ABI.
+[C declarations](../crates/plait-nccl/include/plait_peer.h)
+
+1. Call `plaitPeerCollectiveSubmit` with the input and its producer stream.
+   The caller waits for prior work on that stream and stages the input.
+   After successful submission the input can be reused while the network
+   worker exchanges and reduces the staged bytes.
+2. Poll host completion with `plaitPeerRequestTest` or call
+   `plaitPeerRequestWait` directly. Wait checks the communicator and
+   the exact output size, synchronizes the destination's consumer stream,
+   copies the result to the device, and consumes the request.
+3. Use `plaitPeerRequestDestroy` to discard a result. The accepted operation
+   still runs in its assigned sequence. Use `plaitPeerCancel` to interrupt
+   the group and wake pending requests. Wait for device calls already in
+   progress before releasing their buffers and streams.
+
+Each communicator allows eight requests across input staging and the pending
+network queue. The dispatcher returns a queue slot when it takes the job.
+Each communicator also has a 1 GiB asynchronous host staging budget. Set
+`PLAIT_NCCL_PEER_ASYNC_STAGING_BYTES` to a decimal byte count before
+connecting a worker. Workers on the same group can set different limits.
+The budget covers staged inputs and expected outputs, including results
+waiting for retrieval. Internal reduction scratch and the blocking path
+use their existing allocations.
+
+A worker joining through the control plane reads a ceiling for its exact
+epoch, device, incarnation, and fence. The ceiling is the group's reserved
+host bytes minus pinned bytes, divided by the number of assigned devices
+on that host and rounded down. The communicator takes the lower of this
+ceiling and its local setting. The share stays fixed for the lifetime of the
+communicator. If the voter lacks this lookup or it times out, the worker
+joins with a zero-byte async staging budget and can use the blocking path.
+Include engine memory and blocking scratch when sizing the host profile.
+The staging limit applies to asynchronous payloads.
+
+Submission reserves a queue slot and staging bytes before synchronizing the
+producer stream or copying its input. The byte reservation follows the work
+through the wire exchange and result delivery. Destroying a pending ticket
+frees its result after the worker finishes the accepted operation. A full
+queue or byte budget returns `PLAIT_PEER_BUSY` before device work and leaves
+the sequence unallocated. Retry the
+same operation once there is capacity, or call its blocking entry point
+before submitting a later operation. Python `try_all_gather` and
+`try_all_reduce` return `None` in this case. A peer with available capacity
+can still submit the same operation asynchronously.
+
+In a four-vendor C ABI test the first three participants submitted AllReduce
+and AllGather while the fourth waited. All four later retrieved the results
+in reverse wait order. The results used the original device inputs after
+each caller rewrote its source tensor. A blocking AllReduce between
+submission and wait also completed in sequence with the updated inputs.
+An exchange interrupted with one peer idle returned errors to all three
+queued callers and preserved their destination contents.
+
+### Overlap vLLM prompt scoring with peer AllGather
+
+Use the vLLM fork with the Plait extension built with Python support. Set
+`VLLM_PLAIT_PROMPT_LOGPROBS_OVERLAP=1` on every worker in a native TP group
+using the V2 runner. The Qwen3 scoring path uses this option when a prompt
+logprob batch spans more than one 1,024-row chunk and the logits processor
+uses standard TP AllGather. The fork's Ascend plugin patch adds this path
+for CANN's standard TP mode. Other logits layouts use their existing paths.
+[vLLM integration](https://github.com/devillove084/vllm/commit/4d6f53ef1)
+
+The runner projects chunk A on each device, stages its local logits and
+submits an AllGather. While the network exchanges A, each device projects
+its local logits for chunk B. The runner submits B before collecting A on
+the current device stream. It trims vocabulary padding and computes scores
+in input order. At most two gather requests are outstanding in this loop.
+When local async submission returns `PLAIT_PEER_BUSY`, the runner submits
+the same gather through the blocking entry point before proceeding. Both
+entry points use the same collective order.
+
+A Qwen3-0.6B FP16 group with one CUDA, ROCm, CANN, and PPU worker ran
+the same 1,056-token HTTP request four times with the option off, on, on,
+and off. The prompt scores and generated token ID matched across runs.
+During both enabled requests, the first gather remained pending on each
+worker through completion of the second projection. This debug-build
+test verified overlap and output parity for that request shape.
+
+## Compatibility API
+
+The NCCL C ABI and Python `NCCLLibrary.ncclCommInitRank` keep the legacy
+`(nranks, uniqueId, rank)` bootstrap. Its TCP star and local fast paths are
+available to callers using that ABI. The Python `Group.join_root` and
+`Group.join` helpers use the same star, with slot assignment at rendezvous.
+The vLLM fork's `PlaitCommunicator` calls the peer bootstrap directly.
+
+| Backend | Setting | Device adapter |
+| --- | --- | --- |
+| NVIDIA CUDA | `PLAIT_NCCL_BACKEND=cuda` (default) | CUDA driver copies and stream synchronization |
+| AMD ROCm | `PLAIT_NCCL_BACKEND=rocm` | HIP runtime copies and stream synchronization. [Configure HIP in a vLLM worker](nccl-python.md#vllm-peer-transport) |
+| Huawei Ascend | `PLAIT_NCCL_BACKEND=huawei` | CANN runtime copies and stream synchronization |
+| PPU | `PLAIT_NCCL_BACKEND=ppu` | HGGC runtime, with an adapter ABI for older deployments |
+
+The peer host reduction supports FP32, FP16, BF16, and E4M3, and integer
+sums. FP16 and BF16 accumulate in FP32 before the output is rounded.
+Finite FP16 sums can use x86-64 F16C on reduction slices of 512 bytes or
+larger. The portable FP16 and BF16 conversion paths use bounded blocks on
+slices of at least 8 KiB. Each element accumulates in slot order. Small and
+nonfinite inputs use the scalar reduction.
+
+For groups with three or more slots, sharded FP16 and BF16 AllReduce sums
+use the pipeline when the smallest shard reaches 256 KiB. A slot reduces a
+64 KiB block when its contributions are ready and can return completed
+blocks while other connections are still transferring input. The scatter
+and gather frame order remains compatible with the two-phase implementation.
+
+Use an eager vLLM engine for this path.

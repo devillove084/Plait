@@ -27,7 +27,7 @@ impl IpcAllreduce {
         let receive =
             PeerRegion::alloc(comm.device, capacity).map_err(|error| error.to_string())?;
         let handle = receive.handle().map_err(|error| error.to_string())?;
-        let mut network = comm.network.lock().unwrap();
+        let mut network = comm.star_network().lock().unwrap();
         let peer_handle = if comm.rank == 0 {
             let peer = network.peers.first_mut().ok_or("ipc needs one peer")?;
             let mut bytes = [0u8; 64];

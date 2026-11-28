@@ -449,7 +449,11 @@ dependencies = [
  "libc",
  "libloading 0.8.9",
  "plait-collective",
+ "plait-core",
+ "plait-net",
  "pyo3",
+ "sha2",
+ "tokio",
 ]
 
 [[package]]

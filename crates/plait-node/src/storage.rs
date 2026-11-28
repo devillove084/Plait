@@ -349,6 +349,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retired_decoder_history_replays_without_admitting_new_operations() {
+        use plait_core::OpId;
+        use plait_core::group::{GroupAction, GroupOperation, HostMemory};
+        use plait_core::serving::{ServingAction, ServingLookup, ServingOperation, ServingView};
+
+        use crate::{Client, NodeConfig, RunningNode};
+
+        let id = NodeId::derive("durable-legacy-decoder");
+        let action = ServingAction::PublishDecoderRoutes {
+            model: "legacy".into(),
+            expected_revision: 0,
+            paths: Vec::new(),
+            activate: None,
+        };
+        let previous = ServingOperation {
+            id: OpId::new(id, 1),
+            action: action.clone(),
+        };
+        let mut replica = Replica::new(
+            id,
+            ClusterConfig::bootstrap([id]),
+            Runtime::new(),
+            Options::default(),
+        );
+        let dir = TestDirectory::new();
+        let mut journal = dir.initialize(&replica);
+        replica.track_deltas();
+        replica
+            .propose(Command::Serving(Box::new(previous.clone())), 1)
+            .unwrap();
+        let receipt = replica.machine().serving_receipt(previous.id).unwrap();
+        let expected = receipt.result.clone();
+        assert!(expected.is_ok());
+        journal.record(replica.take_delta().unwrap()).unwrap();
+        drop(journal);
+
+        let mut config = NodeConfig::bootstrap(id, "127.0.0.1:0", BTreeMap::new());
+        config.advertise_devices = false;
+        let node = RunningNode::start_durable(config, dir.resume())
+            .await
+            .unwrap();
+        let mut client = Client::new().await.unwrap();
+        client.add_peer(id, node.addr());
+        assert_eq!(client.apply_serving(id, &previous).await.unwrap(), expected);
+
+        let new = ServingOperation {
+            id: OpId::new(id, 2),
+            action,
+        };
+        let rejected = client.apply_serving(id, &new).await.unwrap_err();
+        assert!(rejected.to_string().contains("native decoder is retired"));
+        assert_eq!(
+            client
+                .query_serving(id, ServingLookup::Operation(new.id))
+                .await
+                .unwrap(),
+            ServingView::Operation(None)
+        );
+        let register = GroupOperation {
+            id: OpId::new(id, 3),
+            action: GroupAction::SetHostMemory {
+                host: id,
+                capacity: HostMemory {
+                    bytes: 64,
+                    pinned_bytes: 8,
+                },
+            },
+        };
+        assert!(client.apply_group(id, &register).await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
     async fn observation_reply_survives_a_replica_restart() {
         use plait_core::OpId;
         use plait_core::serving::{

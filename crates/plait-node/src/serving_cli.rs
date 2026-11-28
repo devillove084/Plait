@@ -1,11 +1,13 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufRead, Write};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use plait_core::serving::{
-    GroupId, GroupPhase, GroupPlan, GroupVersion, GroupView, HostMemory, RouteDirectory,
-    RouteSetId, ServingAction, ServingEndpoint, ServingLookup, ServingOperation, ServingResources,
-    ServingRole, ServingView, W4GroupLayout, WorkerDemand, WorkerGrant,
+    ExecutionDrainTarget, GroupId, GroupPhase, GroupPlan, GroupVersion, GroupView, HostMemory,
+    HostedActivation, HostedPdKv, HostedPdLaunch, HostedPdPlacement, HostedPdStage, HostedRecipe,
+    HostedRoute, HostedRouteDirectory, HostedServingPlan, PdRoute, RouteSetId, ServingAction,
+    ServingEndpoint, ServingLookup, ServingOperation, ServingResources, ServingRole, ServingView,
+    W4GroupLayout, WorkerDemand, WorkerGrant,
 };
 use plait_core::{DeviceId, NodeId, OpId};
 use plait_node::{Client, discover_voters};
@@ -15,7 +17,8 @@ use plait_parallel::serving::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-mod replanning;
+mod hosted;
+mod hosted_pd;
 
 #[derive(Deserialize)]
 #[serde(tag = "request", rename_all = "snake_case")]
@@ -29,8 +32,23 @@ enum Request {
         expected_epoch: u64,
         plan: NativePlanInput,
     },
+    PrepareHosted {
+        id: OpId,
+        group: GroupId,
+        expected_epoch: u64,
+        expected_active: Option<u64>,
+        plan: NativePlanInput,
+        #[serde(default)]
+        activation: HostedActivation,
+        recipe: Option<HostedRecipe>,
+    },
     Inspect {
         version: GroupVersion,
+    },
+    ObserveGroup {
+        id: OpId,
+        group: GroupId,
+        epoch: Option<u64>,
     },
     W4Drain {
         version: GroupVersion,
@@ -59,22 +77,75 @@ enum Request {
     ExecutionHost {
         host: NodeId,
     },
+    BeginExecutionDrain {
+        id: OpId,
+        target: ExecutionDrainTarget,
+    },
+    ConfirmExecutionDrain {
+        id: OpId,
+        target: ExecutionDrainTarget,
+        drain: OpId,
+    },
+    ResumeExecutionTarget {
+        id: OpId,
+        target: ExecutionDrainTarget,
+        drain: OpId,
+    },
+    ExecutionDrain {
+        target: ExecutionDrainTarget,
+    },
     Select {
         forecast: ServingForecast,
         candidates: Vec<CandidateInput>,
+    },
+    ReplanHosted {
+        #[serde(flatten)]
+        input: hosted::Replan,
+    },
+    HostedLinks,
+    HostedPlanning,
+    PrepareHostedPd {
+        id: OpId,
+        model: String,
+        expected_revision: u64,
+        kv: HostedPdKv,
+        placements: Vec<HostedPdPlacementInput>,
+        paths: Vec<PdRoute>,
+    },
+    HostedPdPending {
+        model: String,
+    },
+    PrepareHostedServing {
+        id: OpId,
+        model: String,
+        expected_revision: u64,
+        kv: Option<HostedPdKv>,
+        placements: Vec<HostedPdPlacementInput>,
+        routes: Vec<HostedRoute>,
+    },
+    HostedServingPending {
+        model: String,
+    },
+    PrepareHostedPdTransition {
+        id: OpId,
+        model: String,
+        expected_revision: u64,
+        kv: HostedPdKv,
+        bridge: HostedPdStageInput,
+        release: BTreeSet<GroupVersion>,
+        target: HostedPdStageInput,
+    },
+    HostedPdTransition {
+        model: String,
+    },
+    ReplanHostedPd {
+        #[serde(flatten)]
+        input: hosted_pd::Replan,
     },
     ReplanW4 {
         id: OpId,
         forecast: ServingForecast,
         candidates: Vec<W4CandidateInput>,
-    },
-    ReplanPd {
-        id: OpId,
-        expected_revision: u64,
-        forecast: ServingForecast,
-        #[serde(default)]
-        candidates: Vec<replanning::Input>,
-        pool: Option<plait_parallel::serving::DecoderPool>,
     },
 }
 
@@ -118,7 +189,7 @@ impl TryFrom<W4CandidateInput> for (ServingCandidate, W4GroupLayout) {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct CandidateInput {
     group: GroupId,
     expected_epoch: u64,
@@ -152,6 +223,76 @@ struct NativePlanInput {
     launch_digest: [u8; 32],
     workers: Vec<(DeviceId, WorkerDemand)>,
     hosts: Vec<(NodeId, HostMemory)>,
+}
+
+#[derive(Deserialize)]
+struct HostedPdPlacementInput {
+    group: GroupId,
+    expected_epoch: u64,
+    expected_active: Option<u64>,
+    plan: NativePlanInput,
+    recipe: HostedRecipe,
+    #[serde(default)]
+    aggregate_stream_checkpoints: bool,
+}
+
+impl HostedPdPlacementInput {
+    fn placement(self, kv: &HostedPdKv) -> io::Result<HostedPdPlacement> {
+        self.hosted_placement(Some(kv))
+    }
+
+    fn hosted_placement(self, kv: Option<&HostedPdKv>) -> io::Result<HostedPdPlacement> {
+        let mut plan: GroupPlan = self.plan.try_into()?;
+        if self.aggregate_stream_checkpoints && plan.role != ServingRole::Aggregated {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "aggregate stream checkpoints require an aggregate placement",
+            ));
+        }
+        plan.launch_digest =
+            if plan.role == ServingRole::Aggregated && !self.aggregate_stream_checkpoints {
+                self.recipe.launch_digest()
+            } else {
+                HostedPdLaunch {
+                    role: plan.role,
+                    kv: kv
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "the placement requires a KV contract",
+                            )
+                        })?
+                        .clone(),
+                }
+                .launch_digest(&self.recipe)
+            };
+        Ok(HostedPdPlacement {
+            group: self.group,
+            expected_epoch: self.expected_epoch,
+            expected_active: self.expected_active,
+            plan,
+            recipe: self.recipe,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct HostedPdStageInput {
+    placements: Vec<HostedPdPlacementInput>,
+    paths: Vec<PdRoute>,
+}
+
+impl HostedPdStageInput {
+    fn stage(self, kv: &HostedPdKv) -> io::Result<HostedPdStage> {
+        Ok(HostedPdStage {
+            placements: self
+                .placements
+                .into_iter()
+                .map(|input| input.placement(kv))
+                .collect::<io::Result<_>>()?,
+            paths: self.paths,
+        })
+    }
 }
 
 impl TryFrom<NativePlanInput> for GroupPlan {
@@ -305,29 +446,146 @@ async fn handle(
                 .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
             Ok(json!({ "selection": result }))
         }
+        Request::ReplanHosted { input } => hosted::replan(client, peers, input).await,
+        Request::HostedLinks => hosted::links(client, peers).await,
+        Request::BeginExecutionDrain { id, target } => {
+            execute(
+                client,
+                peers,
+                ServingOperation {
+                    id,
+                    action: ServingAction::BeginExecutionDrain { target },
+                },
+            )
+            .await
+        }
+        Request::ConfirmExecutionDrain { id, target, drain } => {
+            execute(
+                client,
+                peers,
+                ServingOperation {
+                    id,
+                    action: ServingAction::ConfirmExecutionDrain { target, drain },
+                },
+            )
+            .await
+        }
+        Request::ResumeExecutionTarget { id, target, drain } => {
+            execute(
+                client,
+                peers,
+                ServingOperation {
+                    id,
+                    action: ServingAction::ResumeExecutionTarget { target, drain },
+                },
+            )
+            .await
+        }
+        Request::ExecutionDrain { target } => {
+            let ServingView::ExecutionDrain(status) =
+                query(client, peers, ServingLookup::ExecutionDrain(target)).await?
+            else {
+                return Err(io::Error::other("expected execution drain status"));
+            };
+            Ok(json!({ "drain": status }))
+        }
+        Request::HostedPlanning => {
+            Ok(json!({ "planning": hosted::planning(client, peers).await? }))
+        }
+        Request::PrepareHostedPd {
+            id,
+            model,
+            expected_revision,
+            kv,
+            placements,
+            paths,
+        } => {
+            let placements = placements
+                .into_iter()
+                .map(|input| input.placement(&kv))
+                .collect::<io::Result<Vec<_>>>()?;
+            let action = ServingAction::PrepareHostedPd {
+                model,
+                expected_revision,
+                kv,
+                placements,
+                paths,
+            };
+            execute(client, peers, ServingOperation { id, action }).await
+        }
+        Request::HostedPdPending { model } => {
+            let lookup = ServingLookup::HostedPdPending(RouteSetId::for_model(&model));
+            let ServingView::HostedPdPending(intent) = query(client, peers, lookup).await? else {
+                return Err(io::Error::other("expected pending hosted P/D intent"));
+            };
+            Ok(json!({ "pending": intent }))
+        }
+        Request::PrepareHostedServing {
+            id,
+            model,
+            expected_revision,
+            kv,
+            placements,
+            routes,
+        } => {
+            let placements = placements
+                .into_iter()
+                .map(|input| input.hosted_placement(kv.as_ref()))
+                .collect::<io::Result<_>>()?;
+            let action = ServingAction::PrepareHostedServing {
+                model,
+                expected_revision,
+                plan: HostedServingPlan {
+                    kv,
+                    placements,
+                    routes,
+                },
+            };
+            execute(client, peers, ServingOperation { id, action }).await
+        }
+        Request::HostedServingPending { model } => {
+            let lookup = ServingLookup::HostedServingPending(RouteSetId::for_model(&model));
+            let ServingView::HostedServingPending(intent) = query(client, peers, lookup).await?
+            else {
+                return Err(io::Error::other("expected pending hosted serving intent"));
+            };
+            Ok(json!({ "pending": intent }))
+        }
+        Request::PrepareHostedPdTransition {
+            id,
+            model,
+            expected_revision,
+            kv,
+            bridge,
+            release,
+            target,
+        } => {
+            let bridge = bridge.stage(&kv)?;
+            let target = target.stage(&kv)?;
+            let action = ServingAction::PrepareHostedPdTransition {
+                model,
+                expected_revision,
+                kv,
+                bridge,
+                release,
+                target,
+            };
+            execute(client, peers, ServingOperation { id, action }).await
+        }
+        Request::HostedPdTransition { model } => {
+            let lookup = ServingLookup::HostedPdTransition(RouteSetId::for_model(&model));
+            let ServingView::HostedPdTransition(transition) = query(client, peers, lookup).await?
+            else {
+                return Err(io::Error::other("expected a hosted P/D transition status"));
+            };
+            Ok(json!({ "transition": transition }))
+        }
+        Request::ReplanHostedPd { input } => hosted_pd::replan(client, peers, input).await,
         Request::ReplanW4 {
             id,
             forecast,
             candidates,
         } => replan_w4(client, peers, id, forecast, candidates).await,
-        Request::ReplanPd {
-            id,
-            expected_revision,
-            forecast,
-            candidates,
-            pool,
-        } => {
-            replanning::run(
-                client,
-                peers,
-                id,
-                expected_revision,
-                forecast,
-                candidates,
-                pool,
-            )
-            .await
-        }
         Request::Inspect { version } => {
             let ServingView::Group(view) =
                 query(client, peers, ServingLookup::Group(version)).await?
@@ -338,6 +596,9 @@ async fn handle(
                 ));
             };
             Ok(json!({ "group": view.map(GroupInspection::from) }))
+        }
+        Request::ObserveGroup { id, group, epoch } => {
+            observe_group(client, peers, id, group, epoch).await
         }
         Request::W4Drain { version } => {
             let ServingView::W4Drain(status) =
@@ -403,6 +664,26 @@ async fn handle(
                 expected_epoch,
                 plan: plan.try_into()?,
             };
+            execute(client, peers, ServingOperation { id, action }).await
+        }
+        Request::PrepareHosted {
+            id,
+            group,
+            expected_epoch,
+            expected_active,
+            plan,
+            activation,
+            recipe,
+        } => {
+            let action = hosted::prepare(
+                group,
+                expected_epoch,
+                expected_active,
+                plan.try_into()?,
+                activation,
+                recipe,
+                None,
+            );
             execute(client, peers, ServingOperation { id, action }).await
         }
     }
@@ -495,9 +776,10 @@ async fn replan_w4(
     Ok(json!({ "selection": selection, "result": result }))
 }
 
-fn directory_json(directory: RouteDirectory) -> Value {
+fn directory_json(directory: HostedRouteDirectory) -> Value {
     let version = |value: GroupVersion| format!("{}@{}", value.group.0.to_hex(), value.epoch);
     let paths: Vec<_> = directory
+        .split
         .paths
         .into_iter()
         .map(|path| {
@@ -515,7 +797,19 @@ fn directory_json(directory: RouteDirectory) -> Value {
             })
         })
         .collect();
-    json!({ "model": directory.model, "revision": directory.revision, "paths": paths })
+    let mut output = json!({ "model": directory.split.model, "revision": directory.split.revision, "paths": paths });
+    if !directory.aggregated.is_empty() {
+        output["aggregated"] = json!(
+            directory
+                .aggregated
+                .into_iter()
+                .map(|(group, http)| {
+                    json!({ "url": format!("http://{http}"), "version": version(group) })
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+    output
 }
 
 async fn query_routes(
@@ -523,26 +817,26 @@ async fn query_routes(
     peers: impl Iterator<Item = NodeId>,
     model: &str,
     minimum_revision: u64,
-) -> io::Result<Option<RouteDirectory>> {
-    let lookup = ServingLookup::Routes(RouteSetId::for_model(model));
+) -> io::Result<Option<HostedRouteDirectory>> {
+    let lookup = ServingLookup::HostedRoutes(RouteSetId::for_model(model));
     let mut last_error = None;
     let mut unanswered_revision = false;
     for node in peers {
         match tokio::time::timeout(Duration::from_secs(2), client.query_serving(node, lookup)).await
         {
-            Ok(Ok(ServingView::Routes(Some(directory)))) => {
-                if directory.model != model {
+            Ok(Ok(ServingView::HostedRoutes(Some(directory)))) => {
+                if directory.split.model != model {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "directory model mismatch",
                     ));
                 }
-                if directory.revision >= minimum_revision {
+                if directory.split.revision >= minimum_revision {
                     return Ok(Some(directory));
                 }
                 unanswered_revision = true;
             }
-            Ok(Ok(ServingView::Routes(None))) => unanswered_revision = true,
+            Ok(Ok(ServingView::HostedRoutes(None))) => unanswered_revision = true,
             Ok(Ok(_)) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -603,6 +897,30 @@ async fn execute(
 ) -> io::Result<Value> {
     let result = apply(client, peers, &operation).await?;
     Ok(json!({ "result": result }))
+}
+
+async fn observe_group(
+    client: &mut Client,
+    peers: impl Iterator<Item = NodeId>,
+    id: OpId,
+    group: GroupId,
+    epoch: Option<u64>,
+) -> io::Result<Value> {
+    let mut last_error = None;
+    for node in peers {
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            client.observe_serving_group(node, id, group, epoch),
+        )
+        .await
+        {
+            Ok(Ok(result)) => return Ok(json!({ "result": result.map(GroupInspection::from) })),
+            Ok(Err(error)) if error.kind() == io::ErrorKind::InvalidData => return Err(error),
+            Ok(Err(error)) => last_error = Some(error),
+            Err(error) => last_error = Some(io::Error::new(io::ErrorKind::TimedOut, error)),
+        }
+    }
+    Err(last_error.expect("at least one peer"))
 }
 
 async fn apply(

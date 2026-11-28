@@ -1,0 +1,796 @@
+//! Drive hosted P/D recovery from committed group state and scaling from ingress demand.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::io;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use plait_core::serving::{
+    GroupPhase, GroupVersion, HostedAssignment, HostedEvacuationPlanning, HostedLinkSample,
+    HostedPdPlanning, HostedPdReconfiguration, HostedPdRecovery, RouteSetId, ServingAction,
+    ServingLookup, ServingOperation, ServingOutcome, ServingView,
+};
+use plait_core::{NodeId, OpId};
+use plait_parallel::serving::{
+    CheckpointLoad, GroupProfile, HostedLinkPolicy, HostedModePolicy, HostedPdIncumbents,
+    HostedPdPool, ServingForecast, plan_hosted_evacuation, plan_hosted_pd_recovery,
+    plan_hosted_pd_with_assignments,
+};
+use serde::Deserialize;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::task::JoinSet;
+
+use super::{ControlPeers, GroupControl};
+use crate::hosted_probe;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Policy {
+    model: String,
+    checkpoint: String,
+    #[serde(default)]
+    ingress: Vec<SocketAddr>,
+    #[serde(default)]
+    repair_on_failure: bool,
+    window_ms: u64,
+    stable_windows: usize,
+    cooldown_ms: u64,
+    horizon_ms: u64,
+    minimum_gain_requests: f64,
+    pool: HostedPdPool,
+    serving_modes: Option<HostedModePolicy>,
+    link_policy: HostedLinkPolicy,
+}
+
+pub(super) fn validate(policies: &[Policy]) -> io::Result<()> {
+    let mut models = BTreeSet::new();
+    for policy in policies {
+        let unique: BTreeSet<_> = policy.ingress.iter().collect();
+        if policy.model.is_empty()
+            || policy.checkpoint.is_empty()
+            || !models.insert(&policy.model)
+            || (unique.is_empty() && (!policy.repair_on_failure || policy.serving_modes.is_some()))
+            || unique.len() != policy.ingress.len()
+            || policy.ingress.iter().any(|address| {
+                address.port() == 0 || address.ip().is_unspecified() || address.ip().is_multicast()
+            })
+            || policy.window_ms == 0
+            || policy.stable_windows == 0
+            || policy.horizon_ms == 0
+            || !policy.minimum_gain_requests.is_finite()
+            || policy.minimum_gain_requests < 0.0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid hosted P/D scaling policy",
+            ));
+        }
+        if let Some(modes) = &policy.serving_modes {
+            modes
+                .validate(&policy.model)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct Counters {
+    model: String,
+    session: String,
+    uptime_ms: u64,
+    arrivals: u64,
+    completed: u64,
+    failed: u64,
+    in_flight: u64,
+    checkpoints: Option<CheckpointCounters>,
+}
+
+#[derive(Deserialize)]
+struct CheckpointCounters {
+    arrivals: u64,
+    in_flight: u64,
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct ObservedDemand {
+    rps: f64,
+    checkpoint_rps: f64,
+    checkpoint_in_flight: u64,
+}
+
+impl ObservedDemand {
+    fn checkpoints(&self) -> CheckpointLoad {
+        CheckpointLoad {
+            fraction: if self.rps > 0.0 {
+                (self.checkpoint_rps / self.rps).min(1.0)
+            } else {
+                0.0
+            },
+            in_flight: self.checkpoint_in_flight,
+        }
+    }
+}
+
+impl Counters {
+    fn is_valid(&self, model: &str) -> bool {
+        self.model == model
+            && NodeId::from_hex(&self.session).is_ok()
+            && self.checkpoints.as_ref().is_none_or(|count| {
+                count.arrivals <= self.arrivals
+                    && count.in_flight <= count.arrivals.min(self.in_flight)
+            })
+            && self
+                .completed
+                .checked_add(self.failed)
+                .and_then(|count| count.checked_add(self.in_flight))
+                == Some(self.arrivals)
+    }
+
+    fn demand(&self, before: &Self, window_ms: u64, horizon_ms: u64) -> Option<ObservedDemand> {
+        let elapsed = self.uptime_ms.checked_sub(before.uptime_ms)?;
+        if self.session != before.session
+            || elapsed == 0
+            || elapsed < window_ms / 2
+            || elapsed > window_ms.saturating_mul(2)
+            || self.completed < before.completed
+            || self.failed < before.failed
+        {
+            return None;
+        }
+        let arrivals = self.arrivals.checked_sub(before.arrivals)?;
+        let (checkpoint_arrivals, checkpoint_in_flight) =
+            match (&self.checkpoints, &before.checkpoints) {
+                (Some(current), Some(previous)) => {
+                    let count = current.arrivals.checked_sub(previous.arrivals)?;
+                    if count > arrivals
+                        || current.in_flight > previous.in_flight.checked_add(count)?
+                    {
+                        return None;
+                    }
+                    (count, current.in_flight)
+                }
+                (None, None) => (arrivals, self.in_flight),
+                _ => return None,
+            };
+        let to_rps = |arrivals, in_flight| {
+            arrivals as f64 * 1000.0 / elapsed as f64
+                + in_flight as f64 * 1000.0 / horizon_ms as f64
+        };
+        Some(ObservedDemand {
+            rps: to_rps(arrivals, self.in_flight),
+            checkpoint_rps: to_rps(checkpoint_arrivals, checkpoint_in_flight),
+            checkpoint_in_flight,
+        })
+    }
+}
+
+type Cohort = BTreeMap<SocketAddr, Counters>;
+
+type Proposal = ServingAction;
+
+#[derive(Default)]
+struct Evidence {
+    revision: Option<u64>,
+    reference: Option<Cohort>,
+    proposal: Option<(Proposal, usize)>,
+    last_change: Option<Instant>,
+}
+
+impl Evidence {
+    fn observe(
+        &mut self,
+        revision: u64,
+        pending: bool,
+        samples: Cohort,
+        now: Instant,
+        window_ms: u64,
+        cooldown: Duration,
+        horizon_ms: u64,
+    ) -> Option<ObservedDemand> {
+        if self.revision.is_some_and(|seen| revision < seen) {
+            self.reset();
+            return None;
+        }
+        if self.revision != Some(revision) {
+            if self.revision.is_some() || revision != 0 {
+                self.last_change = Some(now);
+            }
+            self.revision = Some(revision);
+            self.reset();
+        }
+        if pending {
+            self.last_change = Some(now);
+            self.reset();
+            return None;
+        }
+        let before = self.reference.replace(samples)?;
+        if self
+            .last_change
+            .is_some_and(|changed| now.duration_since(changed) < cooldown)
+        {
+            self.proposal = None;
+            return None;
+        }
+        let measured = self
+            .reference
+            .as_ref()
+            .expect("installed counters")
+            .iter()
+            .try_fold(ObservedDemand::default(), |mut sum, (addr, current)| {
+                let measured = current.demand(before.get(addr)?, window_ms, horizon_ms)?;
+                sum.rps += measured.rps;
+                sum.checkpoint_rps += measured.checkpoint_rps;
+                sum.checkpoint_in_flight = sum
+                    .checkpoint_in_flight
+                    .checked_add(measured.checkpoint_in_flight)?;
+                Some(sum)
+            });
+        if measured.is_none() {
+            self.proposal = None;
+        }
+        measured
+    }
+
+    fn see(&mut self, proposal: &Proposal, required: usize) -> bool {
+        if let Some((previous, windows)) = &mut self.proposal
+            && previous == proposal
+        {
+            *windows = windows.saturating_add(1);
+            return *windows >= required;
+        }
+        self.proposal = Some((proposal.clone(), 1));
+        required == 1
+    }
+
+    fn reset(&mut self) {
+        self.reference = None;
+        self.proposal = None;
+    }
+}
+
+pub(super) async fn run(policies: Vec<Policy>, peers: ControlPeers) -> io::Result<()> {
+    let mut jobs = JoinSet::new();
+    for policy in policies {
+        jobs.spawn(run_model(policy, peers.clone()));
+    }
+    while let Some(outcome) = jobs.join_next().await {
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!("hosted P/D scaling stopped: {error}"),
+            Err(error) => eprintln!("hosted P/D scaling task failed: {error}"),
+        }
+    }
+    std::future::pending().await
+}
+
+async fn run_model(policy: Policy, peers: ControlPeers) -> io::Result<()> {
+    let Policy {
+        model,
+        checkpoint,
+        ingress,
+        repair_on_failure,
+        window_ms,
+        stable_windows,
+        cooldown_ms,
+        horizon_ms,
+        minimum_gain_requests,
+        pool,
+        serving_modes,
+        link_policy,
+    } = policy;
+    let pool = Arc::new(pool);
+    let link_policy = Arc::new(link_policy);
+    let serving_modes = serving_modes.map(Arc::new);
+    let cooldown = Duration::from_millis(cooldown_ms);
+    let mut control = loop {
+        match GroupControl::connect(peers.clone()).await {
+            Ok(connection) => break connection,
+            Err(error) => eprintln!("opening hosted P/D control for {model}: {error}"),
+        }
+        tokio::time::sleep(Duration::from_millis(window_ms)).await;
+    };
+    let mut evidence = Evidence::default();
+    let key = RouteSetId::for_model(&model);
+    let lookup = ServingLookup::HostedEvacuationPlanning(key);
+    let mut tick = tokio::time::interval(Duration::from_millis(window_ms));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        if repair_on_failure {
+            match control.query(ServingLookup::HostedPdRecovery(key)).await {
+                Ok(ServingView::HostedPdRecovery(Some(recovery))) => {
+                    evidence.reset();
+                    if let Err(error) = recover(
+                        &mut control,
+                        &model,
+                        &checkpoint,
+                        recovery,
+                        pool.clone(),
+                        link_policy.clone(),
+                    )
+                    .await
+                    {
+                        eprintln!("hosted P/D recovery for {model}: {error}");
+                    }
+                    continue;
+                }
+                Ok(ServingView::HostedPdRecovery(None)) => {}
+                other => {
+                    evidence.reset();
+                    eprintln!("reading hosted P/D recovery state for {model}: {other:?}");
+                    continue;
+                }
+            }
+        }
+        let input = async {
+            let ServingView::HostedEvacuationPlanning(snapshot) = control.query(lookup).await?
+            else {
+                return Err(io::Error::other("expected hosted execution planning state"));
+            };
+            if ingress.is_empty() && snapshot.withdrawing.is_empty() {
+                return Ok(None);
+            }
+            let samples = sample_cohort(&ingress, &model).await?;
+            Ok(Some((snapshot, samples)))
+        }
+        .await;
+        let (snapshot, samples) = match input {
+            Ok(Some(input)) => input,
+            Ok(None) => {
+                evidence.reset();
+                continue;
+            }
+            Err(error) => {
+                evidence.reset();
+                eprintln!("hosted load for {model}: {error}");
+                continue;
+            }
+        };
+        let observed_at = Instant::now();
+        let Some(demand) = evidence.observe(
+            snapshot.current.split.revision,
+            snapshot.current.split.pending.is_some(),
+            samples,
+            observed_at,
+            window_ms,
+            cooldown,
+            horizon_ms,
+        ) else {
+            continue;
+        };
+        let demand_rps = demand.rps;
+        let checkpoints = (!ingress.is_empty()).then(|| demand.checkpoints());
+        let planned = if serving_modes.is_some() || !snapshot.withdrawing.is_empty() {
+            // Without an ingress cohort, preserve the full modeled incumbent capacity.
+            let demand_rps = if ingress.is_empty() {
+                f64::MAX / horizon_ms as f64
+            } else {
+                demand_rps
+            };
+            decide_modes(
+                &mut control,
+                &model,
+                snapshot,
+                pool.clone(),
+                serving_modes.clone(),
+                link_policy.clone(),
+                ServingForecast {
+                    model: checkpoint.clone(),
+                    demand_rps,
+                    checkpoints,
+                    now_ms: 0,
+                    horizon_ms,
+                    minimum_gain_requests,
+                    groups: Vec::new(),
+                    paths: Vec::new(),
+                    link_bytes_per_second: BTreeMap::new(),
+                },
+            )
+            .await
+        } else {
+            decide(
+                &mut control,
+                &model,
+                &checkpoint,
+                demand,
+                horizon_ms,
+                minimum_gain_requests,
+                HostedPdReconfiguration {
+                    planning: snapshot.current.split,
+                    releases: snapshot.releases,
+                },
+                pool.clone(),
+                link_policy.clone(),
+            )
+            .await
+        };
+        let proposal = match planned {
+            Ok(Some(choice)) => choice,
+            Ok(None) => {
+                evidence.proposal = None;
+                continue;
+            }
+            Err(error) => {
+                evidence.reset();
+                eprintln!("hosted P/D planning for {model}: {error}");
+                continue;
+            }
+        };
+        if observed_at.elapsed() > Duration::from_millis(window_ms) {
+            evidence.reset();
+            continue;
+        }
+        if !evidence.see(&proposal, stable_windows) {
+            continue;
+        }
+        evidence.last_change = Some(Instant::now());
+        evidence.reset();
+        let operation = ServingOperation {
+            id: OpId::new(NodeId::random(), 1),
+            action: proposal,
+        };
+        match control.apply(&operation).await {
+            Ok(Ok(ServingOutcome::HostedPdStaged { revision })) => {
+                println!(
+                    "hosted P/D staged {model} at revision {revision} with {demand_rps:.3} observed requests/s"
+                );
+            }
+            Ok(Ok(ServingOutcome::HostedServingStaged { revision })) => {
+                println!(
+                    "hosted serving plan staged {model} at revision {revision} with {demand_rps:.3} observed requests/s"
+                );
+            }
+            other => eprintln!("hosted P/D scaling proposal for {model}: {other:?}"),
+        }
+    }
+}
+
+async fn recover(
+    control: &mut GroupControl,
+    model: &str,
+    checkpoint: &str,
+    recovery: HostedPdRecovery,
+    pool: Arc<HostedPdPool>,
+    link_policy: Arc<HostedLinkPolicy>,
+) -> io::Result<()> {
+    if recovery.planning.pending.is_some() {
+        return Ok(());
+    }
+    let links = collect_links(control, &recovery.planning).await?;
+    let now_ms = hosted_probe::now_ms()?;
+    let (alias, checkpoint) = (model.to_owned(), checkpoint.to_owned());
+    let planned = tokio::task::spawn_blocking(move || {
+        plan_hosted_pd_recovery(
+            &alias,
+            &checkpoint,
+            now_ms,
+            &recovery,
+            &pool,
+            &link_policy,
+            &links,
+        )
+    })
+    .await
+    .map_err(io::Error::other)?
+    .map_err(io::Error::other)?;
+    if let Some(action) = planned {
+        let operation = ServingOperation {
+            id: OpId::new(NodeId::random(), 1),
+            action,
+        };
+        match control.apply(&operation).await? {
+            Ok(ServingOutcome::HostedPdStaged { revision }) => {
+                println!("hosted P/D recovery staged {model} at revision {revision}");
+            }
+            other => return Err(io::Error::other(format!("recovery proposal: {other:?}"))),
+        }
+    }
+    Ok(())
+}
+
+async fn decide(
+    control: &mut GroupControl,
+    model: &str,
+    checkpoint: &str,
+    demand: ObservedDemand,
+    horizon_ms: u64,
+    minimum_gain_requests: f64,
+    snapshot: HostedPdReconfiguration,
+    pool: Arc<HostedPdPool>,
+    link_policy: Arc<HostedLinkPolicy>,
+) -> io::Result<Option<Proposal>> {
+    let HostedPdReconfiguration {
+        planning: snapshot,
+        releases,
+    } = snapshot;
+    let assignments = active_assignments(control, &snapshot).await?;
+    let groups = snapshot
+        .active
+        .iter()
+        .filter_map(|active| {
+            let assignment = assignments.get(&active.version)?;
+            let capacity = pool.calibrated_assignment_capacity(active, assignment)?;
+            Some(GroupProfile {
+                version: active.version,
+                capacity,
+            })
+        })
+        .collect();
+    let links = collect_links(control, &snapshot).await?;
+    let forecast = ServingForecast {
+        model: checkpoint.to_owned(),
+        demand_rps: demand.rps,
+        checkpoints: Some(demand.checkpoints()),
+        now_ms: hosted_probe::now_ms()?,
+        horizon_ms,
+        minimum_gain_requests,
+        groups,
+        paths: Vec::new(),
+        link_bytes_per_second: BTreeMap::new(),
+    };
+    let model = model.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let selection = plan_hosted_pd_with_assignments(
+            &model,
+            &snapshot,
+            &forecast,
+            &pool,
+            &link_policy,
+            &links,
+            HostedPdIncumbents {
+                assignments: Some(&assignments),
+                releases: &releases,
+            },
+        )
+        .map_err(io::Error::other)?;
+        Ok(selection
+            .selected
+            .map(|selected| selected.into_action(model, snapshot.revision, pool.kv.clone(), None)))
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+async fn collect_links(
+    control: &mut GroupControl,
+    snapshot: &HostedPdPlanning,
+) -> io::Result<BTreeMap<(NodeId, NodeId), HostedLinkSample>> {
+    let ServingView::HostedProbeEndpoints(endpoints) =
+        control.query(ServingLookup::HostedProbeEndpoints).await?
+    else {
+        return Err(io::Error::other("expected hosted link probes"));
+    };
+    let hosts = snapshot
+        .inventory
+        .hosts
+        .iter()
+        .map(|entry| entry.host)
+        .collect();
+    Ok(hosted_probe::collect(endpoints, Some(&hosts)).await)
+}
+
+async fn decide_modes(
+    control: &mut GroupControl,
+    model: &str,
+    snapshot: HostedEvacuationPlanning,
+    pool: Arc<HostedPdPool>,
+    modes: Option<Arc<HostedModePolicy>>,
+    policy: Arc<HostedLinkPolicy>,
+    mut forecast: ServingForecast,
+) -> io::Result<Option<Proposal>> {
+    let links = collect_links(control, &snapshot.current.split).await?;
+    forecast.now_ms = hosted_probe::now_ms()?;
+    let model = model.to_owned();
+    tokio::task::spawn_blocking(move || {
+        plan_hosted_evacuation(
+            &model,
+            &snapshot,
+            &forecast,
+            &pool,
+            modes.as_deref(),
+            &policy,
+            &links,
+        )
+        .map_err(io::Error::other)
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+async fn active_assignments(
+    control: &mut GroupControl,
+    snapshot: &HostedPdPlanning,
+) -> io::Result<BTreeMap<GroupVersion, HostedAssignment>> {
+    let mut recipes = BTreeMap::new();
+    let hosts: BTreeSet<_> = snapshot
+        .active
+        .iter()
+        .filter_map(|active| active.ranks.keys().next().copied())
+        .collect();
+    for host in hosts {
+        let ServingView::HostedManagedAssignments(assignments) = control
+            .query(ServingLookup::HostedManagedAssignments(host))
+            .await?
+        else {
+            return Err(io::Error::other("expected active hosted assignments"));
+        };
+        for deployment in assignments {
+            if deployment.pd.is_some() && deployment.assignment.phase == GroupPhase::Active {
+                recipes.insert(deployment.assignment.version, deployment.assignment);
+            }
+        }
+    }
+    Ok(recipes)
+}
+
+async fn sample_cohort(ingress: &[SocketAddr], model: &str) -> io::Result<Cohort> {
+    let mut jobs = JoinSet::new();
+    for &addr in ingress {
+        jobs.spawn(async move {
+            let sample =
+                tokio::time::timeout(Duration::from_secs(2), read_counters(addr)).await??;
+            Ok::<_, io::Error>((addr, sample))
+        });
+    }
+    let mut cohort = BTreeMap::new();
+    let mut sessions = BTreeSet::new();
+    while let Some(result) = jobs.join_next().await {
+        let (addr, sample) = result.map_err(io::Error::other)??;
+        if !sample.is_valid(model) || !sessions.insert(sample.session.clone()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid or duplicate ingress counters",
+            ));
+        }
+        cohort.insert(addr, sample);
+    }
+    Ok(cohort)
+}
+
+async fn read_counters(addr: SocketAddr) -> io::Result<Counters> {
+    let mut client = TcpStream::connect(addr).await?;
+    client.write_all(b"PLTPDL01").await?;
+    let size = client.read_u32().await? as usize;
+    if !(1..=4096).contains(&size) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid ingress counters size",
+        ));
+    }
+    let mut body = vec![0; size];
+    client.read_exact(&mut body).await?;
+    Ok(serde_json::from_slice(&body)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use plait_core::serving::{GroupId, GroupVersion, HostedPdKv, PdRoute};
+
+    fn sample(session: u8, uptime_ms: u64, arrivals: u64, in_flight: u64) -> Cohort {
+        BTreeMap::from([(
+            "192.0.2.1:8100".parse().unwrap(),
+            Counters {
+                model: "model".into(),
+                session: NodeId::from_bytes([session; 16]).to_hex(),
+                uptime_ms,
+                arrivals,
+                completed: arrivals - in_flight,
+                failed: 0,
+                in_flight,
+                checkpoints: None,
+            },
+        )])
+    }
+
+    fn proposal(number: u8) -> Proposal {
+        let version = |id| GroupVersion {
+            group: GroupId(NodeId::from_bytes([id; 16])),
+            epoch: 1,
+        };
+        ServingAction::PrepareHostedPd {
+            model: "model".into(),
+            expected_revision: 0,
+            kv: HostedPdKv {
+                store: "192.0.2.1:8000".parse().unwrap(),
+                namespace: "weights".into(),
+                block_size: 128,
+            },
+            paths: vec![PdRoute {
+                prefill: version(1),
+                decode: version(number),
+            }],
+            placements: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn checkpoint_samples_track_opt_in_and_use_all_legacy_arrivals_as_the_bound() {
+        let [mut previous, mut current] = [sample(1, 1000, 5, 2), sample(1, 2000, 9, 3)]
+            .map(|cohort| cohort.into_values().next().unwrap());
+        let legacy = current.demand(&previous, 1000, 10000).unwrap();
+        assert_eq!(
+            legacy.checkpoints(),
+            CheckpointLoad {
+                fraction: 1.0,
+                in_flight: 3
+            }
+        );
+        previous.checkpoints = Some(CheckpointCounters {
+            arrivals: 2,
+            in_flight: 1,
+        });
+        current.checkpoints = Some(CheckpointCounters {
+            arrivals: 3,
+            in_flight: 2,
+        });
+        assert!(current.is_valid("model"));
+        let mixed = current.demand(&previous, 1000, 10000).unwrap();
+        assert_eq!(mixed.rps, 4.3);
+        assert_eq!(
+            mixed.checkpoints(),
+            CheckpointLoad {
+                fraction: 1.2 / 4.3,
+                in_flight: 2
+            }
+        );
+        current.checkpoints.as_mut().unwrap().arrivals = 8;
+        assert!(current.is_valid("model"));
+        assert!(current.demand(&previous, 1000, 10000).is_none());
+    }
+
+    #[test]
+    fn stability_resets_on_different_plan_ingress_session_and_revision() {
+        let t = Instant::now();
+        let mut state = Evidence::default();
+        let observe =
+            |state: &mut Evidence, revision, pending, session, uptime, arrivals, in_flight, now| {
+                state
+                    .observe(
+                        revision,
+                        pending,
+                        sample(session, uptime, arrivals, in_flight),
+                        t + Duration::from_millis(now),
+                        1000,
+                        Duration::from_millis(2000),
+                        10000,
+                    )
+                    .map(|demand| demand.rps)
+            };
+        assert_eq!(observe(&mut state, 0, false, 1, 1000, 0, 0, 1000), None);
+        assert_eq!(
+            observe(&mut state, 0, false, 1, 2000, 2, 1, 2000),
+            Some(2.1)
+        );
+        assert!(!state.see(&proposal(2), 2));
+        assert_eq!(
+            observe(&mut state, 0, false, 1, 3000, 4, 0, 3000),
+            Some(2.0)
+        );
+        assert!(!state.see(&proposal(3), 2));
+
+        assert_eq!(observe(&mut state, 0, false, 2, 1000, 1, 0, 4000), None);
+        assert_eq!(
+            observe(&mut state, 0, false, 2, 2000, 3, 0, 5000),
+            Some(2.0)
+        );
+        assert!(!state.see(&proposal(3), 2));
+        assert_eq!(
+            observe(&mut state, 0, false, 2, 3000, 5, 0, 6000),
+            Some(2.0)
+        );
+        assert!(state.see(&proposal(3), 2));
+
+        assert_eq!(observe(&mut state, 0, true, 2, 4000, 8, 0, 7000), None);
+        assert_eq!(observe(&mut state, 1, false, 2, 5000, 10, 0, 8000), None);
+        assert_eq!(observe(&mut state, 1, false, 2, 6000, 11, 0, 9000), None);
+        assert_eq!(
+            observe(&mut state, 1, false, 2, 7000, 11, 0, 10000),
+            Some(0.0)
+        );
+        assert!(!state.see(&proposal(3), 2));
+    }
+}

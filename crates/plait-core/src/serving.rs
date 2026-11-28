@@ -1,27 +1,14 @@
 //! Serving plans and acknowledgements shared by planners and Plait nodes.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, SocketAddr, SocketAddrV4};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{Access, DeviceId, Key, Mode, NodeId, OpId};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct GroupId(pub NodeId);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct GroupVersion {
-    pub group: GroupId,
-    pub epoch: u64,
-}
-
-/// A pin consumes both the pinning quota and the host's total memory quota.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HostMemory {
-    pub bytes: u64,
-    pub pinned_bytes: u64,
-}
+pub use crate::group::{GroupId, GroupPhase, GroupVersion, HostMemory, WorkerDemand, WorkerGrant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServingRole {
@@ -30,10 +17,363 @@ pub enum ServingRole {
     Decode,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HostedActivation {
+    #[default]
+    OnReady,
+    OnRevocation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedAddress {
+    pub host: NodeId,
+    pub address: IpAddr,
+}
+
+/// The portable inputs needed to launch one committed vLLM process group.
+/// Each host supplies its own installed implementation of `profile`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedRecipe {
+    pub profile: String,
+    pub api_host: NodeId,
+    pub hosts: Vec<HostedAddress>,
+    pub master_port: u16,
+    pub http_port: u16,
+    pub backend_port: u16,
+    pub api_model: String,
+    pub max_model_len: u32,
+    pub gpu_memory_bps: u16,
+    pub prefix_caching: bool,
+}
+
+impl HostedRecipe {
+    pub fn launch_digest(&self) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(b"plait-hosted-recipe-v1");
+        for name in [&self.profile, &self.api_model] {
+            hash.update((name.len() as u64).to_le_bytes());
+            hash.update(name.as_bytes());
+        }
+        hash.update(self.api_host.as_bytes());
+        hash.update((self.hosts.len() as u64).to_le_bytes());
+        for host in &self.hosts {
+            hash.update(host.host.as_bytes());
+            match host.address {
+                IpAddr::V4(address) => {
+                    hash.update([4]);
+                    hash.update(address.octets());
+                }
+                IpAddr::V6(address) => {
+                    hash.update([6]);
+                    hash.update(address.octets());
+                }
+            }
+        }
+        for port in [self.master_port, self.http_port, self.backend_port] {
+            hash.update(port.to_le_bytes());
+        }
+        hash.update(self.max_model_len.to_le_bytes());
+        hash.update(self.gpu_memory_bps.to_le_bytes());
+        hash.update([self.prefix_caching.into()]);
+        hash.finalize().into()
+    }
+
+    pub fn validate(&self, plan: &GroupPlan) -> Result<(), ServingError> {
+        self.validate_topology(plan, 2)?;
+        if self.launch_digest() != plan.launch_digest {
+            return Err(ServingError::InvalidPlan);
+        }
+        Ok(())
+    }
+
+    pub fn validate_aggregated_route(&self, plan: &GroupPlan) -> Result<(), ServingError> {
+        self.validate_topology(plan, 1)?;
+        if plan.role != ServingRole::Aggregated || self.launch_digest() != plan.launch_digest {
+            return Err(ServingError::InvalidPlan);
+        }
+        Ok(())
+    }
+
+    fn validate_topology(&self, plan: &GroupPlan, min_hosts: usize) -> Result<(), ServingError> {
+        let hosts: BTreeSet<_> = self.hosts.iter().map(|host| host.host).collect();
+        let ports = BTreeSet::from([self.master_port, self.http_port, self.backend_port]);
+        if self.profile.is_empty()
+            || self.profile.len() > 128
+            || self
+                .profile
+                .bytes()
+                .any(|c| !(c.is_ascii_alphanumeric() || b"._-".contains(&c)))
+            || self.api_model.is_empty()
+            || self.api_model.len() > 256
+            || self.api_model.contains('\0')
+            || hosts.len() < min_hosts
+            || hosts.len() != self.hosts.len()
+            || !hosts.contains(&self.api_host)
+            || !hosts.iter().eq(plan.hosts.keys())
+            || self
+                .hosts
+                .iter()
+                .any(|host| host.address.is_unspecified() || host.address.is_multicast())
+            || ports.len() != 3
+            || ports.contains(&0)
+            || self.max_model_len == 0
+            || !(1..=10_000).contains(&self.gpu_memory_bps)
+        {
+            return Err(ServingError::InvalidPlan);
+        }
+        Ok(())
+    }
+}
+
+/// Inventory identifier for an engine profile with a specific layer partition.
+pub fn hosted_pipeline_profile(profile: &str, layers: &[u32]) -> Option<String> {
+    if layers.len() < 2
+        || layers.contains(&0)
+        || profile.is_empty()
+        || !profile
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"plait-hosted-layer-partition-v1");
+    for &count in layers {
+        digest.update(count.to_le_bytes());
+    }
+    let name = format!("{profile}.pp.{:x}", digest.finalize());
+    (name.len() <= 128).then_some(name)
+}
+
+/// Inventory name for a hosted engine profile with an explicit AllReduce cap.
+pub const HOSTED_ALL_REDUCE_PROFILE_PREFIX: &str = "plait.ar.";
+
+/// Bind a base or pipeline profile to a replicated AllReduce payload cap.
+pub fn hosted_all_reduce_profile(profile: &str, bytes: u64) -> Option<String> {
+    if profile.is_empty()
+        || profile.len() > 128
+        || profile.starts_with(HOSTED_ALL_REDUCE_PROFILE_PREFIX)
+        || !profile
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"plait-hosted-all-reduce-profile-v1");
+    digest.update(profile.as_bytes());
+    digest.update(bytes.to_le_bytes());
+    Some(format!(
+        "{HOSTED_ALL_REDUCE_PROFILE_PREFIX}{:x}",
+        digest.finalize()
+    ))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedAssignment {
+    pub version: GroupVersion,
+    pub model: String,
+    pub tensor_parallel: u32,
+    pub phase: GroupPhase,
+    pub holder: Option<NodeId>,
+    pub recipe: HostedRecipe,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedPdKv {
+    pub store: SocketAddrV4,
+    pub namespace: String,
+    pub block_size: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedPdLaunch {
+    pub role: ServingRole,
+    pub kv: HostedPdKv,
+}
+
+impl HostedPdLaunch {
+    pub fn launch_digest(&self, recipe: &HostedRecipe) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(b"plait-hosted-pd-v1");
+        hash.update(recipe.launch_digest());
+        hash.update([match self.role {
+            ServingRole::Prefill => 1,
+            ServingRole::Decode => 2,
+            ServingRole::Aggregated => 0,
+        }]);
+        hash.update(self.kv.store.ip().octets());
+        hash.update(self.kv.store.port().to_le_bytes());
+        hash.update(self.kv.block_size.to_le_bytes());
+        hash.update(self.kv.namespace.as_bytes());
+        hash.finalize().into()
+    }
+
+    pub fn validate(&self, recipe: &HostedRecipe, plan: &GroupPlan) -> Result<(), ServingError> {
+        recipe.validate_topology(plan, 1)?;
+        if plan.role != self.role
+            || self.kv.store.port() == 0
+            || self.kv.store.ip().is_unspecified()
+            || self.kv.store.ip().is_multicast()
+            || self.kv.namespace.is_empty()
+            || self.kv.namespace.len() > 256
+            || self.kv.namespace.contains('\0')
+            || self.kv.block_size == 0
+            || self.launch_digest(recipe) != plan.launch_digest
+        {
+            return Err(ServingError::InvalidPlan);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedManagedAssignment {
+    pub assignment: HostedAssignment,
+    pub pd: Option<HostedPdLaunch>,
+}
+
+impl HostedManagedAssignment {
+    pub fn launch_digest(&self) -> [u8; 32] {
+        let recipe = &self.assignment.recipe;
+        self.pd
+            .as_ref()
+            .map_or_else(|| recipe.launch_digest(), |pd| pd.launch_digest(recipe))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedPdPlacement {
+    pub group: GroupId,
+    pub expected_epoch: u64,
+    pub expected_active: Option<u64>,
+    pub plan: GroupPlan,
+    pub recipe: HostedRecipe,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedPdIntent {
+    pub staged: OpId,
+    pub model: String,
+    pub expected_revision: u64,
+    pub previous: Vec<PdRoute>,
+    pub paths: Vec<PdRoute>,
+    pub prepared: BTreeSet<GroupVersion>,
+    pub hosts: BTreeSet<NodeId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedPdStage {
+    pub placements: Vec<HostedPdPlacement>,
+    pub paths: Vec<PdRoute>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedPdTransition {
+    pub staged: OpId,
+    pub model: String,
+    pub expected_revision: u64,
+    pub kv: HostedPdKv,
+    pub bridge: Vec<PdRoute>,
+    pub release: BTreeSet<GroupVersion>,
+    pub target: HostedPdStage,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkerDemand {
-    pub incarnation: u64,
-    pub device_bytes: u64,
+pub enum HostedPdTransitionPhase {
+    PreparingBridge,
+    WaitingForRelease,
+    PreparingTarget,
+    Published,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedPdTransitionStatus {
+    pub staged: OpId,
+    pub revision: u64,
+    pub phase: HostedPdTransitionPhase,
+    pub error: Option<ServingError>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedPdInstance {
+    pub version: GroupVersion,
+    pub model: String,
+    pub role: ServingRole,
+    pub kv: HostedPdKv,
+    pub ranks: BTreeMap<NodeId, u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedPdPlanning {
+    pub revision: u64,
+    pub managed: bool,
+    pub pending: Option<OpId>,
+    pub active: Vec<HostedPdInstance>,
+    pub paths: Vec<PdRoute>,
+    pub resources: ServingResources,
+    pub inventory: HostedPlanning,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedPdRelease {
+    pub version: GroupVersion,
+    pub hosts: BTreeMap<NodeId, HostMemory>,
+    pub ports: HostedPortUse,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedPdReconfiguration {
+    pub planning: HostedPdPlanning,
+    pub releases: Vec<HostedPdRelease>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedPdRecovery {
+    pub planning: HostedPdPlanning,
+    pub checkpoint: String,
+    pub kv: HostedPdKv,
+    pub paths: Vec<PdRoute>,
+    pub failed: BTreeMap<GroupVersion, ServingRole>,
+}
+
+pub use crate::link::{LinkSample as HostedLinkSample, ProbeEndpoint as HostedProbeEndpoint};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedInventory {
+    pub host: NodeId,
+    pub address: IpAddr,
+    pub profiles: BTreeSet<String>,
+    /// Local accelerator ordinal to registered incarnation.
+    pub devices: BTreeMap<u32, u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedPortUse {
+    pub host: NodeId,
+    pub ports: [u16; 3],
+}
+
+impl From<&HostedRecipe> for HostedPortUse {
+    fn from(recipe: &HostedRecipe) -> Self {
+        Self {
+            host: recipe.api_host,
+            ports: [recipe.master_port, recipe.http_port, recipe.backend_port],
+        }
+    }
+}
+
+impl HostedPortUse {
+    pub fn conflicts(self, other: Self) -> bool {
+        self.host == other.host && self.ports.iter().any(|port| other.ports.contains(port))
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedPlanning {
+    pub hosts: Vec<HostedInventory>,
+    pub occupied: Vec<HostedPortUse>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,14 +406,6 @@ impl GroupPlan {
         }
         Ok(())
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkerGrant {
-    pub version: GroupVersion,
-    pub device: DeviceId,
-    pub incarnation: u64,
-    pub fence: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,16 +484,6 @@ impl W4GroupLayout {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum GroupPhase {
-    Preparing,
-    Ready,
-    Active,
-    Draining,
-    Revoked,
-    Retired,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupView {
     pub version: GroupVersion,
@@ -229,6 +551,95 @@ pub struct RouteDirectory {
     pub model: String,
     pub revision: u64,
     pub paths: Vec<ResolvedPdRoute>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum HostedRoute {
+    Aggregated(GroupVersion),
+    Split(PdRoute),
+}
+
+impl HostedRoute {
+    pub fn groups(self) -> impl Iterator<Item = GroupVersion> {
+        let (first, second) = match self {
+            Self::Aggregated(group) => (group, None),
+            Self::Split(path) => (path.prefill, Some(path.decode)),
+        };
+        std::iter::once(first).chain(second)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedServingPlan {
+    pub kv: Option<HostedPdKv>,
+    pub placements: Vec<HostedPdPlacement>,
+    pub routes: Vec<HostedRoute>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedServingIntent {
+    pub staged: OpId,
+    pub model: String,
+    pub expected_revision: u64,
+    pub previous: Vec<HostedRoute>,
+    pub routes: Vec<HostedRoute>,
+    pub prepared: BTreeSet<GroupVersion>,
+    pub hosts: BTreeSet<NodeId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedRouteDirectory {
+    pub split: RouteDirectory,
+    pub aggregated: Vec<(GroupVersion, SocketAddr)>,
+}
+
+/// Inventory and route assignments observed atomically at one replica.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedServingPlanning {
+    pub managed: bool,
+    pub split: HostedPdPlanning,
+    pub committed: Vec<HostedRoute>,
+    pub assignments: BTreeMap<GroupVersion, HostedAssignment>,
+    pub aggregate_kv: BTreeMap<GroupVersion, HostedPdKv>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ExecutionDrainTarget {
+    Host(NodeId),
+    Device(DeviceId),
+}
+
+impl ExecutionDrainTarget {
+    pub fn covers(self, device: DeviceId) -> bool {
+        match self {
+            Self::Host(host) => host == device.node,
+            Self::Device(target) => target == device,
+        }
+    }
+
+    fn key(self) -> Key {
+        match self {
+            Self::Host(host) => Key::HostMemory(host),
+            Self::Device(device) => Key::Device(device),
+        }
+    }
+}
+
+/// The compute ledger for maintenance. Other services on a host have their own lifecycle.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionDrainStatus {
+    pub target: ExecutionDrainTarget,
+    pub drain: Option<OpId>,
+    pub holders: BTreeSet<GroupVersion>,
+    pub deferred: BTreeSet<OpId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedEvacuationPlanning {
+    pub current: HostedServingPlanning,
+    pub withdrawing: BTreeSet<GroupVersion>,
+    pub drains: BTreeMap<ExecutionDrainTarget, OpId>,
+    pub releases: Vec<HostedPdRelease>,
 }
 
 /// Committed resources visible on one replica at the time of the query.
@@ -651,6 +1062,110 @@ pub enum ServingAction {
         host: NodeId,
         holder: NodeId,
     },
+    /// Arm an aggregated HTTP group for an ordered switch after host readiness.
+    PrepareHostedSwitch {
+        group: GroupId,
+        expected_epoch: u64,
+        expected_active: Option<u64>,
+        plan: GroupPlan,
+        activation: HostedActivation,
+        request_sha256: Option<[u8; 32]>,
+    },
+    PrepareHostedDeployment {
+        group: GroupId,
+        expected_epoch: u64,
+        expected_active: Option<u64>,
+        plan: GroupPlan,
+        activation: HostedActivation,
+        request_sha256: Option<[u8; 32]>,
+        recipe: HostedRecipe,
+    },
+    RegisterHostedProbe(HostedProbeEndpoint),
+    AdvertiseHostedInventory {
+        inventory: HostedInventory,
+        supervisor_lock: [u64; 2],
+    },
+    PrepareHostedPoolDeployment {
+        group: GroupId,
+        expected_epoch: u64,
+        expected_active: Option<u64>,
+        plan: GroupPlan,
+        activation: HostedActivation,
+        request_sha256: [u8; 32],
+        recipe: HostedRecipe,
+    },
+    PrepareHostedPd {
+        model: String,
+        expected_revision: u64,
+        kv: HostedPdKv,
+        placements: Vec<HostedPdPlacement>,
+        paths: Vec<PdRoute>,
+    },
+    ResolveHostedPd {
+        intent: HostedPdIntent,
+        cancel: bool,
+    },
+    PreparePlannedHostedPd {
+        model: String,
+        expected_revision: u64,
+        kv: HostedPdKv,
+        placements: Vec<HostedPdPlacement>,
+        paths: Vec<PdRoute>,
+        request_sha256: [u8; 32],
+    },
+    PrepareHostedPdTransition {
+        model: String,
+        expected_revision: u64,
+        kv: HostedPdKv,
+        bridge: HostedPdStage,
+        release: BTreeSet<GroupVersion>,
+        target: HostedPdStage,
+    },
+    ResolveHostedPdTransition {
+        transition: HostedPdTransition,
+        intent: HostedPdIntent,
+    },
+    AdvanceHostedPdTransition(HostedPdTransition),
+    AdvertiseHostedInventoryWithRelease {
+        inventory: HostedInventory,
+        supervisor_lock: [u64; 2],
+        release_profiles: BTreeSet<String>,
+    },
+    PreparePlannedHostedPdTransition {
+        model: String,
+        expected_revision: u64,
+        kv: HostedPdKv,
+        bridge: HostedPdStage,
+        release: Vec<HostedPdRelease>,
+        target: HostedPdStage,
+        request_sha256: Option<[u8; 32]>,
+    },
+    PrepareHostedServing {
+        model: String,
+        expected_revision: u64,
+        plan: HostedServingPlan,
+    },
+    ResolveHostedServing {
+        intent: HostedServingIntent,
+        cancel: bool,
+    },
+    BeginExecutionDrain {
+        target: ExecutionDrainTarget,
+    },
+    ConfirmExecutionDrain {
+        target: ExecutionDrainTarget,
+        drain: OpId,
+    },
+    ResumeExecutionTarget {
+        target: ExecutionDrainTarget,
+        drain: OpId,
+    },
+    PrepareHostedEvacuation {
+        model: String,
+        expected_revision: u64,
+        plan: HostedServingPlan,
+        drains: BTreeMap<ExecutionDrainTarget, OpId>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -727,6 +1242,22 @@ pub enum ServingOutcome {
         revision: u64,
     },
     DecoderSwitchCancelled,
+    HostedProbeRegistered,
+    HostedPdStaged {
+        revision: u64,
+    },
+    HostedPdCancelled,
+    HostedServingStaged {
+        revision: u64,
+    },
+    HostedServingCancelled,
+    ExecutionDrainBegun {
+        drain: OpId,
+    },
+    ExecutionDrainConfirmed {
+        drain: OpId,
+    },
+    ExecutionTargetResumed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -765,6 +1296,12 @@ pub enum ServingError {
     StaleDecoderEntry,
     DecoderSubmissionRouteChanged(PdRoute),
     DecoderSwitchInProgress { staged: OpId },
+    HostedInventoryChanged(NodeId),
+    HostedPortsInUse(NodeId),
+    HostedPdInProgress { staged: OpId },
+    ExecutionTargetDraining(ExecutionDrainTarget),
+    ExecutionTargetInUse(ExecutionDrainTarget),
+    StaleExecutionDrain,
 }
 
 pub type ServingResult = Result<ServingOutcome, ServingError>;
@@ -802,6 +1339,20 @@ pub enum ServingLookup {
     DecoderSwitch(RouteSetId),
     DecoderRouteWork(RouteSetId),
     DecoderAdmissionRoutes(RouteSetId),
+    HostedAssignments(NodeId),
+    HostedProbeEndpoints,
+    HostedPlanning,
+    HostedManagedAssignments(NodeId),
+    HostedPdPending(RouteSetId),
+    HostedPdPlanning(RouteSetId),
+    HostedPdTransition(RouteSetId),
+    HostedPdReconfiguration(RouteSetId),
+    HostedPdRecovery(RouteSetId),
+    HostedRoutes(RouteSetId),
+    HostedServingPending(RouteSetId),
+    HostedServingPlanning(RouteSetId),
+    HostedEvacuationPlanning(RouteSetId),
+    ExecutionDrain(ExecutionDrainTarget),
 }
 
 /// A replica's locally applied state. A missing result may indicate replication lag.
@@ -824,6 +1375,20 @@ pub enum ServingView {
     DecoderSwitch(Option<DecoderSwitch>),
     DecoderRouteWork(Option<DecoderRouteWork>),
     DecoderAdmissionRoutes(DecoderAdmissionRoutes),
+    HostedAssignments(Vec<HostedAssignment>),
+    HostedProbeEndpoints(Vec<HostedProbeEndpoint>),
+    HostedPlanning(HostedPlanning),
+    HostedManagedAssignments(Vec<HostedManagedAssignment>),
+    HostedPdPending(Option<HostedPdIntent>),
+    HostedPdPlanning(HostedPdPlanning),
+    HostedPdTransition(Option<HostedPdTransitionStatus>),
+    HostedPdReconfiguration(HostedPdReconfiguration),
+    HostedPdRecovery(Option<HostedPdRecovery>),
+    HostedRoutes(Option<HostedRouteDirectory>),
+    HostedServingPending(Option<HostedServingIntent>),
+    HostedServingPlanning(HostedServingPlanning),
+    HostedEvacuationPlanning(HostedEvacuationPlanning),
+    ExecutionDrain(ExecutionDrainStatus),
 }
 
 impl ServingOperation {
@@ -833,6 +1398,19 @@ impl ServingOperation {
             ServingAction::SetHostMemory { host, .. }
             | ServingAction::PulseExecutionHost { host, .. } => {
                 keys.insert(Key::HostMemory(*host));
+            }
+            ServingAction::RegisterHostedProbe(endpoint) => {
+                keys.insert(Key::HostMemory(endpoint.host));
+            }
+            ServingAction::AdvertiseHostedInventory { inventory, .. }
+            | ServingAction::AdvertiseHostedInventoryWithRelease { inventory, .. } => {
+                keys.insert(Key::HostMemory(inventory.host));
+                keys.extend(
+                    inventory
+                        .devices
+                        .keys()
+                        .map(|&ordinal| Key::Device(DeviceId::new(inventory.host, ordinal))),
+                );
             }
             ServingAction::ExpireExecutionHost { host, groups, .. } => {
                 keys.insert(Key::HostMemory(*host));
@@ -845,10 +1423,127 @@ impl ServingOperation {
             ServingAction::RegisterWorker { device, .. } => {
                 keys.insert(Key::Device(*device));
             }
+            ServingAction::BeginExecutionDrain { target }
+            | ServingAction::ConfirmExecutionDrain { target, .. }
+            | ServingAction::ResumeExecutionTarget { target, .. } => {
+                keys.insert(target.key());
+            }
+            ServingAction::PrepareHostedPd {
+                model,
+                placements,
+                paths,
+                ..
+            }
+            | ServingAction::PreparePlannedHostedPd {
+                model,
+                placements,
+                paths,
+                ..
+            } => {
+                keys.insert(Key::ServingRoutes(RouteSetId::for_model(model)));
+                hosted_pd_stage_keys(&mut keys, placements, paths);
+            }
+            ServingAction::ResolveHostedPd { intent, .. } => {
+                hosted_pd_intent_keys(&mut keys, intent);
+            }
+            ServingAction::PrepareHostedServing { model, plan, .. }
+            | ServingAction::PrepareHostedEvacuation { model, plan, .. } => {
+                keys.insert(Key::ServingRoutes(RouteSetId::for_model(model)));
+                hosted_pd_stage_keys(&mut keys, &plan.placements, &[]);
+                keys.extend(
+                    plan.routes
+                        .iter()
+                        .flat_map(|route| route.groups())
+                        .map(|version| Key::ServingGroup(version.group)),
+                );
+                if let ServingAction::PrepareHostedEvacuation { drains, .. } = &self.action {
+                    keys.extend(drains.keys().map(|target| target.key()));
+                }
+            }
+            ServingAction::ResolveHostedServing { intent, .. } => {
+                keys.insert(Key::ServingRoutes(RouteSetId::for_model(&intent.model)));
+                keys.extend(
+                    intent
+                        .previous
+                        .iter()
+                        .chain(&intent.routes)
+                        .flat_map(|route| route.groups())
+                        .chain(intent.prepared.iter().copied())
+                        .map(|version| Key::ServingGroup(version.group)),
+                );
+                keys.extend(intent.hosts.iter().copied().map(Key::HostMemory));
+            }
+            ServingAction::PrepareHostedPdTransition {
+                model,
+                bridge,
+                release,
+                target,
+                ..
+            } => {
+                keys.insert(Key::ServingRoutes(RouteSetId::for_model(model)));
+                hosted_pd_stage_keys(&mut keys, &bridge.placements, &bridge.paths);
+                hosted_pd_stage_keys(&mut keys, &target.placements, &target.paths);
+                keys.extend(
+                    release
+                        .iter()
+                        .map(|version| Key::ServingGroup(version.group)),
+                );
+            }
+            ServingAction::PreparePlannedHostedPdTransition {
+                model,
+                bridge,
+                release,
+                target,
+                ..
+            } => {
+                keys.insert(Key::ServingRoutes(RouteSetId::for_model(model)));
+                hosted_pd_stage_keys(&mut keys, &bridge.placements, &bridge.paths);
+                hosted_pd_stage_keys(&mut keys, &target.placements, &target.paths);
+                for retired in release {
+                    keys.insert(Key::ServingGroup(retired.version.group));
+                    keys.extend(retired.hosts.keys().copied().map(Key::HostMemory));
+                }
+            }
+            ServingAction::AdvanceHostedPdTransition(transition)
+            | ServingAction::ResolveHostedPdTransition { transition, .. } => {
+                keys.insert(Key::ServingRoutes(RouteSetId::for_model(&transition.model)));
+                hosted_pd_stage_keys(
+                    &mut keys,
+                    &transition.target.placements,
+                    &transition.target.paths,
+                );
+                hosted_pd_stage_keys(&mut keys, &[], &transition.bridge);
+                keys.extend(
+                    transition
+                        .release
+                        .iter()
+                        .map(|version| Key::ServingGroup(version.group)),
+                );
+                if let ServingAction::ResolveHostedPdTransition { intent, .. } = &self.action {
+                    hosted_pd_intent_keys(&mut keys, intent);
+                }
+            }
             ServingAction::Prepare { group, plan, .. }
             | ServingAction::PrepareW4Switch { group, plan, .. }
-            | ServingAction::PrepareManagedW4 { group, plan, .. } => {
+            | ServingAction::PrepareManagedW4 { group, plan, .. }
+            | ServingAction::PrepareHostedSwitch { group, plan, .. } => {
                 keys.insert(Key::ServingGroup(*group));
+                keys.extend(plan.workers.keys().copied().map(Key::Device));
+                keys.extend(plan.hosts.keys().copied().map(Key::HostMemory));
+            }
+            ServingAction::PrepareHostedDeployment {
+                group,
+                plan,
+                recipe,
+                ..
+            }
+            | ServingAction::PrepareHostedPoolDeployment {
+                group,
+                plan,
+                recipe,
+                ..
+            } => {
+                keys.extend([Key::ServingGroup(*group), Key::HostMemory(recipe.api_host)]);
                 keys.extend(plan.workers.keys().copied().map(Key::Device));
                 keys.extend(plan.hosts.keys().copied().map(Key::HostMemory));
             }
@@ -1124,4 +1819,36 @@ impl ServingOperation {
             })
             .collect()
     }
+}
+
+fn hosted_pd_stage_keys(
+    keys: &mut BTreeSet<Key>,
+    placements: &[HostedPdPlacement],
+    paths: &[PdRoute],
+) {
+    for placement in placements {
+        keys.insert(Key::ServingGroup(placement.group));
+        keys.insert(Key::HostMemory(placement.recipe.api_host));
+        keys.extend(placement.plan.workers.keys().copied().map(Key::Device));
+        keys.extend(placement.plan.hosts.keys().copied().map(Key::HostMemory));
+    }
+    for path in paths {
+        keys.extend([
+            Key::ServingGroup(path.prefill.group),
+            Key::ServingGroup(path.decode.group),
+        ]);
+    }
+}
+
+fn hosted_pd_intent_keys(keys: &mut BTreeSet<Key>, intent: &HostedPdIntent) {
+    keys.insert(Key::ServingRoutes(RouteSetId::for_model(&intent.model)));
+    hosted_pd_stage_keys(keys, &[], &intent.paths);
+    hosted_pd_stage_keys(keys, &[], &intent.previous);
+    keys.extend(
+        intent
+            .prepared
+            .iter()
+            .map(|version| Key::ServingGroup(version.group)),
+    );
+    keys.extend(intent.hosts.iter().copied().map(Key::HostMemory));
 }

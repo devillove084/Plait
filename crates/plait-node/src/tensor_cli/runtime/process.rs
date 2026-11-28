@@ -5,12 +5,12 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
-use plait_core::serving::{DecoderEndpoint, WorkerGrant};
+use plait_core::serving::WorkerGrant;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
-use super::{Artifact, ControlPeers, Program, Request, W4Artifact};
+use super::{Artifact, ControlPeers, Request};
 
 mod lease;
 use lease::WorkerLease;
@@ -38,7 +38,7 @@ impl SlotLock {
 
 pub(super) struct WorkerProcess {
     child: Child,
-    input: Option<ChildStdin>,
+    input: ChildStdin,
     output: Lines<BufReader<ChildStdout>>,
     usable: bool,
     lease: WorkerLease,
@@ -48,34 +48,6 @@ impl WorkerProcess {
     pub(super) async fn start(
         grant: WorkerGrant,
         artifact: &Artifact,
-        listen: SocketAddr,
-        lock: &SlotLock,
-        control: &ControlPeers,
-    ) -> io::Result<Self> {
-        match &artifact.program {
-            Program::W4(layout) => Self::start_w4(grant, layout, listen, lock, control).await,
-            Program::Decoder {
-                decoder_config,
-                weights,
-            } => {
-                let config = serde_json::from_slice(&tokio::fs::read(decoder_config).await?)?;
-                Self::start_decoder(
-                    grant,
-                    config,
-                    weights.as_deref(),
-                    artifact.launch_digest,
-                    listen,
-                    lock,
-                    control,
-                )
-                .await
-            }
-        }
-    }
-
-    async fn start_w4(
-        grant: WorkerGrant,
-        artifact: &W4Artifact,
         listen: SocketAddr,
         lock: &SlotLock,
         control: &ControlPeers,
@@ -94,7 +66,7 @@ impl WorkerProcess {
                 "worker weights must be a single JSON line",
             ));
         }
-        let mut process = Self::spawn("worker-w4", config, Stdio::piped(), lock)?;
+        let mut process = Self::spawn(config, lock)?;
         tokio::time::timeout(Duration::from_secs(90), async {
             process.send(weights.as_bytes()).await?;
             let ready = process.read().await?;
@@ -112,66 +84,16 @@ impl WorkerProcess {
         Ok(process)
     }
 
-    async fn start_decoder(
-        grant: WorkerGrant,
-        mut config: Value,
-        weights: Option<&Path>,
-        launch_digest: [u8; 32],
-        listen: SocketAddr,
-        lock: &SlotLock,
-        control: &ControlPeers,
-    ) -> io::Result<Self> {
-        let object = config.as_object_mut().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "decoder artifact configuration must be an object",
-            )
-        })?;
-        let has_checkpoint = object
-            .get("checkpoint")
-            .is_some_and(|value| !value.is_null());
-        let input = match (has_checkpoint, weights) {
-            (true, None) => Stdio::null(),
-            (false, Some(weights)) => {
-                Stdio::from(tokio::fs::File::open(weights).await?.into_std().await)
-            }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "decoder worker needs exactly one checkpoint or weight record file",
-                ));
-            }
-        };
-        object.insert("ordinal".into(), json!(grant.device.ordinal));
-        object.insert(
-            "service".into(),
-            json!({
-                "listen": listen, "device_lock": lock.path, "control": control,
-                "grant": grant, "launch_digest": launch_digest, "managed": true,
-            }),
-        );
-        let mut process = Self::spawn("decoder-w4", config, input, lock)?;
-        let ready = tokio::time::timeout(Duration::from_secs(90), process.read()).await??;
-        let endpoint: DecoderEndpoint = serde_json::from_value(ready["ready"].clone())?;
-        if endpoint.grant != grant || endpoint.addr.ip() != listen.ip() || endpoint.addr.port() == 0
-        {
-            return Err(io::Error::other(
-                "decoder worker reported a different grant or endpoint",
-            ));
-        }
-        Ok(process)
-    }
-
-    fn spawn(operation: &str, config: Value, input: Stdio, lock: &SlotLock) -> io::Result<Self> {
+    fn spawn(config: Value, lock: &SlotLock) -> io::Result<Self> {
         let mut command = Command::new(std::env::current_exe()?);
         command
-            .args(["tensor", operation])
+            .args(["tensor", "worker-w4"])
             .arg(config.to_string())
-            .stdin(input)
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .kill_on_drop(true);
         let (mut child, lease) = WorkerLease::spawn(&mut command, lock)?;
-        let input = child.stdin.take();
+        let input = child.stdin.take().expect("piped worker stdin");
         let output = BufReader::new(child.stdout.take().expect("piped worker stdout")).lines();
         Ok(Self {
             child,
@@ -180,10 +102,6 @@ impl WorkerProcess {
             usable: true,
             lease,
         })
-    }
-
-    pub(super) fn is_decoder(&self) -> bool {
-        self.input.is_none()
     }
 
     pub(super) fn check_running(&mut self) -> io::Result<()> {
@@ -205,12 +123,6 @@ impl WorkerProcess {
 
     pub(super) async fn call(&mut self, request: &Request) -> io::Result<Value> {
         self.check_running()?;
-        if self.is_decoder() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "decoder worker uses its registered service endpoint",
-            ));
-        }
         if !self.usable {
             return Err(io::Error::other(
                 "resident worker response stream is unavailable",
@@ -249,9 +161,8 @@ impl WorkerProcess {
     }
 
     async fn send(&mut self, payload: &[u8]) -> io::Result<()> {
-        let input = self.input.as_mut().expect("W4 worker stdin");
-        input.write_all(payload).await?;
-        input.write_all(b"\n").await
+        self.input.write_all(payload).await?;
+        self.input.write_all(b"\n").await
     }
 
     async fn read(&mut self) -> io::Result<Value> {

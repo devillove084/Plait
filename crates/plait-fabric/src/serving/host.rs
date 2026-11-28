@@ -1,14 +1,69 @@
 use std::collections::BTreeSet;
 
 use plait_core::serving::{
-    ExecutionHostLiveness, GroupPhase, GroupVersion, ServingError, ServingOutcome, ServingResult,
-    WorkerGrant,
+    ExecutionDrainTarget, ExecutionHostLiveness, GroupPhase, GroupVersion, HostedInventory,
+    HostedProbeEndpoint, ServingError, ServingOutcome, ServingResult, WorkerGrant,
 };
 use plait_core::{DeviceId, NodeId, OpId};
 
 use super::ServingState;
 
 impl ServingState {
+    pub(super) fn advertise_hosted_inventory(
+        &mut self,
+        inventory: &HostedInventory,
+        pulse: OpId,
+        supervisor_lock: [u64; 2],
+    ) -> ServingResult {
+        let host = inventory.host;
+        if inventory.address.is_unspecified()
+            || inventory.address.is_multicast()
+            || inventory.profiles.is_empty()
+            || inventory.devices.is_empty()
+        {
+            return Err(ServingError::InvalidPlan);
+        }
+        let mut inventory = inventory.clone();
+        // A stale device report removes that device from future placements.
+        // The rest of the host keeps its inventory and liveness.
+        inventory.devices.retain(|&ordinal, incarnation| {
+            self.workers
+                .get(&DeviceId::new(host, ordinal))
+                .is_some_and(|worker| worker.incarnation == *incarnation)
+        });
+        let result = self.pulse_execution_host(host, pulse, supervisor_lock)?;
+        self.hosted_inventories.insert(host, inventory);
+        Ok(result)
+    }
+
+    pub(super) fn register_hosted_probe(&mut self, endpoint: HostedProbeEndpoint) -> ServingResult {
+        if !self
+            .execution_host(endpoint.host)
+            .is_some_and(|state| state.online)
+        {
+            return Err(ServingError::ExecutionHostOffline(endpoint.host));
+        }
+        if endpoint.address.port() == 0
+            || endpoint.address.ip().is_unspecified()
+            || endpoint.address.ip().is_multicast()
+        {
+            return Err(ServingError::InvalidEndpoint);
+        }
+        self.hosted_probes.insert(endpoint.host, endpoint);
+        Ok(ServingOutcome::HostedProbeRegistered)
+    }
+
+    pub(crate) fn hosted_probe_endpoints(&self) -> Vec<HostedProbeEndpoint> {
+        self.hosted_probes
+            .values()
+            .filter(|endpoint| {
+                self.execution_host(endpoint.host)
+                    .is_some_and(|state| state.online)
+            })
+            .copied()
+            .collect()
+    }
+
     pub(crate) fn execution_hosts(
         &self,
     ) -> impl Iterator<Item = (NodeId, ExecutionHostLiveness)> + '_ {
@@ -54,13 +109,47 @@ impl ServingState {
                 supervisor_lock,
             },
         );
+        self.hosted_inventories.remove(&host);
+        self.hosted_release_profiles.remove(&host);
         Ok(ServingOutcome::ExecutionHostOnline)
     }
 
     pub(crate) fn execution_versions_on(&self, host: NodeId) -> BTreeSet<GroupVersion> {
-        self.versions_on(host, |grant| {
-            self.resident_owner(grant).is_some() || self.host_has_launch(grant.version, host)
-        })
+        let mut versions = self.versions_on(host, |grant| {
+            self.resident_owner(grant).is_some()
+                || self.host_has_launch(grant.version, host)
+                || self.hosted_pool_versions.contains(&grant.version)
+        });
+        versions.extend(self.live_peer_versions_on(host));
+        versions
+    }
+
+    fn live_peer_versions_on(&self, host: NodeId) -> impl Iterator<Item = GroupVersion> + '_ {
+        self.workers
+            .range(DeviceId::new(host, 0)..=DeviceId::new(host, u32::MAX))
+            .filter_map(|(_, worker)| worker.grant.map(|grant| grant.version))
+            .filter(|&version| self.peer_version_is_live(version))
+    }
+
+    pub(super) fn quarantine_execution_host(&mut self, host: NodeId, intent: OpId) -> OpId {
+        let drain = *self
+            .execution_drains
+            .entry(ExecutionDrainTarget::Host(host))
+            .or_insert(intent);
+        let mut versions = self.versions_on(host, |_| true);
+        // Revoke local hosted standbys before an incumbent can promote them.
+        versions.retain(|&version| {
+            if self.group(version).expect("known affected group").phase == GroupPhase::Active {
+                true
+            } else {
+                self.fail_resident_version(version)
+                    .expect("affected group checked");
+                false
+            }
+        });
+        versions.extend(self.live_peer_versions_on(host));
+        self.fail_execution_versions(&versions);
+        drain
     }
 
     pub(crate) fn resident_versions_on(&self, host: NodeId) -> BTreeSet<GroupVersion> {
@@ -104,10 +193,6 @@ impl ServingState {
         if old.pulse != pulse || !old.online || &self.execution_versions_on(host) != groups {
             return Err(ServingError::StaleExecutionHost);
         }
-        for &version in groups {
-            self.fail_resident_version(version)
-                .expect("affected groups checked");
-        }
         self.execution_hosts.insert(
             host,
             ExecutionHostLiveness {
@@ -115,7 +200,22 @@ impl ServingState {
                 ..old
             },
         );
+        self.fail_execution_versions(groups);
+        self.hosted_probes.remove(&host);
+        self.hosted_inventories.remove(&host);
         Ok(ServingOutcome::ExecutionHostOffline)
+    }
+
+    fn fail_execution_versions(&mut self, groups: &BTreeSet<GroupVersion>) {
+        for &version in groups {
+            if self.peer_version_is_live(version) {
+                self.fail_peer_group(version, Some(groups))
+                    .expect("affected groups checked");
+            } else {
+                self.fail_resident_version(version)
+                    .expect("affected groups checked");
+            }
+        }
     }
 }
 
@@ -127,6 +227,52 @@ mod tests {
     use plait_core::serving::{
         GroupId, GroupPlan, HostMemory, ResidentOwner, ServingRole, WorkerDemand,
     };
+
+    #[test]
+    fn a_stale_device_does_not_expire_the_host_or_its_other_devices() {
+        let mut state = ServingState::default();
+        let host = NodeId::derive("device-registration");
+        state
+            .set_host_memory(
+                host,
+                HostMemory {
+                    bytes: 16,
+                    pinned_bytes: 4,
+                },
+            )
+            .unwrap();
+        state
+            .register_worker(DeviceId::new(host, 0), 2, 16)
+            .unwrap();
+        state
+            .register_worker(DeviceId::new(host, 1), 1, 16)
+            .unwrap();
+        let pulse = OpId::new(host, 1);
+        state
+            .advertise_hosted_inventory(
+                &HostedInventory {
+                    host,
+                    address: "192.0.2.1".parse().unwrap(),
+                    profiles: BTreeSet::from(["weights".into()]),
+                    devices: BTreeMap::from([(0, 1), (1, 1)]),
+                },
+                pulse,
+                [2, 3],
+            )
+            .unwrap();
+        assert_eq!(
+            state
+                .execution_host(host)
+                .filter(|entry| entry.online)
+                .unwrap()
+                .pulse,
+            pulse
+        );
+        assert_eq!(
+            state.hosted_planning().hosts[0].devices,
+            BTreeMap::from([(1, 1)])
+        );
+    }
 
     #[test]
     fn host_expiry_compares_the_pulse_and_keeps_device_reservations() {

@@ -10,6 +10,7 @@ pub mod cluster;
 pub mod codesign;
 pub mod dp;
 pub mod dsa;
+pub mod group_placement;
 pub mod moe;
 pub mod plan;
 pub mod pp;

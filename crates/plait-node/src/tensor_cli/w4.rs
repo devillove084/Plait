@@ -15,13 +15,8 @@ use sha2::{Digest, Sha256};
 
 use super::{ControlPeers, GroupControl, Publish, partial_size, serve_partial};
 
-mod decoder;
 pub(super) mod worker;
 
-pub(super) use decoder::generate_pd;
-pub(super) use decoder::replay_pd;
-pub(super) use decoder::resume_pd;
-pub(super) use decoder::run as run_decoder;
 pub(super) use worker::run as run_worker;
 
 #[derive(Deserialize)]

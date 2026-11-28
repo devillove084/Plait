@@ -63,7 +63,9 @@ impl KernelAllreduce {
             let shm = shm.lock().unwrap();
             (shm.base_pointer(), shm.mapped_size(), shm.slot_bytes())
         };
-        let device_base = runtime.map_host(base, size).map_err(|error| error.0)?;
+        let device_base = runtime
+            .map_host(base, size)
+            .map_err(|error| error.to_string())?;
         let cubin = include_bytes!(env!("PLAIT_PERSISTENT_CUBIN"));
         let mut module = std::ptr::null_mut();
         let status = unsafe { sys::cuModuleLoadData(&mut module, cubin.as_ptr().cast()) };

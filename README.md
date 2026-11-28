@@ -1,250 +1,89 @@
 <p align="center">
-  <img src="docs/assets/plait-logo.png" width="220" alt="Plait logo">
+  <img src="docs/assets/plait-logo.png" width="136" alt="Plait">
 </p>
 
 <h1 align="center">Plait</h1>
 
-<p align="center">
-  <strong>A rankless, ordering-driven tensor fabric.</strong>
-</p>
+<p align="center"><strong>Rankless collective communication for heterogeneous inference.</strong></p>
 
 <p align="center">
-  Rust 2024 · leaderless ordering · no rank 0 · TP/PP/EP/DP/CP/SP · heterogeneous accelerators · GPU peer-memory collectives
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#measured-results">Measurements</a> ·
+  <a href="specs/README.md">Formal verification</a> ·
+  <a href="docs/rankless-nccl.md">Deployment guide</a>
 </p>
 
-Plait is a research runtime for distributed tensor work. It replaces the fixed
-process group and rank-zero driver of a traditional collective with a
-leaderless ordered log. Every node has a stable `NodeId`, every contribution is
-an ordered command, and every replica applies the same state transition.
+Plait is a Rust runtime with an NCCL-compatible interface for PyTorch and vLLM.
+It groups accelerators by capability and topology, moves tensors between workers,
+and uses replicated metadata to replace an execution group when devices join or fail.
 
-This is not a production training system. The control plane, fused runtime,
-GPU peer-memory collectives, heterogeneous planner, and formal models are
-implemented and tested. Cross-host GPUDirect RDMA, durable state, authentication,
-and production-scale validation are not.
+<p align="center">
+  <img src="docs/assets/plait-architecture.svg" width="1000" alt="Plait architecture. Callers submit tensor work to peers. Any voter can propose placement and group changes. Quorum-ordered grants fence the data plane. Host loss revokes affected epochs and can promote a ready standby.">
+</p>
 
-## Why this design
+## How it works
 
-A conventional collective assumes a fixed communicator. Ranks are array
-positions; membership changes require rebuilding the group and the communication
-plan. Plait assumes churn. Nodes join and leave, GPUs differ in compute and link
-class, and a single operator may have a different contributor set from the one
-before it.
+- **Versioned groups.** Stable host and device IDs identify resources. Logical ranks
+  assign tensor or pipeline slots inside one group version. Any voter can propose a
+  change, and a quorum orders conflicting metadata updates.
+- **Heterogeneous placement.** The planner prices device compute, device and host
+  memory, and directed network links. A committed recipe binds the TP and PP shape
+  that the vLLM launcher starts.
+- **Asynchronous collectives.** Workers exchange tensors over peer connections.
+  Native submit and wait calls provide bounded staging so callers can overlap a
+  collective with independent compute. The C ABI retains the NCCL-style entry points.
+- **Host failover.** A confirmed device fault or an expired host heartbeat closes
+  affected epochs. The control plane can promote an armed, ready standby on healthy
+  hosts. The engine owns model state, request continuation, and KV.
 
-```mermaid
-flowchart LR
-  A[Node A] -->|propose| L[(Plait ordering log)]
-  B[Node B] -->|propose| L
-  C[Node C] -->|propose| L
-  L -->|ordered commands| R[Fused runtime]
-  R -->|materialize shard| T[(Tensor state)]
-  T -. bulk bytes .-> M[Registered memory / peer data plane]
-```
+[Editable Excalidraw scene](docs/assets/plait-architecture.excalidraw) ·
+[Group lifecycle and APIs](docs/rankless-nccl.md)
 
-The log carries control metadata and small partials. Large tensors stay in
-registered memory and move through peer pointers or one-sided descriptors.
+## Measured results
 
-## What is implemented
+| Experiment | Baseline → Plait |
+| --- | --- |
+| Same-host PCIe AllReduce, 16 MiB | 12.72 → 16.3 GB/s against NCCL 2.30.4 |
+| Two-host vLLM TP2, 64-token input, concurrency 4 | 9.87 → 15.94 generated tokens/s against NCCL socket transport. Median time to first token fell from 1,014 to 568 ms. |
+| Four-host asynchronous FP16 AllReduce, 128 KiB plus approximately 40 ms of independent GEMM | 80.97 → 41.63 ms against blocking Plait. Async completed sooner in 24 of 24 paired trials. |
 
-- **Leaderless ordering.** Any voter may propose. Fast-path dependency
-  agreement, slow-path acceptance, ballot-based recovery, snapshots, and
-  membership changes are implemented in `plait-consensus`.
-- **Fused runtime.** `DeclareOp`, `Contribute`, and `Fuse` materialize tensor
-  shards after all declared contributors have been applied. `Sum`, `Max`,
-  `Gather`, `TopK`, and `OnlineSoftmax` are implemented.
-- **SCC execution.** `ExecutionGraph` maintains an online SCC condensation.
-  Independent components are ready in parallel; conflicting components stay
-  together.
-- **GPU peer-memory collectives.** Ring allreduce, broadcast, reduce,
-  all-gather, reduce-scatter, and all-to-all use CUDA peer memory and
-  device-resident flags in `plait-collective`. The device-ring allreduce is the
-  default path.
-- **Heterogeneous planning.** `HeterogeneousLayout` solves a max-min linear
-  program over compute rate, effective bandwidth, and latency, then maps the
-  result to contiguous row ranges.
-- **Rejoin policy.** `RejoinCost` chooses between strict recovery, snapshot
-  replay, and deterministic recomputation.
-- **Formal models.** Finite TLA+ models under `specs/` cover the scheduler,
-  ordering safety, dependency stability, recovery liveness, and the unified
-  compute/fusion/commit/execute design.
+The two-host comparison used the same FP16 checkpoint and crossed two input
+lengths with two concurrency levels. With 512-token inputs at concurrency 4,
+Plait raised generation throughput from 9.80 to 14.23 tokens/s and increased
+p95 inter-token latency from 350 to 434 ms. [Benchmark commands](Justfile) ·
+[Deployment and evaluation notes](docs/rankless-nccl.md)
 
-## Measured baseline
-
-On one host with eight NVIDIA Blackwell GPUs, PCIe topology, no NVLink, Plait's
-device-ring allreduce measured:
-
-| Size | Plait | NCCL 2.30.4 |
-|---:|---:|---:|
-| 1 MiB | 11.0 GB/s | 4.82 GB/s |
-| 16 MiB | 16.3 GB/s | 12.72 GB/s |
-| 64 MiB | 15.7 GB/s | 13.60 GB/s |
-
-The matrix path also matches NCCL's float allreduce checksum at `8x8x6` and
-`64x64x64`. These numbers cover same-host allreduce only. They are not an
-end-to-end training claim.
-
-LL and LL128 protocol kernels exist but remain opt-in. On the PCIe test host,
-their per-line synchronization is slower than the ring; PCIe defaults to ring
-plus `Simple`.
-
-## Heterogeneous 4+8 example
-
-The planner models four NVIDIA Ampere ranks and eight NVIDIA Blackwell ranks:
-
-```text
-4 × NVIDIA Ampere     PCIe, compute 1.0, 25 Gbps
-8 × NVIDIA Blackwell UB,   compute 4.0, 200 Gbps
-```
-
-Run:
-
-```sh
-cargo run -q -p plait-node -- hetero-plan
-```
-
-It reports fractional shares, integer row ranges, and the equal-split
-comparison:
-
-```text
-local_share=0.111 remote_share=0.889
-rows=64 local_rows=7 remote_rows=57
-rows=64 equal_split_local=21 equal_split_remote=43
-```
-
-The eight faster ranks receive most of the work. Quorum membership remains one
-vote per node; weights only change work assignment.
+**Four-backend serving.** A single vLLM group ran `TP2 × PP2` across CUDA, ROCm,
+CANN, and HGGC. In a separate failure trial with an armed single-device standby,
+stopping one execution host's heartbeat led to promotion in 8.43 seconds. The
+same HTTP endpoint returned a complete response in 8.71 seconds with matching
+output tokens. The timings describe one controlled process-stop trial.
 
 ## Quick start
 
-Install `just` and a Rust toolchain, then:
+Run the three-node ordering and reduction demo with a Rust toolchain:
 
 ```sh
-just test        # workspace tests
-just demo        # three TCP nodes, fused sum
-just dsa         # TP/CP sparse attention reference
-just parallel    # EP MoE, DP optimizer, PP stage handoff
-just devices     # discovered device profiles
-just hetero      # capability-aware compute placement
-just hetero-plan # 4+8 heterogeneous LP demo
-cargo run -q -p plait-node -- hetero-plan --local-gflops 1394 --remote-gflops 4317
-just matrix      # 12-replica matrix collective
-just ipc         # two-process CUDA IPC allreduce
-just tcp-twolevel-rust # Rust host-staged two-level TCP fallback
-just gpu         # CUDA AXPY and CUTLASS SGEMM
-just gpu-bench   # per-GPU CUTLASS SGEMM throughput
-just rdma        # real ibverbs or an explicit skip
-just ci          # fmt, lint, tests, demos
+cargo run -p plait-node --no-default-features -- demo
 ```
 
-`just setup` clones CUTLASS into `target/cutlass` if needed. The CUDA build
-selects the local architecture; no generated CUTLASS tree is committed.
+Use the [NCCL-compatible Python integration](docs/nccl-python.md) and the
+[Plait vLLM fork](https://github.com/devillove084/vllm/tree/plait/v0.31-runtime)
+for heterogeneous serving. The [deployment guide](docs/rankless-nccl.md) covers
+device enrollment, connectivity, mixed TP × PP, and standby activation.
 
-## Commands and hardware
+## Verification
 
-The GPU data plane requires peer-capable CUDA devices. Local NVIDIA Ampere machines
-may refuse cross-GPU peer access; tests report the skip instead of hiding it.
-The NVIDIA Blackwell host passes cross-GPU IPC.
+TLC checks the configured ordering, grant, collective, and host-failure models.
+TLAPS checks the guarded packed-read, device-publication, zero-point, and mixed
+axis geometry theorems. See the [results and reproduction commands](specs/README.md).
 
-The ibverbs backend compiles and links. The ordinary containers expose no
-`/dev/infiniband`, no active verbs device, and no `CAP_NET_ADMIN`, so
-`just gpu-rdma` and `just rdma` report explicit skips.
+## Scope
 
-### TCP fallback
+The cross-vendor data path uses host-staged TCP. Vendor runtimes supply device
+execution. The journal recovers control metadata. Engines reconstruct device
+buffers and handle request or KV recovery. Deployment assumes a trusted network.
 
-`crates/plait-collective/src/bin/tcp-twolevel.rs` is the Rust two-host
-fallback. It reduces worker inputs into one host leader, exchanges the
-aggregate over four TCP channels, publishes the result through shared memory,
-and uses a ready barrier outside the timing loop. It is host-staged, not a
-GPUDirect path.
-
-Measured with 4 local NVIDIA Ampere ranks and 8 remote NVIDIA Blackwell ranks:
-
-```text
-1 MiB   0.081-0.083 GB/s  > NCCL 0.050
-16 MiB  0.281-0.286 GB/s  > NCCL 0.273
-errors=0
-```
-
-`crates/plait-nccl` provides a PyO3 NCCL-compatible communicator for vLLM.
-`PLAIT_NCCL_SHM=1` enables the host-mapped local path and
-`PLAIT_NCCL_KERNEL=1` enables the single-stream GPU-kernel allreduce path.
-`plait_nccl.kernel_config(device, quantization)` returns a vLLM `KernelConfig`
-using Humming on SM120 and Marlin/Cutlass on Ampere; the collective itself
-stays bf16/fp16.
-`plait_parallel::choose_codesign` picks the smallest fitting
-`(quant format, TP group)`; eight SM120 cards therefore run 122B NVFP4 as four
-TP2 replicas, while a 4B model runs as twelve TP1 replicas.
-`plait_nccl.CapabilityRouter` routes local 9B-W4A16, remote 35B-FP8, and remote 122B-NVFP4 tiers.
-The 122B tier requires native vLLM multiprocessing TP2; external-launcher TP
-produced degenerate Qwen3.5 output even in BF16. FP8 communication is opt-in
-(`plait_nccl.comm_quant.all_reduce_fp8`) and its accuracy/bandwidth gate
-defaults off; it is only for cross-host TP.
-
-Native TP startup (Qwen3.5 must not use `external_launcher`):
-
-```bash
-# local 4x3090 W4A16 TP1
-python scripts/serve-tiered.py --model /mnt/nas1/hf/Qwen3.5-9B-W4A16 \
-  --replicas 4 --tp 1 --port-base 8000
-# remote 8xPRO 122B-NVFP4, four independent native TP2 replicas
-python scripts/serve-tiered.py --model /mnt/nas1/hf/Qwen3.5-122B-A10B-NVFP4 \
-  --replicas 4 --tp 2 --port-base 8100 --max-model-len 1024
-```
-
-Run it with:
-
-```bash
-just tcp-twolevel-rust
-```
-
-TLA+ tools are not vendored. Run:
-
-```sh
-./scripts/check-tla.sh
-```
-
-The script expects `tlc` on `PATH`.
-
-## Repository layout
-
-| Crate | Responsibility |
-| --- | --- |
-| `plait-core` | identities, tensors, commands, conflict keys, membership, quorum policy |
-| `plait-consensus` | leaderless ordering, ballots, recovery, SCC execution, snapshots |
-| `plait-fabric` | fused runtime and replicated state transitions |
-| `plait-collective` | CUDA peer-memory collectives, IPC/VMM, topology, protocols |
-| `plait-parallel` | TP/PP/EP/DP/CP/SP planning, DSA/MoE/DP/PP runners, heterogeneous LP, rejoin |
-| `plait-mem` | aligned buffers, pooling, registered regions, RDMA contract |
-| `plait-rdma` | real libibverbs RC QP, one-sided read/write, completion polling |
-| `plait-net` | framed TCP control transport |
-| `plait-device` | device discovery and capability scheduling |
-| `plait-gpu` | CUDA AXPY and CUTLASS SGEMM execution |
-| `plait-node` | cluster process, client, benchmarks, demos |
-| `plait-nccl` | PyO3 NCCL-compatible communicator for PyTorch/vLLM |
-
-Design documents:
-
-- [docs/design/plait.md](docs/design/plait.md) — design of record
-- [docs/design/plait-requirements.md](docs/design/plait-requirements.md) — requirements
-- [docs/design/asymmetric.md](docs/design/asymmetric.md) — heterogeneous row scheduling
-- [docs/architecture.md](docs/architecture.md) — protocol and data flow
-- [docs/parallelism.md](docs/parallelism.md) — parallelism-axis mapping
-- [docs/rdma.md](docs/rdma.md) — verbs backend and setup
-- [docs/goals/tcp-parity.md](docs/goals/tcp-parity.md) — TCP/NCCL acceptance goal
-- [docs/nccl-python.md](docs/nccl-python.md) — vLLM/Python NCCL compatibility backend
-- [docs/rankless-nccl.md](docs/rankless-nccl.md) — rankless groups and vendor backends
-- [specs/](specs/) — TLA+ models and TLC configurations
-
-## Limitations
-
-- No authentication or encryption. The transport trusts the network.
-- No durable state. Restart with the same identity is not handled.
-- No verified cross-host GPU-buffer collective outside the host-staged `plait-nccl` TCP path.
-- Only NVIDIA has a real kernel adapter. AMD, Huawei, and PPU profiles are
-  discovered and scheduled, but their kernel adapters are not implemented.
-- LL/LL128 remain opt-in and are slower on the tested PCIe host.
-- TLA+ results are finite-state checks, not a refinement proof of the Rust
-  implementation.
-
-## License
-
-See [LICENSE](LICENSE).
+[Architecture](docs/architecture.md) ·
+[Parallelism](docs/parallelism.md) ·
+[License](LICENSE)

@@ -84,6 +84,24 @@ int plait_w4_quantize_f16_v1(
     uint32_t activation_bits, const void *input, void *codes, void *scales,
     void *invalid, void **completion);
 
+/* Optional FP16 input projection on a caller-owned CUDA, HIP, CANN, or PPU stream.
+ * Weight, scale, zero, bias, and output follow plait_w4a16_launch. The library
+ * quantizes A to signed INT4 or INT8 before the corresponding integer GEMM.
+ * The workspace query returns SIZE_MAX for an unsupported shape or bit width.
+ * Supply at least that many device bytes, aligned to four bytes. Scratch and
+ * output must be disjoint from each other and all inputs. Keep the pointers
+ * alive until queued work completes, including after a partial launch error.
+ * Serialize host calls that share scratch, and order cross-stream reuse with
+ * caller synchronization. Non-finite input makes its output row NaN.
+ * The calls allocate no device memory, create no events, and do not wait.
+ */
+size_t plait_w4_stream_workspace_v1(const plait_w4a16_shape *shape, uint32_t activation_bits);
+int plait_w4_stream_launch_v1(
+    const plait_w4a16_shape *shape, uint32_t activation_bits, const uint16_t *input,
+    const uint8_t *weight, const uint16_t *weight_scale, const uint8_t *zero,
+    const uint16_t *bias, void *output, void *workspace, size_t workspace_bytes,
+    void *stream);
+
 /* Optional CUDA-compatible extension. Buffers and completions use the same session ABI.
  * probe returns -1 for an unsupported device, or a runtime status otherwise.
  * launch accepts FP16 without bias and Marlin-packed weights and scales.

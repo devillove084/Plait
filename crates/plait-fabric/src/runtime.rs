@@ -1,11 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use plait_consensus::{InstanceId, StateMachine};
+use plait_core::group::{
+    ComputeRate, GrantStatus, GroupOperation, GroupReceipt, GroupResult,
+    GroupView as PeerGroupView, PlacementInventory, PreparedSetView,
+};
 use plait_core::serving::{
     DecoderCheckpoint, DecoderClaim, DecoderDirectory, DecoderDrainStatus, DecoderFailover,
     DecoderReplayPage, DecoderRouteWork, DecoderSwitch, ExecutionHostLiveness, GroupVersion,
-    GroupView, ResidentOwner, RouteDirectory, RouteSetId, ServingOperation, ServingReceipt,
-    ServingResources, ServingResult, W4DrainStatus, WorkerDispatch, WorkerGrant,
+    GroupView, HostedAssignment, HostedManagedAssignment, HostedPdIntent, HostedPdPlanning,
+    HostedPdReconfiguration, HostedPdRecovery, HostedPdTransitionStatus, HostedPlanning,
+    HostedProbeEndpoint, HostedRouteDirectory, HostedServingIntent, ResidentOwner, RouteDirectory,
+    RouteSetId, ServingAction, ServingOperation, ServingReceipt, ServingResources, ServingResult,
+    W4DrainStatus, WorkerDispatch, WorkerGrant,
 };
 use plait_core::{
     AcceleratorKind, Command, ComputeTask, DeviceId, DeviceProfile, FuseKind, MembershipChange,
@@ -53,6 +60,10 @@ pub enum Event {
         operation: OpId,
         result: ServingResult,
     },
+    GroupApplied {
+        operation: OpId,
+        result: GroupResult,
+    },
     Error(String),
 }
 
@@ -74,9 +85,15 @@ pub struct Runtime {
     devices: BTreeMap<DeviceId, DeviceProfile>,
     placements: BTreeMap<OpId, DeviceId>,
     serving: ServingState,
-    deferred_serving: Option<Vec<ServingOperation>>,
+    deferred_control: Option<Vec<ControlOperation>>,
     applied: BTreeSet<InstanceId>,
     events: Vec<Event>,
+}
+
+#[derive(Clone)]
+enum ControlOperation {
+    Serving(ServingOperation),
+    Group(GroupOperation),
 }
 
 impl Runtime {
@@ -112,12 +129,146 @@ impl Runtime {
         self.serving.group(version)
     }
 
+    pub fn peer_group(&self, version: GroupVersion) -> Option<PeerGroupView> {
+        self.serving.peer_group_view(version)
+    }
+
+    pub fn worker_state(&self, device: DeviceId) -> Option<plait_core::group::WorkerStateView> {
+        self.serving.worker_state(device)
+    }
+
+    pub fn peer_group_recipe(
+        &self,
+        version: GroupVersion,
+    ) -> Option<plait_core::group::GroupRecipe> {
+        self.serving.peer_group_recipe(version)
+    }
+
+    pub fn peer_grant_status(&self, grant: WorkerGrant) -> GrantStatus {
+        self.serving.peer_grant_status(grant)
+    }
+
+    pub fn peer_staging_bytes(&self, grant: WorkerGrant) -> Option<u64> {
+        self.serving.peer_staging_bytes(grant)
+    }
+
+    pub fn peer_standby(&self, group: plait_core::group::GroupId) -> Option<GroupVersion> {
+        self.serving.peer_standby(group)
+    }
+
+    pub fn latest_peer_preparation(
+        &self,
+        group: plait_core::group::GroupId,
+    ) -> Option<PreparedSetView> {
+        self.serving.latest_peer_preparation(group)
+    }
+
+    pub fn placement_inventory(&self, group: plait_core::group::GroupId) -> PlacementInventory {
+        self.serving.placement_inventory(group)
+    }
+
+    pub fn compute_rates(&self, calibration: NodeId) -> Vec<ComputeRate> {
+        self.serving.compute_rates(calibration)
+    }
+
+    pub fn compute_rate(&self, device: DeviceId, calibration: NodeId) -> Option<ComputeRate> {
+        self.serving.compute_rate(device, calibration)
+    }
+
+    pub fn link_probes(&self) -> Vec<plait_core::link::ProbeRegistration> {
+        self.serving.link_probes()
+    }
+
+    pub fn peer_group_receipt(&self, id: OpId) -> Option<&GroupReceipt> {
+        self.serving.peer_group_receipt(id)
+    }
+
     pub fn serving_receipt(&self, operation: OpId) -> Option<&ServingReceipt> {
         self.serving.receipt(operation)
     }
 
     pub fn serving_resources(&self) -> ServingResources {
         self.serving.resources()
+    }
+
+    pub fn serving_hosted_assignments(&self, host: NodeId) -> Vec<HostedAssignment> {
+        self.serving.hosted_assignments(host)
+    }
+
+    pub fn serving_hosted_managed_assignments(&self, host: NodeId) -> Vec<HostedManagedAssignment> {
+        self.serving.hosted_managed_assignments(host)
+    }
+
+    pub fn serving_hosted_pd_pending(&self, key: RouteSetId) -> Option<HostedPdIntent> {
+        self.serving.hosted_pd_pending(key)
+    }
+
+    pub fn serving_hosted_routes(&self, key: RouteSetId) -> Option<HostedRouteDirectory> {
+        self.serving.hosted_routes(key)
+    }
+
+    pub fn serving_hosted_pending(&self, key: RouteSetId) -> Option<HostedServingIntent> {
+        self.serving.hosted_serving_pending(key)
+    }
+
+    pub fn serving_mode_planning(
+        &self,
+        key: RouteSetId,
+    ) -> plait_core::serving::HostedServingPlanning {
+        self.serving.hosted_serving_planning(key)
+    }
+
+    pub fn serving_hosted_evacuation(
+        &self,
+        key: RouteSetId,
+    ) -> plait_core::serving::HostedEvacuationPlanning {
+        self.serving.hosted_evacuation_planning(key)
+    }
+
+    pub fn serving_execution_drain(
+        &self,
+        target: plait_core::serving::ExecutionDrainTarget,
+    ) -> plait_core::serving::ExecutionDrainStatus {
+        self.serving.execution_drain(target)
+    }
+
+    pub fn serving_hosted_work(&self) -> Vec<HostedServingIntent> {
+        self.serving.hosted_serving_work()
+    }
+
+    pub fn serving_hosted_pd_planning(&self, key: RouteSetId) -> HostedPdPlanning {
+        self.serving.hosted_pd_planning(key)
+    }
+
+    pub fn serving_hosted_pd_reconfiguration(&self, key: RouteSetId) -> HostedPdReconfiguration {
+        self.serving.hosted_pd_reconfiguration(key)
+    }
+
+    pub fn serving_hosted_pd_recovery(&self, key: RouteSetId) -> Option<HostedPdRecovery> {
+        self.serving.hosted_pd_recovery(key)
+    }
+
+    pub fn serving_hosted_pd_work(&self) -> Vec<HostedPdIntent> {
+        self.serving.hosted_pd_work()
+    }
+
+    pub fn serving_hosted_pd_transition_status(
+        &self,
+        key: RouteSetId,
+    ) -> Option<HostedPdTransitionStatus> {
+        self.serving.hosted_pd_transition_status(key)
+    }
+
+    pub fn serving_hosted_pd_transition_work(&self) -> Vec<ServingAction> {
+        self.serving.hosted_pd_transition_work()
+    }
+
+    pub fn serving_hosted_probe_endpoints(&self) -> Vec<HostedProbeEndpoint> {
+        self.serving.hosted_probe_endpoints()
+    }
+
+    pub fn serving_hosted_planning(&self) -> HostedPlanning {
+        self.serving.hosted_planning()
     }
 
     pub fn serving_dispatch(&self, version: GroupVersion) -> Vec<WorkerDispatch> {
@@ -310,6 +461,15 @@ impl Runtime {
                 }
                 Ok(())
             }
+            Command::Group(operation) => {
+                if self
+                    .peer_group_receipt(operation.id)
+                    .is_some_and(|receipt| receipt.operation != **operation)
+                {
+                    return Err("group operation id already used for another action".to_owned());
+                }
+                Ok(())
+            }
             Command::Nop | Command::Membership(_) => Ok(()),
         }
     }
@@ -342,10 +502,17 @@ impl Runtime {
             Command::Compute(task) => self.compute(task.clone()),
             Command::Membership(change) => self.membership(change),
             Command::Serving(operation) => {
-                if let Some(changes) = &mut self.deferred_serving {
-                    changes.push((**operation).clone());
+                if let Some(changes) = &mut self.deferred_control {
+                    changes.push(ControlOperation::Serving((**operation).clone()));
                 } else {
                     self.apply_serving(operation);
+                }
+            }
+            Command::Group(operation) => {
+                if let Some(changes) = &mut self.deferred_control {
+                    changes.push(ControlOperation::Group((**operation).clone()));
+                } else {
+                    self.apply_group(operation);
                 }
             }
         }
@@ -354,6 +521,14 @@ impl Runtime {
     fn apply_serving(&mut self, operation: &ServingOperation) {
         let result = self.serving.apply(operation);
         self.events.push(Event::ServingApplied {
+            operation: operation.id,
+            result,
+        });
+    }
+
+    fn apply_group(&mut self, operation: &GroupOperation) {
+        let result = self.serving.apply_peer_group(operation);
+        self.events.push(Event::GroupApplied {
             operation: operation.id,
             result,
         });
@@ -680,7 +855,7 @@ impl StateMachine for Runtime {
     /// same replicated state and applies one complete SCC; the parent then
     /// merges the resulting maps in deterministic batch order.
     fn fork_batch(&self) -> Option<Self> {
-        // Replay only this batch's serving commands at merge time. A cloned
+        // Replay this batch's ordered resource commands at merge time. A cloned
         // reservation table would overwrite decisions made by earlier batches.
         Some(Self {
             ops: self.ops.clone(),
@@ -691,7 +866,7 @@ impl StateMachine for Runtime {
             devices: self.devices.clone(),
             placements: self.placements.clone(),
             applied: self.applied.clone(),
-            deferred_serving: Some(Vec::new()),
+            deferred_control: Some(Vec::new()),
             ..Self::default()
         })
     }
@@ -705,8 +880,11 @@ impl StateMachine for Runtime {
         self.members.extend(other.members);
         self.devices.extend(other.devices);
         self.placements.extend(other.placements);
-        for operation in other.deferred_serving.take().unwrap_or_default() {
-            self.apply_serving(&operation);
+        for operation in other.deferred_control.take().unwrap_or_default() {
+            match operation {
+                ControlOperation::Serving(operation) => self.apply_serving(&operation),
+                ControlOperation::Group(operation) => self.apply_group(&operation),
+            }
         }
         self.events.append(&mut other.events);
     }

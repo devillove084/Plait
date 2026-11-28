@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import secrets
 import time
 from typing import Any
 
@@ -39,6 +40,20 @@ class ncclUniqueId:
         return value
 
 
+class PeerRequest:
+    """One native collective result, with a retained communicator."""
+
+    def __init__(self, request: "_plait_nccl.PeerRequest", owner: "_plait_nccl.CommHandle") -> None:
+        self._request = request
+        self._owner = owner
+
+    def is_completed(self) -> bool:
+        return self._request.is_completed()
+
+    def wait(self, target: int, size_bytes: int, stream: int) -> None:
+        self._request.wait(self._owner, target, size_bytes, stream)
+
+
 class CommHandle:
     """Thin Python view over the Rust communicator."""
 
@@ -55,6 +70,31 @@ class CommHandle:
     def world(self) -> int:
         return self._world
 
+    @property
+    def peer_failed(self) -> bool | None:
+        """Report local peer communicator failure, including grant revocation."""
+        return self._handle.peer_failed
+
+    def report_execution_failure(self) -> None:
+        """Close the peer group and report a failed execution under its grant."""
+        report = getattr(self._handle, "report_execution_failure", self._handle.abort)
+        report()
+
+    def compute_rate_revision(self, host: str, seeds: list[str], calibration: str) -> int:
+        """Read the measurement revision for this communicator's device."""
+        address = f"[{host}]:0" if ":" in host else f"{host}:0"
+        return self._handle.compute_rate(address, seeds, calibration)
+
+    def publish_compute_rate(
+        self, host: str, seeds: list[str], calibration: str,
+        expected_revision: int, operations_per_second: int,
+    ) -> int:
+        """Publish a measurement under this communicator's device grant."""
+        address = f"[{host}]:0" if ":" in host else f"{host}:0"
+        return self._handle.compute_rate(
+            address, seeds, calibration, (expected_revision, operations_per_second),
+        )
+
     def all_reduce(self, send: int, recv: int, count: int, dtype: int, op: int) -> int:
         return self._handle.all_reduce(send, recv, count, dtype, op)
 
@@ -68,8 +108,31 @@ class CommHandle:
     ) -> int:
         return self._handle.all_reduce_fp8_to_f32(send, recv, count)
 
+    def try_all_reduce(
+        self, send: int, count: int, dtype: int, op: int, stream: int = 0
+    ) -> PeerRequest | None:
+        """Stage input and submit, or return None before assigning a sequence."""
+        submit = getattr(self._handle, "submit_all_reduce", None)
+        request = None if submit is None else submit(send, count, dtype, op, stream)
+        return None if request is None else PeerRequest(request, self._handle)
+
+    @property
+    def supports_all_reduce_requests(self) -> bool:
+        return hasattr(self._handle, "submit_all_reduce") and self.peer_failed is not None
+
     def all_gather(self, send: int, recv: int, count: int, dtype: int, stream: int = 0) -> int:
         return self._handle.all_gather(send, recv, count, dtype, stream)
+
+    def try_all_gather(
+        self, send: int, count: int, dtype: int, stream: int = 0
+    ) -> PeerRequest | None:
+        submit = getattr(self._handle, "submit_all_gather", None)
+        request = None if submit is None else submit(send, count, dtype, stream)
+        return None if request is None else PeerRequest(request, self._handle)
+
+    @property
+    def supports_all_gather_requests(self) -> bool:
+        return hasattr(self._handle, "submit_all_gather") and self.peer_failed is not None
 
     def broadcast(self, send: int, recv: int, count: int, dtype: int, root: int, stream: int = 0) -> int:
         return self._handle.broadcast(send, recv, count, dtype, root, stream)
@@ -93,7 +156,9 @@ def _port() -> int:
 
 def _check(result: int) -> None:
     if result != 0:
-        raise RuntimeError(f"Plait NCCL error {result}")
+        take_error = getattr(_plait_nccl, "take_last_error", None)
+        detail = take_error() if take_error is not None else ""
+        raise RuntimeError(f"Plait NCCL error {result}" + (f": {detail}" if detail else ""))
 
 
 def _ptr(value: Any) -> int:
@@ -157,6 +222,90 @@ class NCCLLibrary:
         self._comms.add(comm)
         return comm
 
+    def connect_peers(
+        self,
+        host: str,
+        slot: int,
+        exchange_endpoints,
+        *,
+        replicated_egress_bytes: int | None = None,
+    ) -> CommHandle:
+        """Exchange per-device endpoints, then connect the peer communicator."""
+        address = f"[{host}]:0" if ":" in host else f"{host}:0"
+        ticket = secrets.token_bytes(16)
+        listener = None
+        try:
+            options = {}
+            if replicated_egress_bytes is not None:
+                options["replicated_egress_bytes"] = replicated_egress_bytes
+            listener = _plait_nccl.PeerListener(
+                address, ticket, os.environ.get("PLAIT_TP_GROUP_VERSION"), **options
+            )
+            local = (listener.endpoint(), ticket)
+        except (AttributeError, OSError, TypeError, ValueError, OverflowError) as exc:
+            local = str(exc)
+        members = exchange_endpoints(local)
+        for peer, member in enumerate(members):
+            if isinstance(member, str):
+                raise RuntimeError(f"Plait peer {peer} failed to bind: {member}")
+        if listener is None:
+            raise RuntimeError("local Plait peer listener failed to bind")
+        timeout_ms = int(os.environ.get("PLAIT_NCCL_TIMEOUT_MS", "120000"))
+        device = self.device
+        if device is None:
+            device = int(os.environ.get("PLAIT_NCCL_DEVICE", os.environ.get("LOCAL_RANK", slot)))
+        comm = CommHandle(listener.connect(members, slot, device, timeout_ms))
+        self._comms.add(comm)
+        return comm
+
+    def join_versioned_group(
+        self,
+        host: str,
+        seeds: list[str],
+        version: str,
+        devices: list[tuple[str, int]],
+        slot: int,
+        *,
+        replicated_egress_bytes: int | None = None,
+    ) -> CommHandle:
+        """Join committed devices in the caller's logical collective order."""
+        address = f"[{host}]:0" if ":" in host else f"{host}:0"
+        timeout_ms = int(os.environ.get("PLAIT_NCCL_TIMEOUT_MS", "120000"))
+        if self.device is None:
+            raise ValueError("a versioned group requires the local accelerator index")
+        options = {}
+        if replicated_egress_bytes is not None:
+            options["replicated_egress_bytes"] = replicated_egress_bytes
+        comm = CommHandle(_plait_nccl.join_versioned_group(
+            address, seeds, version, devices, slot, self.device, timeout_ms, **options,
+        ))
+        self._comms.add(comm)
+        return comm
+
+    def join_versioned_model_group(
+        self,
+        host: str,
+        seeds: list[str],
+        version: str,
+        devices: list[tuple[str, int]],
+        slot: int,
+        tensor_parallel: int,
+        *,
+        replicated_egress_bytes: int | None = None,
+    ) -> tuple[CommHandle, CommHandle]:
+        """Join the local TP and PP communicators using one committed device grant."""
+        if self.device is None:
+            raise ValueError("a versioned group requires the local accelerator index")
+        address = f"[{host}]:0" if ":" in host else f"{host}:0"
+        timeout_ms = int(os.environ.get("PLAIT_NCCL_TIMEOUT_MS", "120000"))
+        tp, pp = _plait_nccl.join_versioned_model_group(
+            address, seeds, version, devices, slot, self.device, timeout_ms,
+            tensor_parallel, replicated_egress_bytes,
+        )
+        tensor, pipeline = CommHandle(tp), CommHandle(pp)
+        self._comms.update((tensor, pipeline))
+        return tensor, pipeline
+
     def ncclAllReduce(self, sendbuff, recvbuff, count: int, datatype: int, op: int, comm: CommHandle, stream) -> None:
         send = _ptr(sendbuff)
         recv = _ptr(recvbuff)
@@ -175,8 +324,7 @@ class NCCLLibrary:
                 )
         else:
             result = handle.all_reduce_stream(send, recv, count, datatype, op, cstream)
-        if result != 0:
-            raise RuntimeError(f"Plait NCCL error {result}")
+        _check(result)
 
     def ncclAllGather(self, sendbuff, recvbuff, count: int, datatype: int, comm: CommHandle, stream) -> None:
         _check(comm.all_gather(_ptr(sendbuff), _ptr(recvbuff), count, datatype, _ptr(stream)))
@@ -197,10 +345,13 @@ class NCCLLibrary:
         _check(comm.recv(_ptr(recvbuff), count, datatype, src, _ptr(stream)))
 
     def ncclCommDestroy(self, comm: CommHandle) -> None:
+        abort = getattr(comm._handle, "abort", None)
+        if abort is not None:
+            abort()
         self._comms.discard(comm)
 
     def ncclCommAbort(self, comm: CommHandle) -> None:
-        self._comms.discard(comm)
+        self.ncclCommDestroy(comm)
 
     def ncclGroupStart(self) -> None:
         return None

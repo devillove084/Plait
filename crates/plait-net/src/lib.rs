@@ -16,6 +16,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::{Sink, SinkExt, StreamExt};
 use plait_consensus::{Message, Snapshot};
+use plait_core::group::{GroupLookup, GroupReply};
 use plait_core::serving::{GroupId, GroupView, ServingError, ServingLookup, ServingView};
 use plait_core::{Command, NodeId, OpId};
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::codec::{Framed, FramedWrite, LengthDelimitedCodec};
 
+pub mod control;
 pub mod tensor;
 
 const MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -97,6 +99,16 @@ pub enum Wire {
     },
     DiscoverVoter,
     VoterIdentity(NodeId),
+    GroupQuery {
+        request: u64,
+        lookup: GroupLookup,
+        reply_to: String,
+    },
+    GroupQueryReply {
+        request: u64,
+        lookup: GroupLookup,
+        view: Box<GroupReply>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -426,6 +438,15 @@ async fn send_frame<T: Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_staging_reply_preserves_its_wire_discriminant() {
+        // The deployed collective client uses variant 10 for this reply.
+        let bytes = [10, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0];
+        let reply = GroupReply::PeerStagingBytes(Some(65_536));
+        assert_eq!(bincode::serialize(&reply).unwrap(), bytes);
+        assert_eq!(bincode::deserialize::<GroupReply>(&bytes).unwrap(), reply);
+    }
 
     #[tokio::test]
     async fn sends_and_receives_frames() {

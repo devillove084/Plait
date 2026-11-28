@@ -306,6 +306,7 @@ int device_buffer_read(void *handle, const void *buffer, void *destination, size
 
 template <typename Submit>
 int record_submission(Session *session, void **completion, Submit submit) {
+    if (!session || !completion) return PLAIT_GPU(ErrorInvalidValue);
     auto status = session->bind();
     if (status != PLAIT_GPU(Success)) return status;
     PLAIT_GPU(Event_t) event = nullptr;
@@ -571,6 +572,33 @@ extern "C" int plait_w4_quantize_f16_v1(
     });
 }
 
+static PLAIT_GPU(Error_t) launch_integer_projection(
+    PLAIT_GPU(Stream_t) stream, const plait_w4a16_shape &s, uint32_t bits, const void *activation,
+    const void *activation_scale, const void *weight, const void *weight_scale, const void *zero,
+    const void *bias, void *output) {
+    const auto groups = plait_ceil_div(s.k, s.group_size);
+    const auto stride = plait_ceil_div(s.k, 2);
+    const auto a = static_cast<const uint8_t *>(activation);
+    const auto as = static_cast<const float *>(activation_scale);
+    const auto w = static_cast<const uint8_t *>(weight);
+    const auto ws = static_cast<const __half *>(weight_scale);
+    const auto z = static_cast<const uint8_t *>(zero);
+    const auto b = static_cast<const __half *>(bias);
+#if defined(__HIP__)
+    constexpr uint32_t threads = 128;
+    const auto blocks = plait_ceil_div(s.m * s.n, threads);
+    const auto grid = blocks > 65535 ? 65535 : blocks;
+    if (bits == 4) {
+        w4_integer<4><<<grid, threads, 0, stream>>>(a, as, w, ws, z, b, output, s, groups, stride);
+    } else {
+        w4_integer<8><<<grid, threads, 0, stream>>>(a, as, w, ws, z, b, output, s, groups, stride);
+    }
+#else
+    plait_integer_mma::launch(stream, bits, a, as, w, ws, z, b, output, s, groups, stride);
+#endif
+    return PLAIT_GPU(GetLastError)();
+}
+
 extern "C" int plait_w4_quantized_launch_v1(
     void *handle, const plait_w4a16_shape *shape, uint32_t bits, const void *activation,
     const void *activation_scale, const void *weight, const void *weight_scale, const void *zero,
@@ -580,30 +608,46 @@ extern "C" int plait_w4_quantized_launch_v1(
         return PLAIT_GPU(ErrorInvalidValue);
     }
     auto session = static_cast<Session *>(handle);
-    const auto s = *shape;
-    const auto groups = plait_ceil_div(s.k, s.group_size);
-    const auto stride = plait_ceil_div(s.k, 2);
     return record_submission(session, completion, [&] {
-        const auto a = static_cast<const uint8_t *>(activation);
-        const auto as = static_cast<const float *>(activation_scale);
-        const auto w = static_cast<const uint8_t *>(weight);
-        const auto ws = static_cast<const __half *>(weight_scale);
-        const auto z = static_cast<const uint8_t *>(zero);
-        const auto b = static_cast<const __half *>(bias);
-#if defined(__HIP__)
-        constexpr uint32_t threads = 128;
-        const auto blocks = plait_ceil_div(s.m * s.n, threads);
-        const auto grid = blocks > 65535 ? 65535 : blocks;
-        if (bits == 4) {
-            w4_integer<4><<<grid, threads, 0, session->stream>>>(a, as, w, ws, z, b, output, s, groups, stride);
-        } else {
-            w4_integer<8><<<grid, threads, 0, session->stream>>>(a, as, w, ws, z, b, output, s, groups, stride);
-        }
-#else
-        plait_integer_mma::launch(session->stream, bits, a, as, w, ws, z, b, output, s, groups, stride);
-#endif
-        return PLAIT_GPU(GetLastError)();
+        return launch_integer_projection(session->stream, *shape, bits, activation, activation_scale,
+                                         weight, weight_scale, zero, bias, output);
     });
+}
+
+static size_t stream_scale_offset(const plait_w4a16_shape &s, uint32_t bits) {
+    const auto codes = size_t(s.m) * (bits == 4 ? plait_ceil_div(s.k, 2) : s.k);
+    constexpr auto alignment = alignof(float);
+    return (codes + alignment - 1) & ~(alignment - 1);
+}
+
+extern "C" size_t plait_w4_stream_workspace_v1(const plait_w4a16_shape *shape, uint32_t bits) {
+    if (!plait_w4_quantized_valid_shape(shape, bits) || uint64_t(shape->m) * shape->k > UINT32_MAX) {
+        return SIZE_MAX;
+    }
+    const auto s = *shape;
+    const auto offset = stream_scale_offset(s, bits);
+    const uint64_t scales = uint64_t(s.m) * plait_ceil_div(s.k, s.group_size) * sizeof(float);
+    return scales > SIZE_MAX - offset ? SIZE_MAX : offset + size_t(scales);
+}
+
+extern "C" int plait_w4_stream_launch_v1(
+    const plait_w4a16_shape *shape, uint32_t bits, const uint16_t *input,
+    const uint8_t *weight, const uint16_t *weight_scale, const uint8_t *zero,
+    const uint16_t *bias, void *output, void *workspace, size_t workspace_bytes, void *stream) {
+    const auto required = plait_w4_stream_workspace_v1(shape, bits);
+    if (required == SIZE_MAX || required > workspace_bytes || !workspace ||
+        uintptr_t(workspace) % alignof(float) != 0 || !input || !weight || !weight_scale ||
+        !zero || !output) {
+        return PLAIT_GPU(ErrorInvalidValue);
+    }
+    const auto s = *shape;
+    auto codes = static_cast<uint8_t *>(workspace);
+    auto scales = reinterpret_cast<float *>(codes + stream_scale_offset(s, bits));
+    auto queue = static_cast<PLAIT_GPU(Stream_t)>(stream);
+    auto status = plait_activation_quantizer::launch(queue, s.m, s.k, s.group_size, bits,
+        reinterpret_cast<const __half *>(input), codes, scales, nullptr);
+    if (status != PLAIT_GPU(Success)) return status;
+    return launch_integer_projection(queue, s, bits, codes, scales, weight, weight_scale, zero, bias, output);
 }
 #endif
 
