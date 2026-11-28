@@ -10,6 +10,7 @@
 *.profraw
 *.profdata
 perf.data*
+/paper
 
 # Python build products
 __pycache__/
