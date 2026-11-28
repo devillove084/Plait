@@ -1571,6 +1571,37 @@ until drain finished. A new request reused 144 prompt tokens in Decode
 and matched the aggregate's output. After releasing the old grant, the
 test reused that device for a new aggregate epoch and switched back.
 
+#### Keep serving while reusing devices for a larger group
+
+Use a separate aggregate group as a temporary route when the target
+layout needs devices held by the incumbent. Prepare the temporary engine
+on disjoint devices and verify its versioned HTTP health. Publish the
+incumbent and temporary routes in one native directory. The first
+`SwitchActiveSet` activates the temporary group and drains the incumbent
+in one ordered operation.
+
+The incumbent finishes accepted requests. Its launchers return each
+grant after local execution has stopped. After those grants return,
+prepare the larger layout under the incumbent's group ID with a new
+epoch. The temporary engine serves requests during model loading and
+communication setup. Once the target's route is published and its
+versioned health check passes, a second `SwitchActiveSet` activates the
+larger group and drains the temporary engine.
+
+The native vLLM ingress can see a stale route while the old admission
+gate shuts. When every current route declines a request before
+generation admission, the ingress can try a newly observed route once.
+It waits through at most two 500 ms directory poll intervals within the
+request deadline. A failure with unknown delivery is terminal. The
+second attempt relies on the existing active-set watcher.
+
+Size the temporary engine for the demand that must be served during
+preparation. It holds separate resources and may have lower capacity
+than the incumbent. Without those resources, reusing occupied devices
+still requires a gap between the old and new engines. This procedure
+uses explicit deployment decisions and leaves request state with the
+engine that accepted it.
+
 #### Select a ready native layout from live demand
 
 Run the native ingress with `--mode-policy policy.json`. Enable this flag
