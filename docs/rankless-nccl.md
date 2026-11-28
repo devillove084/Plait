@@ -693,21 +693,25 @@ responses finish. When that count reaches zero, it pauses vLLM in wait mode
 and waits for vLLM to synchronize the devices.
 
 After the API acknowledges drain, its launcher submits `Revoke` for the old
-version. Each participating host observes the revocation and stops its local
-engine process group. It returns only its own grants, after the entire process
-group has exited. Plait releases each host's reservation after its last grant
-returns. The group becomes `Retired` once all grants have returned.
+version. Each participating host observes the revocation and sends `SIGTERM`
+to its local engine process group. After a ten-second grace period the
+launcher sends `SIGKILL` if the group still exists. It waits for the entire
+process group to exit, then persists its exact local grants and release
+operation IDs before submitting any release. Plait releases each host's
+reservation after its last grant returns. The group becomes `Retired` once
+all grants have returned.
 
 The launcher checks that the version is still preparing after acquiring its
 local launch lock. An unexpected child exit is reported against an exact
 grant. If the OS rejects the executable on the first local launch attempt,
 the launcher writes a failure journal in its state directory before sending
-the report. Restart the launcher with the same state directory to resume
-the original report and release operations. Recovery takes the same launch
-lock, checks the exact grants against the voter, and removes the journal
-after receiving every release receipt. If a process group may have started,
-the deployment operator establishes that it has stopped before releasing its
-grants.
+the report. The launcher holds the local launch lock through process exit and
+release. On restart with the same state directory, it acquires that lock,
+checks the grants against a fresh ordered view, and resumes any recorded
+report or release using its original operation ID. It removes the journal
+after receiving every release receipt. When the launcher loses track of a
+process group before recording its exit, the deployment operator establishes
+that the process group has stopped before releasing its grants.
 
 #### Measure peer collective phases
 
