@@ -24,6 +24,9 @@ use cudarc::driver::{
 #[cfg(not(plait_collective_cubin))]
 use cudarc::nvrtc::compile_ptx;
 
+#[cfg(plait_collective_cubin)]
+const COLLECTIVE_CUBIN: &[u8] = include_bytes!(env!("PLAIT_COLLECTIVE_CUBIN"));
+
 #[cfg(not(plait_collective_cubin))]
 const ADD_KERNEL: &str = r#"
 extern "C" __global__ void plait_add_inplace(
@@ -211,12 +214,7 @@ impl PeerGroup {
                 );
             }
             #[cfg(plait_collective_cubin)]
-            let ptx = {
-                use cudarc::nvrtc::Ptx;
-                Ptx::from_binary(std::fs::read(env!("PLAIT_COLLECTIVE_CUBIN")).map_err(
-                    |error| CollectiveError::new(format!("read collective cubin: {error}")),
-                )?)
-            };
+            let ptx = cudarc::nvrtc::Ptx::from_binary(COLLECTIVE_CUBIN.to_vec());
             #[cfg(not(plait_collective_cubin))]
             let ptx = compile_ptx(ADD_KERNEL)
                 .map_err(|error| CollectiveError::new(format!("NVRTC: {error:?}")))?;

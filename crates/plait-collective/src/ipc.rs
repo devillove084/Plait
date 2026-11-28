@@ -11,6 +11,8 @@ use std::sync::Arc;
 use cudarc::driver::sys;
 use cudarc::driver::{CudaContext, DriverError};
 
+#[cfg(plait_collective_cubin)]
+use crate::COLLECTIVE_CUBIN;
 use crate::{CollectiveError, Result};
 
 /// 64-byte CUDA IPC memory handle, serializable as hex.
@@ -261,7 +263,6 @@ pub struct AddKernel {
 impl AddKernel {
     #[cfg(plait_collective_cubin)]
     pub fn current(device: usize) -> Result<Self> {
-        const CUBIN: &[u8] = include_bytes!(env!("PLAIT_COLLECTIVE_CUBIN"));
         let context = CudaContext::new(device)
             .map_err(|error| CollectiveError::new(format!("CUDA context {device}: {error}")))?;
         context
@@ -269,7 +270,9 @@ impl AddKernel {
             .map_err(|error| CollectiveError::new(format!("bind context: {error}")))?;
         let mut module = std::ptr::null_mut();
         check(
-            unsafe { sys::cuModuleLoadData(&mut module, CUBIN.as_ptr().cast::<c_void>()) },
+            unsafe {
+                sys::cuModuleLoadData(&mut module, COLLECTIVE_CUBIN.as_ptr().cast::<c_void>())
+            },
             "cuModuleLoadData",
         )?;
         let name = CString::new("plait_add_inplace").expect("kernel name");
