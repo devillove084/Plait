@@ -77,16 +77,38 @@ execution workers separately can use `--no-advertise-devices`.
    for new work, and check that the returned phase is still `Active`.
 4. `Drain` and `Revoke` remove the version from new admissions. After a worker
    finishes or cancels its calls and closes access to its device and buffers,
-   submit `Release` with its exact grant. The device becomes eligible for a
-   new fence immediately. The host's reservation remains until its last grant
-   in that version is released. Later retries for a released grant preserve
-   any successor reservation.
+   submit `Release` with its exact grant. An available device becomes eligible
+   for a new fence immediately. The host's reservation remains until its last
+   grant in that version is released. Later retries for a released grant
+   preserve any successor reservation.
 
 The `apply` request takes an `operation` containing an `id` and a serialized
 `GroupAction`. Keep the operation ID when retrying an ambiguous result.
 Voters with `run --state-dir` preserve applied group metadata through restart.
 Callers use current metadata and device completion to decide when existing
 handles can be reclaimed.
+
+### Withdraw an unavailable worker
+
+For a confirmed worker outage, send an `apply` request to `plait-node group`
+with the `ReportWorkerUnavailable` action and the exact held grant.
+One ordered operation revokes the group, activates any armed standby, and
+records a drain for that device.
+The report can follow a group-wide failure report while the grant remains
+held. A delayed report for a released grant returns `GrantMismatch`.
+
+Each old worker returns its grant after local work and device access have
+ended. The drained device stays out of placement after its grant returns.
+Other devices on the same host can serve their current groups or receive
+new grants. The resident planner can prepare a smaller configured recipe
+as soon as its devices and host resources become available.
+
+After verifying device recovery, look up the drain with `execution_drain`
+through `plait-node serving`. Use its returned ID to confirm the drain and
+then submit `resume_execution_target`. The original release and fault IDs
+remain safe to retry. Use `ReportFailure` when an error identifies a failed
+communicator without confirming a worker outage. Upgrade every voter
+before submitting the new action.
 
 ### Plan across heterogeneous resources
 

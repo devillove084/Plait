@@ -460,6 +460,43 @@ mod tests {
     }
 
     #[test]
+    fn worker_unavailability_orders_device_reuse_and_group_activation() {
+        use crate::group::{GroupAction, GroupId, GroupOperation, GroupVersion, WorkerGrant};
+        use crate::serving::{ExecutionDrainTarget, ServingAction, ServingOperation};
+
+        let version = GroupVersion {
+            group: GroupId(node("active-group")),
+            epoch: 1,
+        };
+        let grant = WorkerGrant {
+            version,
+            device: device(0).id,
+            incarnation: 1,
+            fence: 1,
+        };
+        let group = |id, action| {
+            Command::Group(Box::new(GroupOperation {
+                id: OpId::new(node("group-client"), id),
+                action,
+            }))
+        };
+        let report = group(1, GroupAction::ReportWorkerUnavailable { grant });
+        assert!(report.conflicts_with(&group(2, GroupAction::Activate(version))));
+        assert!(report.conflicts_with(&group(3, GroupAction::Release(grant))));
+        let resume = |id, device| {
+            Command::Serving(Box::new(ServingOperation {
+                id: OpId::new(node("maintenance-client"), id),
+                action: ServingAction::ResumeExecutionTarget {
+                    target: ExecutionDrainTarget::Device(device),
+                    drain: OpId::new(node("group-client"), 1),
+                },
+            }))
+        };
+        assert!(report.conflicts_with(&resume(1, grant.device)));
+        assert!(!report.conflicts_with(&resume(2, device(1).id)));
+    }
+
+    #[test]
     fn membership_writes_the_configuration_key() {
         let command = Command::Membership(MembershipChange::StageAdd {
             node: node("new"),

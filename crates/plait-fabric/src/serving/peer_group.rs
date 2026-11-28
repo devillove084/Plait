@@ -318,7 +318,7 @@ impl ServingState {
                 Err(GroupError::OperationIdReused)
             };
         }
-        let result = self.peer_group_transition(&operation.action);
+        let result = self.transition_peer_group(operation);
         if let Ok(GroupOutcome::PreparedSet(versions)) = &result {
             for &version in versions {
                 self.peer_groups
@@ -337,7 +337,8 @@ impl ServingState {
         result
     }
 
-    fn peer_group_transition(&mut self, action: &GroupAction) -> GroupResult {
+    fn transition_peer_group(&mut self, operation: &GroupOperation) -> GroupResult {
+        let action = &operation.action;
         match *action {
             GroupAction::SetHostMemory { host, capacity } => {
                 self.set_host_memory(host, capacity)
@@ -366,6 +367,9 @@ impl ServingState {
             GroupAction::Release(grant) => self.release_peer_worker(grant),
             GroupAction::SetStandby { active, standby } => self.set_peer_standby(active, standby),
             GroupAction::ReportFailure { grant, .. } => self.report_peer_failure(grant),
+            GroupAction::ReportWorkerUnavailable { grant } => {
+                self.report_peer_worker_unavailable(grant, operation.id)
+            }
             GroupAction::Observe { group, epoch } => {
                 let epoch = epoch
                     .or_else(|| self.peer_groups.active_epoch(group))
@@ -1042,6 +1046,21 @@ impl ServingState {
         self.fail_peer_group(grant.version, None)
     }
 
+    fn report_peer_worker_unavailable(&mut self, grant: WorkerGrant, report: OpId) -> GroupResult {
+        if self
+            .workers
+            .get(&grant.device)
+            .and_then(|worker| worker.grant)
+            != Some(grant)
+        {
+            return Err(GroupError::GrantMismatch);
+        }
+        let outcome = self.report_peer_failure(grant)?;
+        self.begin_execution_drain(ExecutionDrainTarget::Device(grant.device), report)
+            .expect("the reported worker has a current grant");
+        Ok(outcome)
+    }
+
     pub(super) fn fail_peer_group(
         &mut self,
         version: GroupVersion,
@@ -1183,6 +1202,15 @@ mod tests {
     use plait_core::NodeId;
     use plait_core::group::{GroupFault, HostMemory, WorkerDemand};
     use plait_core::serving::{GroupPlan, ServingRole};
+
+    impl ServingState {
+        fn peer_group_transition(&mut self, action: &GroupAction) -> GroupResult {
+            self.transition_peer_group(&GroupOperation {
+                id: OpId::new(NodeId::derive("peer transition"), 1),
+                action: action.clone(),
+            })
+        }
+    }
 
     fn ready_single_worker(state: &mut ServingState, version: GroupVersion) -> WorkerGrant {
         let grant = state.peer_group_view(version).unwrap().grants[0];
@@ -1661,6 +1689,75 @@ mod tests {
                 current: Some(standby.epoch)
             })
         );
+    }
+
+    #[test]
+    fn confirmed_worker_loss_survives_group_release_without_draining_its_host() {
+        let (mut state, active, standby, failed) = prepared_successor(true);
+        let sibling = ready_single_worker(&mut state, standby);
+        state.set_peer_standby(active, Some(standby.epoch)).unwrap();
+        let target = ExecutionDrainTarget::Device(failed.device);
+        let report = GroupOperation {
+            id: OpId::new(failed.device.node, 1),
+            action: GroupAction::ReportWorkerUnavailable { grant: failed },
+        };
+        let revoked = Ok(GroupOutcome::Version {
+            version: active,
+            phase: GroupPhase::Revoked,
+        });
+
+        // A remote peer can detect the broken link before the device is diagnosed.
+        assert_eq!(state.report_peer_failure(failed), revoked);
+        assert_eq!(state.execution_drain(target).drain, None);
+        assert_eq!(state.apply_peer_group(&report), revoked);
+        assert_eq!(state.execution_drain(target).drain, Some(report.id));
+        assert_eq!(state.workers[&failed.device].grant, Some(failed));
+        assert_eq!(state.peer_grant_status(sibling), GrantStatus::Held);
+        assert_eq!(
+            state.peer_group_view(standby).unwrap().phase,
+            GroupPhase::Active
+        );
+        assert!(state.confirm_execution_drain(target, report.id).is_err());
+
+        state.release_peer_worker(failed).unwrap();
+        assert!(state.confirm_execution_drain(target, report.id).is_ok());
+        let inventory = state.placement_inventory(active.group);
+        assert_eq!(
+            inventory
+                .workers
+                .iter()
+                .filter(|worker| worker.eligible)
+                .map(|worker| worker.device)
+                .collect::<Vec<_>>(),
+            vec![sibling.device],
+        );
+        let resources = state.peer_groups.get(active).unwrap().resources.clone();
+        assert_eq!(
+            state.prepare_peer_group(active.group, standby.epoch, &resources),
+            Err(GroupError::WorkerDraining(failed.device))
+        );
+
+        state.resume_execution_target(target, report.id).unwrap();
+        state
+            .prepare_peer_group(active.group, standby.epoch, &resources)
+            .unwrap();
+        let successor = GroupVersion {
+            group: active.group,
+            epoch: 3,
+        };
+        let fresh = state.peer_group_view(successor).unwrap().grants[0];
+        assert!(fresh.fence > failed.fence);
+        assert_eq!(state.apply_peer_group(&report), revoked);
+        let delayed = GroupOperation {
+            id: OpId::new(failed.device.node, 2),
+            ..report
+        };
+        assert_eq!(
+            state.apply_peer_group(&delayed),
+            Err(GroupError::GrantMismatch)
+        );
+        assert_eq!(state.execution_drain(target).drain, None);
+        assert_eq!(state.peer_grant_status(fresh), GrantStatus::Held);
     }
 
     #[test]

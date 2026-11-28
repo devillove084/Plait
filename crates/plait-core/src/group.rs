@@ -376,6 +376,9 @@ pub enum GroupAction {
         prepare: OpId,
         versions: Vec<GroupVersion>,
     },
+    ReportWorkerUnavailable {
+        grant: WorkerGrant,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -613,6 +616,12 @@ impl GroupOperation {
             | GroupAction::Ready { grant, .. }
             | GroupAction::ReportFailure { grant, .. } => {
                 keys.insert(Key::ServingGroup(grant.version.group));
+            }
+            GroupAction::ReportWorkerUnavailable { grant } => {
+                keys.extend([
+                    Key::ServingGroup(grant.version.group),
+                    Key::Device(grant.device),
+                ]);
             }
             GroupAction::Activate(version)
             | GroupAction::Drain(version)
