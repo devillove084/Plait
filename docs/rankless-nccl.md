@@ -698,9 +698,11 @@ engine process group. It returns only its own grants, after the entire process
 group has exited. Plait releases each host's reservation after its last grant
 returns. The group becomes `Retired` once all grants have returned.
 
-Each launcher reports an unexpected child exit against an exact grant in the
-affected version. Automatic retirement tracks the process groups started by
-the running launcher. A launcher crash can leave grants held until the
+The launcher checks that the version is still preparing after acquiring its
+local launch lock. An unexpected child exit is reported against an exact
+grant. If the OS rejects the executable on the first local launch attempt,
+the launcher uses the same failure report and holds the launch lock through
+the release receipt. A launcher crash can leave grants held until the
 deployment operator establishes that the old process group has stopped.
 
 #### Measure peer collective phases
