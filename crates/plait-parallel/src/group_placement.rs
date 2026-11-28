@@ -42,6 +42,8 @@ pub struct Workload {
 pub struct Recipe {
     pub id: NodeId,
     pub work: Vec<u64>,
+    /// Per-slot reservation in the same device order as `work`.
+    pub device_bytes_by_slot: Option<Vec<u64>>,
     pub compute: ComputeOrder,
     pub communication: Communication,
 }
@@ -110,6 +112,12 @@ pub struct Exchange {
 }
 
 impl Workload {
+    fn device_demand(&self, recipe: Option<&Recipe>, slot: usize) -> u64 {
+        recipe
+            .and_then(|recipe| recipe.device_bytes_by_slot.as_deref())
+            .map_or(self.device_bytes, |bytes| bytes[slot])
+    }
+
     pub fn needs_links(&self) -> bool {
         self.bytes_per_peer > 0
             || self
@@ -141,6 +149,10 @@ impl Workload {
                 || !bindings.insert(recipe.binding_id())
                 || !self.widths.iter().any(|&item| item as usize == width)
                 || recipe.work.iter().all(|&work| work == 0)
+                || recipe
+                    .device_bytes_by_slot
+                    .as_ref()
+                    .is_some_and(|bytes| bytes.len() != width || bytes.contains(&0))
                 || matches!(
                     recipe.communication,
                     Communication::AllToAll {
@@ -338,7 +350,7 @@ pub fn select_set(
                 })
                 .collect();
             for (candidate, recipe) in model.candidates(&inventory, &workers, true) {
-                let resources = model.resources(&candidate);
+                let resources = model.resources(&candidate, recipe);
                 let mut joint = partial.clone();
                 joint.devices.extend(resources.workers.keys().copied());
                 for (&host, &demand) in &resources.hosts {
@@ -358,7 +370,7 @@ pub fn select_set(
                     PreparationChoice {
                         resources,
                         cost: candidate.cost,
-                        recipe,
+                        recipe: recipe.map(Recipe::binding_id),
                     },
                 ));
                 let position =
@@ -408,6 +420,7 @@ struct Worker {
     id: DeviceId,
     incarnation: u64,
     compute_rate: Option<u64>,
+    device_bytes: u64,
 }
 
 impl Worker {
@@ -430,6 +443,7 @@ struct Model<'a> {
     workload: &'a Workload,
     links: BTreeMap<(NodeId, NodeId), DirectedLink>,
     rates: Option<BTreeMap<DeviceId, ComputeRate>>,
+    minimum_device_bytes: u64,
 }
 
 pub fn select(
@@ -480,9 +494,6 @@ pub fn select_with_recipes(
     }
     let incumbent = if let Some((version, workers)) = model.incumbent(inventory, &eligible, &widths)
     {
-        if workers.iter().any(|worker| worker.compute_rate.is_none()) {
-            return Ok(Decision::AwaitComputeRates(version));
-        }
         let recipe = active_recipe
             .map(|id| {
                 workload
@@ -494,10 +505,21 @@ pub fn select_with_recipes(
                     .ok_or("active group recipe is missing from the workload policy")
             })
             .transpose()?;
-        let Some(cost) = model.cost(&workers, recipe) else {
-            return Ok(Decision::AwaitLinks(version));
-        };
-        Some((version, cost))
+        if workers
+            .iter()
+            .enumerate()
+            .all(|(slot, worker)| worker.device_bytes >= workload.device_demand(recipe, slot))
+        {
+            if workers.iter().any(|worker| worker.compute_rate.is_none()) {
+                return Ok(Decision::AwaitComputeRates(version));
+            }
+            let Some(cost) = model.cost(&workers, recipe) else {
+                return Ok(Decision::AwaitLinks(version));
+            };
+            Some((version, cost))
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -534,12 +556,12 @@ pub fn select_with_recipes(
     let Some((best, recipe)) = best else {
         return Ok(Decision::NoPlacement);
     };
-    let resources = model.resources(&best);
+    let resources = model.resources(&best, recipe);
     Ok(Decision::Prepare {
         resources,
         cost: best.cost,
         incumbent: incumbent_cost,
-        recipe,
+        recipe: recipe.map(Recipe::binding_id),
     })
 }
 
@@ -574,27 +596,43 @@ impl<'a> Model<'a> {
                 Ok(by_device)
             })
             .transpose()?;
+        let minimum_device_bytes = workload
+            .recipes
+            .iter()
+            .filter_map(|recipe| recipe.device_bytes_by_slot.as_deref())
+            .flatten()
+            .copied()
+            .fold(workload.device_bytes, u64::min);
         Ok(Self {
             workload,
             links: fresh,
             rates,
+            minimum_device_bytes,
         })
     }
 
-    fn resources(&self, candidate: &Candidate) -> ResourcePlan {
+    fn resources(&self, candidate: &Candidate, recipe: Option<&Recipe>) -> ResourcePlan {
         let hosts = count_hosts(&candidate.workers)
             .into_iter()
             .map(|(host, count)| (host, self.host_demand(count).expect("fitted host")))
             .collect();
+        debug_assert!(
+            recipe.is_none()
+                || candidate
+                    .workers
+                    .windows(2)
+                    .all(|pair| pair[0].id < pair[1].id)
+        );
         let workers = candidate
             .workers
             .iter()
-            .map(|worker| {
+            .enumerate()
+            .map(|(slot, worker)| {
                 (
                     worker.id,
                     WorkerDemand {
                         incarnation: worker.incarnation,
-                        device_bytes: self.workload.device_bytes,
+                        device_bytes: self.workload.device_demand(recipe, slot),
                     },
                 )
             })
@@ -607,7 +645,7 @@ impl<'a> Model<'a> {
         hosts: &[PlacementHost],
         available: &BTreeMap<NodeId, Vec<Worker>>,
         alternatives: bool,
-    ) -> Vec<(Candidate, Option<NodeId>)> {
+    ) -> Vec<(Candidate, Option<&'a Recipe>)> {
         let mut candidates: Vec<_> = if self.workload.recipes.is_empty() {
             let widths = self
                 .workload
@@ -627,12 +665,16 @@ impl<'a> Model<'a> {
                     let width = BTreeSet::from([recipe.work.len()]);
                     self.search_candidates(hosts, available, &width, Some(recipe), alternatives)
                         .into_iter()
-                        .map(|candidate| (candidate, Some(recipe.binding_id())))
+                        .map(move |candidate| (candidate, Some(recipe)))
                 })
                 .collect()
         };
         candidates.sort_by(|(left, left_recipe), (right, right_recipe)| {
-            compare(left, right).then_with(|| left_recipe.cmp(right_recipe))
+            compare(left, right).then_with(|| {
+                left_recipe
+                    .map(Recipe::binding_id)
+                    .cmp(&right_recipe.map(Recipe::binding_id))
+            })
         });
         if alternatives && !self.workload.recipes.is_empty() {
             let mut seen = BTreeSet::new();
@@ -708,12 +750,16 @@ impl<'a> Model<'a> {
                 }
                 let recipe_choices;
                 let by_count = if let Some(recipe) = recipe {
-                    recipe_choices = recipe_worker_choices(
-                        &workers,
-                        &recipe.work[width..width + slots],
-                        recipe.compute,
-                        alternatives,
-                    );
+                    let demands: Vec<_> = (width..width + slots)
+                        .map(|slot| {
+                            (
+                                recipe.work[slot],
+                                self.workload.device_demand(Some(recipe), slot),
+                            )
+                        })
+                        .collect();
+                    recipe_choices =
+                        recipe_worker_choices(&workers, &demands, recipe.compute, alternatives);
                     &recipe_choices[..]
                 } else {
                     &uniform_choices[..slots]
@@ -752,6 +798,7 @@ impl<'a> Model<'a> {
 
     fn eligible(&self, worker: &PlacementWorker) -> Option<Worker> {
         let profile = worker.profile.as_ref()?;
+        let device_bytes = worker.device_bytes.min(profile.memory_bytes);
         let compute_rate = match &self.rates {
             Some(rates) => rates
                 .get(&worker.device)
@@ -762,14 +809,14 @@ impl<'a> Model<'a> {
         };
         (worker.eligible
             && profile.id == worker.device
-            && worker.device_bytes >= self.workload.device_bytes
-            && profile.memory_bytes >= self.workload.device_bytes
+            && device_bytes >= self.minimum_device_bytes
             && (self.workload.compute_work == 0 || compute_rate != Some(0))
             && self.workload.requirement.matches(profile))
         .then_some(Worker {
             id: worker.device,
             incarnation: worker.incarnation,
             compute_rate,
+            device_bytes,
         })
     }
 
@@ -798,19 +845,22 @@ impl<'a> Model<'a> {
         if !widths.contains(&active.workers.len()) {
             return None;
         }
-        let workers = active
+        let mut workers = active
             .workers
             .iter()
             .map(|(id, demand)| {
                 let (worker, entry) = eligible.get(id)?;
-                (demand.device_bytes >= self.workload.device_bytes
-                    && demand.incarnation == worker.incarnation
+                (demand.incarnation == worker.incarnation
                     && entry
                         .grant
                         .is_some_and(|grant| grant.version == active.version))
-                .then_some(*worker)
+                .then_some(Worker {
+                    device_bytes: worker.device_bytes.min(demand.device_bytes),
+                    ..*worker
+                })
             })
             .collect::<Option<Vec<_>>>()?;
+        workers.sort_unstable_by_key(|worker| worker.id);
         for (host, count) in count_hosts(&workers) {
             let budget = active.hosts.iter().find(|(id, _)| *id == host)?.1;
             let needed = self.host_demand(count)?;
@@ -1021,12 +1071,12 @@ fn worker_choices(workers: &[Worker], count: usize, alternatives: bool) -> Vec<V
 
 fn recipe_worker_choices(
     workers: &[Worker],
-    work: &[u64],
+    demands: &[(u64, u64)],
     order: ComputeOrder,
     alternatives: bool,
 ) -> Vec<Vec<Vec<Worker>>> {
     let limit = if alternatives { BEAM_PER_WIDTH } else { 1 };
-    let mut choices = vec![Vec::new(); work.len() + 1];
+    let mut choices = vec![Vec::new(); demands.len() + 1];
     choices[0].push(Candidate {
         workers: Vec::new(),
         cost: Cost {
@@ -1037,7 +1087,10 @@ fn recipe_worker_choices(
     // Hosts are visited in ID order, so this host fills a contiguous slot range.
     // For a fixed range any device subset on the host has the same link cost.
     for &worker in workers {
-        for (slot, &work) in work.iter().enumerate().rev() {
+        for (slot, &(work, device_bytes)) in demands.iter().enumerate().rev() {
+            if worker.device_bytes < device_bytes {
+                continue;
+            }
             let Some(device_ns) = worker.work_ns(work) else {
                 continue;
             };
@@ -1364,6 +1417,121 @@ mod tests {
     }
 
     #[test]
+    fn slot_memory_is_bound_to_the_selected_and_incumbent_devices() {
+        let [a, b] = [1, 2].map(host);
+        let mut light = worker(a, 0, 2_000_000_000);
+        light.device_bytes = 8;
+        let large = worker(a, 1, 100_000_000_000);
+        let mut reserved_for_other_use = worker(a, 2, 300_000_000_000);
+        reserved_for_other_use.device_bytes = 23;
+        let mut small_profile = worker(a, 3, 200_000_000_000);
+        small_profile.profile.as_mut().unwrap().memory_bytes = 16;
+        let group = test_group();
+        let mut inventory = PlacementInventory {
+            group,
+            latest: None,
+            active: None,
+            hosts: [a, b]
+                .into_iter()
+                .map(|host| PlacementHost {
+                    host,
+                    capacity: memory(32, 16),
+                    reserved: HostMemory::default(),
+                    eligible: true,
+                })
+                .collect(),
+            workers: vec![reserved_for_other_use, large, small_profile, light],
+        };
+        let recipe = NodeId::derive("slot-memory");
+        let mut workload = workload();
+        workload.switch_ns = u64::MAX;
+        workload.recipes = vec![Recipe {
+            id: recipe,
+            work: vec![1_000_000, 100_000_000],
+            device_bytes_by_slot: Some(vec![8, 24]),
+            compute: ComputeOrder::Parallel,
+            communication: Communication::Directed { edges: Vec::new() },
+        }];
+        let Decision::Prepare { resources, .. } = select(&inventory, &workload, &[], 55).unwrap()
+        else {
+            panic!("the small device fits the first slot");
+        };
+        assert!(
+            resources
+                .workers
+                .iter()
+                .map(|(id, demand)| (*id, demand.device_bytes))
+                .eq([(DeviceId::new(a, 0), 8), (DeviceId::new(a, 1), 24)])
+        );
+        let set = select_set(
+            &[PlacementGroup {
+                inventory: &inventory,
+                workload: &workload,
+                rates: None,
+                hosts: None,
+            }],
+            &[],
+            55,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(set[0].resources, resources);
+        assert_eq!(set[0].recipe, Some(recipe));
+
+        let version = GroupVersion { group, epoch: 1 };
+        inventory.latest = Some((version, GroupPhase::Active));
+        inventory.hosts[0].reserved = resources.hosts[&a];
+        inventory.active = Some(ActivePlacement {
+            version,
+            workers: resources
+                .workers
+                .iter()
+                .rev()
+                .map(|(id, demand)| (*id, *demand))
+                .collect(),
+            hosts: resources
+                .hosts
+                .iter()
+                .map(|(id, demand)| (*id, *demand))
+                .collect(),
+        });
+        for worker in &mut inventory.workers {
+            if resources.workers.contains_key(&worker.device) {
+                worker.grant = Some(WorkerGrant {
+                    version,
+                    device: worker.device,
+                    incarnation: 1,
+                    fence: 1,
+                });
+            }
+        }
+        let mut other_light = worker(b, 0, 4_000_000_000);
+        other_light.device_bytes = 8;
+        inventory
+            .workers
+            .extend([other_light, worker(b, 1, 200_000_000_000)]);
+        assert!(matches!(
+            select_with_recipes(&inventory, &workload, &[], 55, None, Some(recipe)).unwrap(),
+            Decision::Keep { .. }
+        ));
+
+        workload.recipes[0].device_bytes_by_slot = Some(vec![8, 25]);
+        let Decision::Prepare {
+            resources,
+            incumbent: None,
+            ..
+        } = select_with_recipes(&inventory, &workload, &[], 55, None, Some(recipe)).unwrap()
+        else {
+            panic!("the old heavy-slot reservation is too small");
+        };
+        assert_eq!(resources.workers[&DeviceId::new(b, 1)].device_bytes, 25);
+        for invalid in [vec![8], vec![8, 0]] {
+            workload.recipes[0].device_bytes_by_slot = Some(invalid);
+            assert!(workload.validate(false).is_err());
+        }
+    }
+
+    #[test]
     fn asymmetric_slots_choose_devices_under_online_resource_and_link_limits() {
         let [a, b, c] = [1, 2, 3].map(host);
         let version = GroupVersion {
@@ -1431,6 +1599,7 @@ mod tests {
         workload.recipes = vec![Recipe {
             id: recipe,
             work: vec![1_000_000, 100_000_000],
+            device_bytes_by_slot: None,
             compute: ComputeOrder::Parallel,
             communication: Communication::PeerAllReduce {
                 replicated_egress_bytes: None,
@@ -1515,6 +1684,7 @@ mod tests {
             Recipe {
                 id: parallel,
                 work: vec![100_000_000; 2],
+                device_bytes_by_slot: None,
                 compute: ComputeOrder::Parallel,
                 communication: Communication::PeerAllReduce {
                     replicated_egress_bytes: None,
@@ -1528,6 +1698,7 @@ mod tests {
             Recipe {
                 id: sequential,
                 work: vec![150_000_000, 50_000_000],
+                device_bytes_by_slot: None,
                 compute: ComputeOrder::Sequential,
                 communication: Communication::Directed {
                     edges: vec![Exchange {
@@ -1660,6 +1831,7 @@ mod tests {
             .map(|(id, replicated_egress_bytes)| Recipe {
                 id,
                 work: vec![10; 3],
+                device_bytes_by_slot: None,
                 compute: ComputeOrder::Parallel,
                 communication: Communication::PeerAllReduce {
                     calls: vec![AllReduceCalls {

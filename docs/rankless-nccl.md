@@ -321,6 +321,13 @@ operation. The positions follow ascending device identity. The length
 must be one of the allowed widths. Use work units that match the advertised
 or calibrated device rates.
 
+For uneven partitions, set `device_bytes_by_slot` in the recipe. Provide one
+positive byte count for each entry in `work`, in the same device order. When
+the field is omitted, each slot uses `workload.device_bytes`. The planner
+checks both advertised memory and allocatable bytes, then records the selected
+slot's requirement in each `WorkerDemand`. An incumbent is comparable when
+its committed reservations cover its recipe's demands in that same order.
+
 ```json
 [
   {
@@ -335,6 +342,7 @@ or calibrated device rates.
   {
     "id": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
     "work": [400000000, 600000000],
+    "device_bytes_by_slot": [3221225472, 5368709120],
     "compute": "sequential",
     "communication": {
       "kind": "directed",
