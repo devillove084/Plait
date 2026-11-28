@@ -701,9 +701,13 @@ returns. The group becomes `Retired` once all grants have returned.
 The launcher checks that the version is still preparing after acquiring its
 local launch lock. An unexpected child exit is reported against an exact
 grant. If the OS rejects the executable on the first local launch attempt,
-the launcher uses the same failure report and holds the launch lock through
-the release receipt. A launcher crash can leave grants held until the
-deployment operator establishes that the old process group has stopped.
+the launcher writes a failure journal in its state directory before sending
+the report. Restart the launcher with the same state directory to resume
+the original report and release operations. Recovery takes the same launch
+lock, checks the exact grants against the voter, and removes the journal
+after receiving every release receipt. If a process group may have started,
+the deployment operator establishes that it has stopped before releasing its
+grants.
 
 #### Measure peer collective phases
 
