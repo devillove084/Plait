@@ -496,6 +496,7 @@ at commit `e4d66f4`. [TLAPS release](https://github.com/tlaplus/tlapm/releases/t
 
 ```sh
 (
+  set -e
   cache=$(mktemp -d)
   trap 'rm -rf "$cache"' EXIT
   tlapm --strict --threads 2 --cache-dir "$cache" specs/PlaitContractsProof.tla
