@@ -1830,7 +1830,10 @@ Leave the initial layout's measured capacity in `modes`.
 
 Each trial uses the configured request and token counts. The benchmark
 returns the last contiguous offered rate whose repeated trials satisfy
-the SLO, capped by their lowest measured goodput. The policy starts one
+the SLO, capped by their lowest measured goodput. Online calibration runs
+the rates in ascending order and finishes all seeds at the first rate that
+misses the target. Higher rates cannot extend the passing range. The
+standalone benchmark scans the full grid by default. The policy starts one
 benchmark at a time against a loopback ingress that forwards exclusively
 to the complete ready candidate. Active groups keep serving on the
 production ingress. Benchmark arrivals stay outside its demand counters.
