@@ -67,6 +67,7 @@ tlc -deadlock -config specs/PlaitPeerStaging.cfg specs/PlaitPeerStaging.tla
 tlc -deadlock -config specs/PlaitPeerStagingGrants.cfg specs/PlaitPeerStagingGrants.tla
 tlc -deadlock -config specs/PlaitGroupManifest.cfg specs/PlaitGroupManifest.tla
 tlc -deadlock -config specs/PlaitGroupPlacement.cfg specs/PlaitGroupPlacement.tla
+tlc -deadlock -config specs/PlaitAsymmetricDeviceChoice.cfg specs/PlaitAsymmetricDeviceChoice.tla
 tlc -deadlock -config specs/PlaitGroupReplan.cfg specs/PlaitGroupReplan.tla
 tlc -deadlock -config specs/PlaitGroupRecipe.cfg specs/PlaitGroupRecipe.tla
 tlc -deadlock -config specs/PlaitNativeTpRecipeBudget.cfg specs/PlaitNativeTpRecipeBudget.tla

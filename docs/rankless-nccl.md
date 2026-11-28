@@ -348,7 +348,14 @@ or calibrated device rates.
 ```
 
 Parallel compute charges the slowest device. Sequential compute adds the
-stage times. In `peer_all_reduce`, `bytes` is the entire input on one
+stage times. For each host and contiguous slot range, the planner selects
+eligible devices in device-ID order using the work assigned to those slots.
+For example, with device rates `[1, 100, 90]` and parallel work `[1, 100]`,
+slots on the first two devices finish in one time unit. The two fastest
+devices would put the larger share on the device with rate 90. The
+cross-host search still checks memory headroom and compares link costs.
+
+In `peer_all_reduce`, `bytes` is the entire input on one
 worker, `element_bytes` is its element width, and `count` is the number
 of sequential calls with that shape per scored operation. Add a bucket
 for each payload size, such as separate prefill and decode calls.

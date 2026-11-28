@@ -65,6 +65,15 @@ pub enum ComputeOrder {
     Sequential,
 }
 
+impl ComputeOrder {
+    fn extend(self, prefix_ns: u64, device_ns: u64) -> u64 {
+        match self {
+            Self::Parallel => prefix_ns.max(device_ns),
+            Self::Sequential => prefix_ns.saturating_add(device_ns),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Communication {
@@ -401,6 +410,16 @@ struct Worker {
     compute_rate: Option<u64>,
 }
 
+impl Worker {
+    fn work_ns(self, work: u64) -> Option<u64> {
+        if work == 0 {
+            return Some(0);
+        }
+        let rate = self.compute_rate.filter(|&rate| rate != 0)?;
+        Some(ns(u128::from(work) * NANOS, u128::from(rate)))
+    }
+}
+
 #[derive(Clone)]
 struct Candidate {
     workers: Vec<Worker>,
@@ -655,8 +674,13 @@ impl<'a> Model<'a> {
             let Some(mut workers) = available.get(&host.host).cloned() else {
                 continue;
             };
-            workers
-                .sort_unstable_by_key(|worker| (std::cmp::Reverse(worker.compute_rate), worker.id));
+            if recipe.is_some() {
+                workers.sort_unstable_by_key(|worker| worker.id);
+            } else {
+                workers.sort_unstable_by_key(|worker| {
+                    (std::cmp::Reverse(worker.compute_rate), worker.id)
+                });
+            }
             let fit = (1..=workers.len().min(max_width))
                 .take_while(|&count| {
                     self.host_demand(count).is_some_and(|needed| {
@@ -669,23 +693,44 @@ impl<'a> Model<'a> {
                     })
                 })
                 .count();
-            let by_count: Vec<_> = (1..=fit)
-                .map(|count| worker_choices(&workers, count, alternatives))
-                .collect();
+            let uniform_choices: Vec<_> = if recipe.is_none() {
+                (1..=fit)
+                    .map(|count| worker_choices(&workers, count, alternatives))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let mut next = states.clone();
             for (&width, candidates) in &states {
+                let slots = fit.min(max_width - width);
+                if slots == 0 {
+                    continue;
+                }
+                let recipe_choices;
+                let by_count = if let Some(recipe) = recipe {
+                    recipe_choices = recipe_worker_choices(
+                        &workers,
+                        &recipe.work[width..width + slots],
+                        recipe.compute,
+                        alternatives,
+                    );
+                    &recipe_choices[..]
+                } else {
+                    &uniform_choices[..slots]
+                };
                 for candidate in candidates {
-                    for count in 1..=fit.min(max_width - width) {
-                        for workers in &by_count[count - 1] {
+                    for choices in by_count {
+                        for workers in choices {
                             let mut devices = candidate.workers.clone();
                             devices.extend_from_slice(workers);
                             if let Some(cost) = self.cost(&devices, recipe) {
                                 keep_best(
-                                    next.entry(width + count).or_default(),
+                                    next.entry(devices.len()).or_default(),
                                     Candidate {
                                         workers: devices,
                                         cost,
                                     },
+                                    BEAM_PER_WIDTH,
                                 );
                             }
                         }
@@ -815,15 +860,7 @@ impl<'a> Model<'a> {
         ordered.sort_unstable_by_key(|worker| worker.id);
         let mut compute_ns = 0u64;
         for (worker, &work) in ordered.iter().zip(&recipe.work) {
-            if work == 0 {
-                continue;
-            }
-            let rate = worker.compute_rate.filter(|&rate| rate != 0)?;
-            let time = ns(u128::from(work) * NANOS, u128::from(rate));
-            compute_ns = match recipe.compute {
-                ComputeOrder::Parallel => compute_ns.max(time),
-                ComputeOrder::Sequential => compute_ns.saturating_add(time),
-            };
+            compute_ns = recipe.compute.extend(compute_ns, worker.work_ns(work)?);
         }
         let network_ns = match &recipe.communication {
             Communication::AllToAll {
@@ -982,6 +1019,45 @@ fn worker_choices(workers: &[Worker], count: usize, alternatives: bool) -> Vec<V
     choices
 }
 
+fn recipe_worker_choices(
+    workers: &[Worker],
+    work: &[u64],
+    order: ComputeOrder,
+    alternatives: bool,
+) -> Vec<Vec<Vec<Worker>>> {
+    let limit = if alternatives { BEAM_PER_WIDTH } else { 1 };
+    let mut choices = vec![Vec::new(); work.len() + 1];
+    choices[0].push(Candidate {
+        workers: Vec::new(),
+        cost: Cost {
+            compute_ns: 0,
+            network_ns: 0,
+        },
+    });
+    // Hosts are visited in ID order, so this host fills a contiguous slot range.
+    // For a fixed range any device subset on the host has the same link cost.
+    for &worker in workers {
+        for (slot, &work) in work.iter().enumerate().rev() {
+            let Some(device_ns) = worker.work_ns(work) else {
+                continue;
+            };
+            // Extend the previous prefix before it can pick this device itself.
+            let (prefixes, extensions) = choices.split_at_mut(slot + 1);
+            for prefix in &prefixes[slot] {
+                let mut slice = prefix.clone();
+                slice.workers.push(worker);
+                slice.cost.compute_ns = order.extend(slice.cost.compute_ns, device_ns);
+                keep_best(&mut extensions[0], slice, limit);
+            }
+        }
+    }
+    choices
+        .into_iter()
+        .skip(1)
+        .map(|choices| choices.into_iter().map(|choice| choice.workers).collect())
+        .collect()
+}
+
 fn ns(numerator: u128, denominator: u128) -> u64 {
     u64::try_from(numerator.div_ceil(denominator)).unwrap_or(u64::MAX)
 }
@@ -1007,11 +1083,11 @@ fn compare(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
         })
 }
 
-fn keep_best(candidates: &mut Vec<Candidate>, candidate: Candidate) {
+fn keep_best(candidates: &mut Vec<Candidate>, candidate: Candidate, limit: usize) {
     let index = candidates.partition_point(|prior| compare(prior, &candidate).is_le());
-    if index < BEAM_PER_WIDTH {
+    if index < limit {
         candidates.insert(index, candidate);
-        candidates.truncate(BEAM_PER_WIDTH);
+        candidates.truncate(limit);
     }
 }
 
@@ -1285,6 +1361,133 @@ mod tests {
         assert_eq!(resources.hosts, BTreeMap::from([(c, memory(9, 5))]));
         assert_eq!(cost.network_ns, 0);
         assert!(incumbent.unwrap().network_ns > 0);
+    }
+
+    #[test]
+    fn asymmetric_slots_choose_devices_under_online_resource_and_link_limits() {
+        let [a, b, c] = [1, 2, 3].map(host);
+        let version = GroupVersion {
+            group: test_group(),
+            epoch: 1,
+        };
+        let mut incumbent = [worker(a, 0, 5_000_000_000), worker(a, 1, 95_000_000_000)];
+        for worker in &mut incumbent {
+            worker.grant = Some(WorkerGrant {
+                version,
+                device: worker.device,
+                incarnation: 1,
+                fence: 1,
+            });
+        }
+        let mut undersized = worker(b, 3, 300_000_000_000);
+        undersized.device_bytes = 15;
+        let held = memory(9, 5);
+        let mut inventory = PlacementInventory {
+            group: version.group,
+            latest: Some((version, GroupPhase::Active)),
+            active: Some(ActivePlacement {
+                version,
+                workers: incumbent
+                    .iter()
+                    .map(|worker| {
+                        (
+                            worker.device,
+                            WorkerDemand {
+                                device_bytes: 16,
+                                incarnation: 1,
+                            },
+                        )
+                    })
+                    .collect(),
+                hosts: vec![(a, held)],
+            }),
+            hosts: [a, b, c]
+                .into_iter()
+                .map(|host| PlacementHost {
+                    host,
+                    capacity: if host == c { memory(5, 3) } else { held },
+                    reserved: if host == a {
+                        held
+                    } else {
+                        HostMemory::default()
+                    },
+                    eligible: true,
+                })
+                .collect(),
+            workers: incumbent
+                .into_iter()
+                .chain([
+                    worker(b, 2, 90_000_000_000),
+                    worker(c, 0, 200_000_000_000),
+                    worker(b, 1, 100_000_000_000),
+                    undersized,
+                    worker(b, 0, 1_000_000_000),
+                ])
+                .collect(),
+        };
+        let recipe = NodeId::derive("asymmetric");
+        let mut workload = workload();
+        workload.switch_ns = 150_000;
+        workload.recipes = vec![Recipe {
+            id: recipe,
+            work: vec![1_000_000, 100_000_000],
+            compute: ComputeOrder::Parallel,
+            communication: Communication::PeerAllReduce {
+                replicated_egress_bytes: None,
+                calls: vec![AllReduceCalls {
+                    count: 1,
+                    bytes: 8,
+                    element_bytes: 2,
+                }],
+            },
+        }];
+        let select = |inventory: &PlacementInventory, links: &[DirectedLink]| {
+            select_with_recipes(inventory, &workload, links, 55, None, Some(recipe)).unwrap()
+        };
+        let slow = links_between(b, c, 1_000, 54);
+        let Decision::Prepare {
+            resources, cost, ..
+        } = select(&inventory, &slow)
+        else {
+            panic!("the best local slot mapping pays for the switch");
+        };
+        assert!(
+            resources
+                .workers
+                .keys()
+                .copied()
+                .eq([DeviceId::new(b, 0), DeviceId::new(b, 1)])
+        );
+        assert_eq!(
+            cost,
+            Cost {
+                compute_ns: 1_000_000,
+                network_ns: 0
+            }
+        );
+        inventory.hosts[1].capacity.pinned_bytes -= 1;
+        assert!(matches!(select(&inventory, &slow), Decision::Keep { .. }));
+        let fast = links_between(b, c, 1_000_000_000, 54);
+        let Decision::Prepare {
+            resources, cost, ..
+        } = select(&inventory, &fast)
+        else {
+            panic!("a faster link makes the split placement cheaper");
+        };
+        assert!(
+            resources
+                .workers
+                .keys()
+                .copied()
+                .eq([DeviceId::new(b, 1), DeviceId::new(c, 0)])
+        );
+        assert_eq!(
+            cost,
+            Cost {
+                compute_ns: 500_000,
+                network_ns: 108
+            }
+        );
     }
 
     #[test]
