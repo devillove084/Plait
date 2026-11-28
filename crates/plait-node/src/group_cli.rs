@@ -14,7 +14,7 @@ use plait_parallel::group_placement::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::group_plan::{Snapshot, collect_links};
+use crate::group_plan::{Snapshot, collect_links, project_release};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -50,6 +50,8 @@ enum Request {
         groups: Vec<SetMember>,
         #[serde(default)]
         guards: Vec<(GroupId, Option<u64>)>,
+        #[serde(default)]
+        after_releasing: Vec<GroupVersion>,
         links: Option<Vec<DirectedLink>>,
         prepare: Option<OpId>,
     },
@@ -285,10 +287,20 @@ async fn handle(client: &mut Client, voters: &[NodeId], request: Request) -> io:
         Request::PlanSet {
             groups,
             guards,
+            after_releasing,
             links,
             prepare,
         } => {
-            return plan_set(client, voters, groups, guards, links, prepare).await;
+            return plan_set(
+                client,
+                voters,
+                groups,
+                guards,
+                links,
+                prepare,
+                after_releasing,
+            )
+            .await;
         }
         Request::Apply { operation } => operation,
         Request::Prepare {
@@ -397,6 +409,7 @@ async fn plan_set(
     guards: Vec<(GroupId, Option<u64>)>,
     links: Option<Vec<DirectedLink>>,
     prepare: Option<OpId>,
+    after_releasing: Vec<GroupVersion>,
 ) -> io::Result<Value> {
     if groups.is_empty()
         || groups
@@ -415,6 +428,20 @@ async fn plan_set(
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "empty set or duplicate group or guard",
+        ));
+    }
+    if !after_releasing.is_empty()
+        && (prepare.is_some()
+            || after_releasing
+                .iter()
+                .map(|version| version.group)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != after_releasing.len())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "after_releasing needs distinct active groups and a preview without prepare",
         ));
     }
     if let Some(id) = prepare
@@ -462,6 +489,25 @@ async fn plan_set(
         .collect();
     if !pending.is_empty() {
         return Ok(json!({ "decision": "pending", "versions": pending }));
+    }
+    if !after_releasing.is_empty() {
+        let mut released = Vec::with_capacity(after_releasing.len());
+        for version in &after_releasing {
+            let inventory = placement_inventory(client, voters, version.group, None).await?;
+            let Some(active) = inventory
+                .inventory
+                .active
+                .filter(|active| active.version == *version)
+            else {
+                return Ok(json!({ "decision": "release_set_changed" }));
+            };
+            released.push(active);
+        }
+        for snapshot in &mut snapshots {
+            if !project_release(&mut snapshot.inventory, &released) {
+                return Ok(json!({ "decision": "release_set_changed" }));
+            }
+        }
     }
     let (links, probes) = match links {
         Some(links) => (links, Vec::new()),
@@ -512,7 +558,12 @@ async fn plan_set(
         plans.push(preparation_json(&plan, Some(choice.cost)));
         preparations.push(plan);
     }
-    let mut response = json!({ "decision": "prepare_set", "plans": plans });
+    let decision = if after_releasing.is_empty() {
+        "prepare_set"
+    } else {
+        "after_release"
+    };
+    let mut response = json!({ "decision": decision, "plans": plans });
     if let Some(id) = prepare {
         let action = GroupAction::PrepareSet {
             preparations,

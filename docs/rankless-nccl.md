@@ -296,6 +296,19 @@ after an explicit rejection. Start or let the resident launchers discover
 the prepared groups, wait for all endpoints to become ready, then request
 the separate active-set switch.
 
+To preview placements after the current owners return their grants, omit
+`prepare` and pass `after_releasing` as a list of exact group versions.
+Every listed version must still be active. The preview removes only
+those versions' device grants and charged host memory from the planning
+snapshot. Drained devices, reservations for other groups, and per-host
+capacity limits still apply. A feasible preview returns `after_release`
+with the proposed plans. `release_set_changed` indicates that a required
+active version or its recorded grants could not be verified.
+
+The preview grants no resources. After release, use an ordinary
+`plan_set` with `prepare` to plan against live resources and request
+reservation. Supplying both `after_releasing` and `prepare` is rejected.
+
 #### Replan with measured compute rates
 
 Use a stable `calibration` ID for each workload you want to compare. Use the
@@ -1601,6 +1614,30 @@ than the incumbent. Without those resources, reusing occupied devices
 still requires a gap between the old and new engines. This procedure
 uses explicit deployment decisions and leaves request state with the
 engine that accepted it.
+
+#### Automate the handoff from the native mode policy
+
+Prewarm the temporary aggregate group on independent devices and include
+it in the native directory's `discover.aggregated` list. Add its exact
+version and capacity to `modes` as a single-group mode. Set `bridge` on
+the target's `provision` entry to that version, for example
+`"bridge": "00000000000000000000000000000004@1"`. Each bridge version
+identifies one target provision.
+
+The policy first tries to prepare the target using free resources. If
+the stable target has no placement, it previews placement after the
+exact incumbent active set releases. It switches to the bridge only
+after that preview finds the target's device count and the bridge is
+healthy with a current capacity profile that covers observed arrivals.
+
+While the bridge is active, the controller retries ordinary reservation
+as the old grants return. It can resume from the same active-set
+observation after restarting. The target takes over once all its routes
+are ready and an exact-version capacity profile covers the rate the
+bridge can serve at the observed demand. Configure that profile in
+`modes` or enable candidate calibration. If availability changes or the
+profile expires during preparation, the current bridge can continue
+serving while the controller waits.
 
 #### Select a ready native layout from live demand
 

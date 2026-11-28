@@ -1,11 +1,11 @@
 //! Placement snapshots and reservation evidence shared by native planners.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
 use plait_core::NodeId;
 use plait_core::group::{
-    ComputeRate, GroupAction, GroupId, GroupLookup, GroupPreparation, GroupReply,
+    ActivePlacement, ComputeRate, GroupAction, GroupId, GroupLookup, GroupPreparation, GroupReply,
     PlacementInventory, RateEvidence, ResourcePlan,
 };
 use plait_core::link::ProbeRegistration;
@@ -16,6 +16,59 @@ pub(super) struct Snapshot {
     pub(super) rates: Option<Vec<ComputeRate>>,
     pub(super) active_recipe: Option<NodeId>,
     calibration: Option<NodeId>,
+}
+
+/// Project only the grants and host charges of the caller's exact active set.
+/// Eligibility and charges for other owners remain in the snapshot.
+pub(super) fn project_release(
+    inventory: &mut PlacementInventory,
+    releasing: &[ActivePlacement],
+) -> bool {
+    let workers: BTreeMap<_, _> = inventory
+        .workers
+        .iter()
+        .map(|entry| (entry.device, entry.grant))
+        .collect();
+    let mut reservations: BTreeMap<_, _> = inventory
+        .hosts
+        .iter()
+        .map(|entry| (entry.host, entry.reserved))
+        .collect();
+    let mut released = BTreeSet::new();
+    for active in releasing {
+        for (device, demand) in &active.workers {
+            if !workers.get(device).is_some_and(|grant| {
+                grant.is_some_and(|grant| {
+                    grant.version == active.version && grant.incarnation == demand.incarnation
+                })
+            }) || !released.insert(*device)
+            {
+                return false;
+            }
+        }
+        for (host, demand) in &active.hosts {
+            let Some(reserved) = reservations.get_mut(host) else {
+                return false;
+            };
+            let Some(bytes) = reserved.bytes.checked_sub(demand.bytes) else {
+                return false;
+            };
+            let Some(pinned_bytes) = reserved.pinned_bytes.checked_sub(demand.pinned_bytes) else {
+                return false;
+            };
+            reserved.bytes = bytes;
+            reserved.pinned_bytes = pinned_bytes;
+        }
+    }
+    for entry in &mut inventory.workers {
+        if released.contains(&entry.device) {
+            entry.grant = None;
+        }
+    }
+    for entry in &mut inventory.hosts {
+        entry.reserved = reservations[&entry.host];
+    }
+    true
 }
 
 impl Snapshot {
@@ -198,4 +251,87 @@ pub(super) async fn collect_links(probes: &[ProbeRegistration]) -> Vec<DirectedL
             rtt_ns: sample.rtt_ns,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use plait_core::DeviceId;
+    use plait_core::group::{
+        GroupVersion, HostMemory, PlacementHost, PlacementWorker, WorkerDemand, WorkerGrant,
+    };
+
+    #[test]
+    fn release_projection_credits_only_current_grants_and_their_host_memory() {
+        let host = NodeId::derive("host");
+        let group = GroupId(NodeId::derive("primary"));
+        let version = GroupVersion { group, epoch: 2 };
+        let separate = GroupVersion {
+            group: GroupId(NodeId::derive("bridge")),
+            epoch: 1,
+        };
+        let memory = HostMemory {
+            bytes: 8,
+            pinned_bytes: 2,
+        };
+        let target = ActivePlacement {
+            version,
+            workers: vec![(
+                DeviceId::new(host, 0),
+                WorkerDemand {
+                    incarnation: 2,
+                    device_bytes: 8,
+                },
+            )],
+            hosts: vec![(host, memory)],
+        };
+        let mut inventory = PlacementInventory {
+            group,
+            latest: None,
+            active: None,
+            hosts: vec![PlacementHost {
+                host,
+                capacity: HostMemory {
+                    bytes: 24,
+                    pinned_bytes: 6,
+                },
+                reserved: HostMemory {
+                    bytes: 16,
+                    pinned_bytes: 4,
+                },
+                eligible: true,
+            }],
+            workers: [version, separate]
+                .into_iter()
+                .enumerate()
+                .map(|(ordinal, version)| {
+                    let device = DeviceId::new(host, ordinal as u32);
+                    PlacementWorker {
+                        device,
+                        incarnation: 2,
+                        device_bytes: 8,
+                        grant: Some(WorkerGrant {
+                            version,
+                            device,
+                            incarnation: 2,
+                            fence: 1,
+                        }),
+                        eligible: ordinal != 0,
+                        profile: None,
+                    }
+                })
+                .collect(),
+        };
+        let mut stale = target.clone();
+        stale.version.epoch -= 1;
+        let original = inventory.clone();
+        assert!(!project_release(&mut inventory, &[stale]));
+        assert_eq!(inventory, original);
+
+        assert!(project_release(&mut inventory, &[target]));
+        assert_eq!(inventory.hosts[0].reserved, memory);
+        assert_eq!(inventory.workers[0].grant, None);
+        assert!(!inventory.workers[0].eligible);
+        assert_eq!(inventory.workers[1], original.workers[1]);
+    }
 }
