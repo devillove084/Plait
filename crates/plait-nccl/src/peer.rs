@@ -184,6 +184,7 @@ impl Listener {
         Ok(Arc::new(PeerGroup {
             slot,
             links,
+            profile_group: u128::from_le_bytes(manifest[..16].try_into().unwrap()),
             timeout,
             replicated_egress_bytes: self.replicated_egress_bytes,
             order: Mutex::new(CollectiveOrder::default()),
@@ -377,6 +378,7 @@ fn use_replicated_exchange(
 pub(crate) struct PeerGroup {
     slot: usize,
     links: Vec<Option<Link>>,
+    profile_group: u128,
     timeout: Duration,
     replicated_egress_bytes: Option<u64>,
     order: Mutex<CollectiveOrder>,
@@ -412,6 +414,10 @@ impl PeerGroup {
 
     pub(crate) fn world(&self) -> usize {
         self.links.len()
+    }
+
+    pub(crate) fn profile_group(&self) -> u128 {
+        self.profile_group
     }
 
     pub(crate) fn device_slot(&self, device: DeviceId) -> Option<usize> {

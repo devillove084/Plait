@@ -5,22 +5,31 @@ use std::io::Write;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use crate::peer::Collective;
+use crate::peer::{Collective, PeerGroup};
 
 static LOG: OnceLock<Option<File>> = OnceLock::new();
+static ASYNC_LOG: OnceLock<Option<File>> = OnceLock::new();
 
 pub(crate) fn log() -> Option<&'static File> {
-    LOG.get_or_init(|| {
-        let path = std::env::var_os("PLAIT_NCCL_PHASE_LOG").filter(|path| !path.is_empty())?;
-        match OpenOptions::new().create(true).append(true).open(path) {
-            Ok(file) => Some(file),
-            Err(error) => {
-                eprintln!("Plait collective phase log: {error}");
-                None
-            }
+    LOG.get_or_init(|| open_log("PLAIT_NCCL_PHASE_LOG"))
+        .as_ref()
+}
+
+pub(crate) fn async_log() -> Option<&'static File> {
+    ASYNC_LOG
+        .get_or_init(|| open_log("PLAIT_NCCL_ASYNC_PHASE_LOG"))
+        .as_ref()
+}
+
+fn open_log(variable: &str) -> Option<File> {
+    let path = std::env::var_os(variable).filter(|path| !path.is_empty())?;
+    match OpenOptions::new().create(true).append(true).open(path) {
+        Ok(file) => Some(file),
+        Err(error) => {
+            eprintln!("Plait collective phase log ({variable}): {error}");
+            None
         }
-    })
-    .as_ref()
+    }
 }
 
 pub(crate) struct Timer {
@@ -88,6 +97,31 @@ impl Phases {
             self.upload.elapsed.as_nanos(),
         );
         // One append per row, including when multiple worker processes share a log.
+        let _ = output.write_all(line.as_bytes());
+    }
+
+    pub(crate) fn record_async(
+        &self,
+        mut output: &File,
+        group: &PeerGroup,
+        sequence: u64,
+        operation: Collective,
+        bytes: usize,
+        queued: Duration,
+    ) {
+        let (kind, dtype, _, _) = operation.wire();
+        let line = format!(
+            "{}\t{:032x}\t{}\t{}\t{sequence}\t{kind}\t{}\t{bytes}\t{}\t{}\t{}\t{}\n",
+            std::process::id(),
+            group.profile_group(),
+            group.slot(),
+            group.world(),
+            dtype as u8,
+            queued.as_nanos(),
+            self.collective.elapsed.as_nanos(),
+            self.wire.elapsed.as_nanos(),
+            self.fold.elapsed.as_nanos(),
+        );
         let _ = output.write_all(line.as_bytes());
     }
 }

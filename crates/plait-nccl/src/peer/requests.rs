@@ -1,10 +1,13 @@
+use std::fs::File;
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
+use std::time::Instant;
 
-use super::{Collective, PeerGroup, Timer};
+use super::{Collective, PeerGroup};
+use crate::profile::{self, Phases};
 
 pub(super) const QUEUE_DEPTH: usize = 8;
 const DEFAULT_STAGING_BYTES: usize = 1024 * 1024 * 1024;
@@ -15,6 +18,47 @@ struct Job {
     input: Vec<u8>,
     result: SyncSender<io::Result<StagedOutput>>,
     admission: Admission,
+    timing: Option<(&'static File, Instant)>,
+}
+
+impl Job {
+    fn run(self, group: &Weak<PeerGroup>) {
+        let Admission { slot, staging } = self.admission;
+        drop(slot);
+        let timing = self.timing.map(|(log, enqueued)| (log, enqueued.elapsed()));
+        let outcome = match group.upgrade() {
+            Some(group) => {
+                let mut phases = Phases::new(timing.is_some());
+                let outcome = phases.collective.measure(|| {
+                    group.execute_reserved(
+                        self.sequence,
+                        self.operation,
+                        &self.input,
+                        &mut phases.wire,
+                        &mut phases.fold,
+                    )
+                });
+                if let (Ok(_), Some((log, queued))) = (&outcome, timing) {
+                    phases.record_async(
+                        log,
+                        &group,
+                        self.sequence,
+                        self.operation,
+                        self.input.len(),
+                        queued,
+                    );
+                }
+                outcome
+            }
+            None => Err(disconnected()),
+        };
+        drop(self.input);
+        let result = outcome.map(|bytes| StagedOutput {
+            bytes,
+            _staging: staging,
+        });
+        let _ = self.result.send(result);
+    }
 }
 
 pub(crate) struct Dispatcher {
@@ -56,6 +100,7 @@ impl Dispatcher {
         admission: Admission,
     ) -> io::Result<Completion> {
         group.live()?;
+        let log = profile::async_log();
         let mut sender = group.requests.sender.lock().unwrap();
         if sender.is_none() {
             let (tx, rx) = sync_channel::<Job>(QUEUE_DEPTH);
@@ -64,24 +109,7 @@ impl Dispatcher {
                 .name("plait-peer-collectives".into())
                 .spawn(move || {
                     while let Ok(job) = rx.recv() {
-                        let Admission { slot, staging } = job.admission;
-                        drop(slot);
-                        let outcome = match weak.upgrade() {
-                            Some(group) => group.execute_reserved(
-                                job.sequence,
-                                job.operation,
-                                &job.input,
-                                &mut Timer::new(false),
-                                &mut Timer::new(false),
-                            ),
-                            None => Err(disconnected()),
-                        };
-                        drop(job.input);
-                        let result = outcome.map(|bytes| StagedOutput {
-                            bytes,
-                            _staging: staging,
-                        });
-                        let _ = job.result.send(result);
+                        job.run(&weak);
                     }
                 })?;
             *sender = Some(tx);
@@ -96,6 +124,7 @@ impl Dispatcher {
                     input,
                     result,
                     admission,
+                    timing: log.map(|log| (log, Instant::now())),
                 })
                 .map_err(|error| match error {
                     TrySendError::Full(_) => {

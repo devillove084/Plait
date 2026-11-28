@@ -37,6 +37,26 @@ To use a group published by the Plait control plane, set
 validates the ordered group manifest.
 [Join a committed TP group](rankless-nccl.md#join-a-committed-tp-group-from-vllm)
 
+### Profile asynchronous collectives
+
+Set `PLAIT_NCCL_ASYNC_PHASE_LOG` to a writable file path before submitting
+requests. The worker appends one tab-separated row for each successful
+background collective.
+
+```text
+pid  group_fingerprint  slot  world  sequence  operation  dtype  input_bytes  queue_ns  collective_ns  wire_ns  fold_ns
+```
+
+Match rows across workers by group fingerprint and sequence. The fingerprint
+comes from the manifest agreed at peer bootstrap. The sequence is shared with
+blocking collectives within that group.
+
+`queue_ns` measures from enqueue to worker pickup. `collective_ns` includes
+waiting for the collective's turn and executing it. `wire_ns` includes socket
+I/O and readiness waits, and `fold_ns` measures host reduction. Both are parts
+of `collective_ns`. The worker records the row after input staging and before
+delivery to the caller. Blocking requests use `PLAIT_NCCL_PHASE_LOG`.
+
 ## Legacy NCCL bootstrap
 
 Call `patch_vllm()` to replace the Python NCCL wrapper before communicator
