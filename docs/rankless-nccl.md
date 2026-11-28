@@ -1840,6 +1840,13 @@ production ingress. Benchmark arrivals stay outside its demand counters.
 The benchmark uses the configured candidate hosts and the existing KV
 store, so account for any shared resource load when choosing rates.
 
+`warmups` sets the number of requests submitted before each timed trial.
+The engine schedules these requests into batches. Set `timeout_seconds`
+to cover the warmup and timed portions of the full calibration run. When
+a deployment may start with empty kernel caches, measure that case with
+the candidate off the public route and include its warmup in the rollout
+time budget.
+
 On completion, the policy checks the candidate's bindings, grant count,
 readiness, SLO expiry, and the observed active set again. It discards results
 when these checks fail. A measured candidate must win the same stable
