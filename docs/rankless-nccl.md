@@ -784,6 +784,12 @@ Widths without a configured partition continue to use tensor parallelism.
 The descriptor binds the full version to the selected collective axis.
 The engine verifies the layer partition during startup, before activation.
 
+The peer communicator supports odd group sizes. To use three devices for
+the same 28-layer model, configure `"pipeline_layers": {"3": [9, 9, 10]}`
+for PP3 × TP1. A three-way TP deployment also requires the model's
+attention and weight shards to support a width of three. For example,
+Qwen3-0.6B has 16 attention heads and vLLM rejects TP3 for that model.
+
 For plans using `workload.recipes`, map their base IDs to engine layouts in
 the shared deployment file. Use the same mapping on each launch host.
 

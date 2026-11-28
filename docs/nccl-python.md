@@ -37,6 +37,30 @@ To use a group published by the Plait control plane, set
 validates the ordered group manifest.
 [Join a committed TP group](rankless-nccl.md#join-a-committed-tp-group-from-vllm)
 
+### Pass a CANN stream from PyTorch
+
+When calling Plait with raw `torch_npu` device pointers, synchronize the
+PyTorch stream before passing its `npu_stream` handle. This flushes the
+framework's host-side queue. Plait synchronizes the ACL stream, which covers
+operations that have already reached ACL. The caller must make pending writes
+to both the input and output buffers visible before the call.
+
+```python
+stream = torch.npu.current_stream()
+stream.synchronize()
+status = comm.reduce_scatter(
+    input_tensor.data_ptr(), output_tensor.data_ptr(), output_tensor.numel(),
+    6, 0, stream.npu_stream,  # FP16, sum
+)
+if status != 0:
+    raise RuntimeError(f"Plait ReduceScatter failed with status {status}")
+```
+
+Keep the buffers alive until the operation finishes. For a queued collective,
+apply the stream ordering requirement both when submitting an input and when
+delivering the result to an output buffer. The vLLM fork handles this when
+converting a `torch_npu` stream to a native handle.
+
 ### Profile asynchronous collectives
 
 Set `PLAIT_NCCL_ASYNC_PHASE_LOG` to a writable file path before submitting
