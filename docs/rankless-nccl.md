@@ -1644,13 +1644,15 @@ healthy with a current capacity profile that covers observed arrivals.
 
 While the bridge is active, the controller retries ordinary reservation
 as the old grants return. It can resume from the same active-set
-observation after restarting. The target takes over once all its routes
-are ready and an exact-version capacity profile covers the rate the
-bridge can serve at the observed demand. Configure that profile in
-`modes` or let calibration measure the ready target through the private
-ingress. With `--mode-state`, the controller retains both measurements
-with their route bindings, manifests, and expiry. The current bridge can
-continue serving if availability changes or a needed profile expires.
+observation after restarting. The target takes over after `stable_windows`
+consecutive windows with the same ready target and capacity profile. Each
+window requires the target to cover the smaller of observed arrivals and
+the bridge's capacity. A miss, a different candidate profile, or an ingress
+restart starts a new count. Configure the target profile in `modes` or let
+calibration measure the ready target through the private ingress. With
+`--mode-state`, the controller retains both measurements with their route
+bindings, manifests, and expiry. The bridge can continue serving while
+availability changes or a needed profile expires.
 
 #### Select a ready native layout from live demand
 
