@@ -1840,9 +1840,22 @@ production ingress. Benchmark arrivals stay outside its demand counters.
 The benchmark uses the configured candidate hosts and the existing KV
 store, so account for any shared resource load when choosing rates.
 
-`warmups` sets the number of requests submitted before each timed trial.
-The engine schedules these requests into batches. Set `timeout_seconds`
-to cover the warmup and timed portions of the full calibration run. When
+By default, `warmups` sets the number of requests submitted before each
+timed trial. For a private candidate that benefits from mixed prefill and
+decode warmup, set `warmup_decode_widths` to a list of stream counts.
+In this mode, `warmups` specifies serial requests before the first wave.
+Each wave starts the configured number of streams, waits for a returned
+token ID from each, and inserts one more request. The measuring process
+waits for the complete wave before moving on. For example, `warmups: 3`
+with `warmup_decode_widths: [2, 2, 3, 4]` sends 18 requests once before
+the timed rate sweep. vLLM determines the actual batch composition.
+
+Wave requests use the timed benchmark's prompt generator and the deployed
+model's sampling defaults, with a separate seed. They stay on the pinned
+private ingress. A failed warmup stream cancels its wave and the calibration.
+Only timed trials contribute to the persisted capacity.
+
+Set `timeout_seconds` to cover the full calibration run. When
 a deployment may start with empty kernel caches, measure that case with
 the candidate off the public route and include its warmup in the rollout
 time budget.
@@ -1857,16 +1870,16 @@ readiness, SLO expiry, and the observed active set again. It discards results
 when these checks fail. A measured candidate must win the same stable
 window comparison as a manually profiled candidate. Its profile remains
 available as the incumbent baseline after cutover until it expires or the
-route revision or calibration settings other than `warmups` change.
-Updating `warmups` cancels any in-progress calibration and preserves
-completed capacity evidence for the same version. The next measurement
-uses the new count.
+route revision or calibration settings other than the warmup settings change.
+Updating `warmups` or `warmup_decode_widths` cancels any in-progress calibration
+and preserves completed capacity evidence for the same version. The next
+measurement uses the new warmup configuration.
 
 Pass `--mode-state /var/lib/vllm/plait-capacity.json` with `--mode-policy`
 to preserve those measurements across ingress process restarts. The file
 stores the profile and fingerprints of the calibration settings excluding
-`warmups`, the route bindings, and the communicator manifests. The manifests
-bind the measurements to the particular device grants and endpoint tickets.
+the warmup settings, the route bindings, and the communicator manifests.
+The manifests bind the measurements to the device grants and endpoint tickets.
 A restored profile
 must still be current and describe healthy, matching group versions.
 With a state path configured, a new profile is saved before it can trigger
