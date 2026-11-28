@@ -25,6 +25,7 @@ use super::frame::{read_frame, read_payload, write_frame, write_payload};
 use super::w4::worker::{Invocation as WorkerInvocation, Request};
 
 pub(crate) mod hosted;
+pub(crate) mod native;
 mod process;
 mod submit;
 pub(super) use process::enter_worker;

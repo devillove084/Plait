@@ -77,6 +77,214 @@ macro_rules! wait_value {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn native_host_expiry_promotes_an_idle_standby_and_keeps_old_fences() {
+    use plait_core::group::{
+        GroupAction, GroupError, GroupLookup, GroupMember, GroupOperation, GroupReply, GroupResult,
+        PeerEndpoint, ResourcePlan,
+    };
+    use tokio::process::Command as ProcessCommand;
+
+    async fn apply(client: &mut Client, voter: NodeId, action: GroupAction) -> GroupResult {
+        client
+            .apply_group(
+                voter,
+                &GroupOperation {
+                    id: OpId::new(NodeId::random(), 1),
+                    action,
+                },
+            )
+            .await
+            .unwrap()
+    }
+
+    let [voter, host, spare] = [NodeId::random(), NodeId::random(), NodeId::random()];
+    let (_nodes, addresses) = start_bootstrap(&[voter]).await;
+    let mut client = Client::new().await.unwrap();
+    client.add_peer(voter, &addresses[0]);
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(host.to_hex());
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("native.json");
+    std::fs::write(
+        &config,
+        serde_json::to_vec(&serde_json::json!({
+            "control_ip": "127.0.0.1",
+            "host_memory": {"bytes": 64, "pinned_bytes": 0},
+            "lock_dir": dir.join("locks"),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut node = ProcessCommand::new(env!("CARGO_BIN_EXE_plait-node"))
+        .args(["run", "--compute-only", "--id", &host.to_hex(), "--peer"])
+        .arg(format!("{voter}@{}", addresses[0]))
+        .arg("--native-execution")
+        .arg(&config)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let lookup = ServingLookup::ExecutionHostLiveness(host);
+    wait_until!(
+        "native host registration",
+        matches!(
+            client.query_serving(voter, lookup.clone()).await,
+            Ok(ServingView::ExecutionHostLiveness(Some(state))) if state.online
+        )
+    );
+    apply(
+        &mut client,
+        voter,
+        GroupAction::SetHostMemory {
+            host: spare,
+            capacity: HostMemory {
+                bytes: 64,
+                pinned_bytes: 0,
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let group = GroupId(NodeId::random());
+    let active = GroupVersion { group, epoch: 1 };
+    let standby = GroupVersion { group, epoch: 2 };
+    let resources = |device: DeviceId| ResourcePlan {
+        workers: BTreeMap::from([(
+            device,
+            WorkerDemand {
+                incarnation: 1,
+                device_bytes: 8,
+            },
+        )]),
+        hosts: BTreeMap::from([(
+            device.node,
+            HostMemory {
+                bytes: 8,
+                pinned_bytes: 0,
+            },
+        )]),
+    };
+    let idle = DeviceId::new(host, 1);
+    for device in [DeviceId::new(host, 0), DeviceId::new(spare, 0), idle] {
+        apply(
+            &mut client,
+            voter,
+            GroupAction::RegisterWorker {
+                device,
+                incarnation: 1,
+                device_bytes: 16,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    for (version, owner) in [(active, host), (standby, spare)] {
+        apply(
+            &mut client,
+            voter,
+            GroupAction::Prepare {
+                group,
+                expected_epoch: version.epoch - 1,
+                resources: resources(DeviceId::new(owner, 0)),
+            },
+        )
+        .await
+        .unwrap();
+        let GroupReply::Version(Some(view)) = client
+            .query_group(voter, GroupLookup::Version(version))
+            .await
+            .unwrap()
+        else {
+            panic!("prepared group is visible");
+        };
+        let grant = view.grants[0];
+        let slot = version.epoch as u8;
+        apply(
+            &mut client,
+            voter,
+            GroupAction::PublishEndpoint(GroupMember {
+                grant,
+                endpoint: PeerEndpoint {
+                    address: ([127, 0, 0, 1], 9000 + u16::from(slot)).into(),
+                    ticket: [slot; 16],
+                },
+            }),
+        )
+        .await
+        .unwrap();
+        let GroupReply::Version(Some(view)) = client
+            .query_group(voter, GroupLookup::Version(version))
+            .await
+            .unwrap()
+        else {
+            panic!("manifest is visible");
+        };
+        let manifest = view.manifest.unwrap().digest();
+        apply(&mut client, voter, GroupAction::Ready { grant, manifest })
+            .await
+            .unwrap();
+        if version == active {
+            apply(&mut client, voter, GroupAction::Activate(active))
+                .await
+                .unwrap();
+        }
+    }
+    apply(
+        &mut client,
+        voter,
+        GroupAction::SetStandby {
+            active,
+            standby: Some(standby.epoch),
+        },
+    )
+    .await
+    .unwrap();
+    node.kill().await.unwrap();
+    let started = Instant::now();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if matches!(
+                client.query_serving(voter, lookup.clone()).await,
+                Ok(ServingView::ExecutionHostLiveness(Some(state))) if !state.online
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("voter expires the host without any model traffic");
+    println!(
+        "native host expired {:.3}s after process loss",
+        started.elapsed().as_secs_f64()
+    );
+    for (version, phase) in [(active, GroupPhase::Revoked), (standby, GroupPhase::Active)] {
+        let GroupReply::Version(Some(view)) = client
+            .query_group(voter, GroupLookup::Version(version))
+            .await
+            .unwrap()
+        else {
+            panic!("group is visible after expiry");
+        };
+        assert_eq!(view.phase, phase);
+        assert!(view.released.is_empty());
+    }
+    assert_eq!(
+        apply(
+            &mut client,
+            voter,
+            GroupAction::Prepare {
+                group: GroupId(NodeId::random()),
+                expected_epoch: 0,
+                resources: resources(idle),
+            }
+        )
+        .await,
+        Err(GroupError::HostOffline(host))
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn device_discovery_does_not_block_group_control() {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;

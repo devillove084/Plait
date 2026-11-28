@@ -64,6 +64,7 @@ tlc -deadlock -config specs/PlaitMixedPeerAxesOdd.cfg specs/PlaitMixedPeerAxes.t
 tlc -deadlock -config specs/PlaitPeerRevocation.cfg specs/PlaitPeerRevocation.tla
 tlc -deadlock -config specs/PlaitPeerFailover.cfg specs/PlaitPeerFailover.tla
 tlc -deadlock -config specs/PlaitHostQuarantine.cfg specs/PlaitHostQuarantine.tla
+tlc -deadlock -config specs/PlaitNativeHostExpiry.cfg specs/PlaitNativeHostExpiry.tla
 tlc -deadlock -config specs/PlaitSharedHostFault.cfg specs/PlaitSharedHostFault.tla
 tlc -deadlock -config specs/PlaitPeerRequests.cfg specs/PlaitPeerRequests.tla
 tlc -deadlock -config specs/PlaitPeerAdmission.cfg specs/PlaitPeerAdmission.tla

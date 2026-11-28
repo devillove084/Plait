@@ -157,6 +157,7 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             let mut advertise_devices = true;
             let mut execution = None;
             let mut hosted_execution = None;
+            let mut native_execution = None;
             let mut group_replan = None;
             let mut pci_watch_config = None;
             let mut link_probe: Option<SocketAddr> = None;
@@ -195,6 +196,12 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                             std::fs::File::open(path)?,
                         )?);
                     }
+                    "--native-execution" => {
+                        let path = args.next().ok_or("--native-execution needs a path")?;
+                        native_execution = Some(serde_json::from_reader::<_, tensor_cli::runtime::native::Config>(
+                            std::fs::File::open(path)?,
+                        )?);
+                    }
                     "--group-replan" => {
                         let path = args.next().ok_or("--group-replan needs a path")?;
                         let config: group_replan::Config = serde_json::from_reader(
@@ -223,10 +230,14 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             if state_dir.is_some() && id.is_none() {
                 return Err("durable replicas require an explicit --id".into());
             }
-            if (execution.is_some() || hosted_execution.is_some() || link_probe.is_some() || pci_watch_config.is_some()) && id.is_none() {
+            let execution_modes = [execution.is_some(), hosted_execution.is_some(), native_execution.is_some()]
+                .into_iter()
+                .filter(|mode| *mode)
+                .count();
+            if (execution_modes != 0 || link_probe.is_some() || pci_watch_config.is_some()) && id.is_none() {
                 return Err("execution, link probes, and PCI watches require a stable --id".into());
             }
-            if execution.is_some() && hosted_execution.is_some() {
+            if execution_modes > 1 {
                 return Err("select one local execution supervisor per node".into());
             }
             let id = id.unwrap_or_else(NodeId::random);
@@ -234,10 +245,10 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 if join.is_some() || state_dir.is_some() || peers.is_empty() == seeds.is_empty() {
                     return Err("--compute-only requires either --peer or --seed and no voting membership or journal flags".into());
                 }
-                if execution.is_none() && hosted_execution.is_none() && link_probe.is_none() && group_replan.is_none() && pci_watch_config.is_none() {
+                if execution_modes == 0 && link_probe.is_none() && group_replan.is_none() && pci_watch_config.is_none() {
                     return Err("--compute-only requires execution, link probing, group replanning, or PCI monitoring".into());
                 }
-                let auxiliary = execution.is_some() || hosted_execution.is_some() || group_replan.is_some() || pci_watch_config.is_some();
+                let auxiliary = execution_modes != 0 || group_replan.is_some() || pci_watch_config.is_some();
                 let probe = peer_probes::run(id, link_probe, peers.clone(), seeds.clone(), auxiliary);
                 let replan = group_replan::run(group_replan, peers.clone(), seeds.clone(), None);
                 let watch = pci_watch::run(id, pci_watch_config, peers.clone(), seeds.clone(), false);
@@ -246,6 +257,8 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         tensor_cli::runtime::run(id, config, peers, seeds).await
                     } else if let Some(config) = hosted_execution {
                         tensor_cli::runtime::hosted::run(id, config, peers, seeds).await
+                    } else if let Some(config) = native_execution {
+                        tensor_cli::runtime::native::run(id, config, peers, seeds).await
                     } else {
                         std::future::pending::<std::io::Result<()>>().await
                     }
@@ -289,6 +302,8 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     tensor_cli::runtime::run(id, config, execution_peers, Vec::new()).await
                 } else if let Some(config) = hosted_execution {
                     tensor_cli::runtime::hosted::run(id, config, execution_peers, Vec::new()).await
+                } else if let Some(config) = native_execution {
+                    tensor_cli::runtime::native::run(id, config, execution_peers, Vec::new()).await
                 } else {
                     std::future::pending::<std::io::Result<()>>().await
                 }

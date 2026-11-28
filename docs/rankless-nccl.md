@@ -165,6 +165,43 @@ adapters have no hardware-error contract and retain the generic path.
 [hip-error-codes]: https://rocm.docs.amd.com/projects/HIP/en/latest/reference/error_codes.html
 [cann-runtime-errors]: https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/910/API/runtimeapi/aclcppdevg_03_1345.html
 
+### Detect a missing execution host
+
+Start `plait-node run` with `--native-execution native.json` on each host
+running native vLLM workers. Use the registered host ID. The same option
+works on a voter. A compute-only node can discover voters from a seed.
+
+```sh
+plait-node run --compute-only --id "$HOST_ID" --seed "$VOTER_ADDR" \
+  --native-execution native.json
+```
+
+```json
+{
+  "control_ip": "192.0.2.10",
+  "host_memory": {"bytes": 68719476736, "pinned_bytes": 1073741824},
+  "lock_dir": "/var/lib/plait/native"
+}
+```
+
+Set the memory values to the host budgets available to Plait. Keep the lock
+directory on persistent local storage and retain its `host-supervisor.lock`
+file across restarts. Register devices through the normal group inventory
+path. Start the node before placing groups on that host.
+
+The node publishes a heartbeat every two seconds. After a voter observes
+the same heartbeat for ten seconds, it proposes expiry with that heartbeat
+ID and the current set of affected versions. The commit requires both to
+match. With a live quorum, expiry marks the host offline, revokes its live
+native groups and promotes any armed standby that has reached Ready on
+unaffected hosts. Expiry preserves existing grants and blocks new
+reservations, including for idle devices.
+
+A restart with the same local supervisor lock can renew liveness. Released
+devices then become eligible if they also satisfy the inventory and drain
+checks. A confirmed ECC or PCI fault keeps its quarantine until explicit
+recovery. `--watch-pci` can run in the same node.
+
 ### Watch for PCI device removal
 
 On Linux, add `--watch-pci pci.json` to a resident `plait-node run` command.
@@ -1024,9 +1061,9 @@ expiry excludes a standby affected by that host. Explicit `Drain` and `Revoke`
 disarm the incumbent. A failure in a standby or an older draining version stops
 only that version.
 
-Idle worker loss requires host liveness detection or a surviving participant
-that observes the failure. Run voters that support these actions before arming
-a standby. After promotion, a fresh `observe` resolves the new active version.
+An idle model can fail over when the node's execution heartbeat expires or
+a surviving participant observes the failure. After promotion, a fresh
+`observe` resolves the new active version.
 The deployment layer uses that result for new admissions and the engine owns
 in-flight requests and KV. The revoked group keeps its device fences until its
 owners confirm teardown and submit `Release`.
