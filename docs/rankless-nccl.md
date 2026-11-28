@@ -1851,19 +1851,25 @@ On completion, the policy checks the candidate's bindings, grant count,
 readiness, SLO expiry, and the observed active set again. It discards results
 when these checks fail. A measured candidate must win the same stable
 window comparison as a manually profiled candidate. Its profile remains
-available as the incumbent baseline after cutover until it expires or its
-calibration settings or route revision change.
+available as the incumbent baseline after cutover until it expires or the
+route revision or calibration settings other than `warmups` change.
+Updating `warmups` cancels any in-progress calibration and preserves
+completed capacity evidence for the same version. The next measurement
+uses the new count.
 
 Pass `--mode-state /var/lib/vllm/plait-capacity.json` with `--mode-policy`
 to preserve those measurements across ingress process restarts. The file
-stores the profile and fingerprints of the calibration settings, route
-bindings, and communicator manifests. The manifests bind the measurements
-to the particular device grants and endpoint tickets. A restored profile
+stores the profile and fingerprints of the calibration settings excluding
+`warmups`, the route bindings, and the communicator manifests. The manifests
+bind the measurements to the particular device grants and endpoint tickets.
+A restored profile
 must still be current and describe healthy, matching group versions.
 With a state path configured, a new profile is saved before it can trigger
 a switch. An empty `modes` list lets a resumed ingress use the restored
 baseline. Supply a fresh incumbent profile in `modes` if the stored one
-expires.
+expires. To upgrade a profile from the earlier fingerprint format, let the
+upgraded ingress restore it with the original calibration settings before
+changing `warmups`.
 
 A functional deployment verified this sequence with a CUDA aggregate,
 ROCm Prefill, and PPU Decode serving the same FP16 checkpoint. HTTP demand
