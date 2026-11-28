@@ -676,7 +676,12 @@ the shared deployment file. Use the same mapping on each launch host.
   "layout_recipes": {
     "01010101010101010101010101010101": {"width": 2},
     "02020202020202020202020202020202": {"width": 2, "pipeline_layers": [11, 17]},
-    "03030303030303030303030303030303": {"width": 2, "replicated_egress_bytes": 262144}
+    "03030303030303030303030303030303": {"width": 2, "replicated_egress_bytes": 262144},
+    "04040404040404040404040404040404": {
+      "width": 2,
+      "pipeline_layers": [18, 10],
+      "kv_cache_memory_bytes_by_stage": [344981504, 191889408]
+    }
   }
 }
 ```
@@ -687,6 +692,14 @@ TP cap and copies that cap to `tp_groups`. A missing binding or a width
 mismatch prevents startup. An older untagged version uses the deployment's
 width-based settings. Add new entries while the launcher is running to
 offer more recipes. Existing entries retain their widths and options.
+
+Set `kv_cache_memory_bytes_by_stage` for a PP recipe to supply one positive
+byte count per stage. The launcher passes the vector as
+`--kv-cache-memory-bytes-by-stage`. Multi-host workers agree on the full
+vector during startup. Each TP worker uses the budget for its pipeline stage.
+When the vector is present, it takes precedence over the scalar cache budget.
+The engine plans its KV blocks from these per-worker limits. Include model
+weights, working memory and KV in the separate Plait device reservation.
 
 Run one route publisher alongside the ingress, or add `--routes` to the
 launcher on that host. Both processes use the same route file.
