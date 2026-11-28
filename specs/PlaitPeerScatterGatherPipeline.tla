@@ -1,67 +1,74 @@
 ---- MODULE PlaitPeerScatterGatherPipeline ----
+\* The sender and receiver track each direction of the TCP stream separately.
 EXTENDS Naturals
 
-CONSTANTS Legacy, PreserveFrameOrder
+CONSTANTS World, Legacy, PreserveFrameOrder, RequireAllSources
 
-Slots == {0, 1}
-Peer(slot) == 1 - slot
-Chunks(slot) == IF slot = 0 THEN 2 ELSE 3
+Slots == 0..(World - 1)
+Links == {link \in Slots \X Slots : link[1] # link[2]}
+Peers(slot) == Slots \ {slot}
+Chunks(slot) == IF slot = 0 THEN 2 ELSE IF World = 2 THEN 3 ELSE 1
 
 VARIABLES sentScatter, readScatter, reduced, sentGather, readGather
 vars == <<sentScatter, readScatter, reduced, sentGather, readGather>>
 
 Init ==
-    /\ sentScatter = [slot \in Slots |-> 0]
-    /\ readScatter = [slot \in Slots |-> 0]
+    /\ sentScatter = [link \in Links |-> 0]
+    /\ readScatter = [link \in Links |-> 0]
     /\ reduced = [slot \in Slots |-> 0]
-    /\ sentGather = [slot \in Slots |-> 0]
-    /\ readGather = [slot \in Slots |-> 0]
+    /\ sentGather = [link \in Links |-> 0]
+    /\ readGather = [link \in Links |-> 0]
 
 ScatterDone(slot) ==
-    /\ sentScatter[slot] = Chunks(Peer(slot))
-    /\ readScatter[slot] = Chunks(slot)
+    \A peer \in Peers(slot) :
+        /\ sentScatter[<<slot, peer>>] = Chunks(peer)
+        /\ readScatter[<<peer, slot>>] = Chunks(slot)
 
-SendScatter(slot) ==
-    /\ sentScatter[slot] < Chunks(Peer(slot))
-    /\ sentScatter' = [sentScatter EXCEPT ![slot] = @ + 1]
+SendScatter(link) ==
+    /\ sentScatter[link] < Chunks(link[2])
+    /\ sentScatter' = [sentScatter EXCEPT ![link] = @ + 1]
     /\ UNCHANGED <<readScatter, reduced, sentGather, readGather>>
 
-ReadScatter(slot) ==
-    /\ readScatter[slot] < sentScatter[Peer(slot)]
-    /\ readScatter' = [readScatter EXCEPT ![slot] = @ + 1]
+ReadScatter(link) ==
+    /\ readScatter[link] < sentScatter[link]
+    /\ readScatter' = [readScatter EXCEPT ![link] = @ + 1]
     /\ UNCHANGED <<sentScatter, reduced, sentGather, readGather>>
 
 Fold(slot) ==
-    /\ reduced[slot] < readScatter[slot]
+    /\ reduced[slot] < Chunks(slot)
     /\ slot \in Legacy => ScatterDone(slot)
+    /\ RequireAllSources =>
+        \A peer \in Peers(slot) : reduced[slot] < readScatter[<<peer, slot>>]
     /\ reduced' = [reduced EXCEPT ![slot] = @ + 1]
     /\ UNCHANGED <<sentScatter, readScatter, sentGather, readGather>>
 
-SendGather(slot) ==
-    /\ sentGather[slot] < reduced[slot]
-    /\ slot \in Legacy => ScatterDone(slot)
-    /\ PreserveFrameOrder => sentScatter[slot] = Chunks(Peer(slot))
-    /\ sentGather' = [sentGather EXCEPT ![slot] = @ + 1]
+SendGather(link) ==
+    /\ sentGather[link] < reduced[link[1]]
+    /\ link[1] \in Legacy => ScatterDone(link[1]) /\ reduced[link[1]] = Chunks(link[1])
+    /\ PreserveFrameOrder => sentScatter[link] = Chunks(link[2])
+    /\ sentGather' = [sentGather EXCEPT ![link] = @ + 1]
     /\ UNCHANGED <<sentScatter, readScatter, reduced, readGather>>
 
-ReadGather(slot) ==
-    /\ readGather[slot] < sentGather[Peer(slot)]
-    /\ readScatter[slot] = Chunks(slot)
-    /\ slot \in Legacy => ScatterDone(slot)
-    /\ readGather' = [readGather EXCEPT ![slot] = @ + 1]
+ReadGather(link) ==
+    /\ readGather[link] < sentGather[link]
+    /\ readScatter[link] = Chunks(link[2])
+    /\ link[2] \in Legacy => ScatterDone(link[2])
+    /\ readGather' = [readGather EXCEPT ![link] = @ + 1]
     /\ UNCHANGED <<sentScatter, readScatter, reduced, sentGather>>
 
-Next == \E slot \in Slots : SendScatter(slot) \/ ReadScatter(slot) \/ Fold(slot)
-                           \/ SendGather(slot) \/ ReadGather(slot)
+Next ==
+    \/ \E link \in Links :
+           SendScatter(link) \/ ReadScatter(link) \/ SendGather(link) \/ ReadGather(link)
+    \/ \E slot \in Slots : Fold(slot)
 Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
 
-FrameOrder == \A slot \in Slots :
-    /\ sentGather[slot] > 0 => sentScatter[slot] = Chunks(Peer(slot))
-    /\ readGather[slot] > 0 => readScatter[slot] = Chunks(slot)
+FrameOrder == \A link \in Links :
+    /\ sentGather[link] > 0 => sentScatter[link] = Chunks(link[2])
+    /\ readGather[link] > 0 => readScatter[link] = Chunks(link[2])
 
-ReadyPrefix == \A slot \in Slots :
-    /\ sentGather[slot] <= reduced[slot]
-    /\ reduced[slot] <= readScatter[slot]
+ReadyPrefix == \A link \in Links :
+    /\ sentGather[link] <= reduced[link[1]]
+    /\ reduced[link[2]] <= readScatter[link]
 
-Progress == <>(\A slot \in Slots : readGather[slot] = Chunks(Peer(slot)))
+Progress == <>(\A link \in Links : readGather[link] = Chunks(link[1]))
 ====

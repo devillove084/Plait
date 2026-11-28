@@ -2334,21 +2334,23 @@ or NaN, the caller discards the provisional output and runs the scalar
 reduction. The two-worker FP16 scatter/gather pipeline can write a complete
 block directly into its gather buffer.
 
-Larger all-reduces divide the tensor into contiguous shards and assign one
-shard to each slot. Each worker concurrently sends contributions to the peers
-that own those shards and receives contributions to its own shard. It reduces
-the received values in slot order, then starts a second concurrent exchange
-of the reduced shard. Each phase has its own collective deadline. Reduce-scatter
-returns after the first phase. All-gather receives each peer's shard directly
-into its slot's output range. Broadcast and reduce use the source or destination
-specified by that call.
+Sharded all-reduces assign one contiguous shard to each slot. Each worker
+sends contributions to the slots that own those shards and receives every
+contribution to its own shard. The two-phase path folds the complete shard
+in slot order before exchanging the results. Each exchange has its own
+deadline. Reduce-scatter returns after the fold. All-gather writes each
+incoming shard to its output range. Broadcast and reduce use the source or
+destination specified by that call.
 
-For two-worker FP16 and BF16 sums above 1 MiB, each worker reduces arriving
-scatter data in 64 KiB blocks. After sending its complete scatter frame, a
-worker can send the available gather prefix while it still receives the peer's
-scatter tail. The two frames keep their original order, lengths, and headers
-in each direction, so older participants can still process them in sequence.
-The data plane writes each reduced block directly into its output range.
+Sharded FP16 and BF16 sums use a pipeline in two-worker groups and when a
+larger group's smallest shard is at least 256 KiB. A worker folds each
+64 KiB block as soon as all peers have delivered that range. On each socket
+it sends the reduced prefix after the outgoing scatter frame and reads the
+peer's reduced prefix after the incoming scatter frame. Each frame retains
+its length and sequence header. A peer that consumes the complete scatter
+before starting gather can take part in the same group. The scatter deadline
+applies until all local scatter directions finish, then gather gets its own
+deadline. A worker publishes its tensor after the full exchange succeeds.
 
 Frame writes can send the header and available payload in one vectored call.
 Before consuming a payload, each receiver checks the collective sequence, operation, dtype,

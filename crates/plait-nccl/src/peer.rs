@@ -30,6 +30,7 @@ pub use rankless::{RanklessListener, RanklessMember};
 const COLLECTIVE_LANE: u8 = 0;
 const DIRECT_LANE: u8 = 1;
 const REPLICATED_EXCHANGE: u8 = 2;
+const MIN_MULTI_PIPELINE_SHARD_BYTES: usize = 4 * frame::PIPELINE_BLOCK_BYTES;
 
 pub struct Listener {
     socket: TcpListener,
@@ -619,13 +620,13 @@ impl PeerGroup {
             wire.measure(|| frame::exchange_all(peers, &header, self.timeout))?;
             return Ok(fold.measure(|| collective.reduce(&inputs)));
         }
-        if world == 2
+        if (world == 2 || (world > 2 && bytes / world >= MIN_MULTI_PIPELINE_SHARD_BYTES))
             && matches!(
                 collective,
                 Collective::AllReduce(DataType::Float16 | DataType::Bfloat16, ReduceOp::Sum)
             )
         {
-            return self.pipeline_pair_sum(collective, sequence, input, wire, fold);
+            return self.pipeline_sum(collective, sequence, input, wire, fold);
         }
         match collective {
             Collective::AllReduce(..)
@@ -696,7 +697,7 @@ impl PeerGroup {
         }
     }
 
-    fn pipeline_pair_sum(
+    fn pipeline_sum(
         &self,
         collective: Collective,
         sequence: u64,
@@ -705,41 +706,63 @@ impl PeerGroup {
         fold: &mut Timer,
     ) -> io::Result<Vec<u8>> {
         let (_, dtype, op, _) = collective.wire();
-        let ranges = shard_ranges(input.len(), dtype.bytes(), 2);
-        let peer = 1 - self.slot;
-        let local = &input[ranges[self.slot].clone()];
-        let mut contribution = vec![0; local.len()];
+        let world = self.links.len();
+        let ranges = shard_ranges(input.len(), dtype.bytes(), world);
+        let own = ranges[self.slot].clone();
+        let local = &input[own.clone()];
+        let mut contributions = vec![vec![0; local.len()]; world - 1];
         let mut output = vec![0; input.len()];
-        let (left, right) = output.split_at_mut(ranges[0].end);
-        let (gather_send, gather_recv) = if self.slot == 0 {
-            (left, right)
-        } else {
-            (right, left)
-        };
+        let (mut before, tail) = output.split_at_mut(own.start);
+        let (gather_send, mut after) = tail.split_at_mut(own.len());
+        // The lane order is also the order of the remote operands.
+        let mut lanes: Vec<_> = (0..world)
+            .filter(|&peer| peer != self.slot)
+            .zip(&mut contributions)
+            .map(|(peer, received)| {
+                let range = ranges[peer].clone();
+                let rest = if peer < self.slot {
+                    &mut before
+                } else {
+                    &mut after
+                };
+                let (gather_recv, remaining) = std::mem::take(rest).split_at_mut(range.len());
+                *rest = remaining;
+                frame::ScatterGatherLane::new(
+                    peer,
+                    &self.link(peer).collective,
+                    &input[range],
+                    received,
+                    gather_recv,
+                )
+            })
+            .collect();
         frame::ScatterGather {
-            peer,
-            stream: &self.link(peer).collective,
             scatter_header: collective.header(sequence, input.len(), 0),
             gather_header: collective.header(sequence, input.len(), 1),
-            scatter_send: &input[ranges[peer].clone()],
-            scatter_recv: &mut contribution,
             gather_send,
-            gather_recv,
         }
-        .run(self.timeout, wire, |start, remote, result| {
-            let local = &local[start..start + remote.len()];
-            let ordered = if self.slot == 0 {
-                [local, remote]
-            } else {
-                [remote, local]
-            };
+        .run(&mut lanes, self.timeout, wire, |start, lanes, result| {
+            let block = start..start + result.len();
             fold.measure(|| {
-                if dtype == DataType::Float16
-                    && host_reduce::try_sum_fp16_pair_into(ordered[0], ordered[1], result)
-                {
-                    return;
+                let local = &local[block.clone()];
+                if let [lane] = lanes {
+                    let remote = &lane.contribution()[block];
+                    let ordered = if self.slot == 0 {
+                        [local, remote]
+                    } else {
+                        [remote, local]
+                    };
+                    if dtype != DataType::Float16
+                        || !host_reduce::try_sum_fp16_pair_into(ordered[0], ordered[1], result)
+                    {
+                        result.copy_from_slice(&reduce_slices(op, dtype, &ordered));
+                    }
+                } else {
+                    let mut ordered = Vec::with_capacity(world);
+                    ordered.extend(lanes.iter().map(|lane| &lane.contribution()[block.clone()]));
+                    ordered.insert(self.slot, local);
+                    result.copy_from_slice(&reduce_slices(op, dtype, &ordered));
                 }
-                result.copy_from_slice(&reduce_slices(op, dtype, &ordered));
             });
         })?;
         Ok(output)

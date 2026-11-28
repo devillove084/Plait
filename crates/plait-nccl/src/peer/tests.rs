@@ -163,20 +163,24 @@ fn paired_scatter_sends_a_reduced_prefix_before_the_tail_arrives() {
 
     thread::scope(|scope| {
         let pipeline = scope.spawn(|| {
+            let mut contribution = vec![0; own];
             frame::ScatterGather {
-                peer: 1,
-                stream: &local,
                 scatter_header: scatter,
                 gather_header: gather,
-                scatter_send: &vec![7; other],
-                scatter_recv: &mut vec![0; own],
                 gather_send: reduced,
-                gather_recv: peer_reduced,
             }
             .run(
+                &mut [frame::ScatterGatherLane::new(
+                    1,
+                    &local,
+                    &vec![7; other],
+                    &mut contribution,
+                    peer_reduced,
+                )],
                 timeout,
                 &mut Timer::new(false),
-                |_, contribution, result| {
+                |start, lanes, result| {
+                    let contribution = &lanes[0].contribution()[start..start + result.len()];
                     for (value, target) in contribution.iter().zip(result) {
                         *target = *value + 1;
                     }
@@ -221,6 +225,156 @@ fn paired_half_pipeline_keeps_uneven_and_nonfinite_sums_in_slot_order() {
             let expected = &expected;
             scope.spawn(move || assert_eq!(peer.execute(op, input).unwrap(), *expected));
         }
+    });
+}
+
+#[test]
+fn sharded_half_pipeline_interoperates_with_a_peer_that_waits_for_scatter() {
+    let world = 4;
+    let words = world * (MIN_MULTI_PIPELINE_SHARD_BYTES / 2) + 1;
+    let cases: [[u16; 4]; 4] = [
+        [0x7800, 0x0001, 0xf800, 0x0001],
+        [0x8000, 0x8000, 0x8000, 0x8000],
+        [0x3c01, 0x1000, 0x0000, 0x0000],
+        [0x7801, 0x0002, 0xf801, 0x0003],
+    ];
+    let mut inputs: Vec<Vec<u8>> = (0..world)
+        .map(|slot| {
+            (0..words)
+                .flat_map(|word| cases[word % cases.len()][slot].to_ne_bytes())
+                .collect()
+        })
+        .collect();
+    // Give one slot a nonfinite value after the full blocks have been reduced.
+    inputs[2][2 * (words - 1)..].copy_from_slice(&0x7e27u16.to_ne_bytes());
+    let collective = Collective::AllReduce(DataType::Float16, ReduceOp::Sum);
+    let expected = collective.reduce(&inputs);
+    let ranges = shard_ranges(expected.len(), 2, world);
+    let scatter = collective.header(0, expected.len(), 0);
+    let gather = collective.header(0, expected.len(), 1);
+    thread::scope(|scope| {
+        for (slot, (group, input)) in groups(world).into_iter().zip(&inputs).enumerate() {
+            let expected = &expected;
+            let ranges = &ranges;
+            scope.spawn(move || {
+                if slot == 1 {
+                    let mut wire = Timer::new(false);
+                    let inputs = group
+                        .contributions(&scatter, input, ranges, &mut wire)
+                        .unwrap();
+                    let reduced = collective.reduce(&inputs);
+                    let mut actual = vec![0; input.len()];
+                    group
+                        .gather(
+                            &gather,
+                            &reduced,
+                            &mut actual,
+                            ranges.iter().map(Range::len),
+                            &mut wire,
+                        )
+                        .unwrap();
+                    assert_eq!(actual, *expected);
+                } else {
+                    assert_eq!(group.execute(collective, input).unwrap(), *expected);
+                }
+            });
+        }
+    });
+}
+
+#[test]
+fn sharded_scatter_returns_a_prefix_once_every_source_has_contributed() {
+    exchange_sharded_prefix(false);
+}
+
+#[test]
+fn sharded_scatter_fails_after_a_peer_disconnects_before_the_tail() {
+    exchange_sharded_prefix(true);
+}
+
+fn exchange_sharded_prefix(disconnect: bool) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let timeout = Duration::from_secs(3);
+    let (local, mut remote): (Vec<_>, Vec<_>) = (0..2)
+        .map(|_| {
+            let local = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            local.set_nonblocking(true).unwrap();
+            let (remote, _) = listener.accept().unwrap();
+            configure(&remote, timeout).unwrap();
+            (local, remote)
+        })
+        .unzip();
+    let block = frame::PIPELINE_BLOCK_BYTES;
+    let own = 2 * block + 2;
+    let other = 2 * block;
+    let collective = Collective::AllReduce(DataType::Float16, ReduceOp::Sum);
+    let scatter_header = collective.header(0, own + 2 * other, 0);
+    let gather_header = collective.header(0, own + 2 * other, 1);
+    let mut output = vec![0; own];
+    thread::scope(|scope| {
+        let local = scope.spawn(|| -> io::Result<()> {
+            let scatter_send = vec![3; other];
+            let mut contributions = [vec![0; own], vec![0; own]];
+            let mut gathered = [vec![0; other], vec![0; other]];
+            let mut lanes: Vec<_> = local
+                .iter()
+                .zip(&mut contributions)
+                .zip(&mut gathered)
+                .enumerate()
+                .map(|(index, ((stream, recv), gathered))| {
+                    frame::ScatterGatherLane::new(index + 1, stream, &scatter_send, recv, gathered)
+                })
+                .collect();
+            frame::ScatterGather {
+                scatter_header,
+                gather_header,
+                gather_send: &mut output,
+            }
+            .run(
+                &mut lanes,
+                timeout,
+                &mut Timer::new(false),
+                |start, lanes, result| {
+                    for (index, value) in result.iter_mut().enumerate() {
+                        *value = lanes[0].contribution()[start + index]
+                            + lanes[1].contribution()[start + index];
+                    }
+                },
+            )?;
+            assert_eq!(gathered[0], vec![11; other]);
+            assert_eq!(gathered[1], vec![12; other]);
+            Ok(())
+        });
+        for (index, peer) in remote.iter().enumerate() {
+            frame::write(peer, &scatter_header, &vec![2 + index as u8; block]).unwrap();
+            let mut sent = vec![0; other];
+            frame::read(peer, 0, &scatter_header, &mut sent).unwrap();
+            assert_eq!(sent, vec![3; other]);
+        }
+        // Neither remote sends its scatter tail until the local prefix arrives.
+        for peer in &remote {
+            let mut prefix = vec![0; block];
+            frame::read(peer, 0, &gather_header, &mut prefix).unwrap();
+            assert_eq!(prefix, vec![5; block]);
+        }
+        if disconnect {
+            remote[1].shutdown(Shutdown::Both).unwrap();
+            assert_eq!(
+                local.join().unwrap().unwrap_err().kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+            return;
+        }
+        for (index, peer) in remote.iter_mut().enumerate() {
+            peer.write_all(&vec![6 + index as u8; own - block]).unwrap();
+            frame::write(peer, &gather_header, &vec![11 + index as u8; other]).unwrap();
+        }
+        for peer in &mut remote {
+            let mut tail = vec![0; own - block];
+            peer.read_exact(&mut tail).unwrap();
+            assert_eq!(tail, vec![13; own - block]);
+        }
+        local.join().unwrap().unwrap();
     });
 }
 

@@ -176,102 +176,119 @@ impl Progress {
 
 pub(super) const PIPELINE_BLOCK_BYTES: usize = 64 * 1024;
 
+pub(super) struct ScatterGatherLane<'a> {
+    scatter: Transfer<'a>,
+    gather: Progress,
+    gather_recv: &'a mut [u8],
+}
+
+impl<'a> ScatterGatherLane<'a> {
+    pub(super) fn new(
+        peer: usize,
+        stream: &'a TcpStream,
+        scatter_send: &'a [u8],
+        scatter_recv: &'a mut [u8],
+        gather_recv: &'a mut [u8],
+    ) -> Self {
+        Self {
+            scatter: Transfer {
+                peer,
+                stream,
+                outgoing: scatter_send,
+                incoming: scatter_recv,
+                progress: Progress::default(),
+            },
+            gather: Progress::default(),
+            gather_recv,
+        }
+    }
+
+    pub(super) fn contribution(&self) -> &[u8] {
+        self.scatter.incoming
+    }
+
+    fn advance_gather(&mut self, header: &[u8; 24], reduced: &[u8]) -> io::Result<libc::pollfd> {
+        let scatter = &self.scatter;
+        if !scatter.progress.sending(scatter.outgoing.len()) {
+            self.gather.send(scatter.stream, header, reduced)?;
+        }
+        if !scatter.progress.receiving(scatter.incoming.len()) {
+            self.gather
+                .receive(scatter.stream, scatter.peer, header, self.gather_recv)?;
+        }
+        let events = scatter
+            .progress
+            .events(scatter.outgoing.len(), scatter.incoming.len())
+            | self.gather.events(reduced.len(), self.gather_recv.len());
+        Ok(libc::pollfd {
+            fd: scatter.stream.as_raw_fd(),
+            events,
+            revents: 0,
+        })
+    }
+}
+
 pub(super) struct ScatterGather<'a> {
-    pub peer: usize,
-    pub stream: &'a TcpStream,
     pub scatter_header: [u8; 24],
     pub gather_header: [u8; 24],
-    pub scatter_send: &'a [u8],
-    pub scatter_recv: &'a mut [u8],
     pub gather_send: &'a mut [u8],
-    pub gather_recv: &'a mut [u8],
 }
 
 impl ScatterGather<'_> {
-    /// Keep each direction's frame order while letting the gather send start
-    /// before the scatter receive finishes. Only reduced bytes are writable.
+    /// Reduce the prefix received from every peer. Each direction keeps the
+    /// original frame order, so a peer can still read the full scatter first.
     pub(super) fn run(
         self,
+        lanes: &mut [ScatterGatherLane<'_>],
         timeout: Duration,
         wire: &mut Timer,
-        mut reduce_block: impl FnMut(usize, &[u8], &mut [u8]),
+        mut reduce_block: impl FnMut(usize, &[ScatterGatherLane<'_>], &mut [u8]),
     ) -> io::Result<()> {
         let mut deadline = phase_deadline(timeout)?;
-        let mut scatter = Progress::default();
-        let mut gather = Progress::default();
+        let mut waiting = Vec::with_capacity(lanes.len());
         let mut reduced = 0;
         let mut scatter_finished = false;
         loop {
-            wire.measure(|| {
-                scatter.send(self.stream, &self.scatter_header, self.scatter_send)?;
-                scatter.receive(
-                    self.stream,
-                    self.peer,
-                    &self.scatter_header,
-                    self.scatter_recv,
-                )
+            let (scatter_events, contiguous) = wire.measure(|| {
+                let mut events = 0;
+                let mut contiguous = self.gather_send.len();
+                for lane in &mut *lanes {
+                    events |= lane.scatter.progress(&self.scatter_header)?;
+                    contiguous = contiguous.min(lane.scatter.progress.body_bytes);
+                }
+                Ok::<_, io::Error>((events, contiguous))
             })?;
-            let scatter_sending = scatter.sending(self.scatter_send.len());
-            let scatter_receiving = scatter.receiving(self.scatter_recv.len());
-            if !scatter_sending && !scatter_receiving && !scatter_finished {
+            if scatter_events == 0 && !scatter_finished {
                 deadline = phase_deadline(timeout)?;
                 scatter_finished = true;
             }
 
-            let received = scatter.body_bytes;
-            let ready = if scatter_receiving {
-                received / PIPELINE_BLOCK_BYTES * PIPELINE_BLOCK_BYTES
+            let ready = if contiguous == self.gather_send.len() {
+                contiguous
             } else {
-                received
+                contiguous / PIPELINE_BLOCK_BYTES * PIPELINE_BLOCK_BYTES
             };
             while reduced < ready {
                 let end = ready.min(reduced + PIPELINE_BLOCK_BYTES);
-                reduce_block(
-                    reduced,
-                    &self.scatter_recv[reduced..end],
-                    &mut self.gather_send[reduced..end],
-                );
+                reduce_block(reduced, lanes, &mut self.gather_send[reduced..end]);
                 reduced = end;
             }
 
-            let events = wire.measure(|| {
-                if !scatter_sending {
-                    gather.send(
-                        self.stream,
-                        &self.gather_header,
-                        &self.gather_send[..reduced],
-                    )?;
+            waiting.clear();
+            wire.measure(|| {
+                for lane in &mut *lanes {
+                    let poll =
+                        lane.advance_gather(&self.gather_header, &self.gather_send[..reduced])?;
+                    if poll.events != 0 {
+                        waiting.push(poll);
+                    }
                 }
-                if !scatter_receiving {
-                    gather.receive(
-                        self.stream,
-                        self.peer,
-                        &self.gather_header,
-                        self.gather_recv,
-                    )?;
-                }
-                Ok::<_, io::Error>(gather.events(reduced, self.gather_recv.len()))
+                Ok::<_, io::Error>(())
             })?;
-            let mut events = events;
-            if scatter_sending {
-                events |= libc::POLLOUT;
-            }
-            if scatter_receiving {
-                events |= libc::POLLIN;
-            }
-            if events == 0 {
+            if waiting.is_empty() {
                 return Ok(());
             }
-            wire.measure(|| {
-                wait_ready(
-                    &mut [libc::pollfd {
-                        fd: self.stream.as_raw_fd(),
-                        events,
-                        revents: 0,
-                    }],
-                    deadline,
-                )
-            })?;
+            wire.measure(|| wait_ready(&mut waiting, deadline))?;
         }
     }
 }
