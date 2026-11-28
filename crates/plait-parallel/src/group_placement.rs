@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 
 use plait_core::collective::{
-    PeerAllReducePlan, bind_peer_all_reduce_recipe, peer_all_reduce_plan,
-    peer_all_reduce_plan_with_egress, peer_shard_elements,
+    PeerAllReducePlan, bind_peer_all_reduce_recipe, bind_tensor_pipeline_recipe,
+    peer_all_reduce_plan, peer_all_reduce_plan_with_egress, peer_shard_elements,
 };
 use plait_core::group::{
     ComputeRate, GroupId, GroupPhase, GroupVersion, HostMemory, PlacementHost, PlacementInventory,
@@ -51,6 +51,23 @@ pub struct Recipe {
 
 impl Recipe {
     pub fn binding_id(&self) -> NodeId {
+        match &self.communication {
+            Communication::TensorPipeline {
+                tensor_parallel,
+                all_reduce_by_stage,
+                replicated_egress_bytes,
+                ..
+            } => bind_tensor_pipeline_recipe(
+                self.id,
+                tensor_parallel.get() as u64,
+                all_reduce_by_stage.len() as u64,
+                *replicated_egress_bytes,
+            ),
+            _ => self.legacy_binding_id(),
+        }
+    }
+
+    fn legacy_binding_id(&self) -> NodeId {
         match self.communication {
             Communication::PeerAllReduce {
                 replicated_egress_bytes: Some(bytes),
@@ -62,6 +79,10 @@ impl Recipe {
             } => bind_peer_all_reduce_recipe(self.id, self.work.len() as u64, bytes),
             _ => self.id,
         }
+    }
+
+    fn matches_binding(&self, id: NodeId) -> bool {
+        self.binding_id() == id || self.legacy_binding_id() == id
     }
 
     fn compute_ns(&self, workers: &[Worker], first_slot: usize) -> Option<u64> {
@@ -244,8 +265,11 @@ impl Workload {
         let mut bindings = BTreeSet::new();
         for recipe in &self.recipes {
             let width = recipe.work.len();
+            let binding = recipe.binding_id();
+            let legacy = recipe.legacy_binding_id();
             if !recipes.insert(recipe.id)
-                || !bindings.insert(recipe.binding_id())
+                || !bindings.insert(binding)
+                || (legacy != binding && !bindings.insert(legacy))
                 || !self.widths.iter().any(|&item| item as usize == width)
                 || recipe.work.iter().all(|&work| work == 0)
                 || recipe
@@ -601,7 +625,7 @@ pub fn select_with_recipes(
                     .recipes
                     .iter()
                     .find(|profile| {
-                        profile.binding_id() == id && profile.work.len() == workers.len()
+                        profile.matches_binding(id) && profile.work.len() == workers.len()
                     })
                     .ok_or("active group recipe is missing from the workload policy")
             })
@@ -1537,7 +1561,12 @@ mod tests {
         };
         assert_eq!(
             recipe,
-            Some(bind_peer_all_reduce_recipe(workload.recipes[0].id, 4, 1024))
+            Some(bind_tensor_pipeline_recipe(
+                workload.recipes[0].id,
+                2,
+                2,
+                Some(1024),
+            ))
         );
         assert_eq!(
             cost,
@@ -1607,6 +1636,7 @@ mod tests {
         let mut workload = pipeline_workload();
         workload.switch_ns = 10_000;
         let recipe = workload.recipes[0].binding_id();
+        let legacy = bind_peer_all_reduce_recipe(workload.recipes[0].id, 4, 1024);
         let mut inventory = pipeline_inventory(
             &[a, b, c, d],
             [a, b, c, d]
@@ -1647,17 +1677,19 @@ mod tests {
             hosts: vec![(a, memory(9, 5)), (b, memory(9, 5))],
         });
         let old = links_between(a, b, 1_000_000_000, 50);
-        let replan = |spare_bandwidth| {
+        let replan = |spare_bandwidth, active_recipe| {
             let mut links = old.to_vec();
             links.extend(links_between(c, d, spare_bandwidth, 50));
-            select_with_recipes(&inventory, &workload, &links, 55, None, Some(recipe)).unwrap()
+            select_with_recipes(&inventory, &workload, &links, 55, None, Some(active_recipe))
+                .unwrap()
         };
-        assert!(matches!(replan(100_000_000), Decision::Keep { .. }));
+        assert!(matches!(replan(100_000_000, recipe), Decision::Keep { .. }));
+        assert!(matches!(replan(100_000_000, legacy), Decision::Keep { .. }));
         let Decision::Prepare {
             resources,
             recipe: Some(chosen),
             ..
-        } = replan(10_000_000_000)
+        } = replan(10_000_000_000, legacy)
         else {
             panic!("faster spare links cover the switch cost");
         };

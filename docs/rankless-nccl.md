@@ -558,13 +558,17 @@ destination stages. It totals the traffic on each directed host link,
 charges the highest ingress or egress serialization cost and the slowest
 link RTT, then multiplies by the number of rounds. Use a reverse transfer
 entry when the workload sends sampling results upstream. An explicit
-`replicated_egress_bytes` cap applies to every TP row and uses the same
-recipe ID derivation as `peer_all_reduce`.
+`replicated_egress_bytes` cap applies to every TP row.
 
 Configure the same base recipe ID, total width, TP degree, layer partition,
-and optional cap in the vLLM launch definition. The planner sums the stage
-and transfer costs for one operation. The engine's sustained pipeline
-capacity depends on its batching and overlap.
+and optional cap in the vLLM launch definition. New mixed bindings encode
+both TP and PP degrees and the optional cap, so TP2 × PP3 and TP3 × PP2
+resolve to different launch definitions. Existing mixed recipe IDs still
+resolve under their original definitions. Upgrade the vLLM launcher before
+the planner to keep existing and newly committed layouts launchable.
+
+The planner sums the stage and transfer costs for one operation. The
+engine's sustained pipeline capacity depends on its batching and overlap.
 
 Directed exchanges follow the supplied device positions and add their
 round costs. The generic `all_to_all` recipe charges the supplied worker-pair

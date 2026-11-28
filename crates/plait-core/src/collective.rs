@@ -57,9 +57,44 @@ pub fn bind_peer_all_reduce_recipe(recipe: NodeId, width: u64, egress_bytes: u64
     NodeId::from_bytes(digest.finalize()[..16].try_into().expect("16 digest bytes"))
 }
 
+/// Bind the launch recipe to the TP and PP dimensions and optional TP egress cap.
+pub fn bind_tensor_pipeline_recipe(
+    recipe: NodeId,
+    tensor_parallel: u64,
+    pipeline_parallel: u64,
+    egress_bytes: Option<u64>,
+) -> NodeId {
+    let mut digest = Sha256::new();
+    digest.update(b"plait-tensor-pipeline-recipe-v1");
+    digest.update(recipe.as_bytes());
+    digest.update(tensor_parallel.to_le_bytes());
+    digest.update(pipeline_parallel.to_le_bytes());
+    digest.update([u8::from(egress_bytes.is_some())]);
+    if let Some(bytes) = egress_bytes {
+        digest.update(bytes.to_le_bytes());
+    }
+    NodeId::from_bytes(digest.finalize()[..16].try_into().expect("16 digest bytes"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tensor_pipeline_binding_encodes_both_axes_and_cap_presence() {
+        let base = NodeId::from_bytes([5; 16]);
+        for (tp, pp, cap, expected) in [
+            (2, 3, None, "de552deaea089196c02a9a8007ec5181"),
+            (3, 2, None, "e5f77fd1ea7116777217f7dda2e95016"),
+            (2, 3, Some(0), "77b221cb6d08d3ee7fc3895d20450457"),
+            (2, 3, Some(1024), "ec4150f8b6280f2c4ff75230fa239e79"),
+        ] {
+            assert_eq!(
+                bind_tensor_pipeline_recipe(base, tp, pp, cap).to_string(),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn replicated_egress_limit_charges_each_other_slot_and_rejects_overflow() {
