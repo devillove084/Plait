@@ -9,8 +9,8 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use plait_core::group::{
-    GrantStatus, GroupAction, GroupFault, GroupLookup, GroupOperation, GroupReply, GroupVersion,
-    GroupView, WorkerGrant,
+    DeviceFailureScope, GrantStatus, GroupAction, GroupFault, GroupLookup, GroupOperation,
+    GroupReply, GroupVersion, GroupView, WorkerFaultEvidence, WorkerGrant,
 };
 use plait_core::{DeviceId, NodeId, OpId};
 use plait_net::control::{Client, discover_voters};
@@ -92,6 +92,17 @@ async fn connect(
     timeout: Duration,
     replicated_egress_bytes: Option<u64>,
 ) -> io::Result<RanklessComm> {
+    let failure_scope = match std::env::var("PLAIT_DEVICE_FAILURE_SCOPE") {
+        Err(std::env::VarError::NotPresent) => DeviceFailureScope::default(),
+        Ok(value) if value == "host" => DeviceFailureScope::Host,
+        Ok(value) if value == "device" => DeviceFailureScope::Device,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "PLAIT_DEVICE_FAILURE_SCOPE must be host or device",
+            ));
+        }
+    };
     let JoinGroup {
         version,
         member,
@@ -186,7 +197,7 @@ async fn connect(
         seeds,
         operation: GroupOperation {
             id: OpId::new(session, 5),
-            action: GroupAction::ReportWorkerUnavailable { grant },
+            action: WorkerFaultEvidence::Granted(grant).report(failure_scope),
         },
         attempted: OnceLock::new(),
     });

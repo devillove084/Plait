@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use plait_core::serving::{
-    ExecutionHostLiveness, GroupPhase, GroupVersion, HostedInventory, HostedProbeEndpoint,
-    ServingError, ServingOutcome, ServingResult, WorkerGrant,
+    ExecutionDrainTarget, ExecutionHostLiveness, GroupPhase, GroupVersion, HostedInventory,
+    HostedProbeEndpoint, ServingError, ServingOutcome, ServingResult, WorkerGrant,
 };
 use plait_core::{DeviceId, NodeId, OpId};
 
@@ -120,13 +120,36 @@ impl ServingState {
                 || self.host_has_launch(grant.version, host)
                 || self.hosted_pool_versions.contains(&grant.version)
         });
-        versions.extend(
-            self.workers
-                .range(DeviceId::new(host, 0)..=DeviceId::new(host, u32::MAX))
-                .filter_map(|(_, worker)| worker.grant.map(|grant| grant.version))
-                .filter(|&version| self.peer_version_is_live(version)),
-        );
+        versions.extend(self.live_peer_versions_on(host));
         versions
+    }
+
+    fn live_peer_versions_on(&self, host: NodeId) -> impl Iterator<Item = GroupVersion> + '_ {
+        self.workers
+            .range(DeviceId::new(host, 0)..=DeviceId::new(host, u32::MAX))
+            .filter_map(|(_, worker)| worker.grant.map(|grant| grant.version))
+            .filter(|&version| self.peer_version_is_live(version))
+    }
+
+    pub(super) fn quarantine_execution_host(&mut self, host: NodeId, intent: OpId) -> OpId {
+        let drain = *self
+            .execution_drains
+            .entry(ExecutionDrainTarget::Host(host))
+            .or_insert(intent);
+        let mut versions = self.versions_on(host, |_| true);
+        // Revoke local hosted standbys before an incumbent can promote them.
+        versions.retain(|&version| {
+            if self.group(version).expect("known affected group").phase == GroupPhase::Active {
+                true
+            } else {
+                self.fail_resident_version(version)
+                    .expect("affected group checked");
+                false
+            }
+        });
+        versions.extend(self.live_peer_versions_on(host));
+        self.fail_execution_versions(&versions);
+        drain
     }
 
     pub(crate) fn resident_versions_on(&self, host: NodeId) -> BTreeSet<GroupVersion> {
@@ -177,6 +200,13 @@ impl ServingState {
                 ..old
             },
         );
+        self.fail_execution_versions(groups);
+        self.hosted_probes.remove(&host);
+        self.hosted_inventories.remove(&host);
+        Ok(ServingOutcome::ExecutionHostOffline)
+    }
+
+    fn fail_execution_versions(&mut self, groups: &BTreeSet<GroupVersion>) {
         for &version in groups {
             if self.peer_version_is_live(version) {
                 self.fail_peer_group(version, Some(groups))
@@ -186,9 +216,6 @@ impl ServingState {
                     .expect("affected groups checked");
             }
         }
-        self.hosted_probes.remove(&host);
-        self.hosted_inventories.remove(&host);
-        Ok(ServingOutcome::ExecutionHostOffline)
     }
 }
 

@@ -8,7 +8,7 @@ use plait_core::group::{
     GroupMember, GroupOperation, GroupOutcome, GroupPhase, GroupPreparation, GroupReceipt,
     GroupRecipe, GroupResult, GroupTransition, GroupVersion, GroupView, PeerEndpoint,
     PlacementHost, PlacementInventory, PlacementWorker, PreparedSetView, RateEvidence,
-    ResourcePlan, WorkerGrant, WorkerStateView,
+    ResourcePlan, WorkerFaultEvidence, WorkerGrant, WorkerStateView,
 };
 use plait_core::link::{ProbeEndpoint, ProbeRegistration};
 use plait_core::serving::{ExecutionDrainTarget, ServingError};
@@ -385,6 +385,9 @@ impl ServingState {
                 device,
                 incarnation,
             } => self.withdraw_idle_worker(device, incarnation, operation.id),
+            GroupAction::QuarantineHost { evidence } => {
+                self.quarantine_peer_host(evidence, operation.id)
+            }
             GroupAction::Observe { group, epoch } => {
                 let epoch = epoch
                     .or_else(|| self.peer_groups.active_epoch(group))
@@ -1074,12 +1077,45 @@ impl ServingState {
         Ok(outcome)
     }
 
+    fn quarantine_peer_host(&mut self, evidence: WorkerFaultEvidence, report: OpId) -> GroupResult {
+        let device = match evidence {
+            WorkerFaultEvidence::Granted(grant) => {
+                if self
+                    .workers
+                    .get(&grant.device)
+                    .and_then(|worker| worker.grant)
+                    != Some(grant)
+                {
+                    return Err(GroupError::GrantMismatch);
+                }
+                grant.device
+            }
+            WorkerFaultEvidence::Idle {
+                device,
+                incarnation,
+            } => {
+                self.check_idle_worker(device, incarnation)?;
+                device
+            }
+        };
+        let host = device.node;
+        let drain = self.quarantine_execution_host(host, report);
+        Ok(GroupOutcome::HostQuarantined { host, drain })
+    }
+
     fn withdraw_idle_worker(
         &mut self,
         device: DeviceId,
         incarnation: u64,
         report: OpId,
     ) -> GroupResult {
+        self.check_idle_worker(device, incarnation)?;
+        self.begin_execution_drain(ExecutionDrainTarget::Device(device), report)
+            .map_err(resource_error)?;
+        Ok(GroupOutcome::WorkerWithdrawn(device))
+    }
+
+    fn check_idle_worker(&self, device: DeviceId, incarnation: u64) -> Result<(), GroupError> {
         let worker = self
             .workers
             .get(&device)
@@ -1090,9 +1126,7 @@ impl ServingState {
         if worker.grant.is_some() {
             return Err(GroupError::WorkerBusy(device));
         }
-        self.begin_execution_drain(ExecutionDrainTarget::Device(device), report)
-            .map_err(resource_error)?;
-        Ok(GroupOutcome::WorkerWithdrawn(device))
+        Ok(())
     }
 
     fn advertise_peer_worker(
@@ -1288,7 +1322,7 @@ mod tests {
     use plait_core::AcceleratorKind;
     use plait_core::NodeId;
     use plait_core::group::{GroupFault, HostMemory, WorkerDemand};
-    use plait_core::serving::{GroupPlan, ServingRole};
+    use plait_core::serving::{GroupPlan, ServingOutcome, ServingRole};
 
     impl ServingState {
         fn peer_group_transition(&mut self, action: &GroupAction) -> GroupResult {
@@ -1776,6 +1810,132 @@ mod tests {
                 current: Some(standby.epoch)
             })
         );
+    }
+
+    #[test]
+    fn a_host_fault_revokes_all_its_groups_and_preserves_their_grants() {
+        let (mut state, active, standby, failed) = prepared_successor(true);
+        let sibling = ready_single_worker(&mut state, standby);
+        state.set_peer_standby(active, Some(standby.epoch)).unwrap();
+        let host = failed.device.node;
+        let hosted_device = DeviceId::new(host, 2);
+        let idle = DeviceId::new(host, 3);
+        for device in [hosted_device, idle] {
+            state.register_worker(device, 1, 16).unwrap();
+        }
+        let hosted_plan = GroupPlan {
+            role: ServingRole::Aggregated,
+            model: "model".into(),
+            tensor_parallel: 1,
+            pipeline_parallel: 1,
+            launch_digest: [0; 32],
+            workers: BTreeMap::from([(
+                hosted_device,
+                WorkerDemand {
+                    incarnation: 1,
+                    device_bytes: 8,
+                },
+            )]),
+            hosts: BTreeMap::from([(
+                host,
+                HostMemory {
+                    bytes: 4,
+                    pinned_bytes: 0,
+                },
+            )]),
+        };
+        let ServingOutcome::Group {
+            version: hosted, ..
+        } = state
+            .prepare(GroupId(NodeId::derive("hosted neighbor")), 0, &hosted_plan)
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let hosted_grant = state.group(hosted).unwrap().grants[&hosted_device];
+        let report = |counter, evidence| GroupOperation {
+            id: OpId::new(host, counter),
+            action: GroupAction::QuarantineHost { evidence },
+        };
+        let target = ExecutionDrainTarget::Host(host);
+        let stale = report(
+            1,
+            WorkerFaultEvidence::Granted(WorkerGrant {
+                fence: failed.fence + 1,
+                ..failed
+            }),
+        );
+        assert_eq!(
+            state.apply_peer_group(&stale),
+            Err(GroupError::GrantMismatch)
+        );
+        assert_eq!(
+            state.apply_peer_group(&report(
+                2,
+                WorkerFaultEvidence::Idle {
+                    device: idle,
+                    incarnation: 0
+                }
+            )),
+            Err(GroupError::StaleIncarnation(idle))
+        );
+        assert_eq!(state.execution_drain(target).drain, None);
+        let loss = report(3, WorkerFaultEvidence::Granted(failed));
+        let outcome = Ok(GroupOutcome::HostQuarantined {
+            host,
+            drain: loss.id,
+        });
+        assert_eq!(state.apply_peer_group(&loss), outcome);
+        assert_eq!(state.apply_peer_group(&loss), outcome);
+        for version in [active, standby] {
+            assert_eq!(
+                state.peer_group_view(version).unwrap().phase,
+                GroupPhase::Revoked
+            );
+        }
+        assert_eq!(state.group(hosted).unwrap().phase, GroupPhase::Revoked);
+        for grant in [failed, sibling, hosted_grant] {
+            assert_eq!(state.workers[&grant.device].grant, Some(grant));
+        }
+        state.release_peer_worker(failed).unwrap();
+        let other = report(
+            4,
+            WorkerFaultEvidence::Idle {
+                device: idle,
+                incarnation: 1,
+            },
+        );
+        assert_eq!(state.apply_peer_group(&other), outcome);
+        assert_eq!(
+            state.execution_drain(target).holders,
+            BTreeSet::from([standby, hosted])
+        );
+        assert!(
+            state
+                .placement_inventory(active.group)
+                .workers
+                .iter()
+                .all(|worker| !worker.eligible)
+        );
+    }
+
+    #[test]
+    fn a_host_fault_promotes_a_ready_standby_on_another_host() {
+        let (mut state, active, standby, failed) = prepared_successor(false);
+        let successor = ready_single_worker(&mut state, standby);
+        state.set_peer_standby(active, Some(standby.epoch)).unwrap();
+        let report = GroupOperation {
+            id: OpId::new(failed.device.node, 1),
+            action: GroupAction::QuarantineHost {
+                evidence: WorkerFaultEvidence::Granted(failed),
+            },
+        };
+        state.apply_peer_group(&report).unwrap();
+        assert_eq!(
+            state.peer_group_view(standby).unwrap().phase,
+            GroupPhase::Active
+        );
+        assert_eq!(state.peer_grant_status(successor), GrantStatus::Held);
     }
 
     #[test]

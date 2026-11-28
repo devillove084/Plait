@@ -88,7 +88,27 @@ Voters with `run --state-dir` preserve applied group metadata through restart.
 Callers use current metadata and device completion to decide when existing
 handles can be reclaimed.
 
+### Quarantine a compute host
+
+Confirmed local hardware loss defaults to host scope. A `QuarantineHost`
+operation accepts the exact held grant or the current incarnation of an idle
+worker. The voter records a host drain and revokes all affected execution
+groups in the same operation. Standbys on the quarantined host are revoked
+with the other groups. A ready native standby on a healthy host can take over.
+Existing grants stay charged until their owners confirm teardown.
+
+The host drain excludes all of the host's devices from new placements,
+including devices advertised after the fault. Compute admission and voter
+membership are independent. After inspecting the host, query
+`execution_drain` with `{"Host": <node id>}` through `plait-node serving`,
+then confirm the drain and resume it using its current drain ID.
+Upgrade voters before starting reporters that submit `QuarantineHost`.
+
 ### Withdraw an unavailable worker
+
+The device-scoped path remains available for device recovery experiments.
+Set `PLAIT_DEVICE_FAILURE_SCOPE=device` for the committed peer communicator
+and `"failure_scope": "device"` in the PCI watch configuration.
 
 For a confirmed worker outage, send an `apply` request to `plait-node group`
 with the `ReportWorkerUnavailable` action and the exact held grant.
@@ -125,8 +145,8 @@ and use `resume_execution_target`. Use `ReportFailure` for a communicator
 failure without a confirmed worker outage.
 
 For a committed peer communicator, a confirmed local ECC failure during
-stream synchronization or a device copy submits this action with the
-communicator's own grant. The reporting call stops new local operations and
+stream synchronization or a device copy submits a hardware loss report
+with the communicator's own grant. The reporting call stops new local operations and
 waits up to 15 seconds for the ordered receipt. The report has its own
 operation ID, so an earlier transport failure can still be followed by a
 local hardware diagnosis while the grant is held.
@@ -168,18 +188,17 @@ that omit an enrolled function confirm its absence. A read error resets
 that observation. The reporter runs in the node process and can act even
 when the model worker no longer executes any calls.
 
-For a native group, the node submits the exact held grant. For an idle
-worker, it submits `ReportIdleWorkerUnavailable` for the observed
-incarnation. The idle operation checks that the device remains unassigned
-before recording the drain. If a reservation raced the observation, the
-node reads the current grant and reevaluates the report. Both paths retain
-the drain until an explicit recovery operation. Release of any held grant
-still requires the execution supervisor's local teardown evidence.
+The node submits the exact held grant for an assigned worker and the
+observed incarnation for an idle worker. The voter verifies that the
+worker still matches the report before recording the host drain. If a
+reservation raced the observation, the node reads the current grant and
+reevaluates the report. Device scope retains the original per-device
+withdrawal behavior. Both scopes keep the drain until explicit recovery.
 
-After `ReadmitWorker` succeeds, atomically replace the JSON file with an
+In device scope, after `ReadmitWorker` succeeds, atomically replace the JSON file with an
 entry for the new incarnation. The resident reads the file again before
 each scan. It validates the entire file and keeps the previous inventory
-if a read or validation fails. Keep `control_ip` fixed while the node
+if a read or validation fails. Keep `control_ip` and `failure_scope` fixed while the node
 runs. A PCI address change for a known ordinal requires a higher
 incarnation, even if the ordinal was removed from the watch list.
 

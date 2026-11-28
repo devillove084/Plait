@@ -27,6 +27,41 @@ pub struct WorkerGrant {
     pub fence: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceFailureScope {
+    #[default]
+    Host,
+    Device,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkerFaultEvidence {
+    Granted(WorkerGrant),
+    Idle { device: DeviceId, incarnation: u64 },
+}
+
+impl WorkerFaultEvidence {
+    pub fn report(self, scope: DeviceFailureScope) -> GroupAction {
+        match (scope, self) {
+            (DeviceFailureScope::Host, evidence) => GroupAction::QuarantineHost { evidence },
+            (DeviceFailureScope::Device, Self::Granted(grant)) => {
+                GroupAction::ReportWorkerUnavailable { grant }
+            }
+            (
+                DeviceFailureScope::Device,
+                Self::Idle {
+                    device,
+                    incarnation,
+                },
+            ) => GroupAction::ReportIdleWorkerUnavailable {
+                device,
+                incarnation,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerStateView {
     pub incarnation: u64,
@@ -397,6 +432,9 @@ pub enum GroupAction {
         device_bytes: u64,
         drain: OpId,
     },
+    QuarantineHost {
+        evidence: WorkerFaultEvidence,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -419,6 +457,10 @@ pub enum GroupOutcome {
     PreparedSet(Vec<GroupVersion>),
     AbortedSet(Vec<GroupVersion>),
     WorkerWithdrawn(DeviceId),
+    HostQuarantined {
+        host: NodeId,
+        drain: OpId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -677,6 +719,10 @@ impl GroupOperation {
             }
             GroupAction::ObserveActiveSet { groups } => {
                 reads.extend(groups.iter().copied().map(Key::ServingGroup));
+            }
+            GroupAction::QuarantineHost { .. } => {
+                // The host's affected groups are resolved when applying the operation.
+                keys.insert(Key::Config);
             }
             GroupAction::ObserveProbe(host) => {
                 reads.insert(Key::LinkProbe(*host));

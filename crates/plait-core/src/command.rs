@@ -77,7 +77,7 @@ pub struct Access {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Key {
     /// Replicated membership configuration. Every command reads it; membership
-    /// changes write it, so reconfiguration is serialized with all commands.
+    /// changes and host quarantines write it to order their state changes.
     Config,
     /// Whole-operator state. Contributions to one operator conflict and are
     /// executed in consensus order; different operators run concurrently.
@@ -196,7 +196,7 @@ pub enum KeyClass {
 
 impl Command {
     /// Keys used by Plait ordering conflict detection. The read of `Key::Config` means
-    /// ordinary commands only conflict with a concurrent membership write.
+    /// membership changes and host quarantines are ordered with all commands.
     pub fn accesses(&self) -> Vec<Access> {
         let read_config = Access {
             key: Key::Config,
@@ -274,8 +274,10 @@ impl Command {
                 accesses
             }
             Self::Group(operation) => {
-                let mut accesses = vec![read_config];
-                accesses.extend(operation.accesses());
+                let mut accesses = operation.accesses();
+                if !accesses.iter().any(|access| access.key == Key::Config) {
+                    accesses.insert(0, read_config);
+                }
                 accesses
             }
         }
@@ -494,6 +496,18 @@ mod tests {
         };
         assert!(report.conflicts_with(&resume(1, grant.device)));
         assert!(!report.conflicts_with(&resume(2, device(1).id)));
+        let quarantine = group(
+            4,
+            GroupAction::QuarantineHost {
+                evidence: crate::group::WorkerFaultEvidence::Granted(grant),
+            },
+        );
+        assert!(quarantine.conflicts_with(&resume(2, device(1).id)));
+        let neighbor = GroupVersion {
+            group: GroupId(node("neighbor-group")),
+            epoch: 1,
+        };
+        assert!(quarantine.conflicts_with(&group(5, GroupAction::Activate(neighbor))));
     }
 
     #[test]

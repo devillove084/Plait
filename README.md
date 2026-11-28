@@ -219,6 +219,11 @@ eligible standby registered by the deployment layer. A standby affected by
 the same known host loss is excluded.
 [Communication group failover](docs/rankless-nccl.md#arm-a-standby-for-communication-group-failover)
 
+Confirmed local hardware loss quarantines the compute host by default.
+The same ordered operation excludes all its devices from serving placements
+and revokes the execution groups that use them.
+[Host quarantine and device-scoped recovery](docs/rankless-nccl.md#quarantine-a-compute-host)
+
 The native planner matches placement to device capabilities, per-device
 memory, host memory, and directional links measured by resident nodes.
 It can reserve a replacement while the incumbent runs. The reservation

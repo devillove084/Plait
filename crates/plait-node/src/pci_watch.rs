@@ -8,7 +8,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use plait_core::group::{GroupAction, GroupLookup, GroupOperation, GroupReply};
+use plait_core::group::{
+    DeviceFailureScope, GroupLookup, GroupOperation, GroupReply, WorkerFaultEvidence,
+};
 use plait_core::{DeviceId, NodeId, OpId};
 use serde::Deserialize;
 use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
@@ -25,6 +27,8 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(2);
 struct Config {
     control_ip: IpAddr,
     devices: Vec<Device>,
+    #[serde(default)]
+    failure_scope: DeviceFailureScope,
 }
 
 #[derive(Deserialize, PartialEq, Eq)]
@@ -60,6 +64,7 @@ impl Config {
 pub(super) struct Inventory {
     path: PathBuf,
     control_ip: IpAddr,
+    failure_scope: DeviceFailureScope,
     contents: Vec<u8>,
     // Keep the last accepted binding even when the ordinal leaves the watch list.
     registrations: BTreeMap<u32, Device>,
@@ -82,6 +87,7 @@ impl Inventory {
         Ok(Self {
             path,
             control_ip: config.control_ip,
+            failure_scope: config.failure_scope,
             contents,
             registrations,
             observations,
@@ -98,6 +104,12 @@ impl Inventory {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "PCI watch control IP requires a restart to change",
+            ));
+        }
+        if config.failure_scope != self.failure_scope {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "PCI watch failure scope requires a restart to change",
             ));
         }
         for device in &config.devices {
@@ -172,6 +184,7 @@ impl Observation {
         control: &mut GroupControl,
         device: DeviceId,
         incarnation: u64,
+        failure_scope: DeviceFailureScope,
     ) -> io::Result<()> {
         if self.submitted.is_none() {
             let GroupReply::Worker(state) =
@@ -182,19 +195,21 @@ impl Observation {
             let Some(state) = state.filter(|state| state.incarnation == incarnation) else {
                 return Ok(());
             };
-            let action = match state.grant {
-                None => GroupAction::ReportIdleWorkerUnavailable {
+            let evidence = match state.grant {
+                None => WorkerFaultEvidence::Idle {
                     device,
                     incarnation,
                 },
-                Some(grant) if state.has_native_grant => {
-                    GroupAction::ReportWorkerUnavailable { grant }
+                Some(grant)
+                    if failure_scope == DeviceFailureScope::Host || state.has_native_grant =>
+                {
+                    WorkerFaultEvidence::Granted(grant)
                 }
                 Some(_) => return Ok(()),
             };
             self.submitted = Some(GroupOperation {
                 id: OpId::new(NodeId::random(), 1),
-                action,
+                action: evidence.report(failure_scope),
             });
         }
         let operation = self
@@ -205,7 +220,9 @@ impl Observation {
         self.submitted = None;
         self.reported = result.is_ok();
         if self.reported {
-            println!("plait-node PCI watch withdrew {device} incarnation {incarnation}");
+            println!(
+                "plait-node PCI watch confirmed loss of {device} incarnation {incarnation} ({failure_scope:?})"
+            );
         }
         Ok(())
     }
@@ -313,7 +330,12 @@ async fn watch(
                 let id = DeviceId::new(host, ordinal);
                 let _ = timeout(
                     RPC_TIMEOUT,
-                    observation.reconcile(&mut control, id, device.incarnation),
+                    observation.reconcile(
+                        &mut control,
+                        id,
+                        device.incarnation,
+                        inventory.failure_scope,
+                    ),
                 )
                 .await;
             }
@@ -325,8 +347,8 @@ async fn watch(
 mod tests {
     use super::*;
     use plait_core::group::{
-        GroupId, GroupMember, GroupOutcome, GroupPhase, GroupVersion, HostMemory, PeerEndpoint,
-        ResourcePlan, WorkerDemand,
+        GroupAction, GroupId, GroupMember, GroupOutcome, GroupPhase, GroupVersion, HostMemory,
+        PeerEndpoint, ResourcePlan, WorkerDemand,
     };
     use plait_core::serving::{ExecutionDrainTarget, ServingLookup, ServingView};
     use plait_core::{AcceleratorKind, DeviceProfile};
@@ -360,7 +382,8 @@ mod tests {
         let draft = path.with_extension("next");
         fs::write(
             &draft,
-            json!({"control_ip":"127.0.0.1", "devices":devices}).to_string(),
+            json!({"control_ip":"127.0.0.1", "devices":devices, "failure_scope":"device"})
+                .to_string(),
         )
         .unwrap();
         fs::rename(draft, path).unwrap();
@@ -430,6 +453,87 @@ mod tests {
         replace_config(&path, &[(1, 3, second)]);
         assert!(inventory.refresh().await.unwrap());
         assert_eq!(inventory.observations[&1].absent, 0);
+    }
+
+    #[tokio::test]
+    async fn pci_loss_quarantines_the_compute_host_by_default() {
+        let temp = TestRoot::new();
+        let root = temp.0.join("devices");
+        let bdf = "0000:01:00.0";
+        fs::create_dir_all(root.join(bdf)).unwrap();
+        let path = temp.0.join("pci.json");
+        fs::write(
+            &path,
+            json!({
+                "control_ip": "127.0.0.1",
+                "devices": [{"ordinal": 0, "incarnation": 1, "bdf": bdf}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let inventory = Inventory::load(path).unwrap();
+        let host = NodeId::random();
+        let other = NodeId::random();
+        let mut config = NodeConfig::bootstrap(host, "127.0.0.1:0", BTreeMap::new());
+        config.advertise_devices = false;
+        let node = RunningNode::start(config).await.unwrap();
+        let endpoints = ControlPeers::new(
+            vec![format!("{host}@{}", node.addr())],
+            Vec::new(),
+            "127.0.0.1:0".to_owned(),
+        );
+        let mut control = GroupControl::connect(endpoints.clone()).await.unwrap();
+        for worker_host in [host, other] {
+            let capacity = HostMemory {
+                bytes: 64,
+                pinned_bytes: 0,
+            };
+            apply(
+                &mut control,
+                GroupAction::SetHostMemory {
+                    host: worker_host,
+                    capacity,
+                },
+            )
+            .await;
+        }
+        let devices = [
+            DeviceId::new(host, 0),
+            DeviceId::new(host, 1),
+            DeviceId::new(other, 0),
+        ];
+        for device in devices {
+            apply(
+                &mut control,
+                GroupAction::RegisterWorker {
+                    device,
+                    incarnation: 1,
+                    device_bytes: 16,
+                },
+            )
+            .await;
+        }
+        let failed = active(&mut control, devices[0], 1, 0).await;
+        let sibling = active(&mut control, devices[1], 1, 1).await;
+        let healthy = active(&mut control, devices[2], 1, 2).await;
+        let monitored = root.clone();
+        let monitor = tokio::spawn(async move {
+            let control = GroupControl::connect(endpoints).await.unwrap();
+            watch(host, inventory, control, &monitored).await
+        });
+        fs::remove_dir(root.join(bdf)).unwrap();
+        timeout(Duration::from_secs(6), async {
+            while view(&mut control, sibling).await.phase != GroupPhase::Revoked {
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(view(&mut control, failed).await.phase, GroupPhase::Revoked);
+        assert!(view(&mut control, sibling).await.released.is_empty());
+        assert_eq!(view(&mut control, healthy).await.phase, GroupPhase::Active);
+        monitor.abort();
+        let _ = monitor.await;
     }
 
     #[tokio::test]
