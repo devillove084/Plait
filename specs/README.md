@@ -29,8 +29,8 @@ version set changes.
 
 ## Symbolic proof results
 
-The checks recorded with the proof modules at `ee3786c` and `8f46249`
-discharged the obligations below. The corresponding proof sources are unchanged.
+TLAPS `e4d66f4` reran both proof modules in strict mode against release
+source `207ac56` and discharged all 164 obligations.
 
 | TLAPS proof | Obligations discharged | Statement |
 | --- | ---: | --- |
