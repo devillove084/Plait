@@ -1847,6 +1847,11 @@ a deployment may start with empty kernel caches, measure that case with
 the candidate off the public route and include its warmup in the rollout
 time budget.
 
+For a custom warmup, use the sampling parameters of the timed workload.
+Changing temperature, top-k, or top-p can select different sampler kernels
+on the final pipeline stage. Check the candidate's timed SLO after warmup to
+catch first-use stalls from the remaining workload variants.
+
 On completion, the policy checks the candidate's bindings, grant count,
 readiness, SLO expiry, and the observed active set again. It discards results
 when these checks fail. A measured candidate must win the same stable
