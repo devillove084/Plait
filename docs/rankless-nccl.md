@@ -1840,6 +1840,14 @@ production ingress. Benchmark arrivals stay outside its demand counters.
 The benchmark uses the configured candidate hosts and the existing KV
 store, so account for any shared resource load when choosing rates.
 
+Online calibration imports the installed vLLM serving benchmark once per
+candidate. It runs the same benchmark sequentially with fresh arguments
+for each rate and seed. The calibration deadline covers all trials and
+warmup. Set `calibration.vllm` to an executable path such as
+`/opt/vllm/bin/vllm` to launch that CLI for each trial. The standalone
+benchmark keeps CLI execution as its default and accepts `--in-process`
+to use the installed benchmark.
+
 By default, `warmups` sets the number of requests submitted before each
 timed trial. For a private candidate that benefits from mixed prefill and
 decode warmup, set `warmup_decode_widths` to a list of stream counts.
