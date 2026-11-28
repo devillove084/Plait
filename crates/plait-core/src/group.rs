@@ -390,6 +390,13 @@ pub enum GroupAction {
         device: DeviceId,
         incarnation: u64,
     },
+    ReadmitWorker {
+        profile: DeviceProfile,
+        expected_incarnation: u64,
+        incarnation: u64,
+        device_bytes: u64,
+        drain: OpId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -458,6 +465,7 @@ pub enum GroupError {
     UnknownPreparation(OpId),
     PreparationActivated,
     PreparationHealthy,
+    StaleExecutionDrain,
 }
 
 pub type GroupResult = Result<GroupOutcome, GroupError>;
@@ -505,8 +513,8 @@ pub enum GroupReply {
     ComputeRate(Option<ComputeRate>),
     Recipe(Option<GroupRecipe>),
     Preparation(Option<PreparedSetView>),
-    Worker(Option<WorkerStateView>),
     PeerStagingBytes(Option<u64>),
+    Worker(Option<WorkerStateView>),
 }
 
 /// A replica's applied view of an exact communicator grant.
@@ -556,7 +564,8 @@ impl GroupOperation {
             | GroupAction::PublishComputeRate { device, .. } => {
                 keys.insert(Key::Device(*device));
             }
-            GroupAction::AdvertiseWorker { profile, .. } => {
+            GroupAction::AdvertiseWorker { profile, .. }
+            | GroupAction::ReadmitWorker { profile, .. } => {
                 keys.insert(Key::Device(profile.id));
             }
             GroupAction::PrepareSet {

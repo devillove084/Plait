@@ -439,6 +439,15 @@ async fn send_frame<T: Serialize>(
 mod tests {
     use super::*;
 
+    #[test]
+    fn peer_staging_reply_preserves_its_wire_discriminant() {
+        // The deployed collective client uses variant 10 for this reply.
+        let bytes = [10, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0];
+        let reply = GroupReply::PeerStagingBytes(Some(65_536));
+        assert_eq!(bincode::serialize(&reply).unwrap(), bytes);
+        assert_eq!(bincode::deserialize::<GroupReply>(&bytes).unwrap(), reply);
+    }
+
     #[tokio::test]
     async fn sends_and_receives_frames() {
         let a = NodeId::derive("async-a");

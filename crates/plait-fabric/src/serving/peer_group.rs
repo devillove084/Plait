@@ -420,22 +420,20 @@ impl ServingState {
                 ref profile,
                 incarnation,
                 device_bytes,
-            } => {
-                if profile.name.is_empty() || device_bytes > profile.memory_bytes {
-                    return Err(GroupError::InvalidCapacity);
-                }
-                if self.peer_groups.profiles.get(&profile.id).is_some_and(
-                    |(version, registered)| *version == incarnation && registered != profile,
-                ) {
-                    return Err(GroupError::ProfileMismatch(profile.id));
-                }
-                self.register_worker(profile.id, incarnation, device_bytes)
-                    .map_err(resource_error)?;
-                self.peer_groups
-                    .profiles
-                    .insert(profile.id, (incarnation, profile.clone()));
-                Ok(GroupOutcome::WorkerRegistered)
-            }
+            } => self.advertise_peer_worker(profile, incarnation, device_bytes),
+            GroupAction::ReadmitWorker {
+                ref profile,
+                expected_incarnation,
+                incarnation,
+                device_bytes,
+                drain,
+            } => self.readmit_peer_worker(
+                profile,
+                expected_incarnation,
+                incarnation,
+                device_bytes,
+                drain,
+            ),
             GroupAction::PreparePlanned {
                 group,
                 expected_epoch,
@@ -1097,6 +1095,55 @@ impl ServingState {
         Ok(GroupOutcome::WorkerWithdrawn(device))
     }
 
+    fn advertise_peer_worker(
+        &mut self,
+        profile: &DeviceProfile,
+        incarnation: u64,
+        device_bytes: u64,
+    ) -> GroupResult {
+        if profile.name.is_empty() || device_bytes > profile.memory_bytes {
+            return Err(GroupError::InvalidCapacity);
+        }
+        if self
+            .peer_groups
+            .profiles
+            .get(&profile.id)
+            .is_some_and(|(version, registered)| *version == incarnation && registered != profile)
+        {
+            return Err(GroupError::ProfileMismatch(profile.id));
+        }
+        self.register_worker(profile.id, incarnation, device_bytes)
+            .map_err(resource_error)?;
+        self.peer_groups
+            .profiles
+            .insert(profile.id, (incarnation, profile.clone()));
+        Ok(GroupOutcome::WorkerRegistered)
+    }
+
+    fn readmit_peer_worker(
+        &mut self,
+        profile: &DeviceProfile,
+        expected_incarnation: u64,
+        incarnation: u64,
+        device_bytes: u64,
+        drain: OpId,
+    ) -> GroupResult {
+        let device = profile.id;
+        let worker = self
+            .workers
+            .get(&device)
+            .ok_or(GroupError::UnknownWorker(device))?;
+        if worker.incarnation != expected_incarnation || incarnation <= expected_incarnation {
+            return Err(GroupError::StaleIncarnation(device));
+        }
+        let target = ExecutionDrainTarget::Device(device);
+        self.confirm_execution_drain(target, drain)
+            .map_err(resource_error)?;
+        let outcome = self.advertise_peer_worker(profile, incarnation, device_bytes)?;
+        self.execution_drains.remove(&target);
+        Ok(outcome)
+    }
+
     pub(super) fn fail_peer_group(
         &mut self,
         version: GroupVersion,
@@ -1224,6 +1271,10 @@ fn resource_error(error: ServingError) -> GroupError {
         ServingError::ExecutionTargetDraining(ExecutionDrainTarget::Host(host)) => {
             GroupError::HostDraining(host)
         }
+        ServingError::ExecutionTargetInUse(ExecutionDrainTarget::Device(device)) => {
+            GroupError::WorkerBusy(device)
+        }
+        ServingError::StaleExecutionDrain => GroupError::StaleExecutionDrain,
         ServingError::StaleIncarnation(device) => GroupError::StaleIncarnation(device),
         ServingError::DeviceCapacityExceeded(device) => GroupError::DeviceCapacityExceeded(device),
         ServingError::SequenceExhausted => GroupError::SequenceExhausted,
@@ -1755,6 +1806,7 @@ mod tests {
         );
         assert!(state.confirm_execution_drain(target, report.id).is_err());
 
+        let mut before_release = state.clone();
         state.release_peer_worker(failed).unwrap();
         assert!(state.confirm_execution_drain(target, report.id).is_ok());
         let inventory = state.placement_inventory(active.group);
@@ -1773,7 +1825,130 @@ mod tests {
             Err(GroupError::WorkerDraining(failed.device))
         );
 
-        state.resume_execution_target(target, report.id).unwrap();
+        // The earlier maintenance API remains usable after an explicit check.
+        let mut maintenance = state.clone();
+        maintenance
+            .resume_execution_target(target, report.id)
+            .unwrap();
+        assert_eq!(maintenance.execution_drain(target).drain, None);
+
+        let restored = DeviceProfile {
+            id: failed.device,
+            name: "test".into(),
+            arch: AcceleratorKind::Amd,
+            memory_bytes: 24,
+            flops: 800,
+            compute_units: 2,
+            supports_fp16: true,
+            supports_bf16: true,
+            supports_fp64: false,
+            rdma_capable: false,
+            numa_node: None,
+        };
+        let calibration = NodeId::random();
+        state
+            .publish_compute_rate(
+                calibration,
+                failed.device,
+                failed.incarnation,
+                0,
+                NonZeroU64::new(100),
+            )
+            .unwrap();
+        let expected_incarnation = failed.incarnation;
+        let new_incarnation = expected_incarnation + 1;
+        let readmit = |counter, observed, incarnation, device_bytes, drain| GroupOperation {
+            id: OpId::new(failed.device.node, counter),
+            action: GroupAction::ReadmitWorker {
+                profile: restored.clone(),
+                expected_incarnation: observed,
+                incarnation,
+                device_bytes,
+                drain,
+            },
+        };
+        let admission = readmit(3, expected_incarnation, new_incarnation, 20, report.id);
+        assert_eq!(
+            before_release.apply_peer_group(&admission),
+            Err(GroupError::WorkerBusy(failed.device))
+        );
+        assert_eq!(
+            before_release.execution_drain(target).drain,
+            Some(report.id)
+        );
+        assert_eq!(
+            state.apply_peer_group(&readmit(
+                4,
+                expected_incarnation,
+                new_incarnation,
+                20,
+                OpId::new(failed.device.node, 10),
+            )),
+            Err(GroupError::StaleExecutionDrain)
+        );
+        assert_eq!(
+            state.apply_peer_group(&readmit(
+                5,
+                new_incarnation,
+                new_incarnation + 1,
+                20,
+                report.id
+            )),
+            Err(GroupError::StaleIncarnation(failed.device))
+        );
+        assert_eq!(
+            state.apply_peer_group(&readmit(
+                6,
+                expected_incarnation,
+                new_incarnation,
+                25,
+                report.id
+            )),
+            Err(GroupError::InvalidCapacity)
+        );
+        assert_eq!(state.execution_drain(target).drain, Some(report.id));
+        assert_eq!(
+            state.workers[&failed.device].incarnation,
+            expected_incarnation
+        );
+
+        let host_target = ExecutionDrainTarget::Host(failed.device.node);
+        let host_drain = OpId::new(failed.device.node, 7);
+        let mut host_in_maintenance = state.clone();
+        host_in_maintenance
+            .begin_execution_drain(host_target, host_drain)
+            .unwrap();
+        assert_eq!(
+            host_in_maintenance.apply_peer_group(&admission),
+            Ok(GroupOutcome::WorkerRegistered)
+        );
+        assert_eq!(
+            host_in_maintenance.execution_drain_for(failed.device),
+            Some(host_target)
+        );
+
+        assert_eq!(
+            state.apply_peer_group(&admission),
+            Ok(GroupOutcome::WorkerRegistered)
+        );
+        assert_eq!(state.execution_drain(target).drain, None);
+        assert_eq!(state.workers[&failed.device].device_bytes, 20);
+        assert_eq!(
+            state.peer_groups.profiles.get(&failed.device),
+            Some(&(new_incarnation, restored))
+        );
+        assert!(state.peer_groups.rates.get(&failed.device).is_none());
+        assert_eq!(state.peer_grant_status(sibling), GrantStatus::Held);
+        assert_eq!(
+            state.prepare_peer_group(active.group, standby.epoch, &resources),
+            Err(GroupError::StaleIncarnation(failed.device))
+        );
+        let mut resources = resources;
+        resources
+            .workers
+            .get_mut(&failed.device)
+            .unwrap()
+            .incarnation = new_incarnation;
         state
             .prepare_peer_group(active.group, standby.epoch, &resources)
             .unwrap();
@@ -1782,7 +1957,22 @@ mod tests {
             epoch: 3,
         };
         let fresh = state.peer_group_view(successor).unwrap().grants[0];
+        assert_eq!(fresh.incarnation, new_incarnation);
         assert!(fresh.fence > failed.fence);
+        assert_eq!(
+            state.apply_peer_group(&admission),
+            Ok(GroupOutcome::WorkerRegistered)
+        );
+        assert_eq!(
+            state.apply_peer_group(&GroupOperation {
+                id: OpId::new(failed.device.node, 8),
+                action: GroupAction::ReportIdleWorkerUnavailable {
+                    device: failed.device,
+                    incarnation: expected_incarnation,
+                },
+            }),
+            Err(GroupError::StaleIncarnation(failed.device))
+        );
         assert_eq!(state.apply_peer_group(&report), revoked);
         let delayed = GroupOperation {
             id: OpId::new(failed.device.node, 2),

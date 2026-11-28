@@ -103,12 +103,26 @@ Other devices on the same host can serve their current groups or receive
 new grants. The resident planner can prepare a smaller configured recipe
 as soon as its devices and host resources become available.
 
-After verifying device recovery, look up the drain with `execution_drain`
-through `plait-node serving`. Use its returned ID to confirm the drain and
-then submit `resume_execution_target`. The original release and fault IDs
-remain safe to retry. Use `ReportFailure` when an error identifies a failed
-communicator without confirming a worker outage. Upgrade every voter
-before submitting the new action.
+After verifying the device with its local runtime, look up the device drain
+with `execution_drain` through `plait-node serving`. To return a native
+worker under a fresh incarnation, send `ReadmitWorker` through
+`plait-node group`. Supply the current drain ID as `drain`, the last
+registered generation as `expected_incarnation`, a higher `incarnation`,
+and the recovered worker's `profile` and `device_bytes`, as in
+`AdvertiseWorker`. Upgrade the voters before sending the action.
+
+The voter checks the exact drain and old generation, as well as outstanding
+grants and deferred placements, in the same operation that registers the
+new incarnation and clears the device drain. It clears the recovered
+device's old calibration and keeps its fence counter. The next reservation
+allocates a higher fence. Any covering host drain continues to apply.
+Refresh the placement snapshot and publish new calibration for measured
+layouts. An ambiguous submission can be retried with the original operation
+ID. An explicit rejection needs a new ID after checking the current state.
+
+For an administrative pause at the current incarnation, confirm the drain
+and use `resume_execution_target`. Use `ReportFailure` for a communicator
+failure without a confirmed worker outage.
 
 For a committed peer communicator, a confirmed local ECC failure during
 stream synchronization or a device copy submits this action with the
@@ -161,6 +175,8 @@ before recording the drain. If a reservation raced the observation, the
 node reads the current grant and reevaluates the report. Both paths retain
 the drain until an explicit recovery operation. Release of any held grant
 still requires the execution supervisor's local teardown evidence.
+After readmission, restart the local watch with the enrolled incarnation
+updated to match the new registration.
 Upgrade the voters before enabling the PCI watch.
 
 ### Plan across heterogeneous resources
