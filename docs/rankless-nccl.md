@@ -131,6 +131,38 @@ adapters have no hardware-error contract and retain the generic path.
 [hip-error-codes]: https://rocm.docs.amd.com/projects/HIP/en/latest/reference/error_codes.html
 [cann-runtime-errors]: https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/910/API/runtimeapi/aclcppdevg_03_1345.html
 
+### Watch for PCI device removal
+
+On Linux, add `--watch-pci pci.json` to a resident `plait-node run` command.
+Use the host's registered node ID. The file maps each local worker ordinal
+and incarnation to its PCI address from the host inventory. The address
+identifies the physical PCI function independently of any worker visibility
+mask or model slot.
+
+```json
+{
+  "control_ip": "192.0.2.10",
+  "devices": [
+    {"ordinal": 0, "incarnation": 1, "bdf": "0000:01:00.0"}
+  ]
+}
+```
+
+A compute-only node can use this option with `--seed`. The resident checks
+the kernel PCI directory every 500 ms. Two consecutive successful reads
+that omit an enrolled function confirm its absence. A read error resets
+that observation. The reporter runs in the node process and can act even
+when the model worker no longer executes any calls.
+
+For a native group, the node submits the exact held grant. For an idle
+worker, it submits `ReportIdleWorkerUnavailable` for the observed
+incarnation. The idle operation checks that the device remains unassigned
+before recording the drain. If a reservation raced the observation, the
+node reads the current grant and reevaluates the report. Both paths retain
+the drain until an explicit recovery operation. Release of any held grant
+still requires the execution supervisor's local teardown evidence.
+Upgrade the voters before enabling the PCI watch.
+
 ### Plan across heterogeneous resources
 
 Use `AdvertiseWorker` with a `DeviceProfile`, incarnation, and allocatable

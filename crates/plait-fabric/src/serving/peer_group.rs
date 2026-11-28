@@ -8,7 +8,7 @@ use plait_core::group::{
     GroupMember, GroupOperation, GroupOutcome, GroupPhase, GroupPreparation, GroupReceipt,
     GroupRecipe, GroupResult, GroupTransition, GroupVersion, GroupView, PeerEndpoint,
     PlacementHost, PlacementInventory, PlacementWorker, PreparedSetView, RateEvidence,
-    ResourcePlan, WorkerGrant,
+    ResourcePlan, WorkerGrant, WorkerStateView,
 };
 use plait_core::link::{ProbeEndpoint, ProbeRegistration};
 use plait_core::serving::{ExecutionDrainTarget, ServingError};
@@ -226,6 +226,17 @@ impl ServingState {
         self.peer_groups.get(version).map(Version::view)
     }
 
+    pub(crate) fn worker_state(&self, device: DeviceId) -> Option<WorkerStateView> {
+        let worker = self.workers.get(&device)?;
+        Some(WorkerStateView {
+            incarnation: worker.incarnation,
+            grant: worker.grant,
+            has_native_grant: worker
+                .grant
+                .is_some_and(|grant| self.peer_groups.has_group(grant.version.group)),
+        })
+    }
+
     pub(crate) fn peer_group_recipe(&self, version: GroupVersion) -> Option<GroupRecipe> {
         self.peer_groups.get(version).map(|record| GroupRecipe {
             version,
@@ -370,6 +381,10 @@ impl ServingState {
             GroupAction::ReportWorkerUnavailable { grant } => {
                 self.report_peer_worker_unavailable(grant, operation.id)
             }
+            GroupAction::ReportIdleWorkerUnavailable {
+                device,
+                incarnation,
+            } => self.withdraw_idle_worker(device, incarnation, operation.id),
             GroupAction::Observe { group, epoch } => {
                 let epoch = epoch
                     .or_else(|| self.peer_groups.active_epoch(group))
@@ -1059,6 +1074,27 @@ impl ServingState {
         self.begin_execution_drain(ExecutionDrainTarget::Device(grant.device), report)
             .expect("the reported worker has a current grant");
         Ok(outcome)
+    }
+
+    fn withdraw_idle_worker(
+        &mut self,
+        device: DeviceId,
+        incarnation: u64,
+        report: OpId,
+    ) -> GroupResult {
+        let worker = self
+            .workers
+            .get(&device)
+            .ok_or(GroupError::UnknownWorker(device))?;
+        if worker.incarnation != incarnation {
+            return Err(GroupError::StaleIncarnation(device));
+        }
+        if worker.grant.is_some() {
+            return Err(GroupError::WorkerBusy(device));
+        }
+        self.begin_execution_drain(ExecutionDrainTarget::Device(device), report)
+            .map_err(resource_error)?;
+        Ok(GroupOutcome::WorkerWithdrawn(device))
     }
 
     pub(super) fn fail_peer_group(

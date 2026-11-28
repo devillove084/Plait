@@ -480,6 +480,7 @@ impl NodeState {
                     GroupLookup::Placement(group) => {
                         GroupReply::Placement(runtime.placement_inventory(group))
                     }
+                    GroupLookup::Worker(device) => GroupReply::Worker(runtime.worker_state(device)),
                     GroupLookup::LinkProbes => GroupReply::LinkProbes(runtime.link_probes()),
                     GroupLookup::GrantStatus(grant) => {
                         GroupReply::GrantStatus(runtime.peer_grant_status(grant))

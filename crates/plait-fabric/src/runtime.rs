@@ -133,6 +133,10 @@ impl Runtime {
         self.serving.peer_group_view(version)
     }
 
+    pub fn worker_state(&self, device: DeviceId) -> Option<plait_core::group::WorkerStateView> {
+        self.serving.worker_state(device)
+    }
+
     pub fn peer_group_recipe(
         &self,
         version: GroupVersion,

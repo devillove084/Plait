@@ -27,6 +27,13 @@ pub struct WorkerGrant {
     pub fence: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerStateView {
+    pub incarnation: u64,
+    pub grant: Option<WorkerGrant>,
+    pub has_native_grant: bool,
+}
+
 /// Pinned bytes consume both the pinning quota and the host memory quota.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostMemory {
@@ -379,6 +386,10 @@ pub enum GroupAction {
     ReportWorkerUnavailable {
         grant: WorkerGrant,
     },
+    ReportIdleWorkerUnavailable {
+        device: DeviceId,
+        incarnation: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -400,6 +411,7 @@ pub enum GroupOutcome {
     ActiveSet(Vec<(GroupId, Option<u64>)>),
     PreparedSet(Vec<GroupVersion>),
     AbortedSet(Vec<GroupVersion>),
+    WorkerWithdrawn(DeviceId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -475,6 +487,7 @@ pub enum GroupLookup {
     Recipe(GroupVersion),
     LatestPreparation(GroupId),
     PeerStagingBytes(WorkerGrant),
+    Worker(DeviceId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -492,6 +505,7 @@ pub enum GroupReply {
     ComputeRate(Option<ComputeRate>),
     Recipe(Option<GroupRecipe>),
     Preparation(Option<PreparedSetView>),
+    Worker(Option<WorkerStateView>),
     PeerStagingBytes(Option<u64>),
 }
 
@@ -538,6 +552,7 @@ impl GroupOperation {
                 keys.insert(Key::HostMemory(*host));
             }
             GroupAction::RegisterWorker { device, .. }
+            | GroupAction::ReportIdleWorkerUnavailable { device, .. }
             | GroupAction::PublishComputeRate { device, .. } => {
                 keys.insert(Key::Device(*device));
             }
