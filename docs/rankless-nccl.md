@@ -2461,13 +2461,21 @@ The vLLM fork's `PlaitCommunicator` calls the peer bootstrap directly.
 | Backend | Setting | Device adapter |
 | --- | --- | --- |
 | NVIDIA CUDA | `PLAIT_NCCL_BACKEND=cuda` (default) | CUDA driver copies and stream synchronization |
-| AMD ROCm | `PLAIT_NCCL_BACKEND=rocm` | HIP runtime copies and stream synchronization |
+| AMD ROCm | `PLAIT_NCCL_BACKEND=rocm` | HIP runtime copies and stream synchronization. [Configure HIP in a vLLM worker](nccl-python.md#vllm-peer-transport) |
 | Huawei Ascend | `PLAIT_NCCL_BACKEND=huawei` | CANN runtime copies and stream synchronization |
 | PPU | `PLAIT_NCCL_BACKEND=ppu` | HGGC runtime, with an adapter ABI for older deployments |
 
 The peer host reduction supports FP32, FP16, BF16, and E4M3, and integer
 sums. FP16 and BF16 accumulate in FP32 before the output is rounded.
-Finite FP16 and BF16 sums use bounded conversion blocks for contributions
-of at least 8 KiB. Each element accumulates in slot order. Small and
+Finite FP16 sums can use x86-64 F16C on reduction slices of 512 bytes or
+larger. The portable FP16 and BF16 conversion paths use bounded blocks on
+slices of at least 8 KiB. Each element accumulates in slot order. Small and
 nonfinite inputs use the scalar reduction.
+
+For groups with three or more slots, sharded FP16 and BF16 AllReduce sums
+use the pipeline when the smallest shard reaches 256 KiB. A slot reduces a
+64 KiB block when its contributions are ready and can return completed
+blocks while other connections are still transferring input. The scatter
+and gather frame order remains compatible with the two-phase implementation.
+
 Use an eager vLLM engine for this path.
