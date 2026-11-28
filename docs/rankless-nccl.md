@@ -2293,11 +2293,14 @@ The collective sockets enter nonblocking mode at group setup. In a two-worker
 replicated all-reduce, each worker exchanges one frame with its peer. It uses
 its existing staged input and allocates space for the remote contribution.
 
-On x86-64 hosts with F16C, two-input FP16 sums of at least 512 bytes convert
-eight values at a time, add in FP32, and round once to FP16. Other hosts use
-the portable blocked or scalar implementation. Infinities and NaNs use the
-scalar reduction. The FP16 scatter/gather pipeline can write a complete block
-directly into its gather buffer.
+On x86-64 hosts with F16C, FP16 sums of at least 512 bytes per input slice
+convert eight values at a time. The host accumulates in FP32 in slot order,
+rounds to FP16 once and processes a partial vector element by element. In the
+sharded path, the cutoff applies to the local shard. Other hosts use the
+portable blocked or scalar implementation. If any input contains an infinity
+or NaN, the caller discards the provisional output and runs the scalar
+reduction. The two-worker FP16 scatter/gather pipeline can write a complete
+block directly into its gather buffer.
 
 Larger all-reduces divide the tensor into contiguous shards and assign one
 shard to each slot. Each worker concurrently sends contributions to the peers

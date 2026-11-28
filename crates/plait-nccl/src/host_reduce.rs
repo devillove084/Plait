@@ -13,6 +13,18 @@ pub(super) fn sum_fp16(buffers: &[&[u8]]) -> Option<Vec<u8>> {
     if let [left, right] = buffers {
         return sum_fp16_pair(left, right);
     }
+    #[cfg(target_arch = "x86_64")]
+    if let Some((&first, peers)) = buffers.split_first()
+        && !peers.is_empty()
+        && first.len() >= MIN_F16C_BYTES
+        && first.len() % 2 == 0
+        && peers.iter().all(|peer| peer.len() == first.len())
+        && std::is_x86_feature_detected!("f16c")
+    {
+        let mut output = vec![0; first.len()];
+        // CPU support and matching, even-length source slices were checked above.
+        return unsafe { sum_fp16_many_f16c(first, peers, &mut output) }.then_some(output);
+    }
     sum_blocks(
         buffers,
         0x7c00,
@@ -231,9 +243,100 @@ unsafe fn sum_fp16_pair_f16c(left: &[u8], right: &[u8], output: &mut [u8]) -> bo
     true
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "f16c")]
+unsafe fn sum_fp16_many_f16c(first: &[u8], peers: &[&[u8]], output: &mut [u8]) -> bool {
+    use std::arch::x86_64::{
+        _MM_FROUND_TO_NEAREST_INT, _mm_and_si128, _mm_cmpeq_epi16, _mm_loadu_si128,
+        _mm_movemask_epi8, _mm_set1_epi16, _mm_storeu_si128, _mm256_add_ps, _mm256_cvtph_ps,
+        _mm256_cvtps_ph,
+    };
+
+    const VECTOR_BYTES: usize = 16;
+    const EXPONENT: u16 = 0x7c00;
+    let exponent = _mm_set1_epi16(EXPONENT as i16);
+    let finite =
+        |bits| _mm_movemask_epi8(_mm_cmpeq_epi16(_mm_and_si128(bits, exponent), exponent)) == 0;
+    let vector_end = first.len() / VECTOR_BYTES * VECTOR_BYTES;
+    for (block, output) in output.chunks_exact_mut(VECTOR_BYTES).enumerate() {
+        let start = block * VECTOR_BYTES;
+        // The checked lengths provide a full vector at this offset for every slot.
+        let head = unsafe { _mm_loadu_si128(first.as_ptr().add(start).cast()) };
+        if !finite(head) {
+            return false;
+        }
+        let mut sums = _mm256_cvtph_ps(head);
+        for peer in peers {
+            let lanes = unsafe { _mm_loadu_si128(peer.as_ptr().add(start).cast()) };
+            if !finite(lanes) {
+                return false;
+            }
+            sums = _mm256_add_ps(sums, _mm256_cvtph_ps(lanes));
+        }
+        let rounded = _mm256_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(sums);
+        unsafe { _mm_storeu_si128(output.as_mut_ptr().cast(), rounded) };
+    }
+    for (index, result) in output[vector_end..].chunks_exact_mut(2).enumerate() {
+        let offset = vector_end + 2 * index;
+        let first = u16::from_ne_bytes([first[offset], first[offset + 1]]);
+        if first & EXPONENT == EXPONENT {
+            return false;
+        }
+        let mut sum = f16::from_bits(first).to_f32();
+        for peer in peers {
+            let word = u16::from_ne_bytes([peer[offset], peer[offset + 1]]);
+            if word & EXPONENT == EXPONENT {
+                return false;
+            }
+            sum += f16::from_bits(word).to_f32();
+        }
+        result.copy_from_slice(&f16::from_f32(sum).to_bits().to_ne_bytes());
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn fp16_many_handles_misaligned_vectors_and_nonfinite_tails() {
+        if !std::is_x86_feature_detected!("f16c") {
+            return;
+        }
+        let bytes = MIN_F16C_BYTES + 6;
+        let cases: [[u16; 4]; 4] = [
+            [0x7800, 0x0001, 0xf800, 0x0001],
+            [0x8000, 0x8000, 0x8000, 0x8000],
+            [0x3c01, 0x1000, 0x0000, 0x0000],
+            [0x7bff, 0x7bff, 0x7bff, 0x7bff],
+        ];
+        let mut inputs = [(); 4].map(|()| vec![0u8; bytes + 1]);
+        let mut expected = Vec::new();
+        for (index, words) in cases.iter().cycle().take(bytes / 2).enumerate() {
+            let offset = 1 + 2 * index;
+            for (input, word) in inputs.iter_mut().zip(words) {
+                input[offset..offset + 2].copy_from_slice(&word.to_ne_bytes());
+            }
+            let sum = words[1..]
+                .iter()
+                .fold(f16::from_bits(words[0]).to_f32(), |sum, &word| {
+                    sum + f16::from_bits(word).to_f32()
+                });
+            expected.extend(f16::from_f32(sum).to_bits().to_ne_bytes());
+        }
+        let reduce = |inputs: &[Vec<u8>; 4]| sum_fp16(&inputs.each_ref().map(|input| &input[1..]));
+        assert_eq!(reduce(&inputs), Some(expected));
+        for index in [0, bytes / 2 - 1] {
+            let offset = 1 + 2 * index;
+            let word = &mut inputs[2][offset..offset + 2];
+            let original = [word[0], word[1]];
+            word.copy_from_slice(&0x7c01u16.to_ne_bytes());
+            assert!(reduce(&inputs).is_none());
+            inputs[2][offset..offset + 2].copy_from_slice(&original);
+        }
+    }
 
     #[test]
     fn fp16_pair_writes_unaligned_blocks_and_checks_the_tail() {

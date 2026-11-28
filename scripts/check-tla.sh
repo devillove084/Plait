@@ -51,6 +51,7 @@ tlc -deadlock -config specs/PlaitPeerCollective.cfg specs/PlaitPeerCollective.tl
 tlc -deadlock -config specs/PlaitPeerCollectiveOdd.cfg specs/PlaitPeerCollective.tla
 tlc -deadlock -config specs/PlaitPeerCollectiveReplicatedLoss.cfg specs/PlaitPeerCollective.tla
 tlc -deadlock -config specs/PlaitPeerCollectiveMixed.cfg specs/PlaitPeerCollective.tla
+tlc -deadlock -config specs/PlaitHostFoldOrder.cfg specs/PlaitHostFoldOrder.tla
 tlc -deadlock -config specs/PlaitPeerScatterGatherPipeline.cfg specs/PlaitPeerScatterGatherPipeline.tla
 tlc -deadlock -config specs/PlaitPeerScatterGatherPipelineMixed.cfg specs/PlaitPeerScatterGatherPipeline.tla
 tlc -deadlock -config specs/PlaitPeerAllReducePricing.cfg specs/PlaitPeerAllReducePricing.tla
