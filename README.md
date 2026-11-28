@@ -266,6 +266,13 @@ discovers candidate origins from committed grants and switches after the
 exact candidate versions have current SLO measurements.
 [On-demand native layouts](docs/rankless-nccl.md#prepare-a-native-layout-on-demand)
 
+When a candidate needs devices still held by the incumbent, the ingress
+can route to a separate group while the old grants return. The vLLM
+integration exercised both automatic handoffs with a ROCm, CANN, and HGGC
+pipeline and a single CUDA device as the temporary group. Private SLO
+measurements gated each handoff.
+[Automatic device reuse](docs/rankless-nccl.md#automate-the-handoff-from-the-native-mode-policy)
+
 Managed replacements reuse complete prompt KV blocks across TP sizes and PP
 layouts with the vLLM fork's `PlaitKvConnector` and its optional
 `vllm-plait-kv-store` binary.
