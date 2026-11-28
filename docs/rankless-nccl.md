@@ -714,9 +714,18 @@ continue observing that engine. A restarted launcher matches the version
 and exact grants before writing a stop request. Once the local parent has
 recorded exit, the launcher takes the launch lock and replays release
 operations with their original IDs, then removes the records after every
-receipt. If the local parent itself is lost before recording exit, the
-deployment operator establishes that its descendants have stopped before
-releasing the grants.
+receipt.
+
+For automatic recovery after losing the local parent, set `cgroup_root` in
+the Linux engine configuration to an absolute delegated cgroup v2 directory.
+Each engine gets a new subtree and joins it before starting vLLM. The engine
+and external managers keep its processes in that subtree. To recover an
+orphan, the launcher acquires the launch lock and matches the saved boot ID,
+cgroup identity, and exact grants. After ordered revocation it terminates
+that subtree through `cgroup.kill`. It writes the exit journal once
+`cgroup.events` reports `populated 0`, then reuses the original release IDs.
+An unverifiable subtree leaves its grants held until another exit proof
+is available. [Linux cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html)
 
 #### Measure peer collective phases
 
