@@ -1,6 +1,7 @@
 //! Topology-aware placement of native execution groups.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 
 use plait_core::collective::{
     PeerAllReducePlan, bind_peer_all_reduce_recipe, peer_all_reduce_plan,
@@ -54,8 +55,43 @@ impl Recipe {
             Communication::PeerAllReduce {
                 replicated_egress_bytes: Some(bytes),
                 ..
+            }
+            | Communication::TensorPipeline {
+                replicated_egress_bytes: Some(bytes),
+                ..
             } => bind_peer_all_reduce_recipe(self.id, self.work.len() as u64, bytes),
             _ => self.id,
+        }
+    }
+
+    fn compute_ns(&self, workers: &[Worker], first_slot: usize) -> Option<u64> {
+        let mut times = workers
+            .iter()
+            .zip(&self.work[first_slot..])
+            .map(|(worker, &work)| worker.work_ns(work));
+        match self.compute {
+            ComputeOrder::Parallel => times.try_fold(0u64, |max, time| Some(max.max(time?))),
+            ComputeOrder::Sequential => {
+                times.try_fold(0u64, |sum, time| Some(sum.saturating_add(time?)))
+            }
+            ComputeOrder::Pipeline => {
+                let Communication::TensorPipeline {
+                    tensor_parallel, ..
+                } = &self.communication
+                else {
+                    return None;
+                };
+                let mut completed = 0u64;
+                let mut stage = 0u64;
+                for (offset, time) in times.enumerate() {
+                    if (first_slot + offset) % tensor_parallel.get() == 0 {
+                        completed = completed.saturating_add(stage);
+                        stage = 0;
+                    }
+                    stage = stage.max(time?);
+                }
+                Some(completed.saturating_add(stage))
+            }
         }
     }
 }
@@ -65,15 +101,7 @@ impl Recipe {
 pub enum ComputeOrder {
     Parallel,
     Sequential,
-}
-
-impl ComputeOrder {
-    fn extend(self, prefix_ns: u64, device_ns: u64) -> u64 {
-        match self {
-            Self::Parallel => prefix_ns.max(device_ns),
-            Self::Sequential => prefix_ns.saturating_add(device_ns),
-        }
-    }
+    Pipeline,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -90,6 +118,13 @@ pub enum Communication {
     },
     Directed {
         edges: Vec<Exchange>,
+    },
+    TensorPipeline {
+        tensor_parallel: NonZeroUsize,
+        all_reduce_by_stage: Vec<Vec<AllReduceCalls>>,
+        transfers: Vec<PipelineTransfer>,
+        #[serde(default)]
+        replicated_egress_bytes: Option<u64>,
     },
 }
 
@@ -111,6 +146,62 @@ pub struct Exchange {
     pub bytes: u64,
 }
 
+/// One serial transfer phase between pipeline stages, with equal-sized TP lanes.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PipelineTransfer {
+    pub from_stage: usize,
+    pub to_stage: usize,
+    pub bytes_per_lane: u64,
+    pub rounds: u64,
+}
+
+impl Communication {
+    fn valid(&self, width: usize) -> bool {
+        match self {
+            Self::AllToAll {
+                rounds,
+                bytes_per_peer,
+            } => *rounds > 0 || *bytes_per_peer == 0,
+            Self::PeerAllReduce { calls, .. } => !calls.is_empty() && valid_all_reduce(calls),
+            Self::Directed { edges } => edges.iter().all(|edge| {
+                edge.from < width && edge.to < width && edge.from != edge.to && edge.rounds > 0
+            }),
+            Self::TensorPipeline {
+                tensor_parallel,
+                all_reduce_by_stage,
+                transfers,
+                ..
+            } => {
+                let tensor = tensor_parallel.get();
+                let stages = width / tensor;
+                tensor > 1
+                    && stages > 1
+                    && width % tensor == 0
+                    && all_reduce_by_stage.len() == stages
+                    && all_reduce_by_stage
+                        .iter()
+                        .all(|calls| valid_all_reduce(calls))
+                    && transfers.iter().all(|transfer| {
+                        transfer.from_stage < stages
+                            && transfer.to_stage < stages
+                            && transfer.from_stage != transfer.to_stage
+                            && transfer.rounds > 0
+                    })
+            }
+        }
+    }
+}
+
+fn valid_all_reduce(calls: &[AllReduceCalls]) -> bool {
+    calls.iter().all(|call| {
+        call.count > 0
+            && call.bytes > 0
+            && matches!(call.element_bytes, 1 | 2 | 4 | 8)
+            && call.bytes % call.element_bytes == 0
+    })
+}
+
 impl Workload {
     fn device_demand(&self, recipe: Option<&Recipe>, slot: usize) -> u64 {
         recipe
@@ -127,6 +218,14 @@ impl Workload {
                     Communication::AllToAll { rounds, .. } => *rounds != 0,
                     Communication::PeerAllReduce { calls, .. } => !calls.is_empty(),
                     Communication::Directed { edges } => !edges.is_empty(),
+                    Communication::TensorPipeline {
+                        all_reduce_by_stage,
+                        transfers,
+                        ..
+                    } => {
+                        !transfers.is_empty()
+                            || all_reduce_by_stage.iter().any(|calls| !calls.is_empty())
+                    }
                 })
     }
 
@@ -153,19 +252,9 @@ impl Workload {
                     .device_bytes_by_slot
                     .as_ref()
                     .is_some_and(|bytes| bytes.len() != width || bytes.contains(&0))
-                || matches!(
-                    recipe.communication,
-                    Communication::AllToAll {
-                        rounds: 0,
-                        bytes_per_peer: 1..
-                    }
-                )
-                || matches!(&recipe.communication, Communication::PeerAllReduce { calls, .. }
-                    if calls.is_empty() || calls.iter().any(|call| call.count == 0 || call.bytes == 0
-                        || !matches!(call.element_bytes, 1 | 2 | 4 | 8)
-                        || call.bytes % call.element_bytes != 0))
-                || matches!(&recipe.communication, Communication::Directed { edges } if edges.iter().any(|edge|
-                    edge.from >= width || edge.to >= width || edge.from == edge.to || edge.rounds == 0))
+                || matches!(recipe.compute, ComputeOrder::Pipeline)
+                    != matches!(recipe.communication, Communication::TensorPipeline { .. })
+                || !recipe.communication.valid(width)
             {
                 return Err("invalid group placement recipe");
             }
@@ -775,7 +864,7 @@ impl<'a> Model<'a> {
                         })
                         .collect();
                     recipe_choices =
-                        recipe_worker_choices(&workers, &demands, recipe.compute, alternatives);
+                        recipe_worker_choices(&workers, &demands, recipe, width, alternatives);
                     &recipe_choices[..]
                 } else {
                     &uniform_choices[..slots]
@@ -944,10 +1033,7 @@ impl<'a> Model<'a> {
     ) -> Option<Cost> {
         let mut ordered = workers.to_vec();
         ordered.sort_unstable_by_key(|worker| worker.id);
-        let mut compute_ns = 0u64;
-        for (worker, &work) in ordered.iter().zip(&recipe.work) {
-            compute_ns = recipe.compute.extend(compute_ns, worker.work_ns(work)?);
-        }
+        let compute_ns = recipe.compute_ns(&ordered, 0)?;
         let network_ns = match &recipe.communication {
             Communication::AllToAll {
                 rounds,
@@ -973,6 +1059,18 @@ impl<'a> Model<'a> {
                 }
                 total
             }
+            Communication::TensorPipeline {
+                tensor_parallel,
+                all_reduce_by_stage,
+                transfers,
+                replicated_egress_bytes,
+            } => network.tensor_pipeline(
+                &ordered,
+                tensor_parallel.get(),
+                all_reduce_by_stage,
+                transfers,
+                *replicated_egress_bytes,
+            )?,
         };
         Some(Cost {
             compute_ns,
@@ -1058,24 +1156,73 @@ impl LinkCosts<'_> {
         hosts: &BTreeMap<NodeId, usize>,
         traffic: impl Fn(NodeId, NodeId) -> u128,
     ) -> Option<u64> {
+        let pairs = hosts.keys().flat_map(|&source| {
+            let traffic = &traffic;
+            hosts
+                .keys()
+                .filter(move |&&target| target != source)
+                .map(move |&target| ((source, target), traffic(source, target)))
+        });
+        self.exchange_links(pairs)
+    }
+
+    fn tensor_pipeline(
+        &mut self,
+        workers: &[Worker],
+        tensor: usize,
+        all_reduce_by_stage: &[Vec<AllReduceCalls>],
+        transfers: &[PipelineTransfer],
+        replicated_egress_bytes: Option<u64>,
+    ) -> Option<u64> {
+        let mut total = 0u64;
+        // An unfinished row is a placement prefix. Tensor shard sizes
+        // use the committed row width once all its slots have devices.
+        for (stage, calls) in workers.chunks_exact(tensor).zip(all_reduce_by_stage) {
+            total = total.saturating_add(self.peer_all_reduce(
+                stage,
+                calls,
+                replicated_egress_bytes,
+            )?);
+        }
+        for transfer in transfers {
+            let from_slot = transfer.from_stage * tensor;
+            let to_slot = transfer.to_stage * tensor;
+            let mut traffic = BTreeMap::new();
+            for lane in 0..tensor {
+                if let (Some(from), Some(to)) =
+                    (workers.get(from_slot + lane), workers.get(to_slot + lane))
+                    && from.id.node != to.id.node
+                {
+                    *traffic.entry((from.id.node, to.id.node)).or_insert(0u128) +=
+                        u128::from(transfer.bytes_per_lane);
+                }
+            }
+            let elapsed = self.exchange_links(traffic)?;
+            total = total.saturating_add(elapsed.saturating_mul(transfer.rounds));
+        }
+        Some(total)
+    }
+
+    fn exchange_links(
+        &mut self,
+        pairs: impl IntoIterator<Item = ((NodeId, NodeId), u128)>,
+    ) -> Option<u64> {
         let mut peak_rtt = 0;
         let mut peak_serialization = 0u64;
         let mut inbound = BTreeMap::new();
-        for &source in hosts.keys() {
-            let mut outgoing = 0u64;
-            for &target in hosts.keys().filter(|&&target| target != source) {
-                let link = self.read(source, target)?;
-                peak_rtt = peak_rtt.max(link.rtt_ns);
-                let time = ns(
-                    traffic(source, target).saturating_mul(NANOS),
-                    u128::from(link.bytes_per_second),
-                );
-                outgoing = outgoing.saturating_add(time);
-                let incoming = inbound.entry(target).or_insert(0u64);
-                *incoming = incoming.saturating_add(time);
-                peak_serialization = peak_serialization.max(*incoming);
-            }
-            peak_serialization = peak_serialization.max(outgoing);
+        let mut outbound = BTreeMap::new();
+        for ((source, target), bytes) in pairs {
+            let link = self.read(source, target)?;
+            peak_rtt = peak_rtt.max(link.rtt_ns);
+            let time = ns(
+                bytes.saturating_mul(NANOS),
+                u128::from(link.bytes_per_second),
+            );
+            let incoming = inbound.entry(target).or_insert(0u64);
+            let outgoing = outbound.entry(source).or_insert(0u64);
+            *incoming = incoming.saturating_add(time);
+            *outgoing = outgoing.saturating_add(time);
+            peak_serialization = peak_serialization.max(*incoming).max(*outgoing);
         }
         Some(peak_rtt.saturating_add(peak_serialization))
     }
@@ -1125,10 +1272,17 @@ fn worker_choices(workers: &[Worker], count: usize, alternatives: bool) -> Vec<V
 fn recipe_worker_choices(
     workers: &[Worker],
     demands: &[(u64, u64)],
-    order: ComputeOrder,
+    recipe: &Recipe,
+    first_slot: usize,
     alternatives: bool,
 ) -> Vec<Vec<Vec<Worker>>> {
-    let limit = if alternatives { BEAM_PER_WIDTH } else { 1 };
+    // A host can cross a PP stage boundary. Keep alternatives whose partial
+    // stage time may be masked by workers on another host.
+    let limit = if alternatives || matches!(recipe.compute, ComputeOrder::Pipeline) {
+        BEAM_PER_WIDTH
+    } else {
+        1
+    };
     let mut choices = vec![Vec::new(); demands.len() + 1];
     choices[0].push(Candidate {
         workers: Vec::new(),
@@ -1152,7 +1306,13 @@ fn recipe_worker_choices(
             for prefix in &prefixes[slot] {
                 let mut slice = prefix.clone();
                 slice.workers.push(worker);
-                slice.cost.compute_ns = order.extend(slice.cost.compute_ns, device_ns);
+                slice.cost.compute_ns = match recipe.compute {
+                    ComputeOrder::Parallel => slice.cost.compute_ns.max(device_ns),
+                    ComputeOrder::Sequential => slice.cost.compute_ns.saturating_add(device_ns),
+                    ComputeOrder::Pipeline => recipe
+                        .compute_ns(&slice.workers, first_slot)
+                        .expect("validated pipeline with known worker compute rates"),
+                };
                 keep_best(&mut extensions[0], slice, limit);
             }
         }
@@ -1273,6 +1433,236 @@ mod tests {
             sampled_at_ms,
         };
         [link(a, b), link(b, a)]
+    }
+
+    fn pipeline_workload() -> Workload {
+        let mut workload = workload();
+        workload.widths = vec![4];
+        workload.bytes_per_peer = 0;
+        workload.recipes = vec![Recipe {
+            id: NodeId::derive("two tensor stages"),
+            work: vec![1_000_000; 4],
+            device_bytes_by_slot: None,
+            compute: ComputeOrder::Pipeline,
+            communication: Communication::TensorPipeline {
+                tensor_parallel: NonZeroUsize::new(2).unwrap(),
+                all_reduce_by_stage: vec![
+                    vec![AllReduceCalls {
+                        count: 2,
+                        bytes: 512,
+                        element_bytes: 2,
+                    }],
+                    vec![AllReduceCalls {
+                        count: 3,
+                        bytes: 256,
+                        element_bytes: 2,
+                    }],
+                ],
+                transfers: vec![
+                    PipelineTransfer {
+                        from_stage: 0,
+                        to_stage: 1,
+                        bytes_per_lane: 4096,
+                        rounds: 2,
+                    },
+                    PipelineTransfer {
+                        from_stage: 1,
+                        to_stage: 0,
+                        bytes_per_lane: 64,
+                        rounds: 1,
+                    },
+                ],
+                replicated_egress_bytes: Some(1024),
+            },
+        }];
+        workload
+    }
+
+    fn pipeline_inventory(hosts: &[NodeId], workers: Vec<PlacementWorker>) -> PlacementInventory {
+        PlacementInventory {
+            group: test_group(),
+            latest: None,
+            active: None,
+            hosts: hosts
+                .iter()
+                .map(|&host| PlacementHost {
+                    host,
+                    capacity: memory(32, 16),
+                    reserved: memory(0, 0),
+                    eligible: true,
+                })
+                .collect(),
+            workers,
+        }
+    }
+
+    #[test]
+    fn mixed_layout_requires_samples_only_for_tensor_rows_and_pipeline_columns() {
+        let [a, b, c, d] = [1, 2, 3, 4].map(host);
+        let workload = pipeline_workload();
+        let inventory = pipeline_inventory(
+            &[a, b, c, d],
+            vec![
+                worker(d, 0, 200_000_000),
+                worker(c, 0, 400_000_000),
+                worker(b, 0, 100_000_000),
+                worker(a, 0, 200_000_000),
+            ],
+        );
+        let mut links = [
+            (a, b, 10),
+            (b, a, 10),
+            (c, d, 20),
+            (d, c, 20),
+            (a, c, 40),
+            (b, d, 60),
+            (c, a, 30),
+            (d, b, 50),
+        ]
+        .map(|(source, target, rtt_ns)| DirectedLink {
+            source,
+            target,
+            rtt_ns,
+            bytes_per_second: 1_000_000_000,
+            sampled_at_ms: 50,
+        });
+        let Decision::Prepare {
+            cost,
+            recipe,
+            link_samples,
+            ..
+        } = select(&inventory, &workload, &links, 55).unwrap()
+        else {
+            panic!("two tensor rows and two pipeline columns are sufficient");
+        };
+        assert_eq!(
+            recipe,
+            Some(bind_peer_all_reduce_recipe(workload.recipes[0].id, 4, 1024))
+        );
+        assert_eq!(
+            cost,
+            Cost {
+                compute_ns: 15_000_000,
+                network_ns: 10_298
+            }
+        );
+        let affected = |links: &[DirectedLink]| {
+            links
+                .iter()
+                .map(|link| (link.source, link.target))
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(affected(&link_samples), affected(&links));
+
+        links[7].sampled_at_ms = 40;
+        assert!(matches!(
+            select(&inventory, &workload, &links, 55).unwrap(),
+            Decision::NoPlacement
+        ));
+    }
+
+    #[test]
+    fn mixed_pipeline_columns_share_host_bandwidth() {
+        let [a, b] = [1, 2].map(host);
+        let workload = pipeline_workload();
+        let inventory = pipeline_inventory(
+            &[a, b],
+            vec![
+                worker(a, 0, 200_000_000),
+                worker(a, 1, 100_000_000),
+                worker(b, 0, 400_000_000),
+                worker(b, 1, 200_000_000),
+            ],
+        );
+        let mut links = links_between(a, b, 1_000_000_000, 50);
+        links[1].bytes_per_second = 500_000_000;
+        let Decision::Prepare { cost, .. } = select(&inventory, &workload, &links, 55).unwrap()
+        else {
+            panic!("local TP rows use only the two measured host directions");
+        };
+        assert_eq!(cost.compute_ns, 15_000_000);
+        assert_eq!(cost.network_ns, 2 * (100 + 2 * 4096) + 100 + 4 * 64);
+    }
+
+    #[test]
+    fn mixed_recipe_rejects_inconsistent_compute_and_geometry() {
+        let mut workload = pipeline_workload();
+        assert!(workload.needs_links());
+        assert!(workload.validate(false).is_ok());
+        workload.recipes[0].compute = ComputeOrder::Parallel;
+        assert!(workload.validate(false).is_err());
+        workload.recipes[0].compute = ComputeOrder::Pipeline;
+        let Communication::TensorPipeline { transfers, .. } =
+            &mut workload.recipes[0].communication
+        else {
+            unreachable!()
+        };
+        transfers[1].to_stage = 2;
+        assert!(workload.validate(false).is_err());
+    }
+
+    #[test]
+    fn improved_pipeline_links_can_pay_for_a_new_placement() {
+        let [a, b, c, d] = [1, 2, 3, 4].map(host);
+        let mut workload = pipeline_workload();
+        workload.switch_ns = 10_000;
+        let recipe = workload.recipes[0].binding_id();
+        let mut inventory = pipeline_inventory(
+            &[a, b, c, d],
+            [a, b, c, d]
+                .into_iter()
+                .flat_map(|host| (0..2).map(move |slot| worker(host, slot, 1_000_000_000)))
+                .collect(),
+        );
+        let version = GroupVersion {
+            group: inventory.group,
+            epoch: 1,
+        };
+        for worker in &mut inventory.workers[..4] {
+            worker.grant = Some(WorkerGrant {
+                version,
+                device: worker.device,
+                incarnation: 1,
+                fence: 1,
+            });
+        }
+        for host in &mut inventory.hosts[..2] {
+            host.reserved = memory(9, 5);
+        }
+        inventory.latest = Some((version, GroupPhase::Active));
+        inventory.active = Some(ActivePlacement {
+            version,
+            workers: inventory.workers[..4]
+                .iter()
+                .map(|worker| {
+                    (
+                        worker.device,
+                        WorkerDemand {
+                            incarnation: 1,
+                            device_bytes: workload.device_bytes,
+                        },
+                    )
+                })
+                .collect(),
+            hosts: vec![(a, memory(9, 5)), (b, memory(9, 5))],
+        });
+        let old = links_between(a, b, 1_000_000_000, 50);
+        let replan = |spare_bandwidth| {
+            let mut links = old.to_vec();
+            links.extend(links_between(c, d, spare_bandwidth, 50));
+            select_with_recipes(&inventory, &workload, &links, 55, None, Some(recipe)).unwrap()
+        };
+        assert!(matches!(replan(100_000_000), Decision::Keep { .. }));
+        let Decision::Prepare {
+            resources,
+            recipe: Some(chosen),
+            ..
+        } = replan(10_000_000_000)
+        else {
+            panic!("faster spare links cover the switch cost");
+        };
+        assert_eq!(chosen, recipe);
+        assert!(resources.hosts.keys().copied().eq([c, d]));
     }
 
     #[test]

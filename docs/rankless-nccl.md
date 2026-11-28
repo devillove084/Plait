@@ -494,8 +494,8 @@ its committed reservations cover its recipe's demands in that same order.
 ]
 ```
 
-Parallel compute charges the slowest device. Sequential compute adds the
-stage times. For each host and contiguous slot range, the planner selects
+Parallel compute charges the slowest device. Sequential compute adds
+the device times. For each host and contiguous slot range, the planner selects
 eligible devices in device-ID order using the work assigned to those slots.
 For example, with device rates `[1, 100, 90]` and parallel work `[1, 100]`,
 slots on the first two devices finish in one time unit. The two fastest
@@ -526,6 +526,45 @@ That cost sums the bytes on each directed host link divided by its measured
 rate. The planner charges each call in the bucket and requires both link
 directions between participating hosts. Same-host transfers contribute
 zero cross-host cost.
+
+For a mixed TP × PP layout, use `compute: "pipeline"` and communication
+kind `tensor_pipeline`. The four entries in `work` follow vLLM's slot order
+for this TP2 × PP2 example.
+
+```json
+{
+  "id": [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
+  "work": [400000000, 400000000, 600000000, 600000000],
+  "compute": "pipeline",
+  "communication": {
+    "kind": "tensor_pipeline",
+    "tensor_parallel": 2,
+    "all_reduce_by_stage": [
+      [{"count": 28, "bytes": 131072, "element_bytes": 2}],
+      [{"count": 28, "bytes": 131072, "element_bytes": 2}]
+    ],
+    "transfers": [
+      {"from_stage": 0, "to_stage": 1, "bytes_per_lane": 65536, "rounds": 1},
+      {"from_stage": 1, "to_stage": 0, "bytes_per_lane": 16, "rounds": 1}
+    ]
+  }
+}
+```
+
+The planner adds the slowest worker time from each stage. Each stage's
+AllReduce uses the TP width to choose the exchange algorithm and shard sizes.
+Each transfer phase pairs equal TP slots in the declared source and
+destination stages. It totals the traffic on each directed host link,
+charges the highest ingress or egress serialization cost and the slowest
+link RTT, then multiplies by the number of rounds. Use a reverse transfer
+entry when the workload sends sampling results upstream. An explicit
+`replicated_egress_bytes` cap applies to every TP row and uses the same
+recipe ID derivation as `peer_all_reduce`.
+
+Configure the same base recipe ID, total width, TP degree, layer partition,
+and optional cap in the vLLM launch definition. The planner sums the stage
+and transfer costs for one operation. The engine's sustained pipeline
+capacity depends on its batching and overlap.
 
 Directed exchanges follow the supplied device positions and add their
 round costs. The generic `all_to_all` recipe charges the supplied worker-pair

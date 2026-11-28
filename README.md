@@ -240,13 +240,15 @@ recommendations. Deployment starts the successor and decides when to activate it
 
 Callers can supply multiple compute and communication recipes for the same
 group width. The planner scores them against device rates and link samples,
-then commits the selected recipe with the version's device grants.
+then commits the selected recipe with the version's device grants. Mixed
+TP × PP recipes price TP within each stage and directional transfers
+between the corresponding PP lanes.
 [Layout selection](docs/rankless-nccl.md#compare-layouts-of-the-same-width)
 
 The vLLM fork can start engines from those grants. Its route publisher
 checks both communicator and engine readiness, prepares the HTTP origin,
-and then activates the new group. Deployment can assign a complete grant
-group to either a tensor-parallel replica or a pipeline with one worker per stage.
+and then activates the new group. Deployment supports tensor-parallel,
+pipeline-parallel, and mixed TP × PP groups.
 [Automatic vLLM group deployment](docs/rankless-nccl.md#launch-and-activate-groups-from-the-vllm-fork)
 
 ### vLLM reference integration
