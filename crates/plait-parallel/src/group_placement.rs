@@ -211,6 +211,8 @@ pub enum Decision {
         cost: Cost,
         incumbent: Option<Cost>,
         recipe: Option<NodeId>,
+        /// Directed samples used to price the selected and compared layouts.
+        link_samples: Vec<DirectedLink>,
     },
 }
 
@@ -446,6 +448,11 @@ struct Model<'a> {
     minimum_device_bytes: u64,
 }
 
+struct LinkCosts<'a> {
+    samples: &'a BTreeMap<(NodeId, NodeId), DirectedLink>,
+    observed: Option<&'a mut BTreeMap<(NodeId, NodeId), DirectedLink>>,
+}
+
 pub fn select(
     inventory: &PlacementInventory,
     workload: &Workload,
@@ -492,6 +499,11 @@ pub fn select_with_recipes(
             eligible.insert(worker.id, (worker, entry));
         }
     }
+    let mut observed = BTreeMap::new();
+    let mut network = LinkCosts {
+        samples: &model.links,
+        observed: Some(&mut observed),
+    };
     let incumbent = if let Some((version, workers)) = model.incumbent(inventory, &eligible, &widths)
     {
         let recipe = active_recipe
@@ -513,7 +525,7 @@ pub fn select_with_recipes(
             if workers.iter().any(|worker| worker.compute_rate.is_none()) {
                 return Ok(Decision::AwaitComputeRates(version));
             }
-            let Some(cost) = model.cost(&workers, recipe) else {
+            let Some(cost) = model.cost_using(&workers, recipe, &mut network) else {
                 return Ok(Decision::AwaitLinks(version));
             };
             Some((version, cost))
@@ -557,11 +569,15 @@ pub fn select_with_recipes(
         return Ok(Decision::NoPlacement);
     };
     let resources = model.resources(&best, recipe);
+    let cost = model
+        .cost_using(&best.workers, recipe, &mut network)
+        .expect("selected layout was priced from the same samples");
     Ok(Decision::Prepare {
         resources,
-        cost: best.cost,
+        cost,
         incumbent: incumbent_cost,
         recipe: recipe.map(Recipe::binding_id),
+        link_samples: observed.into_values().collect(),
     })
 }
 
@@ -878,8 +894,24 @@ impl<'a> Model<'a> {
     }
 
     fn cost(&self, workers: &[Worker], recipe: Option<&Recipe>) -> Option<Cost> {
+        self.cost_using(workers, recipe, &mut self.link_costs())
+    }
+
+    fn link_costs(&self) -> LinkCosts<'_> {
+        LinkCosts {
+            samples: &self.links,
+            observed: None,
+        }
+    }
+
+    fn cost_using(
+        &self,
+        workers: &[Worker],
+        recipe: Option<&Recipe>,
+        network: &mut LinkCosts<'_>,
+    ) -> Option<Cost> {
         if let Some(recipe) = recipe {
-            return self.recipe_cost(workers, recipe);
+            return Self::recipe_cost(workers, recipe, network);
         }
         let compute_ns = if self.workload.compute_work == 0 {
             0
@@ -895,7 +927,7 @@ impl<'a> Model<'a> {
             )
         };
         let network_ns = if self.workload.bytes_per_peer > 0 {
-            self.all_to_all(workers, self.workload.bytes_per_peer, 1)?
+            network.all_to_all(workers, self.workload.bytes_per_peer, 1)?
         } else {
             0
         };
@@ -905,7 +937,11 @@ impl<'a> Model<'a> {
         })
     }
 
-    fn recipe_cost(&self, workers: &[Worker], recipe: &Recipe) -> Option<Cost> {
+    fn recipe_cost(
+        workers: &[Worker],
+        recipe: &Recipe,
+        network: &mut LinkCosts<'_>,
+    ) -> Option<Cost> {
         let mut ordered = workers.to_vec();
         ordered.sort_unstable_by_key(|worker| worker.id);
         let mut compute_ns = 0u64;
@@ -916,18 +952,18 @@ impl<'a> Model<'a> {
             Communication::AllToAll {
                 rounds,
                 bytes_per_peer,
-            } => self.all_to_all(workers, *bytes_per_peer, *rounds)?,
+            } => network.all_to_all(workers, *bytes_per_peer, *rounds)?,
             Communication::PeerAllReduce {
                 calls,
                 replicated_egress_bytes,
-            } => self.peer_all_reduce(&ordered, calls, *replicated_egress_bytes)?,
+            } => network.peer_all_reduce(&ordered, calls, *replicated_egress_bytes)?,
             Communication::Directed { edges } => {
                 let mut total = 0u64;
                 for edge in edges {
                     if let (Some(from), Some(to)) = (ordered.get(edge.from), ordered.get(edge.to))
                         && from.id.node != to.id.node
                     {
-                        total = total.saturating_add(self.link_time(
+                        total = total.saturating_add(network.link_time(
                             from.id.node,
                             to.id.node,
                             u128::from(edge.bytes),
@@ -943,8 +979,19 @@ impl<'a> Model<'a> {
             network_ns,
         })
     }
+}
 
-    fn all_to_all(&self, workers: &[Worker], bytes_per_peer: u64, rounds: u64) -> Option<u64> {
+impl LinkCosts<'_> {
+    fn read(&mut self, source: NodeId, target: NodeId) -> Option<DirectedLink> {
+        let key = (source, target);
+        let sample = *self.samples.get(&key)?;
+        if let Some(observed) = &mut self.observed {
+            observed.insert(key, sample);
+        }
+        Some(sample)
+    }
+
+    fn all_to_all(&mut self, workers: &[Worker], bytes_per_peer: u64, rounds: u64) -> Option<u64> {
         let mut network_ns = 0;
         if rounds > 0 {
             let counts = count_hosts(workers);
@@ -965,7 +1012,7 @@ impl<'a> Model<'a> {
     }
 
     fn peer_all_reduce(
-        &self,
+        &mut self,
         ordered: &[Worker],
         calls: &[AllReduceCalls],
         replicated_egress_bytes: Option<u64>,
@@ -1007,7 +1054,7 @@ impl<'a> Model<'a> {
     }
 
     fn exchange_phase(
-        &self,
+        &mut self,
         hosts: &BTreeMap<NodeId, usize>,
         traffic: impl Fn(NodeId, NodeId) -> u128,
     ) -> Option<u64> {
@@ -1017,7 +1064,7 @@ impl<'a> Model<'a> {
         for &source in hosts.keys() {
             let mut outgoing = 0u64;
             for &target in hosts.keys().filter(|&&target| target != source) {
-                let link = self.links.get(&(source, target))?;
+                let link = self.read(source, target)?;
                 peak_rtt = peak_rtt.max(link.rtt_ns);
                 let time = ns(
                     traffic(source, target).saturating_mul(NANOS),
@@ -1033,8 +1080,14 @@ impl<'a> Model<'a> {
         Some(peak_rtt.saturating_add(peak_serialization))
     }
 
-    fn link_time(&self, source: NodeId, target: NodeId, bytes: u128, rounds: u64) -> Option<u64> {
-        let link = self.links.get(&(source, target))?;
+    fn link_time(
+        &mut self,
+        source: NodeId,
+        target: NodeId,
+        bytes: u128,
+        rounds: u64,
+    ) -> Option<u64> {
+        let link = self.read(source, target)?;
         Some(
             ns(
                 bytes
@@ -1406,6 +1459,7 @@ mod tests {
             resources,
             cost,
             incumbent,
+            link_samples,
             ..
         } = select(&inventory, &workload, &slow, 55).unwrap()
         else {
@@ -1414,6 +1468,12 @@ mod tests {
         assert_eq!(resources.hosts, BTreeMap::from([(c, memory(9, 5))]));
         assert_eq!(cost.network_ns, 0);
         assert!(incumbent.unwrap().network_ns > 0);
+        assert!(
+            link_samples
+                .iter()
+                .map(|sample| (sample.source, sample.target))
+                .eq([(a, b), (b, a)])
+        );
     }
 
     #[test]
@@ -1727,6 +1787,7 @@ mod tests {
             resources: selected,
             recipe: Some(id),
             cost,
+            link_samples,
             ..
         } = select(&inventory, &workload, &links, 55).unwrap()
         else {
@@ -1736,6 +1797,12 @@ mod tests {
         assert_eq!(selected, resources);
         assert_eq!(cost.compute_ns, 125_000_000);
         assert_eq!(cost.network_ns, 41_001_024);
+        assert!(
+            link_samples
+                .iter()
+                .map(|sample| (sample.source, sample.target))
+                .eq([(a, b)])
+        );
     }
 
     #[test]
@@ -1771,12 +1838,22 @@ mod tests {
         ];
         // The two-worker host services four cross-host worker pairs per direction.
         assert_eq!(
-            model.peer_all_reduce(&workers, &calls, None),
+            model.link_costs().peer_all_reduce(&workers, &calls, None),
             Some(399 * (100 + 4 * 2048) + 57 * (100 + 4 * 10240))
         );
-        assert_eq!(model.peer_all_reduce(&workers[..2], &calls, None), Some(0));
+        assert_eq!(
+            model
+                .link_costs()
+                .peer_all_reduce(&workers[..2], &calls, None),
+            Some(0)
+        );
         let incomplete = Model::new(&workload, &links[..5], 55, None).unwrap();
-        assert_eq!(incomplete.peer_all_reduce(&workers, &calls, None), None);
+        assert_eq!(
+            incomplete
+                .link_costs()
+                .peer_all_reduce(&workers, &calls, None),
+            None
+        );
     }
 
     #[test]
@@ -1799,7 +1876,7 @@ mod tests {
         // A owns 43,694 bytes and B owns 21,846. B's slower egress is the
         // bottleneck in both sequential phases, with different payload sizes.
         assert_eq!(
-            model.peer_all_reduce(&workers, &calls, None),
+            model.link_costs().peer_all_reduce(&workers, &calls, None),
             Some(2 * 43_694 + 2 * 43_692 + 2 * 100)
         );
     }

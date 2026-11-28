@@ -261,6 +261,7 @@ async fn handle(client: &mut Client, voters: &[NodeId], request: Request) -> io:
                     cost,
                     incumbent,
                     recipe,
+                    ..
                 } => {
                     let mut response = json!({
                         "decision": "prepare", "cost": cost, "incumbent": incumbent,

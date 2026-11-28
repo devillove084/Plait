@@ -11,8 +11,9 @@ use plait_core::group::{
     GroupId, GroupLookup, GroupOperation, GroupPhase, GroupReply, GroupResult, GroupVersion,
     ResourcePlan,
 };
+use plait_core::link::ProbeRegistration;
 use plait_core::{NodeId, OpId};
-use plait_parallel::group_placement::{Decision, Workload};
+use plait_parallel::group_placement::{Decision, DirectedLink, Workload};
 use serde::Deserialize;
 use tokio::task::JoinSet;
 use tokio::time::{MissedTickBehavior, interval};
@@ -146,21 +147,78 @@ struct Proposal {
     resources: ResourcePlan,
 }
 
+struct LinkReading {
+    registrations: (ProbeRegistration, ProbeRegistration),
+    sampled_at_ms: u64,
+}
+
+type LinkWindow = BTreeMap<(NodeId, NodeId), LinkReading>;
+
+fn link_window(samples: &[DirectedLink], probes: &[ProbeRegistration]) -> io::Result<LinkWindow> {
+    let by_host: BTreeMap<_, _> = probes
+        .iter()
+        .map(|probe| (probe.endpoint.host, *probe))
+        .collect();
+    samples
+        .iter()
+        .map(|sample| {
+            let registration = |host| {
+                by_host
+                    .get(&host)
+                    .copied()
+                    .ok_or_else(|| io::Error::other("priced link has no registered probe endpoint"))
+            };
+            Ok((
+                (sample.source, sample.target),
+                LinkReading {
+                    registrations: (registration(sample.source)?, registration(sample.target)?),
+                    sampled_at_ms: sample.sampled_at_ms,
+                },
+            ))
+        })
+        .collect()
+}
+
+struct Observation {
+    proposal: Proposal,
+    links: LinkWindow,
+    count: u32,
+}
+
 #[derive(Default)]
 struct Replan {
-    seen: Option<(Proposal, u32)>,
+    seen: Option<Observation>,
     submitted: Option<GroupOperation>,
 }
 
 impl Replan {
-    fn confirm(&mut self, proposed: &Proposal, samples: u32) -> bool {
-        if let Some((last, count)) = &mut self.seen
-            && last == proposed
+    fn confirm(&mut self, proposed: &Proposal, links: LinkWindow, samples: u32) -> bool {
+        if let Some(last) = &mut self.seen
+            && last.proposal == *proposed
+            && last.links.len() == links.len()
+            && last.links.iter().all(|(path, reading)| {
+                links
+                    .get(path)
+                    .is_some_and(|present| present.registrations == reading.registrations)
+            })
         {
-            *count = count.saturating_add(1);
-            return *count >= samples;
+            // Keep the last counted window while individual probe directions catch up.
+            if last
+                .links
+                .iter()
+                .any(|(path, reading)| links[path].sampled_at_ms <= reading.sampled_at_ms)
+            {
+                return false;
+            }
+            last.links = links;
+            last.count = last.count.saturating_add(1);
+            return last.count >= samples;
         }
-        self.seen = Some((proposed.clone(), 1));
+        self.seen = Some(Observation {
+            proposal: proposed.clone(),
+            links,
+            count: 1,
+        });
         samples == 1
     }
 
@@ -208,6 +266,7 @@ impl Replan {
                 resources,
                 incumbent,
                 recipe,
+                link_samples,
                 ..
             } = snapshot.select(&policy.workload, &links)?
             else {
@@ -225,7 +284,8 @@ impl Replan {
                 recipe,
                 resources,
             };
-            if !self.confirm(&proposed, samples) {
+            let observed = link_window(&link_samples, probes.as_deref().unwrap_or_default())?;
+            if !self.confirm(&proposed, observed, samples) {
                 return Ok(None);
             }
             self.submitted = Some(GroupOperation {
@@ -252,16 +312,16 @@ mod tests {
     use super::*;
     use plait_core::DeviceId;
     use plait_core::group::{HostMemory, WorkerDemand};
+    use plait_core::link::ProbeEndpoint;
 
-    #[test]
-    fn stability_is_scoped_to_the_same_devices_and_incumbent() {
+    fn proposal() -> Proposal {
         let node = NodeId::derive("host");
         let device = DeviceId::new(node, 0);
         let active = GroupVersion {
             group: GroupId(NodeId::derive("group")),
             epoch: 1,
         };
-        let mut proposed = Proposal {
+        Proposal {
             latest: Some((active, GroupPhase::Active)),
             active: Some(active),
             compared_active: true,
@@ -276,21 +336,66 @@ mod tests {
                 )]),
                 hosts: BTreeMap::from([(node, HostMemory::default())]),
             },
-        };
+        }
+    }
+
+    #[test]
+    fn stability_is_scoped_to_the_same_devices_and_incumbent() {
+        let mut proposed = proposal();
+        let device = *proposed.resources.workers.keys().next().unwrap();
         let mut replan = Replan::default();
-        assert!(!replan.confirm(&proposed, 2));
+        let mut confirm = |proposed: &Proposal| replan.confirm(proposed, LinkWindow::new(), 2);
+        assert!(!confirm(&proposed));
         proposed
             .resources
             .workers
             .get_mut(&device)
             .unwrap()
             .incarnation = 2;
-        assert!(!replan.confirm(&proposed, 2));
+        assert!(!confirm(&proposed));
         proposed.active = None;
         proposed.compared_active = false;
-        assert!(!replan.confirm(&proposed, 2));
-        assert!(replan.confirm(&proposed, 2));
+        assert!(!confirm(&proposed));
+        assert!(confirm(&proposed));
         proposed.recipe = Some(NodeId::derive("directed"));
-        assert!(!replan.confirm(&proposed, 2));
+        assert!(!confirm(&proposed));
+    }
+
+    #[test]
+    fn stable_link_window_requires_both_directions_and_resets_on_probe_replacement() {
+        let a = NodeId::derive("a");
+        let b = NodeId::derive("b");
+        let mut probes = [a, b].map(|host| ProbeRegistration {
+            revision: 1,
+            endpoint: ProbeEndpoint {
+                host,
+                session: host,
+                address: "127.0.0.1:1234".parse().unwrap(),
+            },
+        });
+        let sample = |source, target, sampled_at_ms| DirectedLink {
+            source,
+            target,
+            sampled_at_ms,
+            bytes_per_second: 1,
+            rtt_ns: 1,
+        };
+        let mut replan = Replan::default();
+        let proposed = proposal();
+        let mut confirm = |first, second, probes: &[ProbeRegistration]| {
+            let window = link_window(&[sample(a, b, first), sample(b, a, second)], probes).unwrap();
+            replan.confirm(&proposed, window, 3)
+        };
+        assert!(!confirm(10, 11, &probes));
+        assert!(!confirm(10, 11, &probes));
+        assert!(!confirm(14, 11, &probes));
+        assert!(!confirm(10, 16, &probes));
+        assert!(!confirm(14, 16, &probes));
+        assert!(confirm(18, 17, &probes));
+        probes[0].revision += 1;
+        probes[0].endpoint.session = NodeId::derive("restart");
+        assert!(!confirm(20, 21, &probes));
+        assert!(!confirm(22, 22, &probes));
+        assert!(confirm(24, 24, &probes));
     }
 }

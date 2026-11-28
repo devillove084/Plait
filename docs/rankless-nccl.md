@@ -297,9 +297,13 @@ Set `control_ip` to a local address the voters can reach. List only the
 widths the engine can run and size the memory and cost estimates for that
 workload. Set the policy's optional `calibration` to the ID of the published
 compute rates. By default, the node polls every five seconds and requires
-two consecutive recommendations for the same candidate and incumbent.
-Each poll evaluates the latest available rates and links, which may include
-measurements used in a previous poll.
+two matching recommendations for the same candidate and incumbent. When
+their comparison uses network measurements, each confirmation needs a newer
+sample for every priced direction. A partial update waits for the remaining
+directions. A change in the probe registration starts the count over. The
+resident probes sample every ten seconds. Size `max_link_age_ms` to cover
+the sampling period and delays across the relevant hosts. Comparisons with
+no network measurements count matching polls.
 
 A confirmed candidate is submitted with the latest group epoch, resource
 requirements, and measurement versions from the final poll. Several nodes
