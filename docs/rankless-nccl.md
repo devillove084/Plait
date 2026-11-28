@@ -472,8 +472,10 @@ AllReduce budget. The value counts one worker's payload across all its peers in
 one replicated AllReduce. All descriptors for the same group version must agree.
 The handshake checks the value along with the manifest and slot order. A change
 requires a new communicator. Omit the field to use the default policy and join
-peers that predate this option. The placement estimator currently prices that
-default policy.
+peers that predate this option. For managed launches, define the candidate caps
+in the [placement recipes](#compare-layouts-of-the-same-width) and map them in
+the launchers' `layout_recipes`. The committed recipe binds the selected cap to
+the group version. Each launcher copies it into its worker descriptor.
 
 Each worker independently resolves its grant, publishes its endpoint, and reads
 the complete manifest through a voter. The peer handshake binds the manifest and
