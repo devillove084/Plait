@@ -3,7 +3,8 @@ use std::net::TcpStream;
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
-use crate::profile::Timer;
+use super::PeerGroup;
+use crate::profile::{self, Timer};
 
 pub(super) fn write(mut stream: &TcpStream, header: &[u8], data: &[u8]) -> io::Result<()> {
     let mut slices = [IoSlice::new(header), IoSlice::new(data)];
@@ -38,18 +39,29 @@ pub(super) fn exchange_all<'a>(
     peers: impl Iterator<Item = (usize, &'a TcpStream, &'a [u8], &'a mut [u8])>,
     header: &[u8; 24],
     timeout: Duration,
+    wire: &mut Timer,
+    trace: Option<&ShardTrace>,
 ) -> io::Result<()> {
-    let deadline = phase_deadline(timeout)?;
-    let mut transfers: Vec<_> = peers
-        .map(|(peer, stream, outgoing, incoming)| Transfer {
-            peer,
-            stream,
-            outgoing,
-            incoming,
-            progress: Progress::default(),
-        })
-        .collect();
-    transfer_all(&mut transfers, header, deadline)
+    let transfers = wire.measure(|| {
+        let deadline = phase_deadline(timeout)?;
+        let mut transfers: Vec<_> = peers
+            .map(|(peer, stream, outgoing, incoming)| Transfer {
+                peer,
+                stream,
+                outgoing,
+                incoming,
+                progress: Progress::new(trace.is_some()),
+            })
+            .collect();
+        transfer_all(&mut transfers, header, deadline)?;
+        Ok::<_, io::Error>(transfers)
+    })?;
+    if let Some(trace) = trace {
+        for transfer in &transfers {
+            trace.record(header, transfer.peer, &transfer.progress);
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn exchange_pair(
@@ -98,6 +110,61 @@ struct Progress {
     remote_header: [u8; 24],
     header_bytes: usize,
     body_bytes: usize,
+    marks: Option<Box<Milestones>>,
+}
+
+#[derive(Default)]
+struct Milestones {
+    tx_first: Option<Instant>,
+    tx_last: Option<Instant>,
+    rx_header: Option<Instant>,
+    rx_first: Option<Instant>,
+    rx_last: Option<Instant>,
+}
+
+pub(super) struct ShardTrace {
+    file: &'static std::fs::File,
+    group: u128,
+    slot: usize,
+    sequence: u64,
+    start: Instant,
+}
+
+impl ShardTrace {
+    pub(super) fn new(group: &PeerGroup, sequence: u64) -> Option<Self> {
+        Some(Self {
+            file: profile::shard_log()?,
+            group: group.profile_group(),
+            slot: group.slot(),
+            sequence,
+            start: Instant::now(),
+        })
+    }
+
+    fn record(&self, header: &[u8; 24], peer: usize, progress: &Progress) {
+        let Some(marks) = &progress.marks else { return };
+        let kind = header[20];
+        let stage = header[23];
+        let ns = |mark: Option<Instant>| {
+            mark.map_or(0, |mark| mark.duration_since(self.start).as_nanos())
+        };
+        let line = format!(
+            "{}\t{:032x}\t{}\t{}\t{peer}\t{kind}\t{stage}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            std::process::id(),
+            self.group,
+            self.slot,
+            self.sequence,
+            progress.sent.saturating_sub(progress.remote_header.len()),
+            progress.body_bytes,
+            ns(marks.tx_first),
+            ns(marks.tx_last),
+            ns(marks.rx_header),
+            ns(marks.rx_first),
+            ns(marks.rx_last),
+        );
+        let mut file = self.file;
+        let _ = file.write_all(line.as_bytes());
+    }
 }
 
 impl Transfer<'_> {
@@ -112,6 +179,13 @@ impl Transfer<'_> {
 }
 
 impl Progress {
+    fn new(traced: bool) -> Self {
+        Self {
+            marks: traced.then(Box::default),
+            ..Self::default()
+        }
+    }
+
     fn sending(&self, available: usize) -> bool {
         self.sent < self.remote_header.len() + available
     }
@@ -131,8 +205,18 @@ impl Progress {
                 IoSlice::new(&header[self.sent.min(header.len())..]),
                 IoSlice::new(&payload[self.sent.saturating_sub(header.len())..]),
             ];
-            self.sent +=
+            let written =
                 socket_progress(stream.write_vectored(&remaining), io::ErrorKind::WriteZero)?;
+            self.sent += written;
+            if written != 0
+                && let Some(marks) = &mut self.marks
+            {
+                let now = Instant::now();
+                marks.tx_last = Some(now);
+                if self.sent > header.len() {
+                    marks.tx_first.get_or_insert(now);
+                }
+            }
         }
         Ok(())
     }
@@ -151,13 +235,26 @@ impl Progress {
             )?;
             if self.header_bytes == header.len() {
                 check_header(peer, header, &self.remote_header)?;
+                if let Some(marks) = &mut self.marks {
+                    let now = Instant::now();
+                    marks.rx_header = Some(now);
+                    marks.rx_last = Some(now);
+                }
             }
         }
         if self.header_bytes == header.len() && self.body_bytes < payload.len() {
-            self.body_bytes += socket_progress(
+            let received = socket_progress(
                 stream.read(&mut payload[self.body_bytes..]),
                 io::ErrorKind::UnexpectedEof,
             )?;
+            self.body_bytes += received;
+            if received != 0
+                && let Some(marks) = &mut self.marks
+            {
+                let now = Instant::now();
+                marks.rx_first.get_or_insert(now);
+                marks.rx_last = Some(now);
+            }
         }
         Ok(())
     }
@@ -242,12 +339,19 @@ impl ScatterGather<'_> {
         lanes: &mut [ScatterGatherLane<'_>],
         timeout: Duration,
         wire: &mut Timer,
+        trace: Option<&ShardTrace>,
         mut reduce_block: impl FnMut(usize, &[ScatterGatherLane<'_>], &mut [u8]),
     ) -> io::Result<()> {
         let mut deadline = phase_deadline(timeout)?;
         let mut waiting = Vec::with_capacity(lanes.len());
         let mut reduced = 0;
         let mut scatter_finished = false;
+        if trace.is_some() {
+            for lane in &mut *lanes {
+                lane.scatter.progress.marks = Some(Box::default());
+                lane.gather.marks = Some(Box::default());
+            }
+        }
         loop {
             let (scatter_events, contiguous) = wire.measure(|| {
                 let mut events = 0;
@@ -286,6 +390,13 @@ impl ScatterGather<'_> {
                 Ok::<_, io::Error>(())
             })?;
             if waiting.is_empty() {
+                if let Some(trace) = trace {
+                    for lane in &*lanes {
+                        let peer = lane.scatter.peer;
+                        trace.record(&self.scatter_header, peer, &lane.scatter.progress);
+                        trace.record(&self.gather_header, peer, &lane.gather);
+                    }
+                }
                 return Ok(());
             }
             wire.measure(|| wait_ready(&mut waiting, deadline))?;
@@ -338,6 +449,54 @@ fn socket_progress(result: io::Result<usize>, on_closed: io::ErrorKind) -> io::R
         }
         Err(error) => Err(error),
     }
+}
+
+#[cfg(test)]
+#[test]
+fn traced_frame_separates_a_valid_header_from_the_first_payload() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let local = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut remote, _) = listener.accept().unwrap();
+    let timeout = Some(Duration::from_secs(3));
+    local.set_read_timeout(timeout).unwrap();
+    remote.set_read_timeout(timeout).unwrap();
+    let header = [0; 24];
+    let mut progress = Progress::new(true);
+
+    progress.send(&local, &header, &[]).unwrap();
+    let mut observed = [0; 24];
+    remote.read_exact(&mut observed).unwrap();
+    assert_eq!(observed, header);
+    let marks = progress.marks.as_ref().unwrap();
+    assert!(marks.tx_first.is_none());
+    let header_write = marks.tx_last.unwrap();
+    while progress.sending(3) {
+        progress.send(&local, &header, &[1, 2, 3]).unwrap();
+    }
+    let mut sent = [0; 3];
+    remote.read_exact(&mut sent).unwrap();
+    assert_eq!(sent, [1, 2, 3]);
+
+    remote.write_all(&header).unwrap();
+    while progress.receiving(0) {
+        progress.receive(&local, 1, &header, &mut []).unwrap();
+    }
+    let marks = progress.marks.as_ref().unwrap();
+    assert!(marks.rx_first.is_none());
+    assert_eq!(marks.rx_header, marks.rx_last);
+    let payload_release = Instant::now();
+    remote.write_all(&[4, 5, 6]).unwrap();
+    let mut received = [0; 3];
+    while progress.receiving(received.len()) {
+        progress.receive(&local, 1, &header, &mut received).unwrap();
+    }
+    let marks = progress.marks.as_ref().unwrap();
+    assert_eq!(received, [4, 5, 6]);
+    assert!(header_write <= marks.tx_first.unwrap());
+    assert!(marks.tx_first <= marks.tx_last);
+    assert!(marks.rx_header.unwrap() <= payload_release);
+    assert!(payload_release <= marks.rx_first.unwrap());
+    assert!(marks.rx_first <= marks.rx_last);
 }
 
 fn wait_ready(waiting: &mut [libc::pollfd], deadline: Instant) -> io::Result<()> {

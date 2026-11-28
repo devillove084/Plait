@@ -57,6 +57,21 @@ I/O and readiness waits, and `fold_ns` measures host reduction. Both are parts
 of `collective_ns`. The worker records the row after input staging and before
 delivery to the caller. Blocking requests use `PLAIT_NCCL_PHASE_LOG`.
 
+Set `PLAIT_NCCL_SHARD_PHASE_LOG` to trace scatter and gather frames on each
+peer connection. This trace works for both blocking and asynchronous calls.
+Match it to the asynchronous trace by group fingerprint, slot, and sequence.
+
+```text
+pid  group_fingerprint  slot  sequence  peer  operation  stage  tx_bytes  rx_bytes  tx_first_payload_ns  tx_last_ns  rx_header_ns  rx_first_payload_ns  rx_last_ns
+```
+
+AllReduce uses stage 0 for scatter and stage 1 for gather. Times are relative
+to entry into the sharded operation on that worker. Transmit times record
+acceptance by the local socket. Receive times record when the worker validates
+the header, reads the first payload, and finishes reading the frame. A zero
+first-payload time indicates an empty payload. Compare intervals on each worker
+using its local monotonic clock.
+
 ## Legacy NCCL bootstrap
 
 Call `patch_vllm()` to replace the Python NCCL wrapper before communicator

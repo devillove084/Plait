@@ -179,6 +179,7 @@ fn paired_scatter_sends_a_reduced_prefix_before_the_tail_arrives() {
                 )],
                 timeout,
                 &mut Timer::new(false),
+                None,
                 |start, lanes, result| {
                     let contribution = &lanes[0].contribution()[start..start + result.len()];
                     for (value, target) in contribution.iter().zip(result) {
@@ -260,7 +261,7 @@ fn sharded_half_pipeline_interoperates_with_a_peer_that_waits_for_scatter() {
                 if slot == 1 {
                     let mut wire = Timer::new(false);
                     let inputs = group
-                        .contributions(&scatter, input, ranges, &mut wire)
+                        .contributions(&scatter, input, ranges, &mut wire, None)
                         .unwrap();
                     let reduced = collective.reduce(&inputs);
                     let mut actual = vec![0; input.len()];
@@ -271,6 +272,7 @@ fn sharded_half_pipeline_interoperates_with_a_peer_that_waits_for_scatter() {
                             &mut actual,
                             ranges.iter().map(Range::len),
                             &mut wire,
+                            None,
                         )
                         .unwrap();
                     assert_eq!(actual, *expected);
@@ -334,6 +336,7 @@ fn exchange_sharded_prefix(disconnect: bool) {
                 &mut lanes,
                 timeout,
                 &mut Timer::new(false),
+                None,
                 |start, lanes, result| {
                     for (index, value) in result.iter_mut().enumerate() {
                         *value = lanes[0].contribution()[start + index]
@@ -422,6 +425,8 @@ fn sharded_exchange_progresses_on_other_links_while_one_peer_waits() {
             .into_iter(),
             &header,
             Duration::from_secs(3),
+            &mut Timer::new(false),
+            None,
         )
         .unwrap();
         assert_eq!((first, second), ([7], [8]));

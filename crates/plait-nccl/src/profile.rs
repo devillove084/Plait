@@ -9,6 +9,7 @@ use crate::peer::{Collective, PeerGroup};
 
 static LOG: OnceLock<Option<File>> = OnceLock::new();
 static ASYNC_LOG: OnceLock<Option<File>> = OnceLock::new();
+static SHARD_LOG: OnceLock<Option<File>> = OnceLock::new();
 
 pub(crate) fn log() -> Option<&'static File> {
     LOG.get_or_init(|| open_log("PLAIT_NCCL_PHASE_LOG"))
@@ -18,6 +19,12 @@ pub(crate) fn log() -> Option<&'static File> {
 pub(crate) fn async_log() -> Option<&'static File> {
     ASYNC_LOG
         .get_or_init(|| open_log("PLAIT_NCCL_ASYNC_PHASE_LOG"))
+        .as_ref()
+}
+
+pub(crate) fn shard_log() -> Option<&'static File> {
+    SHARD_LOG
+        .get_or_init(|| open_log("PLAIT_NCCL_SHARD_PHASE_LOG"))
         .as_ref()
 }
 

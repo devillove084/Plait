@@ -623,7 +623,7 @@ impl PeerGroup {
                     ))
                 },
             );
-            wire.measure(|| frame::exchange_all(peers, &header, self.timeout))?;
+            frame::exchange_all(peers, &header, self.timeout, wire, None)?;
             return Ok(fold.measure(|| collective.reduce(&inputs)));
         }
         if (world == 2 || (world > 2 && bytes / world >= MIN_MULTI_PIPELINE_SHARD_BYTES))
@@ -638,8 +638,9 @@ impl PeerGroup {
             Collective::AllReduce(..)
             | Collective::ReduceScatter(..)
             | Collective::AllReduceFp8ToF32 => {
+                let trace = frame::ShardTrace::new(self, sequence);
                 let ranges = shard_ranges(bytes, dtype.bytes(), world);
-                let inputs = self.contributions(&header, input, &ranges, wire)?;
+                let inputs = self.contributions(&header, input, &ranges, wire, trace.as_ref())?;
                 let fp8 = matches!(collective, Collective::AllReduceFp8ToF32);
                 let reduced = fold.measure(|| collective.reduce(&inputs));
                 if matches!(collective, Collective::ReduceScatter(..)) {
@@ -657,10 +658,12 @@ impl PeerGroup {
                     &mut output,
                     ranges.iter().map(|range| range.len() * output_width),
                     wire,
+                    trace.as_ref(),
                 )?;
                 Ok(output)
             }
             Collective::AllGather(_) => {
+                let trace = frame::ShardTrace::new(self, sequence);
                 let total = bytes
                     .checked_mul(world)
                     .ok_or_else(|| io::Error::other("gather size overflow"))?;
@@ -671,6 +674,7 @@ impl PeerGroup {
                     &mut output,
                     std::iter::repeat_n(bytes, world),
                     wire,
+                    trace.as_ref(),
                 )?;
                 Ok(output)
             }
@@ -711,6 +715,7 @@ impl PeerGroup {
         wire: &mut Timer,
         fold: &mut Timer,
     ) -> io::Result<Vec<u8>> {
+        let trace = frame::ShardTrace::new(self, sequence);
         let (_, dtype, op, _) = collective.wire();
         let world = self.links.len();
         let ranges = shard_ranges(input.len(), dtype.bytes(), world);
@@ -747,30 +752,37 @@ impl PeerGroup {
             gather_header: collective.header(sequence, input.len(), 1),
             gather_send,
         }
-        .run(&mut lanes, self.timeout, wire, |start, lanes, result| {
-            let block = start..start + result.len();
-            fold.measure(|| {
-                let local = &local[block.clone()];
-                if let [lane] = lanes {
-                    let remote = &lane.contribution()[block];
-                    let ordered = if self.slot == 0 {
-                        [local, remote]
+        .run(
+            &mut lanes,
+            self.timeout,
+            wire,
+            trace.as_ref(),
+            |start, lanes, result| {
+                let block = start..start + result.len();
+                fold.measure(|| {
+                    let local = &local[block.clone()];
+                    if let [lane] = lanes {
+                        let remote = &lane.contribution()[block];
+                        let ordered = if self.slot == 0 {
+                            [local, remote]
+                        } else {
+                            [remote, local]
+                        };
+                        if dtype != DataType::Float16
+                            || !host_reduce::try_sum_fp16_pair_into(ordered[0], ordered[1], result)
+                        {
+                            result.copy_from_slice(&reduce_slices(op, dtype, &ordered));
+                        }
                     } else {
-                        [remote, local]
-                    };
-                    if dtype != DataType::Float16
-                        || !host_reduce::try_sum_fp16_pair_into(ordered[0], ordered[1], result)
-                    {
+                        let mut ordered = Vec::with_capacity(world);
+                        ordered
+                            .extend(lanes.iter().map(|lane| &lane.contribution()[block.clone()]));
+                        ordered.insert(self.slot, local);
                         result.copy_from_slice(&reduce_slices(op, dtype, &ordered));
                     }
-                } else {
-                    let mut ordered = Vec::with_capacity(world);
-                    ordered.extend(lanes.iter().map(|lane| &lane.contribution()[block.clone()]));
-                    ordered.insert(self.slot, local);
-                    result.copy_from_slice(&reduce_slices(op, dtype, &ordered));
-                }
-            });
-        })?;
+                });
+            },
+        )?;
         Ok(output)
     }
 
@@ -780,6 +792,7 @@ impl PeerGroup {
         input: &[u8],
         ranges: &[Range<usize>],
         wire: &mut Timer,
+        trace: Option<&frame::ShardTrace>,
     ) -> io::Result<Vec<Vec<u8>>> {
         let own = ranges[self.slot].clone();
         let mut contributions = vec![vec![0; own.len()]; self.links.len()];
@@ -797,7 +810,7 @@ impl PeerGroup {
                     received.as_mut_slice(),
                 ))
             });
-        wire.measure(|| frame::exchange_all(peers, header, self.timeout))?;
+        frame::exchange_all(peers, header, self.timeout, wire, trace)?;
         Ok(contributions)
     }
 
@@ -808,6 +821,7 @@ impl PeerGroup {
         mut output: &mut [u8],
         shard_lengths: impl Iterator<Item = usize>,
         wire: &mut Timer,
+        trace: Option<&frame::ShardTrace>,
     ) -> io::Result<()> {
         let peers =
             self.links
@@ -824,7 +838,7 @@ impl PeerGroup {
                         None
                     }
                 });
-        wire.measure(|| frame::exchange_all(peers, header, self.timeout))
+        frame::exchange_all(peers, header, self.timeout, wire, trace)
     }
 
     pub fn send(self: &Arc<Self>, peer: usize, dtype: DataType, input: Vec<u8>) -> io::Result<()> {
