@@ -693,11 +693,13 @@ responses finish. When that count reaches zero, it pauses vLLM in wait mode
 and waits for vLLM to synchronize the devices.
 
 After the API acknowledges drain, its launcher submits `Revoke` for the old
-version. Each participating host observes the revocation and sends `SIGTERM`
-to its local engine process group. After a ten-second grace period the
-launcher sends `SIGKILL` if the group still exists. It waits for the entire
-process group to exit, then persists its exact local grants and release
-operation IDs before submitting any release. Plait releases each host's
+version. On Linux the launcher confirms the revocation against its local
+ownership record and writes a stop request for that engine instance. The
+engine's local parent sends `SIGTERM` to the engine session. After a
+ten-second grace period, it force-stops any remaining children and reaps
+adopted descendants, including children that changed process groups. It
+persists the exact local grants and release operation IDs only after the
+kernel reports that all children have exited. Plait releases each host's
 reservation after its last grant returns. The group becomes `Retired` once
 all grants have returned.
 
@@ -705,13 +707,16 @@ The launcher checks that the version is still preparing after acquiring its
 local launch lock. An unexpected child exit is reported against an exact
 grant. If the OS rejects the executable on the first local launch attempt,
 the launcher writes a failure journal in its state directory before sending
-the report. The launcher holds the local launch lock through process exit and
-release. On restart with the same state directory, it acquires that lock,
-checks the grants against a fresh ordered view, and resumes any recorded
-report or release using its original operation ID. It removes the journal
-after receiving every release receipt. When the launcher loses track of a
-process group before recording its exit, the deployment operator establishes
-that the process group has stopped before releasing its grants.
+the report. On Linux the engine's parent process inherits the launch lock and
+keeps it even if the launcher exits. It writes the ownership record before
+starting the engine. Restart the launcher with the same state directory to
+continue observing that engine. A restarted launcher matches the version
+and exact grants before writing a stop request. Once the local parent has
+recorded exit, the launcher takes the launch lock and replays release
+operations with their original IDs, then removes the records after every
+receipt. If the local parent itself is lost before recording exit, the
+deployment operator establishes that its descendants have stopped before
+releasing the grants.
 
 #### Measure peer collective phases
 
